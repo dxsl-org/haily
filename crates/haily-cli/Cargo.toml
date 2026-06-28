@@ -32,4 +32,7 @@ default = []
 telegram = ["haily-io/telegram"]
 # Enable embedded llama.cpp inference (requires C++ compiler + cmake).
 # Pass a GGUF model path via the `llm.llama_model_path` preference.
-llama = ["haily-llm/llama"]
+llama  = ["haily-llm/llama"]
+cuda   = ["haily-llm/cuda"]
+metal  = ["haily-llm/metal"]
+vulkan = ["haily-llm/vulkan"]

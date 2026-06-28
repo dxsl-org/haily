@@ -66,6 +66,12 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         if let Ok(Some(fmt)) = meta::get_preference(db, "llm.llama_prompt_format").await {
             cfg.llama_prompt_format = PromptFormat::from_str(&fmt);
         }
+        // GPU layers: explicit override wins; otherwise keep the compile-time auto-detected default.
+        if let Ok(Some(v)) = meta::get_preference(db, "llm.llama_n_gpu_layers").await {
+            if let Ok(n) = v.parse::<u32>() {
+                cfg.llama_n_gpu_layers = n;
+            }
+        }
     }
 
     // Env vars override preferences (useful for Docker / CI)

@@ -31,6 +31,11 @@ pub struct LlmConfig {
     /// ChatML for Qwen2.5; Gemma4 for google/gemma-4 GGUF files.
     #[cfg(feature = "llama")]
     pub llama_prompt_format: PromptFormat,
+    /// Number of model layers to offload to GPU.
+    /// 0 = CPU-only; 999 = full GPU offload (llama.cpp clamps to actual layer count).
+    /// Auto-detected from compiled GPU features; override via `llm.llama_n_gpu_layers` preference.
+    #[cfg(feature = "llama")]
+    pub llama_n_gpu_layers: u32,
 }
 
 impl Default for LlmConfig {
@@ -48,6 +53,8 @@ impl Default for LlmConfig {
             llama_n_ctx: 4096,
             #[cfg(feature = "llama")]
             llama_prompt_format: PromptFormat::ChatML,
+            #[cfg(feature = "llama")]
+            llama_n_gpu_layers: crate::gpu::default_gpu_layers(),
         }
     }
 }
@@ -85,8 +92,14 @@ impl LlmRouter {
                 let path = config.llama_model_path.clone().unwrap();
                 tracing::info!("LLM: llama.cpp embedded ({})", path.display());
                 let fmt = config.llama_prompt_format;
+                let n_gpu_layers = config.llama_n_gpu_layers;
+                tracing::info!(
+                    "LLM: llama.cpp embedded ({}) — {}",
+                    path.display(),
+                    crate::gpu::gpu_mode_label(n_gpu_layers)
+                );
                 let client = tokio::task::spawn_blocking(move || {
-                    LlamaClient::load(path, config.llama_n_ctx, fmt)
+                    LlamaClient::load(path, config.llama_n_ctx, fmt, n_gpu_layers)
                 })
                 .await??;
                 return Ok(Self {

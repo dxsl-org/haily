@@ -4,6 +4,8 @@ mod prompt;
 mod router;
 
 #[cfg(feature = "llama")]
+mod gpu;
+#[cfg(feature = "llama")]
 mod llama;
 
 pub use cloud::CloudClient;

@@ -1,0 +1,31 @@
+[package]
+name = "haily-llm"
+version.workspace = true
+edition.workspace = true
+description = "LLM provider abstraction — llama.cpp embedded + Ollama + cloud APIs"
+
+[features]
+default = []
+# Enables embedded local inference via llama.cpp (requires C++ compiler + cmake).
+# Not enabled by default to keep dev builds fast; include in release packaging.
+llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# GPU backends — enable alongside `llama`. Each passes through to llama-cpp-2
+# so the correct native code gets compiled in.
+# Build env vars are still required (e.g. LLAMA_CUDA=1 for CUDA).
+cuda   = ["llama-cpp-2/cuda"]
+metal  = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
+
+[dependencies]
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+futures      = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+reqwest      = { workspace = true, features = ["rustls-tls"] }
+async-trait  = "0.1"
+llama-cpp-2  = { version = "0.1", optional = true }
+encoding_rs  = { version = "0.8", optional = true }

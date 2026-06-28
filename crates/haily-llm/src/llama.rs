@@ -31,9 +31,13 @@ pub struct LlamaClient {
 
 impl LlamaClient {
     /// Load a GGUF model from disk. Blocks the calling thread while loading.
-    pub fn load(model_path: PathBuf, n_ctx: u32, fmt: PromptFormat) -> Result<Self> {
+    ///
+    /// `n_gpu_layers`: layers to offload to GPU (0 = CPU-only, 999 = full offload).
+    /// llama.cpp clamps the value to the actual layer count of the model.
+    pub fn load(model_path: PathBuf, n_ctx: u32, fmt: PromptFormat, n_gpu_layers: u32) -> Result<Self> {
         let backend = LlamaBackend::init().context("init llama backend")?;
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0); // CPU-only
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(n_gpu_layers as i32);
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
             .context("load GGUF model")?;
         Ok(Self {
