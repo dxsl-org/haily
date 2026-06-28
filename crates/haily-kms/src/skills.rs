@@ -99,13 +99,25 @@ fn cluster_traces(tasks: &[String]) -> Vec<Vec<usize>> {
 // LLM-based synthesis
 // ---------------------------------------------------------------------------
 
+/// Strip control chars, angle brackets, and excess length from a user-supplied trace description
+/// before interpolating into the LLM synthesis prompt (M4 / ASI01).
+fn sanitize_trace_desc(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(200)
+        .map(|c| match c { '<' | '>' => ' ', c => c })
+        .collect()
+}
+
 fn synthesis_prompt(trace_descs: &[&str]) -> String {
+    let safe_descs: Vec<String> = trace_descs.iter().map(|d| sanitize_trace_desc(d)).collect();
     format!(
-        "Các traces sau đây thực hiện cùng loại task. \
+        "---TASK---\n\
+         Các traces sau đây thực hiện cùng loại task. \
          Hãy generalize thành 1 reusable skill và trả về JSON hợp lệ (không markdown):\n\
-         {{\"name\":\"...\",\"description\":\"...\",\"pattern\":\"...\",\"steps\":[...]}}\n\n\
-         Traces:\n{}",
-        trace_descs.join("\n")
+         {{\"name\":\"...\",\"description\":\"...\",\"pattern\":\"...\",\"steps\":[...]}}\n\
+         ---TRACES---\n{}\n---END---",
+        safe_descs.join("\n")
     )
 }
 
@@ -196,10 +208,8 @@ pub async fn synthesize_skills_from_traces(
 /// EMA confidence update after a tool outcome.
 /// `reward` = 1.0 for success, 0.0 for failure.
 pub async fn update_skill_confidence(db: &DbHandle, skill_id: &str, reward: f64) -> Result<()> {
-    let skills = db_skills::active_skills(db).await?;
-    let skill = skills.iter().find(|s| s.id == skill_id);
-    if let Some(s) = skill {
-        let new_conf = EMA_ALPHA * reward + (1.0 - EMA_ALPHA) * s.confidence;
+    if let Some(skill) = db_skills::get_skill(db, skill_id).await? {
+        let new_conf = EMA_ALPHA * reward + (1.0 - EMA_ALPHA) * skill.confidence;
         db_skills::update_skill_confidence(db, skill_id, new_conf.clamp(0.0, 1.0)).await?;
     }
     Ok(())

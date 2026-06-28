@@ -8,7 +8,7 @@ pub mod system_prompt;
 pub mod embedder;
 
 use anyhow::Result;
-use haily_db::{queries::facts, queries::meta, DbHandle};
+use haily_db::{queries::facts, queries::meta, queries::skills as db_skills, DbHandle};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -143,8 +143,8 @@ impl KmsHandle {
         }
     }
 
-    /// Build a LifeContext snapshot for a session — loads preferences that define
-    /// agent identity and injects recent relevant facts as memory bullets.
+    /// Build a LifeContext snapshot for a session.
+    /// Loads agent identity, feedback preferences, corrections, and top active skills.
     pub async fn build_life_context(&self, session_id: Uuid) -> Result<LifeContext> {
         let _ = session_id; // will be used in Phase 07 for per-session soul overrides
 
@@ -166,12 +166,44 @@ impl KmsHandle {
             .await?
             .unwrap_or_else(|| "tôi".to_string());
 
+        // Build feedback directives from stored preferences (C1 — close the feedback loop).
+        let mut feedback_directives: Vec<String> = Vec::new();
+
+        if meta::get_preference(&self.db, "prefer_shorter_responses").await?.as_deref() == Some("true") {
+            feedback_directives.push("Trả lời ngắn gọn, súc tích.".to_string());
+        }
+        if meta::get_preference(&self.db, "feedback.language_complaint").await?.is_some() {
+            feedback_directives.push("Chú ý dùng đúng ngôn ngữ mà người dùng yêu cầu.".to_string());
+        }
+        if meta::get_preference(&self.db, "feedback.tone_complaint").await?.is_some() {
+            feedback_directives.push("Điều chỉnh phong cách theo phản hồi của người dùng.".to_string());
+        }
+        for pref in meta::list_by_prefix(&self.db, "feedback.correction.").await? {
+            let old = pref.key
+                .trim_start_matches("feedback.correction.")
+                .replace('_', " ");
+            feedback_directives.push(format!("Sửa: \"{}\" → \"{}\"", old, pref.value));
+        }
+
+        // Load top-5 active skills (C2 — inject synthesized skills into context).
+        let skill_rows = db_skills::active_skills_top(&self.db, 5).await?;
+        let active_skills: Vec<SkillSummary> = skill_rows
+            .into_iter()
+            .map(|s| SkillSummary {
+                name: s.name,
+                description: s.description,
+                pattern: s.pattern,
+            })
+            .collect();
+
         Ok(LifeContext {
             agent_name,
             soul,
             user_address,
             agent_pronoun,
             relevant_facts: vec![],
+            feedback_directives,
+            active_skills,
         })
     }
 
@@ -199,6 +231,13 @@ impl KmsHandle {
 }
 
 #[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct LifeContext {
     pub agent_name: String,
     pub soul: Soul,
@@ -206,6 +245,10 @@ pub struct LifeContext {
     pub agent_pronoun: String,
     /// Fact texts (subject predicate object) injected as memory bullets.
     pub relevant_facts: Vec<String>,
+    /// Short directives derived from user feedback preferences.
+    pub feedback_directives: Vec<String>,
+    /// Top active skills to guide the LLM toward learned patterns.
+    pub active_skills: Vec<SkillSummary>,
 }
 
 #[derive(Debug, Clone, Default)]

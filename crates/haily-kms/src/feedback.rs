@@ -29,7 +29,12 @@ pub async fn apply_feedback_signal(signal: &FeedbackSignal, db: &DbHandle) -> Re
             info!(key, "negative feedback preference set");
         }
         FeedbackSignal::Correction { old, new } => {
-            let key = format!("feedback.correction.{}", old.replace(' ', "_"));
+            if old.is_empty() || new.is_empty() {
+                return Ok(());
+            }
+            // Cap key suffix to 64 chars to prevent unbounded pref key growth.
+            let suffix: String = old.replace(' ', "_").chars().take(64).collect();
+            let key = format!("feedback.correction.{suffix}");
             meta::upsert_preference(db, &key, new, "explicit").await?;
             info!(%old, %new, "correction saved as preference");
         }

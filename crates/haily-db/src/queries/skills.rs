@@ -66,6 +66,8 @@ pub async fn recent_traces(db: &DbHandle, limit: i64) -> Result<Vec<TaskTrace>> 
     .await?)
 }
 
+/// Insert a skill, skipping silently if `name` already exists (unique index guard).
+/// Always returns the row — newly inserted or the pre-existing one.
 pub async fn insert_skill(
     db: &DbHandle,
     name: &str,
@@ -75,11 +77,10 @@ pub async fn insert_skill(
 ) -> Result<Skill> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    Ok(sqlx::query_as::<_, Skill>(
-        "INSERT INTO kms_skills
+    sqlx::query(
+        "INSERT OR IGNORE INTO kms_skills
              (id, name, description, pattern, steps, confidence, use_count, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1.0, 0, ?, ?)
-         RETURNING *",
+         VALUES (?, ?, ?, ?, ?, 1.0, 0, ?, ?)",
     )
     .bind(&id)
     .bind(name)
@@ -88,6 +89,12 @@ pub async fn insert_skill(
     .bind(steps_json)
     .bind(&now)
     .bind(&now)
+    .execute(db.pool())
+    .await?;
+    Ok(sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL",
+    )
+    .bind(name)
     .fetch_one(db.pool())
     .await?)
 }
@@ -107,12 +114,34 @@ pub async fn increment_use_count(db: &DbHandle, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Traces created at or after `since` (RFC3339).
+/// Traces created at or after `since` (RFC3339). Capped at 500 rows (H2 guard).
 pub async fn traces_since(db: &DbHandle, since: &str) -> Result<Vec<TaskTrace>> {
     Ok(sqlx::query_as::<_, TaskTrace>(
-        "SELECT * FROM kms_task_traces WHERE created_at >= ? ORDER BY created_at DESC",
+        "SELECT * FROM kms_task_traces WHERE created_at >= ? ORDER BY created_at DESC LIMIT 500",
     )
     .bind(since)
+    .fetch_all(db.pool())
+    .await?)
+}
+
+/// Fetch a single active skill by ID — used for targeted EMA updates.
+pub async fn get_skill(db: &DbHandle, id: &str) -> Result<Option<Skill>> {
+    Ok(sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
+/// Top-N active skills by confidence — used to inject skills into the system prompt.
+pub async fn active_skills_top(db: &DbHandle, limit: i64) -> Result<Vec<Skill>> {
+    Ok(sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills
+         WHERE deleted_at IS NULL AND archived_at IS NULL
+         ORDER BY confidence DESC LIMIT ?",
+    )
+    .bind(limit)
     .fetch_all(db.pool())
     .await?)
 }

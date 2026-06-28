@@ -6,17 +6,19 @@ const POS_PATTERNS: &[&str] = &[
     "cảm ơn", "thank", "good",
 ];
 const NEG_PATTERNS: &[&str] = &[
-    "👎", "sai", "không phải", "đừng làm vậy", "đừng", "không đúng",
+    "👎", "sai", "không phải", "đừng làm vậy", "không đúng",
     "dài quá", "ngắn thôi", "quá dài", "wrong", "bad", "stop",
 ];
 
 fn try_parse_correction(msg: &str) -> Option<FeedbackSignal> {
+    // Work entirely on the lowercased string to avoid byte-offset/char-boundary
+    // mismatches when to_lowercase() changes byte lengths (e.g. Turkish İ).
     let lower = msg.to_lowercase();
     for marker in &["không phải", "not "] {
         if let Some(pos) = lower.find(marker) {
-            let after = &msg[pos + marker.len()..];
+            let after = &lower[pos + marker.len()..];
             for sep in &[" mà là ", " mà ", " it's ", " but "] {
-                if let Some(sep_pos) = after.to_lowercase().find(sep) {
+                if let Some(sep_pos) = after.find(sep) {
                     let old = after[..sep_pos].trim().to_string();
                     let new = after[sep_pos + sep.len()..].trim().to_string();
                     if !old.is_empty() && !new.is_empty() {

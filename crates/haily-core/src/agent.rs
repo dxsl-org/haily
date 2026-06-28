@@ -70,15 +70,17 @@ pub async fn run_turn(
                     .await
                     .unwrap_or_else(|e| format!("Error: {e:#}"));
 
+            let tool_ok = !result.starts_with("Error:");
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
                 "args": args.to_string(),
-                "ok":   !result.starts_with("Error:")
+                "ok":   tool_ok
             }));
 
             let result_msg = format!(
-                "<tool_result>{{\"tool\":\"{tool_name}\",\"result\":{},\"ok\":true}}</tool_result>",
-                serde_json::Value::String(result)
+                "<tool_result>{{\"tool\":\"{tool_name}\",\"result\":{},\"ok\":{}}}</tool_result>",
+                serde_json::Value::String(result),
+                tool_ok
             );
             messages.push(Message { role: Role::User, content: result_msg });
         } else {
@@ -92,12 +94,13 @@ pub async fn run_turn(
     // Record task trace for skill synthesis
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
     let tool_calls_json = serde_json::to_string(&tool_call_log).unwrap_or_default();
+    let outcome = if tool_call_log.iter().any(|e| e["ok"] == false) { "failure" } else { "success" };
     let _ = db_skills::insert_trace(
         &db,
         &session_id,
         &req.message,
         &tool_calls_json,
-        "success",
+        outcome,
         Some(elapsed_ms),
     )
     .await;

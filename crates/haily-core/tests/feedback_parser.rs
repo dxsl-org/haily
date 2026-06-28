@@ -28,11 +28,13 @@ fn detects_negative_too_long() {
 
 #[test]
 fn detects_correction_vietnamese() {
+    // try_parse_correction works on the lowercased string to avoid byte-offset/char-boundary
+    // issues — so old/new are lowercase. Preference keys are case-insensitive so this is correct.
     let sig = detect_feedback("không phải Hà Nội mà là Hồ Chí Minh");
     assert!(matches!(
         sig,
         Some(FeedbackSignal::Correction { ref old, ref new })
-            if old.contains("Hà Nội") && new.contains("Hồ Chí Minh")
+            if old.contains("hà nội") && new.contains("hồ chí minh")
     ));
 }
 
