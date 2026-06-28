@@ -1,0 +1,35 @@
+[package]
+name = "haily-cli"
+version.workspace = true
+edition.workspace = true
+description = "Binary entry point — --cli, --headless, --gui modes"
+
+[[bin]]
+name = "haily-cli"
+path = "src/main.rs"
+
+[dependencies]
+haily-db        = { workspace = true }
+haily-llm       = { workspace = true }
+haily-io        = { workspace = true }
+haily-kms       = { workspace = true }
+haily-core      = { workspace = true }
+haily-proactive = { workspace = true }
+tokio     = { workspace = true }
+anyhow    = { workspace = true }
+tracing   = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }
+uuid      = { workspace = true }
+clap      = { version = "4", features = ["derive"] }
+dirs      = "5"
+
+[features]
+default = []
+# Enable Telegram bot adapter for headless mode.
+# Requires TELEGRAM_BOT_TOKEN env var at runtime.
+telegram = ["haily-io/telegram"]
+# Enable embedded llama.cpp inference (requires C++ compiler + cmake).
+# Pass a GGUF model path via the `llm.llama_model_path` preference.
+llama = ["haily-llm/llama"]
