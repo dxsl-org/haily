@@ -1,9 +1,24 @@
-use crate::{CloudClient, CompletionRequest, LlmClient, OllamaClient};
+use crate::CloudClient;
 #[cfg(feature = "llama")]
 use crate::prompt::PromptFormat;
-use anyhow::{anyhow, Result};
+use crate::{CompletionRequest, LlmClient};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// Placeholder used when no backend is configured.
+/// Returns a user-visible error on every completion so the app still starts.
+struct NoopClient;
+
+#[async_trait]
+impl LlmClient for NoopClient {
+    async fn complete(&self, _req: CompletionRequest) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "Chưa cấu hình LLM. Mở Settings → Model LLM để chọn model."
+        ))
+    }
+    fn provider_name(&self) -> &str { "unconfigured" }
+}
 
 #[cfg(feature = "llama")]
 use crate::LlamaClient;
@@ -12,11 +27,6 @@ use crate::LlamaClient;
 /// Loaded from KMS preferences on startup; user can update without restart.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    /// Prefer Ollama over embedded llama.cpp when both are available.
-    pub prefer_ollama: bool,
-    pub ollama_url: String,
-    pub ollama_model: String,
-
     pub cloud_api_key: Option<String>,
     pub cloud_base_url: String,
     pub cloud_model: String,
@@ -41,9 +51,6 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            prefer_ollama: false,
-            ollama_url: "http://localhost:11434".into(),
-            ollama_model: "qwen2.5:3b".into(),
             cloud_api_key: std::env::var("OPENAI_API_KEY").ok(),
             cloud_base_url: "https://api.openai.com".into(),
             cloud_model: "gpt-4o-mini".into(),
@@ -62,16 +69,18 @@ impl Default for LlmConfig {
 /// Routes requests to the best available LLM backend.
 ///
 /// Priority:
-///   1. llama.cpp embedded  (feature = "llama", model file present, prefer_ollama = false)
-///   2. Ollama              (running at ollama_url, or prefer_ollama = true)
-///   3. Cloud API           (api_key configured)
+///   1. llama.cpp embedded  (feature = "llama", model file present)
+///   2. Cloud API           (api_key configured)
 pub struct LlmRouter {
     primary: Arc<dyn LlmClient>,
     fallback: Option<Arc<dyn LlmClient>>,
 }
 
 impl LlmRouter {
-    pub async fn init(config: LlmConfig) -> Result<Self> {
+    /// Always succeeds — uses `NoopClient` when no backend is reachable so the
+    /// app can start without a configured model. The error surfaces only when the
+    /// user actually sends a message.
+    pub async fn init(config: LlmConfig) -> Self {
         let cloud: Option<Arc<dyn LlmClient>> = config.cloud_api_key.as_deref().map(|key| {
             Arc::new(CloudClient::new(
                 config.cloud_base_url.clone(),
@@ -80,52 +89,41 @@ impl LlmRouter {
             )) as Arc<dyn LlmClient>
         });
 
-        let ollama_running = OllamaClient::probe(&config.ollama_url).await;
-
         #[cfg(feature = "llama")]
         {
             let llama_ok = config.llama_model_path.as_ref()
                 .map(|p| p.exists())
                 .unwrap_or(false);
 
-            if llama_ok && !config.prefer_ollama {
+            if llama_ok {
                 let path = config.llama_model_path.clone().unwrap();
-                tracing::info!("LLM: llama.cpp embedded ({})", path.display());
                 let fmt = config.llama_prompt_format;
                 let n_gpu_layers = config.llama_n_gpu_layers;
                 tracing::info!(
-                    "LLM: llama.cpp embedded ({}) — {}",
+                    "LLM: llama.cpp ({}) — {}",
                     path.display(),
                     crate::gpu::gpu_mode_label(n_gpu_layers)
                 );
-                let client = tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     LlamaClient::load(path, config.llama_n_ctx, fmt, n_gpu_layers)
-                })
-                .await??;
-                return Ok(Self {
-                    primary: Arc::new(client),
-                    fallback: cloud,
-                });
+                }).await {
+                    Ok(Ok(client)) => return Self {
+                        primary: Arc::new(client),
+                        fallback: cloud,
+                    },
+                    Ok(Err(e)) => tracing::warn!("llama.cpp load failed: {e:#}"),
+                    Err(e)     => tracing::warn!("llama.cpp spawn failed: {e:#}"),
+                }
             }
-        }
-
-        if ollama_running {
-            tracing::info!("LLM: Ollama @ {} ({})", config.ollama_url, config.ollama_model);
-            let client = Arc::new(OllamaClient::new(&config.ollama_url, &config.ollama_model));
-            return Ok(Self { primary: client, fallback: cloud });
         }
 
         if let Some(cloud_client) = cloud {
             tracing::info!("LLM: cloud API ({})", config.cloud_model);
-            return Ok(Self { primary: cloud_client, fallback: None });
+            return Self { primary: cloud_client, fallback: None };
         }
 
-        Err(anyhow!(
-            "No LLM backend available. Options:\n\
-             1. Install Ollama: https://ollama.com  →  ollama pull qwen2.5:3b\n\
-             2. Set OPENAI_API_KEY env var for cloud fallback\n\
-             3. Build with --features llama and provide a GGUF model file"
-        ))
+        tracing::warn!("No LLM backend configured — open Settings → Model LLM");
+        Self { primary: Arc::new(NoopClient), fallback: None }
     }
 
     pub fn provider_name(&self) -> &str {

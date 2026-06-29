@@ -6,7 +6,7 @@
 use haily_db::{queries::meta, DbHandle};
 use haily_io::{AdapterManager, GuiRequestSender, Request, ResponseChunk};
 use haily_kms::KmsHandle;
-use haily_llm::LlmConfig;
+use haily_llm::{LlmConfig, PromptFormat};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -14,6 +14,7 @@ use uuid::Uuid;
 struct AppState {
     gui_req_tx: GuiRequestSender,
     db: Arc<DbHandle>,
+    orc: Arc<haily_core::Orchestrator>,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,30 +43,17 @@ async fn send_message(
     Ok(session_id.to_string())
 }
 
-/// List model names available in the running Ollama instance.
-/// Returns an empty list if Ollama is unreachable.
+/// Re-read LLM preferences from DB and hot-swap the active LLM backend.
+/// Call after saving any llm.* preference so changes take effect immediately.
+///
+/// Returns the active provider name ("llama.cpp", cloud model, or "unconfigured")
+/// so the UI can distinguish a real model load from a silent fallback — the router
+/// never errors on load, it falls back to `NoopClient` ("unconfigured") instead.
 #[tauri::command]
-async fn list_ollama_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let url = meta::get_preference(&state.db, "llm.ollama_url")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "http://localhost:11434".to_string());
-
-    #[derive(serde::Deserialize)]
-    struct TagsResponse { models: Vec<ModelEntry> }
-    #[derive(serde::Deserialize)]
-    struct ModelEntry { name: String }
-
-    let resp = reqwest::Client::new()
-        .get(format!("{url}/api/tags"))
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let tags: TagsResponse = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(tags.models.into_iter().map(|m| m.name).collect())
+async fn reload_llm(state: State<'_, AppState>) -> Result<String, String> {
+    let cfg = load_llm_config(&state.orc.kms).await;
+    state.orc.reload_llm(cfg).await;
+    Ok(state.orc.llm_provider())
 }
 
 /// Return all stored user preferences as a flat key→value map.
@@ -81,6 +69,40 @@ async fn get_preferences(
         .map(|p| (p.key, serde_json::Value::String(p.value)))
         .collect();
     Ok(serde_json::Value::Object(map))
+}
+
+/// Scan <exe_dir>/models/ for GGUF files and return metadata for the UI.
+/// Multi-part files (part 2, 3, …) are hidden — only the -00001- entry point
+/// is shown; llama.cpp loads all parts automatically.
+#[tauri::command]
+fn list_local_models() -> Vec<serde_json::Value> {
+    let models_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("models")))
+        .unwrap_or_else(|| std::path::PathBuf::from("models"));
+
+    let Ok(entries) = std::fs::read_dir(&models_dir) else { return vec![] };
+
+    let mut models: Vec<serde_json::Value> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()?.to_str()? != "gguf" { return None; }
+            let name = path.file_name()?.to_str()?.to_string();
+            // Hide continuation parts (e.g. -00002-of-00003)
+            if name.contains("-of-") && !name.contains("-00001-of-") { return None; }
+            let lower = name.to_lowercase();
+            let format = if lower.contains("gemma") { "gemma4" } else { "chatml" };
+            Some(serde_json::json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "format": format,
+            }))
+        })
+        .collect();
+
+    models.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    models
 }
 
 /// Persist a single preference key/value (source = "gui").
@@ -127,11 +149,26 @@ async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         };
     }
 
-    pref!("llm.ollama_url",     cfg.ollama_url);
-    pref!("llm.ollama_model",   cfg.ollama_model);
     pref!("llm.cloud_base_url", cfg.cloud_base_url);
     pref!("llm.cloud_model",    cfg.cloud_model);
     pref!("llm.cloud_api_key",  cfg.cloud_api_key, opt);
+
+    if let Ok(Some(path)) = meta::get_preference(db, "llm.llama_model_path").await {
+        cfg.llama_model_path = Some(std::path::PathBuf::from(path));
+    }
+    if let Ok(Some(fmt)) = meta::get_preference(db, "llm.llama_prompt_format").await {
+        cfg.llama_prompt_format = PromptFormat::from_str(&fmt);
+    }
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.llama_n_gpu_layers").await {
+        if let Ok(n) = v.parse::<u32>() {
+            cfg.llama_n_gpu_layers = n;
+        }
+    }
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.llama_n_ctx").await {
+        if let Ok(n) = v.parse::<u32>() {
+            cfg.llama_n_ctx = n;
+        }
+    }
 
     for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"] {
         if let Ok(v) = std::env::var(key) {
@@ -168,8 +205,12 @@ async fn run_dispatch(am: AdapterManager, orc: Arc<haily_core::Orchestrator>) ->
                     }
                 })
             };
+            // Clone before move so we can send an error message if process() fails.
+            let resp_tx_err = resp_tx.clone();
             if let Err(e) = orc_c.process(req, resp_tx).await {
                 tracing::error!("orchestrator error: {e:#}");
+                resp_tx_err.send(ResponseChunk::Text(format!("⚠️ {e:#}"))).await.ok();
+                resp_tx_err.send(ResponseChunk::Complete).await.ok();
             }
             delivery.await.ok();
             am_c.unbind_session(&session_id);
@@ -179,9 +220,11 @@ async fn run_dispatch(am: AdapterManager, orc: Arc<haily_core::Orchestrator>) ->
 }
 
 fn data_dir() -> std::path::PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("haily")
+    // Portable-first: store data next to the exe in ./data/
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("data")))
+        .unwrap_or_else(|| std::path::PathBuf::from("data"))
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +256,7 @@ pub fn run() {
             let daemon = haily_proactive::ProactiveDaemon::new(db.clone(), am.clone());
             tauri::async_runtime::spawn(async move { daemon.start(); });
 
-            app.manage(AppState { gui_req_tx, db: db.clone() });
+            app.manage(AppState { gui_req_tx, db: db.clone(), orc: Arc::clone(&orc) });
 
             // Agent dispatch runs in background
             let am_c = am.clone();
@@ -244,7 +287,8 @@ pub fn run() {
             send_message,
             get_preferences,
             set_preference,
-            list_ollama_models,
+            list_local_models,
+            reload_llm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Haily");

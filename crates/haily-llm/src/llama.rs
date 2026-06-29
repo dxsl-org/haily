@@ -5,7 +5,7 @@
 ///
 /// Supports ChatML (Qwen2.5) and Gemma4 prompt formats via `PromptFormat`.
 use crate::{
-    prompt::{self, PromptFormat},
+    prompt::PromptFormat,
     CompletionRequest, LlmClient,
 };
 use anyhow::{anyhow, Context, Result};
@@ -20,10 +20,45 @@ use llama_cpp_2::{
     model::LlamaModel,
     sampling::LlamaSampler,
 };
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, sync::OnceLock};
+
+/// Process-global llama backend. llama.cpp's backend is a singleton guarded by a
+/// global flag: `LlamaBackend::init()` errors if called while another backend is
+/// alive, and dropping it frees global state. Re-initializing across a model
+/// reload therefore fails (→ silent fallback) or aborts the process mid-inference.
+///
+/// We initialize it exactly once and never drop it, so every `LlamaClient` —
+/// including ones created by a hot model swap — shares the same valid backend.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+/// Returns the shared backend, initializing it on first use.
+///
+/// Only one `LlamaBackend::init()` can succeed process-wide; concurrent callers
+/// that lose the race spin briefly until the winner publishes the backend.
+fn backend() -> Result<&'static LlamaBackend> {
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    match LlamaBackend::init() {
+        Ok(b) => {
+            // set() only fails if another thread published first; in that case our
+            // `b` is the unique backend and theirs cannot exist, so this never errs.
+            let _ = BACKEND.set(b);
+            Ok(BACKEND.get().expect("backend just set"))
+        }
+        Err(_already_init) => {
+            // Another thread is mid-init; wait for it to publish.
+            loop {
+                if let Some(b) = BACKEND.get() {
+                    return Ok(b);
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
 
 pub struct LlamaClient {
-    backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
     n_ctx: u32,
     fmt: PromptFormat,
@@ -35,13 +70,24 @@ impl LlamaClient {
     /// `n_gpu_layers`: layers to offload to GPU (0 = CPU-only, 999 = full offload).
     /// llama.cpp clamps the value to the actual layer count of the model.
     pub fn load(model_path: PathBuf, n_ctx: u32, fmt: PromptFormat, n_gpu_layers: u32) -> Result<Self> {
-        let backend = LlamaBackend::init().context("init llama backend")?;
+        let backend = backend()?;
+        // Requesting GPU offload on a build with no GPU backend makes llama.cpp try
+        // to allocate buffers on a non-existent device — an abort that kills the whole
+        // process, not a recoverable error. Clamp to CPU-only when GPU is unavailable.
+        let effective_gpu_layers = if n_gpu_layers > 0 && !backend.supports_gpu_offload() {
+            tracing::warn!(
+                requested = n_gpu_layers,
+                "no GPU backend compiled/available — forcing CPU-only (n_gpu_layers=0)"
+            );
+            0
+        } else {
+            n_gpu_layers
+        };
         let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(n_gpu_layers as i32);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            .with_n_gpu_layers(effective_gpu_layers);
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .context("load GGUF model")?;
         Ok(Self {
-            backend: Arc::new(backend),
             model: Arc::new(model),
             n_ctx,
             fmt,
@@ -57,11 +103,11 @@ impl LlmClient for LlamaClient {
         let temperature = req.temperature;
         let n_ctx = self.n_ctx;
 
-        let backend = Arc::clone(&self.backend);
         let model = Arc::clone(&self.model);
 
         tokio::task::spawn_blocking(move || {
-            run_inference(&backend, &model, &prompt_text, n_ctx, max_tokens, temperature)
+            let backend = backend()?;
+            run_inference(backend, &model, &prompt_text, n_ctx, max_tokens, temperature)
         })
         .await
         .context("spawn_blocking panicked")?
@@ -92,10 +138,13 @@ fn run_inference(
         ));
     }
 
-    // Context
+    // Context. n_batch must be ≥ the prompt length: the prompt is decoded in a
+    // single batch below, and llama.cpp asserts `n_tokens_all <= n_batch`
+    // (an abort, not a recoverable error). The full system prompt + tool reference
+    // routinely exceeds the old 512 default, so size the batch to the context.
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(NonZeroU32::new(n_ctx).unwrap()))
-        .with_n_batch(512);
+        .with_n_batch(n_ctx);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .context("create llama context")?;
@@ -108,12 +157,24 @@ fn run_inference(
     }
     ctx.decode(&mut batch).context("decode prompt batch")?;
 
-    // Sampler chain: top-k → top-p → temperature
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::top_k(40),
-        LlamaSampler::top_p(0.9, 1),
-        LlamaSampler::temp(temperature),
-    ]);
+    // Sampler chain MUST end with a selecting sampler (`dist`/`greedy`); the
+    // transform samplers (top_k/top_p/temp) only reshape logits and never set
+    // the selected token, leaving `llama_sampler_sample` to return a garbage
+    // token (observed as immediate EOG → empty output).
+    let mut sampler = if temperature <= 0.0 {
+        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    } else {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        LlamaSampler::chain_simple([
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(seed),
+        ])
+    };
 
     let mut output = String::new();
     let mut n_cur = tokens.len() as i32;

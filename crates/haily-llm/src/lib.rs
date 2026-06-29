@@ -1,5 +1,4 @@
 mod cloud;
-mod ollama;
 mod prompt;
 mod router;
 
@@ -9,7 +8,6 @@ mod gpu;
 mod llama;
 
 pub use cloud::CloudClient;
-pub use ollama::OllamaClient;
 pub use prompt::PromptFormat;
 pub use router::{LlmConfig, LlmRouter};
 

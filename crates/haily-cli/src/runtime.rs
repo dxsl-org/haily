@@ -51,8 +51,6 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         };
     }
 
-    pref!("llm.ollama_url",       cfg.ollama_url);
-    pref!("llm.ollama_model",     cfg.ollama_model);
     pref!("llm.cloud_base_url",   cfg.cloud_base_url);
     pref!("llm.cloud_model",      cfg.cloud_model);
     pref!("llm.cloud_api_key",    cfg.cloud_api_key, opt);
@@ -116,8 +114,11 @@ pub async fn dispatch_loop(am: AdapterManager, orc: Arc<Orchestrator>) -> Result
                 })
             };
 
+            let resp_tx_err = resp_tx.clone();
             if let Err(e) = orc_clone.process(req, resp_tx).await {
                 tracing::error!("orchestrator error: {e:#}");
+                resp_tx_err.send(ResponseChunk::Text(format!("⚠️ {e:#}"))).await.ok();
+                resp_tx_err.send(ResponseChunk::Complete).await.ok();
             }
 
             delivery.await.ok();
