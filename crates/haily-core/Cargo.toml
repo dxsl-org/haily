@@ -1,0 +1,22 @@
+[package]
+name = "haily-core"
+version.workspace = true
+edition.workspace = true
+description = "Orchestrator and agent loop"
+
+[dependencies]
+haily-db    = { workspace = true }
+haily-llm   = { workspace = true }
+haily-io    = { workspace = true }
+haily-kms   = { workspace = true }
+haily-tools = { workspace = true }
+tokio        = { workspace = true }
+tokio-stream = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+chrono       = { workspace = true }
+async-trait  = "0.1"

@@ -1,0 +1,13 @@
+[package]
+name = "haily-proactive"
+version.workspace = true
+edition.workspace = true
+description = "Proactive daemon — morning brief, alerts, DND, pattern detection"
+
+[dependencies]
+haily-db    = { workspace = true }
+haily-io    = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+chrono      = { workspace = true }

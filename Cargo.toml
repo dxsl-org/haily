@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/haily-db",
+    "crates/haily-llm",
+    "crates/haily-io",
+    "crates/haily-kms",
+    "crates/haily-tools",
+    "crates/haily-core",
+    "crates/haily-proactive",
+    "crates/haily-cli",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Error handling
+anyhow = "1"
+thiserror = "1"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# IDs and time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
+# Internal crates (path deps for workspace members that import each other)
+haily-db    = { path = "crates/haily-db" }
+haily-llm   = { path = "crates/haily-llm" }
+haily-io    = { path = "crates/haily-io" }
+haily-kms   = { path = "crates/haily-kms" }
+haily-tools = { path = "crates/haily-tools" }
+haily-core  = { path = "crates/haily-core" }
+haily-proactive = { path = "crates/haily-proactive" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

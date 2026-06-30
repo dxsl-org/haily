@@ -1,0 +1,26 @@
+[package]
+name = "haily-kms"
+version.workspace = true
+edition.workspace = true
+description = "Knowledge Management System — long-term memory, hybrid search, life context"
+
+[features]
+default = []
+# fastembed downloads multilingual-e5-base ONNX model (~150 MB) on first run.
+# Gate it so dev builds stay fast; enable in packaging.
+embeddings = ["dep:fastembed"]
+
+[dependencies]
+haily-db   = { workspace = true }
+haily-llm  = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { workspace = true }
+chrono     = { workspace = true }
+async-trait = "0.1"
+hnsw_rs    = "0.3"
+fastembed  = { version = "4", optional = true }

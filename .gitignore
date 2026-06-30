@@ -1,0 +1,44 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Node / SvelteKit
+node_modules/
+build/
+.svelte-kit/
+.env
+.env.*
+!.env.example
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/WixTools/
+
+# Haily runtime data — never commit these
+*.gguf
+*.db
+*.db-shm
+*.db-wal
+haily.log
+haily-*.log
+
+# Agent plans — gitignored per docs/documentation-management
+.agents/
+.docs/
+models/
+data/
+
+# Local dev artifacts
+haily.exe
+.logs/
+src-tauri/.logs/
+
+# Reference codebase (old Go version — local only)
+.reference/
+
+# Claude Code personal config
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+[package]
+name = "haily-io"
+version.workspace = true
+edition.workspace = true
+description = "Unified I/O adapter — GUI, CLI, Telegram all implement Adapter trait"
+
+[features]
+default = []
+# Telegram bot support (requires TELOXIDE_TOKEN env var at runtime)
+telegram = ["dep:teloxide"]
+
+[dependencies]
+tokio       = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+uuid        = { workspace = true }
+async-trait = "0.1"
+dashmap     = "6"
+teloxide    = { version = "0.12", features = ["macros"], optional = true }

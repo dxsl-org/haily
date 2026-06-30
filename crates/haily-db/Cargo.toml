@@ -1,0 +1,17 @@
+[package]
+name = "haily-db"
+version.workspace = true
+edition.workspace = true
+description = "SQLite schema owner — all SQL lives here"
+
+[dependencies]
+sqlx          = { version = "0.8", features = ["sqlite", "runtime-tokio", "uuid", "chrono", "macros"] }
+libsqlite3-sys = { version = "0.28", features = ["bundled"] }
+tokio    = { workspace = true }
+anyhow   = { workspace = true }
+thiserror = { workspace = true }
+tracing  = { workspace = true }
+uuid     = { workspace = true }
+chrono   = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }
