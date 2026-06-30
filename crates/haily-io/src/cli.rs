@@ -1,14 +1,19 @@
-use crate::{Adapter, Notification, Request, RequestSender, ResponseChunk};
+use crate::{Adapter, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
-pub struct CliAdapter;
+pub struct CliAdapter {
+    /// Active work items cached by notify(WorkItemsChanged). Read before each prompt.
+    /// Only the REPL loop writes to stdout, so updating this from notify() is race-free.
+    status: Arc<Mutex<Vec<WorkItemStatus>>>,
+}
 
 impl CliAdapter {
     pub fn new() -> Self {
-        Self
+        Self { status: Arc::new(Mutex::new(Vec::new())) }
     }
 }
 
@@ -24,6 +29,7 @@ impl Adapter for CliAdapter {
     /// All CLI interactions share a single session for the lifetime of the process.
     async fn start(&self, tx: RequestSender) -> Result<()> {
         let session_id = Uuid::new_v4();
+        let status = Arc::clone(&self.status);
 
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
@@ -31,6 +37,17 @@ impl Adapter for CliAdapter {
             let mut stdout = tokio::io::stdout();
 
             loop {
+                // Render active work items above the prompt (cache updated by notify).
+                // Build the panel string while holding the lock, then drop the guard
+                // before .await so MutexGuard is not held across a suspension point.
+                let panel: Option<String> = {
+                    let items = status.lock().unwrap();
+                    if items.is_empty() { None } else { Some(render_status_panel(&items)) }
+                };
+                if let Some(panel) = panel {
+                    stdout.write_all(panel.as_bytes()).await.ok();
+                }
+
                 stdout.write_all(b"\nYou: ").await.ok();
                 stdout.flush().await.ok();
 
@@ -88,7 +105,6 @@ impl Adapter for CliAdapter {
                 );
                 stdout.write_all(prompt.as_bytes()).await?;
                 stdout.flush().await?;
-                // Phase 07 orchestrator handles the approval response loop
                 let _ = approval_id;
             }
             ResponseChunk::ToolResult { name, ok } => {
@@ -103,6 +119,11 @@ impl Adapter for CliAdapter {
     async fn notify(&self, msg: Notification) -> Result<()> {
         let mut stdout = tokio::io::stdout();
         let text = match msg {
+            // Update the cached status; the REPL loop will render it before the next prompt.
+            Notification::WorkItemsChanged(items) => {
+                *self.status.lock().unwrap() = items;
+                return Ok(());
+            }
             Notification::MorningBrief(brief) => format!("\n[Morning Brief]\n{brief}\n"),
             Notification::Alert { title, body, urgent } => {
                 let prefix = if urgent { "🔴" } else { "📢" };
@@ -120,4 +141,29 @@ impl Adapter for CliAdapter {
     fn id(&self) -> &str {
         "cli"
     }
+}
+
+/// Compact status panel rendered above the `You:` prompt when tasks are active.
+///
+/// Each line: `  ⚙ "title" [last_tool] 30%`
+/// A separator line follows the item list.
+fn render_status_panel(items: &[WorkItemStatus]) -> String {
+    let mut out = String::new();
+    for item in items {
+        let icon = match item.status.as_str() {
+            "running"                => "⚙",
+            "queued"                 => "⏳",
+            "paused" | "interrupted" => "⏸",
+            _                        => "•",
+        };
+        let title: String = if item.title.chars().count() > 42 {
+            item.title.chars().take(41).collect::<String>() + "…"
+        } else {
+            item.title.clone()
+        };
+        let phase = item.phase.as_deref().map(|p| format!(" [{p}]")).unwrap_or_default();
+        out.push_str(&format!("  {icon} \"{title}\"{phase} {}%\n", item.progress));
+    }
+    out.push_str("  ─────────────────────────────────\n");
+    out
 }

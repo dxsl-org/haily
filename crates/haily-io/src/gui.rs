@@ -65,10 +65,15 @@ impl Adapter for GuiAdapter {
 
     async fn notify(&self, msg: Notification) -> Result<()> {
         // Buffer as a synthetic "system" response chunk so the UI can display it.
+        // WorkItemsChanged is handled by the frontend work-item panel; skip here.
+        if matches!(msg, Notification::WorkItemsChanged(_)) {
+            return Ok(());
+        }
         let text = match &msg {
             Notification::MorningBrief(brief) => format!("[Morning Brief]\n{brief}"),
             Notification::Alert { title, body, .. } => format!("{title}\n{body}"),
             Notification::ReminderFired { title, .. } => format!("⏰ {title}"),
+            Notification::WorkItemsChanged(_) => unreachable!(),
         };
         // Delivered on a synthetic session so Phase 10 can route it to a notification panel.
         let synthetic_session = Uuid::nil();

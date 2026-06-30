@@ -41,6 +41,15 @@ pub enum ResponseChunk {
     Complete,
 }
 
+/// Snapshot of a single active work item for display in adapters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemStatus {
+    pub title: String,
+    pub status: String,
+    pub progress: u8,
+    pub phase: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Notification {
     MorningBrief(String),
@@ -53,6 +62,8 @@ pub enum Notification {
         reminder_id: Uuid,
         title: String,
     },
+    /// Broadcast when the set of active work items changes (added, progressed, or removed).
+    WorkItemsChanged(Vec<WorkItemStatus>),
 }
 
 pub type RequestSender = tokio::sync::mpsc::Sender<Request>;

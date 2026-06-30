@@ -1,8 +1,8 @@
 /// Shared startup, LLM config loading, and the request dispatch loop.
 use anyhow::Result;
 use haily_core::Orchestrator;
-use haily_db::{queries::meta, DbHandle};
-use haily_io::{AdapterManager, Request, ResponseChunk};
+use haily_db::{queries::{meta, work_items}, DbHandle};
+use haily_io::{AdapterManager, Notification, Request, ResponseChunk, WorkItemStatus};
 use haily_kms::KmsHandle;
 use haily_llm::LlmConfig;
 #[cfg(feature = "llama")]
@@ -108,6 +108,8 @@ pub async fn dispatch_loop(am: AdapterManager, orc: Arc<Orchestrator>) -> Result
     am.start_all(req_tx).await?;
     info!("dispatch loop running");
 
+    spawn_work_item_watcher(Arc::clone(&orc.db), am.clone());
+
     while let Some(req) = req_rx.recv().await {
         let session_id = req.session_id;
         am.bind_session(session_id, &req.adapter_id);
@@ -142,4 +144,39 @@ pub async fn dispatch_loop(am: AdapterManager, orc: Arc<Orchestrator>) -> Result
     }
 
     Ok(())
+}
+
+/// Poll active work items every second; broadcast changes to all adapters.
+///
+/// Adapters cache the snapshot and render it at their next natural update point
+/// (e.g., before the `You:` prompt in the CLI), avoiding mid-output interleaving.
+fn spawn_work_item_watcher(db: Arc<DbHandle>, am: AdapterManager) {
+    tokio::spawn(async move {
+        let mut last_ids: Vec<String> = Vec::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let items = match work_items::list_active(&db).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("work item watcher: {e:#}");
+                    continue;
+                }
+            };
+            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            if ids == last_ids {
+                continue;
+            }
+            last_ids = ids;
+            let summaries: Vec<WorkItemStatus> = items
+                .into_iter()
+                .map(|i| WorkItemStatus {
+                    title: i.title,
+                    status: i.status,
+                    progress: i.progress.min(100) as u8,
+                    phase: i.phase,
+                })
+                .collect();
+            am.notify_all(Notification::WorkItemsChanged(summaries)).await.ok();
+        }
+    });
 }
