@@ -1,16 +1,21 @@
 use crate::{prompt, CompletionRequest, LlmClient};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// OpenAI-compatible chat completion client.
-/// Covers: OpenAI, Anthropic (via proxy), Gemini (via proxy), local OpenAI-compat servers.
+/// OpenAI-compatible client with multi-key round-robin rotation.
+///
+/// On HTTP 429 (rate-limited) the current key is skipped and the next one is tried
+/// within the same request. Non-429 errors propagate immediately without rotation.
 pub struct CloudClient {
     http: Client,
     base_url: String,
-    api_key: String,
+    api_keys: Vec<String>,
     model: String,
+    /// Monotonic counter; key selected by `counter % len`. Wraps naturally.
+    next_key_idx: AtomicUsize,
 }
 
 #[derive(Deserialize)]
@@ -31,7 +36,7 @@ struct ChoiceMessage {
 impl CloudClient {
     pub fn new(
         base_url: impl Into<String>,
-        api_key: impl Into<String>,
+        api_keys: Vec<String>,
         model: impl Into<String>,
     ) -> Self {
         Self {
@@ -40,25 +45,15 @@ impl CloudClient {
                 .build()
                 .expect("reqwest client build"),
             base_url: base_url.into(),
-            api_key: api_key.into(),
+            api_keys,
             model: model.into(),
+            next_key_idx: AtomicUsize::new(0),
         }
     }
 
-    /// Convenience constructor for OpenAI.
-    pub fn openai(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new("https://api.openai.com", api_key, model)
-    }
-
-    /// Convenience constructor for Anthropic via its OpenAI-compat endpoint.
-    pub fn anthropic(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new("https://api.anthropic.com", api_key, model)
-    }
-}
-
-#[async_trait]
-impl LlmClient for CloudClient {
-    async fn complete(&self, req: CompletionRequest) -> Result<String> {
+    /// Single attempt with one key. Returns `Ok(None)` on 429 (caller rotates),
+    /// `Ok(Some(text))` on success, `Err` on any other failure.
+    async fn try_key(&self, req: &CompletionRequest, key: &str) -> Result<Option<String>> {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": prompt::to_openai_messages(&req.messages),
@@ -74,20 +69,53 @@ impl LlmClient for CloudClient {
         let resp = self
             .http
             .post(format!("{}/v1/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(key)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
 
-        let parsed: ChatResponse = resp.json().await?;
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Ok(None);
+        }
+
+        let parsed: ChatResponse = resp.error_for_status()?.json().await?;
         let content = parsed
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
             .ok_or_else(|| anyhow!("cloud API returned no content"))?;
-        Ok(content)
+        Ok(Some(content))
+    }
+}
+
+#[async_trait]
+impl LlmClient for CloudClient {
+    async fn complete(&self, req: CompletionRequest) -> Result<String> {
+        let n = self.api_keys.len();
+        if n == 0 {
+            return Err(anyhow!(
+                "Chưa cấu hình API key. Mở Settings → Cloud API để thêm key."
+            ));
+        }
+
+        // Round-robin: pick a starting key, then rotate on 429.
+        let start = self.next_key_idx.fetch_add(1, Ordering::Relaxed) % n;
+        let last_err = anyhow!("tất cả API keys đều bị rate-limit (429)");
+
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let key = &self.api_keys[idx];
+            match self.try_key(&req, key).await {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {
+                    tracing::warn!(key_idx = idx, total = n, "API key 429 — thử key tiếp theo");
+                }
+                Err(e) => return Err(e), // non-429: do not rotate
+            }
+        }
+
+        Err(last_err)
     }
 
     fn provider_name(&self) -> &str {

@@ -51,9 +51,23 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         };
     }
 
-    pref!("llm.cloud_base_url",   cfg.cloud_base_url);
-    pref!("llm.cloud_model",      cfg.cloud_model);
-    pref!("llm.cloud_api_key",    cfg.cloud_api_key, opt);
+    pref!("llm.cloud_base_url", cfg.cloud_base_url);
+    pref!("llm.cloud_model",    cfg.cloud_model);
+
+    // Multi-key: stored as JSON array under `llm.cloud_api_keys`.
+    // Backward compat: fall back to the old single-key `llm.cloud_api_key`.
+    if let Ok(Some(json)) = meta::get_preference(db, "llm.cloud_api_keys").await {
+        if let Ok(keys) = serde_json::from_str::<Vec<String>>(&json) {
+            cfg.cloud_api_keys = keys;
+        }
+    }
+    if cfg.cloud_api_keys.is_empty() {
+        if let Ok(Some(key)) = meta::get_preference(db, "llm.cloud_api_key").await {
+            if !key.is_empty() {
+                cfg.cloud_api_keys = vec![key];
+            }
+        }
+    }
 
     // Embedded llama.cpp config (only active when `llama` feature is compiled in).
     #[cfg(feature = "llama")]
@@ -72,11 +86,12 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         }
     }
 
-    // Env vars override preferences (useful for Docker / CI)
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"] {
-        if let Ok(v) = std::env::var(key) {
-            if cfg.cloud_api_key.is_none() {
-                cfg.cloud_api_key = Some(v);
+    // Env var fallback (useful for Docker / CI).
+    // Only applies if no keys were found in DB.
+    if cfg.cloud_api_keys.is_empty() {
+        for env_key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"] {
+            if let Ok(v) = std::env::var(env_key) {
+                cfg.cloud_api_keys.push(v);
             }
         }
     }

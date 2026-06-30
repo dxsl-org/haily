@@ -27,7 +27,9 @@ use crate::LlamaClient;
 /// Loaded from KMS preferences on startup; user can update without restart.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    pub cloud_api_key: Option<String>,
+    /// One or more API keys for the cloud backend.
+    /// Multiple keys rotate round-robin; empty = no cloud backend.
+    pub cloud_api_keys: Vec<String>,
     pub cloud_base_url: String,
     pub cloud_model: String,
 
@@ -50,8 +52,13 @@ pub struct LlmConfig {
 
 impl Default for LlmConfig {
     fn default() -> Self {
+        // Collect env-var keys available at startup (may be overridden by DB prefs).
+        let env_keys: Vec<String> = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .collect();
         Self {
-            cloud_api_key: std::env::var("OPENAI_API_KEY").ok(),
+            cloud_api_keys: env_keys,
             cloud_base_url: "https://api.openai.com".into(),
             cloud_model: "gpt-4o-mini".into(),
             #[cfg(feature = "llama")]
@@ -81,13 +88,15 @@ impl LlmRouter {
     /// app can start without a configured model. The error surfaces only when the
     /// user actually sends a message.
     pub async fn init(config: LlmConfig) -> Self {
-        let cloud: Option<Arc<dyn LlmClient>> = config.cloud_api_key.as_deref().map(|key| {
-            Arc::new(CloudClient::new(
+        let cloud: Option<Arc<dyn LlmClient>> = if !config.cloud_api_keys.is_empty() {
+            Some(Arc::new(CloudClient::new(
                 config.cloud_base_url.clone(),
-                key,
+                config.cloud_api_keys.clone(),
                 config.cloud_model.clone(),
-            )) as Arc<dyn LlmClient>
-        });
+            )) as Arc<dyn LlmClient>)
+        } else {
+            None
+        };
 
         #[cfg(feature = "llama")]
         {

@@ -56,6 +56,49 @@
   }
 
   const p = (key: string, fallback = '') => prefs[key] ?? fallback;
+
+  // ── Cloud API multi-key management ──────────────────────────────────────────
+
+  // Editable list of API keys for the cloud tab.
+  let apiKeys = $state<string[]>([]);
+  let cloudApplyError = $state('');
+  let cloudApplyOk = $state('');
+  let cloudApplying = $state(false);
+
+  // Populate from prefs once they arrive (can be empty on first load).
+  $effect(() => {
+    const json = prefs['llm.cloud_api_keys'];
+    if (json) {
+      try { apiKeys = JSON.parse(json); } catch {}
+    } else if (prefs['llm.cloud_api_key']) {
+      // backward compat: migrate single-key pref
+      apiKeys = [prefs['llm.cloud_api_key']];
+    }
+  });
+
+  function addKey() { apiKeys = [...apiKeys, '']; }
+  function removeKey(i: number) { apiKeys = apiKeys.filter((_, idx) => idx !== i); }
+  function updateKey(i: number, val: string) {
+    apiKeys = apiKeys.map((k, idx) => (idx === i ? val : k));
+  }
+
+  async function applyCloud() {
+    cloudApplyError = '';
+    cloudApplyOk = '';
+    cloudApplying = true;
+    try {
+      const filtered = apiKeys.map(k => k.trim()).filter(Boolean);
+      await save('llm.cloud_api_keys', JSON.stringify(filtered));
+      const provider = await invoke<string>('reload_llm');
+      cloudApplyOk = provider !== 'unconfigured'
+        ? `✓ Đã áp dụng — ${filtered.length} key, provider: ${provider}`
+        : '⚠️ Không có key hợp lệ — kiểm tra lại API key.';
+    } catch (e) {
+      cloudApplyError = String(e);
+    } finally {
+      cloudApplying = false;
+    }
+  }
 </script>
 
 <div class="subtabs">
@@ -131,11 +174,44 @@
       <input type="text" value={p('llm.cloud_model', 'gpt-4o-mini')}
         onblur={e => save('llm.cloud_model', e.currentTarget.value)} />
     </label>
-    <label>API Key
-      <input type="password" value={p('llm.cloud_api_key')}
-        placeholder="sk-..."
-        onblur={e => save('llm.cloud_api_key', e.currentTarget.value)} />
-    </label>
+
+    <div class="key-section">
+      <div class="key-header">
+        <span class="key-label">API Keys <span class="key-count">({apiKeys.length})</span></span>
+        <button class="add-btn" onclick={addKey}>+ Thêm key</button>
+      </div>
+      {#if apiKeys.length === 0}
+        <div class="key-empty">Chưa có API key nào. Bấm "+ Thêm key" để thêm.</div>
+      {:else}
+        <div class="key-list">
+          {#each apiKeys as key, i}
+            <div class="key-row">
+              <span class="key-idx">{i + 1}</span>
+              <input
+                type="password"
+                placeholder="sk-..."
+                value={key}
+                oninput={e => updateKey(i, e.currentTarget.value)}
+              />
+              <button class="del-btn" onclick={() => removeKey(i)} title="Xóa key này">✕</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <span class="hint">
+        Nhiều key luân phiên theo vòng tròn. Nếu một key bị rate-limit (429), key kế tiếp được dùng tự động.
+      </span>
+    </div>
+
+    <button class="apply-btn" onclick={applyCloud} disabled={cloudApplying}>
+      {cloudApplying ? '⏳ Đang áp dụng…' : 'Áp dụng'}
+    </button>
+
+    {#if cloudApplyError}
+      <div class="status-error">⚠️ {cloudApplyError}</div>
+    {:else if cloudApplyOk}
+      <div class="status-ok">{cloudApplyOk}</div>
+    {/if}
   </div>
 {/if}
 
@@ -215,6 +291,67 @@
   .status-ok    { background: #0f2a1a; color: #4ade80; border: 1px solid #166534; }
   .status-error { background: #2a0f0f; color: #f87171; border: 1px solid #7f1d1d; word-break: break-word; }
   .status-info  { background: #1a1a2a; color: #a0a0c0; border: 1px solid #2e2e4a; }
+
+  .key-section { display: flex; flex-direction: column; gap: 8px; }
+  .key-header { display: flex; justify-content: space-between; align-items: center; }
+  .key-label { font-size: 12px; color: #8884aa; }
+  .key-count { color: #6b6b8a; font-size: 11px; }
+  .key-list { display: flex; flex-direction: column; gap: 6px; }
+  .key-row { display: flex; align-items: center; gap: 6px; }
+  .key-idx {
+    flex-shrink: 0;
+    width: 18px;
+    font-size: 11px;
+    color: #4a4a6a;
+    text-align: right;
+  }
+  .key-row input { flex: 1; }
+  .del-btn {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border: 1px solid #2e2e4a;
+    border-radius: 6px;
+    background: #16162a;
+    color: #6b6b8a;
+    font-size: 11px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .del-btn:hover { color: #f87171; border-color: #7f1d1d; }
+  .add-btn {
+    font-size: 11px;
+    padding: 4px 10px;
+    border: 1px solid #2e2e4a;
+    border-radius: 6px;
+    background: #16162a;
+    color: #a09ac0;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .add-btn:hover { color: #c084fc; border-color: #4a3a7a; }
+  .key-empty {
+    font-size: 12px;
+    color: #4a4a6a;
+    padding: 8px 10px;
+    background: #0f0f18;
+    border-radius: 8px;
+    border: 1px dashed #2e2e4a;
+  }
+  .apply-btn {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 8px;
+    background: #4c1d95;
+    color: #e0dff5;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.15s;
+    align-self: flex-start;
+  }
+  .apply-btn:hover:not(:disabled) { background: #6d28d9; }
+  .apply-btn:disabled { opacity: 0.5; cursor: default; }
 
   .loading, .empty {
     font-size: 12px;

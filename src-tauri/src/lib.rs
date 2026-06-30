@@ -151,7 +151,20 @@ async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
 
     pref!("llm.cloud_base_url", cfg.cloud_base_url);
     pref!("llm.cloud_model",    cfg.cloud_model);
-    pref!("llm.cloud_api_key",  cfg.cloud_api_key, opt);
+
+    // Multi-key: stored as JSON array. Backward compat: fall back to single-key.
+    if let Ok(Some(json)) = meta::get_preference(db, "llm.cloud_api_keys").await {
+        if let Ok(keys) = serde_json::from_str::<Vec<String>>(&json) {
+            cfg.cloud_api_keys = keys;
+        }
+    }
+    if cfg.cloud_api_keys.is_empty() {
+        if let Ok(Some(key)) = meta::get_preference(db, "llm.cloud_api_key").await {
+            if !key.is_empty() {
+                cfg.cloud_api_keys = vec![key];
+            }
+        }
+    }
 
     if let Ok(Some(path)) = meta::get_preference(db, "llm.llama_model_path").await {
         cfg.llama_model_path = Some(std::path::PathBuf::from(path));
@@ -170,10 +183,10 @@ async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         }
     }
 
-    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"] {
-        if let Ok(v) = std::env::var(key) {
-            if cfg.cloud_api_key.is_none() {
-                cfg.cloud_api_key = Some(v);
+    if cfg.cloud_api_keys.is_empty() {
+        for env_key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HAILY_CLOUD_KEY"] {
+            if let Ok(v) = std::env::var(env_key) {
+                cfg.cloud_api_keys.push(v);
             }
         }
     }
