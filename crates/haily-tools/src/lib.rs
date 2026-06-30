@@ -42,7 +42,10 @@ impl ToolRegistry {
     /// Register all V1 tools.
     pub fn build_v1() -> Self {
         let mut reg = Self::new();
-        use v1::{calendar::*, memory::*, notes::*, reminders::*, tasks::*, web::*};
+        use v1::{
+            calendar::*, memory::*, notes::*, reminders::*, tasks::*, web::*,
+            work_items::*, worktree_tool::*,
+        };
         for tool in [
             Arc::new(WebSearchTool)   as Arc<dyn Tool>,
             Arc::new(UrlFetchTool)    as Arc<dyn Tool>,
@@ -66,6 +69,9 @@ impl ToolRegistry {
             Arc::new(MemoryListTool)     as Arc<dyn Tool>,
             Arc::new(MemoryForgetTool)   as Arc<dyn Tool>,
             Arc::new(FeedbackReactTool)  as Arc<dyn Tool>,
+            Arc::new(WorkItemListTool)   as Arc<dyn Tool>,
+            Arc::new(WorkItemResumeTool) as Arc<dyn Tool>,
+            Arc::new(WorktreeApplyTool)  as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }

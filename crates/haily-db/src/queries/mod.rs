@@ -8,3 +8,4 @@ pub mod reminders;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;
+pub mod work_items;

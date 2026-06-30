@@ -2,6 +2,7 @@ mod agent;
 mod context;
 pub mod feedback_parser;
 mod tool_call;
+pub mod worktree;
 
 use anyhow::Result;
 use haily_db::DbHandle;
@@ -34,6 +35,13 @@ impl Orchestrator {
             tools = tools.len(),
             "Orchestrator ready"
         );
+
+        // Reset work items stuck in `running` from a previous crash to `interrupted`.
+        match haily_db::queries::work_items::reset_stale_running(&db).await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "work items reset to interrupted"),
+            Err(e) => tracing::warn!("failed to reset stale work items: {e:#}"),
+            _ => {}
+        }
 
         Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm_inner));
         let llm = Arc::new(RwLock::new(llm_inner));

@@ -1,7 +1,7 @@
 /// Main agent turn: user message → LLM → tool loop → final response.
 use anyhow::Result;
 use haily_db::{
-    queries::{sessions, skills as db_skills},
+    queries::{sessions, skills as db_skills, work_items},
     DbHandle,
 };
 use haily_io::{Request, ResponseChunk};
@@ -58,35 +58,95 @@ pub async fn run_turn(
     let mut guard = tool_call::LoopGuard::new();
     let mut tool_call_log: Vec<serde_json::Value> = Vec::new();
 
-    let final_response = loop {
-        let llm_req = CompletionRequest::simple(messages.clone());
-        let response = llm.complete(llm_req).await?;
+    // WorkItem tracking: lazily created on first tool call.
+    // Simple Q&A turns (no tool calls) produce no WorkItem row.
+    let mut work_item_id: Option<String> = None;
+    let mut tool_index: usize = 0;
 
-        if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
-            messages.push(Message { role: Role::Assistant, content: response.clone() });
+    // Capture the loop result without propagating `?` immediately so the
+    // WorkItem finalization block below always runs — even when LLM calls fail
+    // mid-turn after the WorkItem has already been created.
+    let loop_result: Result<String> = 'turn: {
+        loop {
+            let llm_req = CompletionRequest::simple(messages.clone());
+            let response = match llm.complete(llm_req).await {
+                Ok(r) => r,
+                Err(e) => break 'turn Err(e),
+            };
 
-            let result =
-                tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx, &mut guard)
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {e:#}"));
+            if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
+                messages.push(Message { role: Role::Assistant, content: response.clone() });
 
-            let tool_ok = !result.starts_with("Error:");
-            tool_call_log.push(serde_json::json!({
-                "tool": &tool_name,
-                "args": args.to_string(),
-                "ok":   tool_ok
-            }));
+                // Lazy WorkItem creation: only on the first tool call of this turn.
+                if work_item_id.is_none() {
+                    if let Ok(wi) = work_items::create(&db, &session_id, &req.message).await {
+                        let _ = work_items::start(&db, &wi.id).await;
+                        work_item_id = Some(wi.id);
+                    }
+                }
 
-            let result_msg = format!(
-                "<tool_result>{{\"tool\":\"{tool_name}\",\"result\":{},\"ok\":{}}}</tool_result>",
-                serde_json::Value::String(result),
-                tool_ok
-            );
-            messages.push(Message { role: Role::User, content: result_msg });
-        } else {
-            break tool_call::strip_tool_markup(&response);
+                let result =
+                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx, &mut guard)
+                        .await
+                        .unwrap_or_else(|e| format!("Error: {e:#}"));
+
+                let tool_ok = !result.starts_with("Error:");
+                tool_call_log.push(serde_json::json!({
+                    "tool": &tool_name,
+                    "args": args.to_string(),
+                    "ok":   tool_ok
+                }));
+
+                let result_msg = format!(
+                    "<tool_result>{{\"tool\":\"{tool_name}\",\"result\":{},\"ok\":{}}}</tool_result>",
+                    serde_json::Value::String(result),
+                    tool_ok
+                );
+                messages.push(Message { role: Role::User, content: result_msg });
+
+                // Checkpoint after each tool call. Progress saturates at 90 until completion.
+                if let Some(wi_id) = &work_item_id {
+                    let progress = ((tool_index + 1) * 10).min(90) as i64;
+                    let checkpoint_json = serde_json::json!({
+                        "tool_index": tool_index,
+                        "last_tool": &tool_name
+                    })
+                    .to_string();
+                    let _ = work_items::checkpoint(
+                        &db,
+                        wi_id,
+                        Some(tool_name.as_str()),
+                        progress,
+                        &checkpoint_json,
+                    )
+                    .await;
+                }
+
+                tool_index += 1;
+            } else {
+                break 'turn Ok(tool_call::strip_tool_markup(&response));
+            }
         }
     };
+
+    // Finalize the WorkItem on ALL exit paths — success, tool failure, or LLM error.
+    if let Some(wi_id) = &work_item_id {
+        match &loop_result {
+            Err(e) => {
+                let _ = work_items::fail(&db, wi_id, &format!("{e:#}")).await;
+            }
+            Ok(_) => {
+                let any_error = tool_call_log.iter().any(|e| e["ok"] == false);
+                if any_error {
+                    let _ = work_items::fail(&db, wi_id, "One or more tool calls failed").await;
+                } else {
+                    let _ = work_items::complete(&db, wi_id).await;
+                }
+            }
+        }
+    }
+
+    let final_response = loop_result?;
 
     let tokens = estimate_tokens(&final_response);
     sessions::insert_message(&db, &session_id, "assistant", &final_response, Some(tokens)).await?;
