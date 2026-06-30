@@ -105,12 +105,28 @@ impl LlmClient for LlamaClient {
 
         let model = Arc::clone(&self.model);
 
-        tokio::task::spawn_blocking(move || {
+        let fmt = self.fmt;
+        let raw = tokio::task::spawn_blocking(move || {
             let backend = backend()?;
             run_inference(backend, &model, &prompt_text, n_ctx, max_tokens, temperature)
         })
         .await
-        .context("spawn_blocking panicked")?
+        .context("spawn_blocking panicked")??;
+
+        // Strip trailing stop tokens that weren't caught by is_eog_token().
+        // llama.cpp's EOG detection is vocabulary-dependent and may miss stop
+        // sequences that the model generates as plain text pieces.
+        let stop: &[&str] = match fmt {
+            PromptFormat::ChatML => &["<|im_end|>"],
+            PromptFormat::Gemma4 => &["<end_of_turn>", "</start_of_turn>"],
+        };
+        let mut out = raw.as_str();
+        for seq in stop {
+            if let Some(stripped) = out.strip_suffix(seq) {
+                out = stripped;
+            }
+        }
+        Ok(out.trim_end().to_string())
     }
 
     fn provider_name(&self) -> &str {
