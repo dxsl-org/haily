@@ -73,12 +73,13 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
     let mut builder = AdapterManager::builder();
 
     #[cfg(feature = "telegram")]
-    {
-        let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
-        if token.is_none() {
+    match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(token) => {
+            builder = builder.register(Arc::new(haily_io::TelegramAdapter::new(Some(token))));
+        }
+        Err(_) => {
             warn!("TELEGRAM_BOT_TOKEN not set — Telegram adapter disabled");
         }
-        builder = builder.register(Arc::new(haily_io::TelegramAdapter::new(token)));
     }
 
     #[cfg(not(feature = "telegram"))]

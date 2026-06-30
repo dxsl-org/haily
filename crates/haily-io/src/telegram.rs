@@ -133,6 +133,11 @@ impl Adapter for TelegramAdapter {
     }
 
     async fn notify(&self, msg: Notification) -> Result<()> {
+        // WorkItemsChanged is a terminal/panel concern — message channels don't have
+        // a persistent status area to update, so we skip it here.
+        if matches!(msg, Notification::WorkItemsChanged(_)) {
+            return Ok(());
+        }
         let text = match msg {
             Notification::MorningBrief(brief) => {
                 format!("🌅 <b>Morning Brief</b>\n{brief}")
@@ -144,6 +149,7 @@ impl Adapter for TelegramAdapter {
             Notification::ReminderFired { title, .. } => {
                 format!("⏰ <b>Reminder</b>: {title}")
             }
+            Notification::WorkItemsChanged(_) => unreachable!(),
         };
 
         // Broadcast to all known chats
