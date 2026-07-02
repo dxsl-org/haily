@@ -6,6 +6,7 @@
 //! exits — always call `shutdown()` on the signal/exit-event path.
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::load_llm_config;
+use crate::turns::TurnRegistry;
 use crate::{dispatch, watchers};
 use anyhow::Result;
 use haily_core::Orchestrator;
@@ -17,6 +18,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Toggles for subsystems that historically differed between modes (F6 mode
 /// asymmetry). Both default to `true` — every mode gets the full feature set unless
@@ -48,6 +50,7 @@ pub struct AppHandle {
     pub adapters: AdapterManager,
     shutdown: CancellationToken,
     tasks: TaskTracker,
+    turns: Arc<TurnRegistry>,
 }
 
 impl AppHandle {
@@ -61,6 +64,7 @@ impl AppHandle {
     ) -> Result<Self> {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
+        let turns = Arc::new(TurnRegistry::new());
 
         let db_path = data_dir.join("haily.db");
         info!("DB: {}", db_path.display());
@@ -112,6 +116,7 @@ impl AppHandle {
             Arc::clone(&orchestrator),
             shutdown.child_token(),
             tasks.clone(),
+            Arc::clone(&turns),
         )
         .await?;
 
@@ -139,7 +144,24 @@ impl AppHandle {
             "startup complete — dispatch loop running"
         );
 
-        Ok(Self { db, kms, orchestrator, adapters: am, shutdown, tasks })
+        Ok(Self { db, kms, orchestrator, adapters: am, shutdown, tasks, turns })
+    }
+
+    /// Cancel the in-flight turn for `session_id`, if any. Delegates to the shared
+    /// `TurnRegistry` — see `turns::TurnRegistry::cancel` for the exact semantics.
+    /// Returns `false` (not an error) when `session_id` has no registered turn
+    /// (already finished, unknown, or never started); callers should treat that as
+    /// "nothing to do", mirroring `approve_tool`'s convention for stale ids.
+    pub fn cancel_turn(&self, session_id: Uuid) -> bool {
+        self.turns.cancel(session_id)
+    }
+
+    /// Shared handle to the turn registry, for callers (e.g. the Tauri command layer)
+    /// that want to hold their own `Arc` clone rather than locking `app` per call —
+    /// mirrors `Orchestrator::approval_resolver()`'s "clone the handle once at setup"
+    /// pattern.
+    pub fn turn_registry(&self) -> Arc<TurnRegistry> {
+        Arc::clone(&self.turns)
     }
 
     /// Number of tasks currently registered on the root `TaskTracker` — dispatch loop,

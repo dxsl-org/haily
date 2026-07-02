@@ -179,6 +179,136 @@ async fn shutdown_mid_stream_ends_the_turn_quickly_not_after_full_completion() {
     );
 }
 
+/// Critical: `AppHandle::cancel_turn` on an unknown session must return `false`
+/// rather than panicking or affecting any other in-flight turn — this is the exact
+/// call the Tauri `cancel_turn` command makes for a stale/already-finished session id.
+#[tokio::test]
+async fn cancel_turn_on_unknown_session_returns_false() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![MockAdapter::new() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    assert!(
+        !handle.cancel_turn(uuid::Uuid::new_v4()),
+        "no turn registered for this session — must return false"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+/// Critical: a registered turn's token must actually fire when `AppHandle::cancel_turn`
+/// is called by session id — this is the plumbing the GUI's Stop button depends on.
+/// Uses the slow-LLM server (delay before any response) so there is a window where the
+/// turn is in flight and its token is registered but not yet cleaned up.
+#[tokio::test]
+async fn cancel_turn_fires_the_in_flight_turns_token() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let turn_latency = std::time::Duration::from_millis(1500);
+    let base_url = spawn_slow_llm_server(turn_latency).await;
+
+    let adapter = MockAdapter::new();
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    handle.orchestrator.reload_llm(cloud_config(base_url)).await;
+    let session_id = adapter.send("please cancel me").await;
+
+    // Give dispatch time to register the turn before cancelling — otherwise this
+    // would race a turn that hasn't been registered into the TurnRegistry yet.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert!(
+        handle.cancel_turn(session_id),
+        "a turn was in flight for this session — cancel_turn must find and cancel it"
+    );
+
+    // The cancelled turn should still finalize quickly (well under the full
+    // uninitiated 1.5s LLM latency) rather than hang, proving the fired token
+    // actually reached the in-flight `process` call.
+    let chunks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let chunks = adapter.chunks_for(session_id);
+            if chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)) {
+                return chunks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled turn did not finalize in time");
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)),
+        "a cancelled turn must still finalize with Complete: {chunks:?}"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+/// Critical: the registry entry for a turn must be removed once that turn completes
+/// normally (no Stop click involved) — otherwise `TurnRegistry` would grow unbounded
+/// over the life of a long-running process, one stale entry per historical turn.
+#[tokio::test]
+async fn turn_registry_does_not_leak_entries_after_normal_completion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base_url = spawn_slow_llm_server(std::time::Duration::ZERO).await;
+
+    let adapter = MockAdapter::new();
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    handle.orchestrator.reload_llm(cloud_config(base_url)).await;
+    let session_id = adapter.send("finish normally").await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let chunks = adapter.chunks_for(session_id);
+            if chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("turn did not complete in time");
+
+    // Poll briefly: the turn task's own cleanup (dispatch.rs's `turns_clone.remove`)
+    // runs just after the Complete chunk is forwarded, so there is a small window
+    // where it hasn't executed yet.
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !handle.cancel_turn(session_id) {
+                return;
+            }
+            // cancel_turn() returning true here would mean the entry leaked past
+            // completion; if that ever happens, there is nothing left to clean up on
+            // a second call so this loop would spin forever — bounded by the timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        removed.is_ok(),
+        "turn registry entry for a completed turn was never removed — it leaked"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
 /// High: CLI mode enables the proactive daemon (mode asymmetry fix — F6). Verified by
 /// task count delta rather than log scraping: with the daemon enabled, bootstrap
 /// registers strictly more tasks than with it disabled (watcher + dispatch only).

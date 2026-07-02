@@ -57,6 +57,18 @@ export async function sendMessage(message: string): Promise<string> {
 }
 
 /**
+ * Cancel the in-flight turn for `sessionId`. Fires that turn's cancellation token on
+ * the backend; the dispatch loop still emits its normal terminal chunk (`Complete` or
+ * `Error`) afterward, so callers should rely on the existing `onChunk` handling to
+ * close the bubble out rather than mutating UI state directly from this call's
+ * result. Returns `false` (not a thrown error) if the turn already finished or
+ * `sessionId` is unknown — callers should treat that as a no-op.
+ */
+export async function cancelTurn(sessionId: string): Promise<boolean> {
+  return invoke('cancel_turn', { sessionId });
+}
+
+/**
  * Resolve a pending tool approval. `sessionId` must be the session the
  * `ToolApprovalRequest` chunk arrived on (`ChunkPayload.session_id`) — it is the
  * auth boundary on the backend, not `approvalId` alone. Returns `false` (not a

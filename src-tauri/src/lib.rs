@@ -3,7 +3,7 @@
 /// `RunEvent::ExitRequested` → `AppHandle::shutdown`, bounded by `SHUTDOWN_TIMEOUT`.
 mod models;
 
-use haily_app::{AppHandle, BootstrapOptions};
+use haily_app::{AppHandle, BootstrapOptions, TurnRegistry};
 use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, ApprovalResolver, GuiRequestSender, GuiResponseReceiver, Request};
 use haily_kms::KmsHandle;
@@ -25,6 +25,10 @@ struct AppState {
     /// on. Cloned out of `app` once at setup so `approve_tool` doesn't need to lock
     /// `app` (which is also the shutdown surface) for every button tap.
     approval_resolver: Arc<dyn ApprovalResolver>,
+    /// In-flight turn cancellation registry — same instance `dispatch.rs` registers
+    /// every turn's token into. Cloned out of `app` once at setup, mirroring
+    /// `approval_resolver`, so `cancel_turn` doesn't need to lock `app` either.
+    turns: Arc<TurnRegistry>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -52,6 +56,19 @@ async fn approve_tool(
     let session_id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     let approval_id = Uuid::parse_str(&approval_id).map_err(|e| e.to_string())?;
     Ok(state.approval_resolver.resolve(approval_id, session_id, approved))
+}
+
+/// Cancel the in-flight turn for `session_id`. Fires that turn's `CancellationToken`
+/// (registered by `dispatch.rs` — see `haily_app::TurnRegistry`), which ends the
+/// active LLM stream; the dispatch loop then still emits its normal terminal chunk
+/// (`Complete` or `Error`), so the frontend's existing chunk handling closes the
+/// bubble out with whatever text streamed before cancellation. Returns `false` (not
+/// an error) if `session_id` has no in-flight turn — already finished, unknown, or
+/// never started — which the caller should treat as a no-op.
+#[tauri::command]
+async fn cancel_turn(session_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
+    Ok(state.turns.cancel(session_id))
 }
 
 /// Re-read LLM preferences and hot-swap the active backend. Returns the active
@@ -121,13 +138,22 @@ pub fn run() {
             let db = Arc::clone(&app_handle.db);
             let kms = Arc::clone(&app_handle.kms);
             let approval_resolver = app_handle.orchestrator.approval_resolver();
-            app.manage(AppState { gui_req_tx, db, kms, approval_resolver, app: Mutex::new(Some(app_handle)) });
+            let turns = app_handle.turn_registry();
+            app.manage(AppState {
+                gui_req_tx,
+                db,
+                kms,
+                approval_resolver,
+                turns,
+                app: Mutex::new(Some(app_handle)),
+            });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             send_message,
             approve_tool,
+            cancel_turn,
             get_preferences,
             set_preference,
             list_local_models,

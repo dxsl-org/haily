@@ -2219,6 +2219,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dashmap",
  "haily-core",
  "haily-db",
  "haily-io",

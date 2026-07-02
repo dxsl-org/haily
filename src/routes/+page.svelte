@@ -4,6 +4,7 @@
   import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
+  import { cancelTurn } from '$lib/tauri';
   import type { ChunkPayload, PendingApproval } from '$lib/tauri';
 
   type Role = 'user' | 'assistant' | 'system';
@@ -19,6 +20,11 @@
 
   let settingsOpen = $state(false);
   let pendingApproval = $state<PendingApproval | null>(null);
+  // The session_id of the turn currently streaming, or null when idle. Drives the
+  // send/Stop button swap — set when `send_message` returns, cleared when that
+  // session's `Complete`/`Error` chunk arrives (mirrors `sessionIndex`'s lifecycle).
+  let activeSession = $state<string | null>(null);
+  let stopping = $state(false);
 
   let messages = $state<Message[]>([
     {
@@ -75,6 +81,10 @@
       } else if (chunk.type === 'Complete') {
         messages[idx].pending = false;
         sessionIndex.delete(session_id);
+        if (activeSession === session_id) {
+          activeSession = null;
+          stopping = false;
+        }
       }
       // ToolResult chunks are status-only (✓/✗ tool name) — the CLI/Telegram
       // adapters surface them inline; the GUI has no dedicated status line for them
@@ -92,7 +102,10 @@
     // Block new turns while a tool approval is pending: the backend turn is paused
     // waiting on the modal, and starting a second turn would overwrite the pending
     // approval state (orphaning the first request to a silent 120s timeout-deny).
-    if (!text || sending || pendingApproval) return;
+    // Also block while a turn is already streaming (`activeSession` set) — the GUI
+    // is single-turn-at-a-time; a second concurrent send would overwrite the Stop
+    // button's target with no way back to the first turn's session id.
+    if (!text || sending || pendingApproval || activeSession) return;
 
     input = '';
     sending = true;
@@ -107,12 +120,32 @@
     try {
       const sessionId = await invoke<string>('send_message', { message: text });
       sessionIndex.set(sessionId, assistantIdx);
+      activeSession = sessionId;
     } catch (e) {
       messages[assistantIdx].content = `⚠️ Lỗi kết nối: ${e}`;
       messages[assistantIdx].pending = false;
     } finally {
       sending = false;
       textarea?.focus();
+    }
+  }
+
+  /** Stop the currently streaming turn. Backend still emits a terminal `Complete`
+   * chunk after cancellation, so the bubble closes out via the normal chunk-handling
+   * path above rather than being mutated here — this only fires the cancellation and
+   * tracks the transient "stopping…" state for the button label. */
+  async function stop() {
+    if (!activeSession || stopping) return;
+    stopping = true;
+    try {
+      await cancelTurn(activeSession);
+    } catch (e) {
+      // Cancellation is best-effort from the UI's perspective — if the IPC call
+      // itself fails (not "no turn found", which resolves false, but a genuine
+      // invoke error), leave the bubble streaming rather than silently losing the
+      // failure; the console log gives a debugging trail without a modal.
+      console.error('cancelTurn failed', e);
+      stopping = false;
     }
   }
 
@@ -173,11 +206,17 @@
       oninput={autoResize}
       placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
       rows="1"
-      disabled={sending || pendingApproval !== null}
+      disabled={sending || pendingApproval !== null || activeSession !== null}
     ></textarea>
-    <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
-      {sending ? '…' : '↑'}
-    </button>
+    {#if activeSession}
+      <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
+        {stopping ? '…' : '■'}
+      </button>
+    {:else}
+      <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
+        {sending ? '…' : '↑'}
+      </button>
+    {/if}
   </div>
 </div>
 
@@ -370,4 +409,7 @@
 
   button:hover:not(:disabled) { background: #8b5cf6; }
   button:disabled { opacity: 0.4; cursor: default; }
+
+  button.stop { background: #3a1f2e; color: #f87171; font-size: 15px; }
+  button.stop:hover:not(:disabled) { background: #4a2436; }
 </style>
