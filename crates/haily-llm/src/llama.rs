@@ -99,6 +99,11 @@ impl LlamaClient {
 impl LlmClient for LlamaClient {
     async fn complete(&self, req: CompletionRequest) -> Result<String> {
         let prompt_text = self.fmt.format(&req.messages);
+        // chars/3 heuristic from `haily_core::budget::estimate` — duplicated here (not
+        // imported: haily-llm is a leaf crate and must not depend on haily-core) purely
+        // to log estimate-vs-actual so the heuristic's accuracy can be validated against
+        // this call's real tokenize() count (research report 03 §A2 risk note).
+        let estimated_prompt_tokens = prompt_text.chars().count().div_ceil(3);
         let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
         let temperature = req.temperature;
         let n_ctx = self.n_ctx;
@@ -106,12 +111,18 @@ impl LlmClient for LlamaClient {
         let model = Arc::clone(&self.model);
 
         let fmt = self.fmt;
-        let raw = tokio::task::spawn_blocking(move || {
+        let (raw, actual_prompt_tokens) = tokio::task::spawn_blocking(move || {
             let backend = backend()?;
             run_inference(backend, &model, &prompt_text, n_ctx, max_tokens, temperature)
         })
         .await
         .context("spawn_blocking panicked")??;
+
+        tracing::debug!(
+            estimated = estimated_prompt_tokens,
+            actual = actual_prompt_tokens,
+            "prompt token estimate vs actual"
+        );
 
         // Strip trailing stop tokens that weren't caught by is_eog_token().
         // llama.cpp's EOG detection is vocabulary-dependent and may miss stop
@@ -132,6 +143,10 @@ impl LlmClient for LlamaClient {
     fn provider_name(&self) -> &str {
         "llama.cpp"
     }
+
+    fn context_window(&self) -> u32 {
+        self.n_ctx
+    }
 }
 
 /// Validate `n_ctx` is a usable (non-zero) context window size.
@@ -143,6 +158,27 @@ fn validate_n_ctx(n_ctx: u32) -> Result<NonZeroU32> {
         .ok_or_else(|| anyhow!("llama.cpp context window (n_ctx) must be non-zero"))
 }
 
+/// Ceiling on `n_batch` — the physical-token compute buffer llama.cpp allocates
+/// up front. Decoupled from `n_ctx` (phase-05): before this, `n_batch` was set
+/// equal to `n_ctx`, so raising the context window (e.g. 4096 → 8192) silently
+/// doubled the compute buffer too, even though `n_batch` only bounds how many
+/// tokens are decoded in a single `llama_decode` call, not the context size.
+const N_BATCH_CEILING: u32 = 512;
+
+/// Size `n_batch` for a single-shot prompt decode.
+///
+/// The prompt is decoded in ONE batch (see `run_inference` below), and llama.cpp
+/// asserts `n_tokens_all <= n_batch` inside `llama_decode` — a hard process abort,
+/// not a recoverable `Result::Err`, if violated (confirmed by a prior incident: commit
+/// b958477, GGML_ASSERT(n_tokens <= n_batch) aborting on the first message once the
+/// system prompt + tool reference exceeded the old flat 512 default). So `n_batch`
+/// must never be set below `prompt_tokens`, but it also should not scale with
+/// `n_ctx` — those are independent llama.cpp knobs. Pure function so both the
+/// ceiling and the safety floor are unit-testable without a loaded model.
+fn compute_n_batch(prompt_tokens: usize, n_ctx: u32) -> u32 {
+    (prompt_tokens as u32).max(N_BATCH_CEILING).min(n_ctx)
+}
+
 fn run_inference(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -150,7 +186,7 @@ fn run_inference(
     n_ctx: u32,
     max_new_tokens: i32,
     temperature: f32,
-) -> Result<String> {
+) -> Result<(String, usize)> {
     // n_ctx=0 is a misconfiguration (empty context window) — reject it up front with a
     // clear error instead of panicking inside NonZeroU32::new(..).unwrap() below.
     let n_ctx_nonzero = validate_n_ctx(n_ctx)?;
@@ -167,13 +203,12 @@ fn run_inference(
         ));
     }
 
-    // Context. n_batch must be ≥ the prompt length: the prompt is decoded in a
-    // single batch below, and llama.cpp asserts `n_tokens_all <= n_batch`
-    // (an abort, not a recoverable error). The full system prompt + tool reference
-    // routinely exceeds the old 512 default, so size the batch to the context.
+    // n_batch sized to the actual prompt (see `compute_n_batch`), NOT to n_ctx —
+    // raising the context window must not silently double the batch compute buffer.
+    let n_batch = compute_n_batch(tokens.len(), n_ctx);
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx_nonzero))
-        .with_n_batch(n_ctx);
+        .with_n_batch(n_batch);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .context("create llama context")?;
@@ -235,7 +270,7 @@ fn run_inference(
         }
     }
 
-    Ok(output)
+    Ok((output, tokens.len()))
 }
 
 #[cfg(test)]
@@ -251,5 +286,36 @@ mod tests {
     fn validate_n_ctx_accepts_positive_values() {
         let n = validate_n_ctx(4096).unwrap();
         assert_eq!(n.get(), 4096);
+    }
+
+    #[test]
+    fn compute_n_batch_never_falls_below_prompt_length() {
+        // A prompt bigger than the 512 ceiling must still get a big enough batch to
+        // decode in one shot (this is the exact scenario that caused the b958477
+        // process-abort regression before n_batch was tied to n_ctx).
+        assert_eq!(compute_n_batch(2000, 8192), 2000);
+    }
+
+    #[test]
+    fn compute_n_batch_is_capped_at_ceiling_for_small_prompts() {
+        // Small prompt: batch should not balloon to n_ctx just because n_ctx is large —
+        // this is the decoupling the phase-05 fix introduces.
+        assert_eq!(compute_n_batch(50, 8192), 512);
+    }
+
+    #[test]
+    fn compute_n_batch_never_exceeds_n_ctx() {
+        // n_batch is meaningless (and rejected by llama.cpp) if it exceeds the
+        // context window itself — clamp as a final safety bound.
+        assert_eq!(compute_n_batch(2000, 1024), 1024);
+    }
+
+    #[test]
+    fn compute_n_batch_does_not_double_when_n_ctx_doubles() {
+        // The core decoupling assertion: raising n_ctx from 4096 to 8192 for a
+        // moderate prompt must not double the batch compute buffer.
+        let small_prompt = 300;
+        assert_eq!(compute_n_batch(small_prompt, 4096), 512);
+        assert_eq!(compute_n_batch(small_prompt, 8192), 512);
     }
 }

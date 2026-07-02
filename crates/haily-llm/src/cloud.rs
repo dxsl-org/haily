@@ -124,4 +124,8 @@ impl LlmClient for CloudClient {
     fn provider_name(&self) -> &str {
         "cloud"
     }
+
+    fn context_window(&self) -> u32 {
+        crate::router::CLOUD_CONTEXT_WINDOW_CLAMP
+    }
 }

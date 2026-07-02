@@ -1,5 +1,6 @@
 mod agent;
 pub mod approval;
+mod budget;
 mod context;
 mod delegate;
 mod domains;

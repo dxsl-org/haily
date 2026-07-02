@@ -18,7 +18,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -70,4 +70,10 @@ pub enum StreamChunk {
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, req: CompletionRequest) -> Result<String>;
     fn provider_name(&self) -> &str;
+
+    /// Context window size (tokens) this backend can accept in a single prompt.
+    /// Used by `haily-core`'s token budgeter to decide how much history fits —
+    /// each backend reports its own so budgeting stays correct across a hot-swap
+    /// (e.g. llama.cpp's configured `n_ctx` vs a cloud provider's much larger window).
+    fn context_window(&self) -> u32;
 }

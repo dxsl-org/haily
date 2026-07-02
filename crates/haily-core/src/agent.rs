@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
 
-use crate::{approval::ApprovalBroker, context, feedback_parser, tool_call};
+use crate::{approval::ApprovalBroker, budget, context, feedback_parser, tool_call};
 
 fn estimate_tokens(s: &str) -> i64 {
     (s.len() / 4) as i64
@@ -96,7 +96,17 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let sub_turn_broker = ApprovalBroker::new();
     let sub_turn_cancel = CancellationToken::new();
 
+    // No DB history to load for a stateless sub-turn (`msgs` starts as just
+    // `[system, task]`), but the tool loop still accumulates `<tool_result>`
+    // messages that can grow unbounded — same overflow risk as `run_turn`, so the
+    // same re-fit-per-iteration budgeting applies. `pinned_tail_len` starts at 1
+    // (the task message) and grows by 2 per tool round-trip.
+    let token_budget = budget::TokenBudget::new(llm.context_window());
+    let mut pinned_tail_len: usize = 1;
+
     let final_response = loop {
+        msgs = token_budget.refit(&msgs, pinned_tail_len);
+
         let llm_req = CompletionRequest::simple(msgs.clone());
         let response = llm.complete(llm_req).await?;
 
@@ -138,6 +148,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 tool_ok
             );
             msgs.push(haily_llm::Message { role: haily_llm::Role::User, content: result_msg });
+            // Assistant tool-call + tool-result just pushed both join the pinned
+            // tail — the NEXT iteration's `refit` must not trim them.
+            pinned_tail_len += 2;
         } else {
             break tool_call::strip_tool_markup(&response);
         }
@@ -206,8 +219,11 @@ pub async fn run_turn(
     sessions::insert_message(&db, &session_id, "user", &req.message, None).await?;
     info!(session = session_id, "processing user message");
 
+    let context_window = llm.context_window();
+    let token_budget = budget::TokenBudget::new(context_window);
     let (mut messages, _ctx) =
-        context::build_messages(&kms, &db, &tools, &session_id, &req.message).await?;
+        context::build_messages(&kms, &db, &tools, &session_id, &req.message, context_window)
+            .await?;
 
     let tool_ctx = ToolContext {
         db: db.clone(),
@@ -224,11 +240,23 @@ pub async fn run_turn(
     let mut work_item_id: Option<String> = None;
     let mut tool_index: usize = 0;
 
+    // Pinned tail length: starts at 1 (just the user message `build_messages` already
+    // appended) and grows by 2 (assistant tool-call + `<tool_result>`) per loop
+    // iteration — everything from the user message onward must never be trimmed
+    // (see `budget.rs`'s pinning rule), only the prior-turn history before it.
+    let mut pinned_tail_len: usize = 1;
+
     // Capture the loop result without propagating `?` immediately so the
     // WorkItem finalization block below always runs — even when LLM calls fail
     // mid-turn after the WorkItem has already been created.
     let loop_result: Result<String> = 'turn: {
         loop {
+            // Re-fit before every LLM call (cheap — estimates only): a prior
+            // iteration's `<tool_result>` may have grown the pinned tail enough that
+            // history needs re-trimming to stay within budget, and this must happen
+            // every iteration, not just once at turn start.
+            messages = token_budget.refit(&messages, pinned_tail_len);
+
             let llm_req = CompletionRequest::simple(messages.clone());
             let response = match llm.complete(llm_req).await {
                 Ok(r) => r,
@@ -280,6 +308,9 @@ pub async fn run_turn(
                     tool_ok
                 );
                 messages.push(Message { role: Role::User, content: result_msg });
+                // Assistant tool-call + tool-result message just pushed both join the
+                // pinned tail — the NEXT loop iteration's `refit` must not trim them.
+                pinned_tail_len += 2;
 
                 // Checkpoint after each tool call. Progress saturates at 90 until completion.
                 if let Some(wi_id) = &work_item_id {

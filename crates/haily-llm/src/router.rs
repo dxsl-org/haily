@@ -18,7 +18,22 @@ impl LlmClient for NoopClient {
         ))
     }
     fn provider_name(&self) -> &str { "unconfigured" }
+    fn context_window(&self) -> u32 {
+        // Never actually budgeted against — every `complete()` call errors first.
+        // A conservative non-zero value avoids a divide-by-zero-shaped footgun if a
+        // caller ever budgets before checking `provider_name()`.
+        DEFAULT_LLAMA_N_CTX
+    }
 }
+
+/// Per-provider context-window constants used for budgeting (`context_window()`).
+/// Clamped, not the provider's true native maximum, so history sizing stays sane
+/// immediately after a hot-swap between backends with very different windows.
+pub(crate) const DEFAULT_LLAMA_N_CTX: u32 = 8192;
+/// Cloud providers advertise context windows far larger than a local model
+/// (e.g. 128k-200k) — clamped to 32k for budgeting per phase-05 spec so a session's
+/// history doesn't balloon to an unreasonable size just because the backend changed.
+pub(crate) const CLOUD_CONTEXT_WINDOW_CLAMP: u32 = 32_000;
 
 #[cfg(feature = "llama")]
 use crate::LlamaClient;
@@ -36,7 +51,9 @@ pub struct LlmConfig {
     /// Path to GGUF model file for embedded inference (only used with `llama` feature).
     #[cfg(feature = "llama")]
     pub llama_model_path: Option<std::path::PathBuf>,
-    /// Context window size for llama.cpp (default 4096).
+    /// Context window size for llama.cpp (default 8192 — ~295MB KV cache for
+    /// Qwen2.5-3B, acceptable on any laptop capable of running a 3B model; see
+    /// research report 03 §A1). User-configurable via the `llm.llama_n_ctx` preference.
     #[cfg(feature = "llama")]
     pub llama_n_ctx: u32,
     /// Prompt format used when formatting messages for the GGUF model.
@@ -64,7 +81,7 @@ impl Default for LlmConfig {
             #[cfg(feature = "llama")]
             llama_model_path: None,
             #[cfg(feature = "llama")]
-            llama_n_ctx: 4096,
+            llama_n_ctx: DEFAULT_LLAMA_N_CTX,
             #[cfg(feature = "llama")]
             llama_prompt_format: PromptFormat::ChatML,
             #[cfg(feature = "llama")]
@@ -147,6 +164,15 @@ impl LlmRouter {
     pub fn provider_name(&self) -> &str {
         self.primary.provider_name()
     }
+
+    /// Context window (tokens) of the currently-active backend, for `haily-core`'s
+    /// token budgeter. Reflects `primary`, not `fallback` — a request that spills
+    /// over to the cloud fallback mid-flight is rare enough (and the fallback's
+    /// window is typically larger, not smaller) that budgeting for the primary is
+    /// the correct common case; see phase-05 spec.
+    pub fn context_window(&self) -> u32 {
+        self.primary.context_window()
+    }
 }
 
 #[async_trait]
@@ -170,5 +196,9 @@ impl LlmClient for LlmRouter {
 
     fn provider_name(&self) -> &str {
         self.primary.provider_name()
+    }
+
+    fn context_window(&self) -> u32 {
+        self.primary.context_window()
     }
 }

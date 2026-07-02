@@ -151,7 +151,7 @@
 
     <label>Context window (tokens)
       <input type="number" min="512" max="131072" step="512"
-        value={p('llm.llama_n_ctx', '4096')}
+        value={p('llm.llama_n_ctx', '8192')}
         onblur={e => save('llm.llama_n_ctx', e.currentTarget.value)} />
     </label>
 
