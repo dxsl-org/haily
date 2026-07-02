@@ -53,6 +53,22 @@ jobs:
 
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
+      # The workspace run above unifies features across members, which can MASK a
+      # lint that only fires under a crate's own default feature set (e.g. a
+      # `needless_update` that's needless without the `llama` feature but needed with
+      # it). Re-run clippy per crate so those feature-combo lints can't slip through.
+      - name: Clippy (per-crate, no feature unification)
+        run: |
+          for crate in haily-types haily-db haily-llm haily-io haily-kms \
+                       haily-tools haily-core haily-app haily-proactive haily-cli; do
+            echo "::group::clippy -p $crate"
+            cargo clippy -p "$crate" --all-targets -- -D warnings
+            echo "::endgroup::"
+          done
+      # Guard the CPU-only (no embedded llama.cpp) build path — the unified config
+      # loader must stay compilable with the llama feature off.
+      - name: Clippy (haily-app, no default features)
+        run: cargo clippy -p haily-app --no-default-features --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
 
