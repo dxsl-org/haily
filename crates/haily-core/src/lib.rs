@@ -56,6 +56,15 @@ impl Orchestrator {
         auto_approve: std::collections::HashSet<String>,
     ) -> Result<Self> {
         let llm_inner = Arc::new(LlmRouter::init(config).await);
+        let llm_provider = llm_inner.provider_name().to_string();
+
+        // Wrap in the shared RwLock BEFORE building DelegateTools or spawning the
+        // self-improvement workers (F5 fix — red team): both used to capture the
+        // pre-RwLock `llm_inner` Arc directly, so `reload_llm()` never reached
+        // either L1/L2 delegation or hourly skill synthesis. Every consumer below
+        // now holds this same `Arc<RwLock<Arc<LlmRouter>>>` and read-clones it per
+        // use, exactly like `process()` does for the top-level turn.
+        let llm = Arc::new(RwLock::new(llm_inner));
 
         // `base_v1` is a clean V1 registry used only for sub_registry() lookups.
         // L0 only exposes a minimal quick-action tool set so weak local models
@@ -95,9 +104,10 @@ impl Orchestrator {
                     domain_name: spec.tool_name.trim_start_matches("delegate_to_"),
                     db: Arc::clone(&db),
                     kms: Arc::clone(&kms),
-                    llm: Arc::clone(&llm_inner),
+                    llm: Arc::clone(&llm),
                     sub_registry: l2_reg,
                     max_depth: 2, // L1 (depth=1) can spawn; L2 (depth=2) blocked by depth guard
+                    model_tier: spec.model_tier,
                 }));
             }
 
@@ -108,18 +118,15 @@ impl Orchestrator {
                 domain_name: domain.tool_name.trim_start_matches("delegate_to_"),
                 db: Arc::clone(&db),
                 kms: Arc::clone(&kms),
-                llm: Arc::clone(&llm_inner),
+                llm: Arc::clone(&llm),
                 sub_registry: Arc::new(l1_reg),
                 max_depth: 1, // L0 (depth=0) can spawn L1; L1 depth guard handles the rest
+                model_tier: domain.model_tier,
             }));
         }
 
         let tools = Arc::new(tools);
-        tracing::info!(
-            llm = llm_inner.provider_name(),
-            tools = tools.len(),
-            "Orchestrator ready"
-        );
+        tracing::info!(llm = llm_provider, tools = tools.len(), "Orchestrator ready");
 
         // Reset work items stuck in `running` from a previous crash to `interrupted`.
         match haily_db::queries::work_items::reset_stale_running(&db).await {
@@ -128,8 +135,7 @@ impl Orchestrator {
             _ => {}
         }
 
-        Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm_inner), shutdown, tasks);
-        let llm = Arc::new(RwLock::new(llm_inner));
+        Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm), shutdown, tasks);
 
         Ok(Self {
             kms,
@@ -190,9 +196,16 @@ impl Orchestrator {
     /// Both loops select on `shutdown.cancelled()` so they wake and exit immediately
     /// on shutdown rather than finishing out a up-to-24h sleep, and are registered on
     /// `tasks` so the caller's `TaskTracker::wait()` blocks until they have exited.
+    ///
+    /// `llm` is the SAME `Arc<RwLock<Arc<LlmRouter>>>` `Orchestrator` holds (F5 fix,
+    /// second location — red team): capturing a plain `Arc<LlmRouter>` here would
+    /// freeze hourly synthesis on whatever backend was active at boot, immune to
+    /// `reload_llm()` exactly like the pre-fix `DelegateTool` bug. The router is
+    /// read-cloned fresh on EVERY iteration (not once at spawn time) so a reload
+    /// that lands between two synthesis runs is picked up by the next one.
     fn spawn_self_improvement_workers(
         kms: Arc<KmsHandle>,
-        llm: Arc<LlmRouter>,
+        llm: Arc<RwLock<Arc<LlmRouter>>>,
         shutdown: CancellationToken,
         tasks: TaskTracker,
     ) {
@@ -208,7 +221,10 @@ impl Orchestrator {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
-                        match kms_s.synthesize_skills(llm_s.as_ref()).await {
+                        // Clone the Arc under a brief read-lock — never hold the lock
+                        // across the `.await` below (same rule as `process()`).
+                        let router = Arc::clone(&*llm_s.read().unwrap_or_else(|e| e.into_inner()));
+                        match kms_s.synthesize_skills(router.as_ref()).await {
                             Ok(v) if !v.is_empty() => tracing::info!(count = v.len(), "skills synthesized"),
                             Err(e) => tracing::warn!("skill synthesis failed: {e:#}"),
                             _ => {}
@@ -251,7 +267,7 @@ mod shutdown_tests {
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
         let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
-        let llm = Arc::new(LlmRouter::init(LlmConfig::default()).await);
+        let llm = Arc::new(RwLock::new(Arc::new(LlmRouter::init(LlmConfig::default()).await)));
 
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
@@ -271,6 +287,63 @@ mod shutdown_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
             .await
             .expect("workers must exit promptly on cancellation, not after their sleep interval");
+    }
+
+    /// Phase 7 (F5, second location — red team): `spawn_self_improvement_workers`
+    /// must receive the SAME `Arc<RwLock<Arc<LlmRouter>>>` `Orchestrator::reload_llm`
+    /// writes to, not a plain `Arc<LlmRouter>` snapshotted at spawn time. The
+    /// worker's 1h/24h sleep makes waiting for an actual synthesis run impractical in
+    /// a unit test, so this isolates exactly the mechanism the fix depends on: the
+    /// SAME lock instance passed into the spawn function must observe a `reload_llm`-
+    /// style swap performed from outside it. A regression back to capturing
+    /// `Arc<LlmRouter>` by value (dereferencing once at spawn time) would make this
+    /// fail to compile — `spawn_self_improvement_workers`'s signature itself is part
+    /// of what this test guards.
+    #[tokio::test]
+    async fn worker_router_lock_observes_a_reload_performed_after_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let original = Arc::new(LlmRouter::init(LlmConfig::default()).await);
+        let llm = Arc::new(RwLock::new(Arc::clone(&original)));
+
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+
+        // Pass the SAME Arc<RwLock<..>> the workers will read from on their next
+        // tick — this is the exact call shape `Orchestrator::init` now uses.
+        Orchestrator::spawn_self_improvement_workers(
+            Arc::clone(&kms),
+            Arc::clone(&llm),
+            shutdown.clone(),
+            tasks.clone(),
+        );
+
+        // Simulate `reload_llm`: swap the inner Arc under the lock from OUTSIDE the
+        // worker closures, exactly as `Orchestrator::reload_llm` does on the field
+        // the workers were handed a clone of.
+        let reloaded = Arc::new(LlmRouter::init(LlmConfig::default()).await);
+        {
+            let mut guard = llm.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::clone(&reloaded);
+        }
+
+        // A fresh read through the same lock the spawned workers hold must see the
+        // reloaded instance, not the one captured before `reload_llm` ran — proving
+        // the workers share the lock by reference rather than a frozen snapshot.
+        let observed = Arc::clone(&*llm.read().unwrap_or_else(|e| e.into_inner()));
+        assert!(
+            Arc::ptr_eq(&observed, &reloaded),
+            "workers' shared lock must observe a reload performed after spawn"
+        );
+        assert!(!Arc::ptr_eq(&observed, &original), "stale pre-reload router must no longer be observable");
+
+        shutdown.cancel();
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .expect("workers must exit promptly on cancellation");
     }
 }
 
@@ -322,6 +395,22 @@ mod wiring_tests {
         let mut seen = std::collections::HashSet::new();
         for name in DOMAINS.iter().map(|d| d.tool_name).chain(SPECIALISTS.iter().map(|s| s.tool_name)) {
             assert!(seen.insert(name), "duplicate delegate tool name: {name}");
+        }
+    }
+
+    /// Phase 7 tier foundation: `model_tier` is a real `Option<haily_llm::Tier>` on
+    /// every config, so an invalid tier value cannot even compile — this test's job
+    /// is just to confirm every entry's default is the documented `None` (zero
+    /// behavior change) rather than an unintended `Some(_)` slipping in during future
+    /// edits. If a domain/specialist genuinely opts into a tier later, update its
+    /// expectation here deliberately rather than let the check silently drop.
+    #[test]
+    fn every_domain_and_specialist_tier_defaults_to_none() {
+        for d in DOMAINS {
+            assert!(d.model_tier.is_none(), "domain {} has a non-default model_tier", d.tool_name);
+        }
+        for s in SPECIALISTS {
+            assert!(s.model_tier.is_none(), "specialist {} has a non-default model_tier", s.tool_name);
         }
     }
 }

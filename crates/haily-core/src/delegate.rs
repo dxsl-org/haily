@@ -9,9 +9,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_llm::LlmRouter;
+use haily_llm::{LlmRouter, Tier};
 use haily_tools::{Tool, ToolClass, ToolContext, ToolRegistry};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const SUB_TURN_TIMEOUT_SECS: u64 = 120;
@@ -42,12 +42,19 @@ pub struct DelegateTool {
     /// Shared handles needed to run the sub-turn.
     pub db: Arc<DbHandle>,
     pub kms: Arc<KmsHandle>,
-    pub llm: Arc<LlmRouter>,
+    /// The SAME `Arc<RwLock<Arc<LlmRouter>>>` `Orchestrator` holds (F5 fix) — a
+    /// frozen `Arc<LlmRouter>` captured at construction would never observe
+    /// `reload_llm()`. Read-cloned under a brief lock per sub-turn in `execute`,
+    /// mirroring `Orchestrator::process`'s rule: never hold the lock across await.
+    pub llm: Arc<RwLock<Arc<LlmRouter>>>,
     /// Domain-filtered registry — only tools on the whitelist.
     pub sub_registry: Arc<ToolRegistry>,
     /// Maximum depth at which this tool will actually delegate.
     /// Calls from depth >= max_depth return a fallback string instead of spawning.
     pub max_depth: u8,
+    /// Model tier this domain/specialist prefers (Phase 7 tier foundation). `None`
+    /// for every config today — passed through to `run_sub_turn`'s completion calls.
+    pub model_tier: Option<Tier>,
 }
 
 #[async_trait]
@@ -115,6 +122,12 @@ impl Tool for DelegateTool {
             "delegating to domain agent"
         );
 
+        // Clone the Arc under a brief read-lock — never hold the lock across await
+        // (same rule as `Orchestrator::process`). This is what makes `reload_llm()`
+        // reach an in-flight or future delegation: every call reads the CURRENT
+        // router instead of one frozen at `DelegateTool` construction time.
+        let llm = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
+
         let result = tokio::time::timeout(
             Duration::from_secs(SUB_TURN_TIMEOUT_SECS),
             crate::agent::run_sub_turn(crate::agent::SubTurnRequest {
@@ -124,9 +137,10 @@ impl Tool for DelegateTool {
                 depth: ctx.depth + 1,
                 db: Arc::clone(&self.db),
                 kms: Arc::clone(&self.kms),
-                llm: Arc::clone(&self.llm),
+                llm,
                 tools: Arc::clone(&self.sub_registry),
                 session_id: ctx.session_id,
+                model_tier: self.model_tier,
             }),
         )
         .await;
@@ -181,5 +195,112 @@ mod tests {
     fn sanitize_leaves_clean_input_untouched() {
         let raw = "Nghiên cứu ETF index fund";
         assert_eq!(sanitize_delegate_input(raw), raw);
+    }
+}
+
+#[cfg(test)]
+mod reload_propagation_tests {
+    //! Phase 7 (F5): proves `DelegateTool` reads the router through the SAME
+    //! `Arc<RwLock<Arc<LlmRouter>>>` `Orchestrator::reload_llm` writes to, instead of
+    //! a frozen `Arc<LlmRouter>` captured at construction. The mock server below
+    //! echoes back its own `model` field as the completion text — the only reliable
+    //! way to prove a delegated sub-turn actually reached the NEW backend, since
+    //! `provider_name()` returns the same `"cloud"` label for both.
+    use super::*;
+    use haily_db::DbHandle;
+    use haily_kms::KmsHandle;
+    use haily_llm::LlmConfig;
+    use haily_tools::ToolRegistry;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    async fn spawn_model_echo_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request_text = String::from_utf8_lossy(&buf[..n]);
+                    let body_start = request_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                    let model = serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
+                        .ok()
+                        .and_then(|v| v["model"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let payload = serde_json::json!({
+                        "choices": [{ "message": { "content": model } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn cloud_config(base_url: String, model: &str) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: model.to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_llm_reaches_the_next_delegated_sub_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+
+        let base_url = spawn_model_echo_server().await;
+        let llm = Arc::new(RwLock::new(Arc::new(
+            LlmRouter::init(cloud_config(base_url.clone(), "model-before-reload")).await,
+        )));
+
+        let delegate = DelegateTool {
+            tool_name: "delegate_to_test",
+            description: "test",
+            system_prompt: "test system prompt",
+            domain_name: "test",
+            db: Arc::clone(&db),
+            kms: Arc::clone(&kms),
+            llm: Arc::clone(&llm),
+            sub_registry: Arc::new(ToolRegistry::new()),
+            max_depth: 1,
+            model_tier: None,
+        };
+
+        let ctx = ToolContext { db: Arc::clone(&db), kms: Arc::clone(&kms), session_id: Uuid::new_v4(), depth: 0 };
+        let args = serde_json::json!({ "task": "short task before reload" });
+        let before = delegate.execute(args, &ctx).await.expect("execute before reload");
+        assert!(before.contains("model-before-reload"), "expected pre-reload model in response, got: {before}");
+
+        // Simulate `Orchestrator::reload_llm` — swap the Arc under the SAME lock the
+        // DelegateTool holds, exactly as `reload_llm` does on `Orchestrator::llm`.
+        let new_router = Arc::new(LlmRouter::init(cloud_config(base_url, "model-after-reload")).await);
+        {
+            let mut guard = llm.write().unwrap_or_else(|e| e.into_inner());
+            *guard = new_router;
+        }
+
+        let args = serde_json::json!({ "task": "short task after reload" });
+        let after = delegate.execute(args, &ctx).await.expect("execute after reload");
+        assert!(
+            after.contains("model-after-reload"),
+            "expected the sub-turn to use the RELOADED model, got: {after} — DelegateTool is still reading a frozen router"
+        );
     }
 }

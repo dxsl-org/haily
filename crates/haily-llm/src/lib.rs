@@ -10,7 +10,7 @@ mod llama;
 
 pub use cloud::CloudClient;
 pub use prompt::PromptFormat;
-pub use router::{LlmConfig, LlmRouter};
+pub use router::{LlmConfig, LlmRouter, Tier, TierModels};
 
 #[cfg(feature = "llama")]
 pub use llama::LlamaClient;

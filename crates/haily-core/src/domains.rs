@@ -15,6 +15,11 @@ pub struct DomainConfig {
     pub system_prompt: &'static str,
     /// Subset of V1 tool names the domain agent may call.
     pub allowed_tools: &'static [&'static str],
+    /// Model tier this domain's sub-turns should prefer (Phase 7 tier foundation —
+    /// wired but inert). `None` means "use the router's default model", which is
+    /// every domain's value today — full complexity-based auto-routing is YAGNI
+    /// until a task-outcome quality signal exists.
+    pub model_tier: Option<haily_llm::Tier>,
 }
 
 pub const DOMAINS: &[DomainConfig] = &[
@@ -31,6 +36,7 @@ Không làm những việc ngoài phạm vi kỹ thuật phần mềm.",
             "task_create", "task_list", "task_complete",
             "memory_remember", "memory_search",
         ],
+        model_tier: None,
     },
     DomainConfig {
         tool_name: "delegate_to_researcher",
@@ -43,6 +49,7 @@ Luôn trích dẫn nguồn. Phân biệt rõ fact vs opinion. Không bịa đặ
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search", "memory_list",
         ],
+        model_tier: None,
     },
     DomainConfig {
         tool_name: "delegate_to_finance",
@@ -55,6 +62,7 @@ Luôn nhắc nhở rủi ro khi tư vấn đầu tư. Không đưa ra lời khuy
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search",
         ],
+        model_tier: None,
     },
     DomainConfig {
         tool_name: "delegate_to_life",
@@ -68,6 +76,7 @@ Nhiệm vụ: hỗ trợ sức khỏe, lên kế hoạch du lịch, theo dõi h�
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search",
         ],
+        model_tier: None,
     },
     DomainConfig {
         tool_name: "delegate_to_creator",
@@ -81,6 +90,7 @@ Giữ giọng văn nhất quán theo yêu cầu của người dùng. Sáng tạ
             "task_create", "task_list",
             "memory_remember", "memory_search",
         ],
+        model_tier: None,
     },
     DomainConfig {
         tool_name: "delegate_to_business",
@@ -94,5 +104,6 @@ Chuyên nghiệp, súc tích, đúng deadline. Ưu tiên action items rõ ràng.
             "task_create", "task_list", "task_complete",
             "memory_remember", "memory_search",
         ],
+        model_tier: None,
     },
 ];

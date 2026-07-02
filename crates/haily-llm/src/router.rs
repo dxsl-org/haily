@@ -4,6 +4,7 @@ use crate::prompt::PromptFormat;
 use crate::{CompletionRequest, LlmClient, StreamChunk};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -46,6 +47,38 @@ pub(crate) const CLOUD_CONTEXT_WINDOW_CLAMP: u32 = 32_000;
 #[cfg(feature = "llama")]
 use crate::LlamaClient;
 
+/// Model-tier foundation (Phase 7 — wired but inert): names a routing tier a
+/// `DomainConfig`/`SpecialistConfig` can request. Full complexity-based
+/// auto-routing is deliberately NOT implemented (YAGNI until a task-outcome
+/// quality signal exists) — today a tier only changes which *cloud model name*
+/// a completion uses, never the backend/provider itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    Fast,
+    Medium,
+    Thinking,
+}
+
+/// Optional cloud model-name override per tier. Every field defaults to `None`,
+/// meaning "no override — use `LlmConfig::cloud_model`" — this is the zero-behavior-
+/// change default the phase-07 spec requires.
+#[derive(Debug, Clone, Default)]
+pub struct TierModels {
+    pub fast: Option<String>,
+    pub medium: Option<String>,
+    pub thinking: Option<String>,
+}
+
+impl TierModels {
+    fn get(&self, tier: Tier) -> Option<&str> {
+        match tier {
+            Tier::Fast => self.fast.as_deref(),
+            Tier::Medium => self.medium.as_deref(),
+            Tier::Thinking => self.thinking.as_deref(),
+        }
+    }
+}
+
 /// Runtime configuration for LLM routing.
 /// Loaded from KMS preferences on startup; user can update without restart.
 #[derive(Debug, Clone)]
@@ -55,6 +88,9 @@ pub struct LlmConfig {
     pub cloud_api_keys: Vec<String>,
     pub cloud_base_url: String,
     pub cloud_model: String,
+    /// Per-tier cloud model-name overrides — see `Tier`/`TierModels`. All `None`
+    /// by default (no behavior change until a caller opts a domain/specialist in).
+    pub tier_models: TierModels,
 
     /// Path to GGUF model file for embedded inference (only used with `llama` feature).
     #[cfg(feature = "llama")]
@@ -86,6 +122,7 @@ impl Default for LlmConfig {
             cloud_api_keys: env_keys,
             cloud_base_url: "https://api.openai.com".into(),
             cloud_model: "gpt-4o-mini".into(),
+            tier_models: TierModels::default(),
             #[cfg(feature = "llama")]
             llama_model_path: None,
             #[cfg(feature = "llama")]
@@ -98,6 +135,31 @@ impl Default for LlmConfig {
     }
 }
 
+/// Builds one `CloudClient` per tier that names a model override in
+/// `config.tier_models`, reusing `config`'s base URL and API keys. Silently skips
+/// (with a warning) a tier whose override is set but no cloud keys are configured —
+/// `complete_tiered` degrades to `primary` in that case, which is always correct.
+fn build_tier_clients(config: &LlmConfig) -> HashMap<Tier, Arc<dyn LlmClient>> {
+    let mut clients: HashMap<Tier, Arc<dyn LlmClient>> = HashMap::new();
+    if config.cloud_api_keys.is_empty() {
+        return clients;
+    }
+    for (tier, model) in [
+        (Tier::Fast, config.tier_models.get(Tier::Fast)),
+        (Tier::Medium, config.tier_models.get(Tier::Medium)),
+        (Tier::Thinking, config.tier_models.get(Tier::Thinking)),
+    ] {
+        let Some(model) = model else { continue };
+        match CloudClient::new(config.cloud_base_url.clone(), config.cloud_api_keys.clone(), model) {
+            Ok(client) => {
+                clients.insert(tier, Arc::new(client));
+            }
+            Err(e) => tracing::warn!(?tier, "failed to build tier cloud client: {e:#}"),
+        }
+    }
+    clients
+}
+
 /// Routes requests to the best available LLM backend.
 ///
 /// Priority:
@@ -106,6 +168,11 @@ impl Default for LlmConfig {
 pub struct LlmRouter {
     primary: Arc<dyn LlmClient>,
     fallback: Option<Arc<dyn LlmClient>>,
+    /// One cloud client per tier that has a configured model-name override.
+    /// An absent entry means "no override" — `complete_tiered` falls back to
+    /// `primary` in that case. Built once at `init`/`reload_llm` time so a
+    /// hot-swap picks up new tier overrides exactly like the primary does.
+    tier_clients: HashMap<Tier, Arc<dyn LlmClient>>,
 }
 
 impl LlmRouter {
@@ -128,6 +195,12 @@ impl LlmRouter {
         } else {
             None
         };
+
+        // Tier clients only make sense against the cloud backend (llama.cpp has a
+        // single loaded GGUF file — there is no "different model" to route a tier
+        // to locally). Built from the same base_url/keys as `cloud`, one extra
+        // `CloudClient` per tier that names an override.
+        let tier_clients = build_tier_clients(&config);
 
         #[cfg(feature = "llama")]
         {
@@ -153,6 +226,7 @@ impl LlmRouter {
                     Ok(Ok(client)) => return Self {
                         primary: Arc::new(client),
                         fallback: cloud,
+                        tier_clients,
                     },
                     Ok(Err(e)) => tracing::warn!("llama.cpp load failed: {e:#}"),
                     Err(e)     => tracing::warn!("llama.cpp spawn failed: {e:#}"),
@@ -162,11 +236,23 @@ impl LlmRouter {
 
         if let Some(cloud_client) = cloud {
             tracing::info!("LLM: cloud API ({})", config.cloud_model);
-            return Self { primary: cloud_client, fallback: None };
+            return Self { primary: cloud_client, fallback: None, tier_clients };
         }
 
         tracing::warn!("No LLM backend configured — open Settings → Model LLM");
-        Self { primary: Arc::new(NoopClient), fallback: None }
+        Self { primary: Arc::new(NoopClient), fallback: None, tier_clients }
+    }
+
+    /// Complete a request against a specific model `tier`. Falls back to `primary`
+    /// (the default model) when `tier` is `None`, or when `Some(tier)` names a tier
+    /// with no configured override — this is the "wired but inert" contract: callers
+    /// may pass a tier freely and always get a working completion, with zero
+    /// behavior change until an operator actually configures `LlmConfig::tier_models`.
+    pub async fn complete_tiered(&self, tier: Option<Tier>, req: CompletionRequest) -> Result<String> {
+        match tier.and_then(|t| self.tier_clients.get(&t)) {
+            Some(client) => client.complete(req).await,
+            None => self.complete(req).await,
+        }
     }
 
     pub fn provider_name(&self) -> &str {
@@ -302,5 +388,117 @@ impl LlmClient for LlmRouter {
 
     fn context_window(&self) -> u32 {
         self.primary.context_window()
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    //! `complete_tiered` fallback semantics (phase-07 tier foundation). The mock
+    //! server below echoes back the `model` field it received in the request body
+    //! as the completion text — the only reliable way to prove which cloud model
+    //! name a given call actually used (both tiers speak through the same
+    //! `CloudClient` HTTP shape, so `provider_name()` alone can't distinguish them).
+    use super::*;
+    use crate::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Minimal OpenAI-compatible responder: reads the request body, extracts the
+    /// `"model"` field, and returns it verbatim as the completion content.
+    async fn spawn_model_echo_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request_text = String::from_utf8_lossy(&buf[..n]);
+                    let body_start = request_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                    let model = serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
+                        .ok()
+                        .and_then(|v| v["model"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let payload = serde_json::json!({
+                        "choices": [{ "message": { "content": model } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn tiered_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "default-model".to_string(),
+            tier_models: TierModels {
+                fast: Some("fast-model".to_string()),
+                medium: None,
+                thinking: None,
+            },
+            ..LlmConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_tiered_uses_the_configured_tier_model() {
+        let base_url = spawn_model_echo_server().await;
+        let router = LlmRouter::init(tiered_config(base_url)).await;
+
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text = router.complete_tiered(Some(Tier::Fast), req).await.expect("completion");
+
+        assert_eq!(text, "fast-model", "Some(configured tier) must route to its override model");
+    }
+
+    #[tokio::test]
+    async fn complete_tiered_falls_back_to_default_when_tier_is_none() {
+        let base_url = spawn_model_echo_server().await;
+        let router = LlmRouter::init(tiered_config(base_url)).await;
+
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text = router.complete_tiered(None, req).await.expect("completion");
+
+        assert_eq!(text, "default-model", "tier=None must use the default model");
+    }
+
+    #[tokio::test]
+    async fn complete_tiered_falls_back_to_default_when_tier_is_unconfigured() {
+        let base_url = spawn_model_echo_server().await;
+        let router = LlmRouter::init(tiered_config(base_url)).await;
+
+        // `medium` has no override in `tiered_config` — must fall back, not error.
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text = router.complete_tiered(Some(Tier::Medium), req).await.expect("completion");
+
+        assert_eq!(text, "default-model", "tier=Some(unconfigured) must fall back to the default model");
+    }
+
+    #[tokio::test]
+    async fn complete_tiered_propagates_primary_error_when_no_backend_configured() {
+        // No cloud keys at all — primary is `NoopClient`, which always errors. Both
+        // paths (tier and no-tier) must surface that same error, not panic or hang.
+        let router = LlmRouter::init(LlmConfig {
+            cloud_api_keys: vec![],
+            ..LlmConfig::default()
+        })
+        .await;
+
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let err = router.complete_tiered(Some(Tier::Fast), req).await.expect_err("no backend configured");
+        assert!(err.to_string().contains("Chưa cấu hình LLM"));
     }
 }
