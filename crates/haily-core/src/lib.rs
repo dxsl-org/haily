@@ -6,6 +6,7 @@ mod delegate;
 mod domains;
 pub mod feedback_parser;
 mod specialists;
+mod tag_matcher;
 mod tool_call;
 pub mod worktree;
 

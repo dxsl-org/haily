@@ -92,7 +92,12 @@ async fn dispatch_loop(
             let resp_tx_err = resp_tx.clone();
             if let Err(e) = orc_clone.process(req, resp_tx, turn_cancel).await {
                 tracing::error!("orchestrator error: {e:#}");
-                resp_tx_err.send(ResponseChunk::Text(format!("⚠️ {e:#}"))).await.ok();
+                // `Error`, not `Text` — a turn that streamed partial text before
+                // failing (e.g. a mid-stream `StreamChunk::Error` from the LLM) must
+                // let buffering adapters (Telegram) tell "discard what's buffered"
+                // apart from "append this too", or the user sees a single fused
+                // "partial-answer⚠️error" message. See `haily_types::ResponseChunk::Error`.
+                resp_tx_err.send(ResponseChunk::Error(format!("⚠️ {e:#}"))).await.ok();
                 resp_tx_err.send(ResponseChunk::Complete).await.ok();
             }
 

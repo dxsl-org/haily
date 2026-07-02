@@ -19,6 +19,7 @@ vulkan = ["llama-cpp-2/vulkan"]
 [dependencies]
 tokio        = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util   = { workspace = true }
 futures      = { workspace = true }
 anyhow       = { workspace = true }
 thiserror    = { workspace = true }
@@ -27,5 +28,10 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 reqwest      = { workspace = true, features = ["rustls-tls"] }
 async-trait  = "0.1"
+# SSE parsing for cloud streaming — hand-rolled dialect parsing (OpenAI `data:` lines,
+# Anthropic named events) on top of this low-level extension trait. Deliberately NOT
+# `reqwest-eventsource`, which bundles its own retry/backoff that would fight the
+# existing multi-key round-robin in `cloud.rs` (see research report 01).
+eventsource-stream = "0.2"
 llama-cpp-2  = { version = "0.1", optional = true }
 encoding_rs  = { version = "0.8", optional = true }

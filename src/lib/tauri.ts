@@ -13,6 +13,14 @@ export interface TextChunk {
   data: string;
 }
 
+/** Turn-ending failure — distinct from `TextChunk` so a consumer that accumulates
+ * text can tell "replace/flag as error" apart from "append this too". Mirrors
+ * `haily_types::ResponseChunk::Error`. */
+export interface ErrorChunk {
+  type: 'Error';
+  data: string;
+}
+
 export interface ToolApprovalRequestChunk {
   type: 'ToolApprovalRequest';
   data: { tool: string; args: string; approval_id: string };
@@ -27,7 +35,7 @@ export interface CompleteChunk {
   type: 'Complete';
 }
 
-export type Chunk = TextChunk | ToolApprovalRequestChunk | ToolResultChunk | CompleteChunk;
+export type Chunk = TextChunk | ErrorChunk | ToolApprovalRequestChunk | ToolResultChunk | CompleteChunk;
 
 export interface ChunkPayload {
   session_id: string;

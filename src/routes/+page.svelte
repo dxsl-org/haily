@@ -67,6 +67,11 @@
 
       if (chunk.type === 'Text') {
         messages[idx].content += chunk.data;
+      } else if (chunk.type === 'Error') {
+        // Append distinctly rather than silently folding into the running text —
+        // the GUI doesn't buffer-then-flush like Telegram, but a bare append would
+        // still visually run the error into whatever partial answer streamed first.
+        messages[idx].content += `\n⚠️ ${chunk.data}`;
       } else if (chunk.type === 'Complete') {
         messages[idx].pending = false;
         sessionIndex.delete(session_id);

@@ -6,7 +6,7 @@
 /// Supports ChatML (Qwen2.5) and Gemma4 prompt formats via `PromptFormat`.
 use crate::{
     prompt::PromptFormat,
-    CompletionRequest, LlmClient,
+    CompletionRequest, LlmClient, StreamChunk,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, sync::OnceLock};
+use tokio::sync::mpsc;
 
 /// Process-global llama backend. llama.cpp's backend is a singleton guarded by a
 /// global flag: `LlamaBackend::init()` errors if called while another backend is
@@ -140,6 +141,88 @@ impl LlmClient for LlamaClient {
         Ok(out.trim_end().to_string())
     }
 
+    /// Streams token pieces as they're generated. Cancellation: `req.cancel` is
+    /// checked once per token (right where `run_inference_streaming`'s `on_piece`
+    /// callback fires) — firing it stops generation within one token's decode time.
+    /// The bounded channel itself is a second, implicit cancellation path: if the
+    /// consumer drops `rx` (e.g. it already saw `StreamChunk::Error` and gave up),
+    /// `blocking_send` starts failing and the same `on_piece` callback stops the loop.
+    async fn complete_stream(&self, req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
+        let (tx, rx) = mpsc::channel(LLAMA_STREAM_BOUND);
+        let cancel = req.cancel.clone().unwrap_or_default();
+        let model = Arc::clone(&self.model);
+        let fmt = self.fmt;
+        let n_ctx = self.n_ctx;
+        let prompt_text = self.fmt.format(&req.messages);
+        let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
+        let temperature = req.temperature;
+
+        tokio::task::spawn_blocking(move || {
+            let stop: &[&str] = match fmt {
+                PromptFormat::ChatML => &["<|im_end|>"],
+                PromptFormat::Gemma4 => &["<end_of_turn>", "</start_of_turn>"],
+            };
+            // Belt-and-suspenders stop-sequence hold-back: the same fallback
+            // `complete()` applies after the fact, but streaming must not emit the
+            // stop sequence's bytes to the user piece-by-piece as they arrive, so a
+            // small trailing buffer is withheld until it's provably not a stop
+            // sequence prefix — mirrors `tag_matcher::holdback_len`'s shape (haily-llm
+            // is a leaf crate and cannot depend on haily-core, so this is a narrower,
+            // local instance of the same pattern, not a shared abstraction).
+            let mut holdback = String::new();
+            let mut total_tokens: u32 = 0;
+
+            let result = (|| -> Result<()> {
+                let backend = backend()?;
+                run_inference_streaming(
+                    backend,
+                    &model,
+                    &prompt_text,
+                    n_ctx,
+                    max_tokens,
+                    temperature,
+                    |piece| {
+                        if cancel.is_cancelled() {
+                            return false;
+                        }
+                        total_tokens += 1;
+                        holdback.push_str(piece);
+                        let safe_len = stop_safe_prefix_len(&holdback, stop);
+                        if safe_len > 0 {
+                            let emit: String = holdback.drain(..safe_len).collect();
+                            if tx.blocking_send(StreamChunk::Token(emit)).is_err() {
+                                return false; // receiver dropped — stop generating
+                            }
+                        }
+                        true
+                    },
+                )
+                .map(|_| ())
+            })();
+
+            match result {
+                Ok(()) => {
+                    if cancel.is_cancelled() {
+                        let _ = tx.blocking_send(StreamChunk::Error("cancelled".to_string()));
+                    } else {
+                        // Whatever remains in `holdback` at clean end-of-generation was
+                        // never confirmed to be a live stop sequence — flush it so no
+                        // trailing text is silently dropped.
+                        if !holdback.is_empty() {
+                            let _ = tx.blocking_send(StreamChunk::Token(holdback));
+                        }
+                        let _ = tx.blocking_send(StreamChunk::Done { total_tokens });
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(StreamChunk::Error(format!("{e:#}")));
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
     fn provider_name(&self) -> &str {
         "llama.cpp"
     }
@@ -147,6 +230,32 @@ impl LlmClient for LlamaClient {
     fn context_window(&self) -> u32 {
         self.n_ctx
     }
+}
+
+/// Bounded channel size for llama.cpp's streaming decode loop — gives backpressure
+/// against a slow consumer (GUI/CLI/Telegram) without letting local inference (the
+/// expensive resource) run unbounded ahead of what's been delivered.
+const LLAMA_STREAM_BOUND: usize = 64;
+
+/// Length (bytes) of the prefix of `holdback` that is safe to emit immediately —
+/// i.e. the remaining tail cannot be extended into any of `stop` by appending more
+/// characters. Returns 0 if the ENTIRE `holdback` is currently a prefix of some stop
+/// sequence (must wait for more tokens, or for generation to end, to resolve).
+///
+/// Walks char-boundary start positions from the earliest (longest possible safe
+/// emit) to latest, returning the FIRST (leftmost/longest-tail) boundary whose
+/// remaining suffix is a stop-sequence prefix — that suffix, and everything after
+/// it, must be withheld. Char boundaries only (not raw byte offsets): the `stop`
+/// sequences are ASCII, but `holdback` itself can contain multibyte model output, so
+/// an arbitrary byte offset could land mid-codepoint and panic.
+fn stop_safe_prefix_len(holdback: &str, stop: &[&str]) -> usize {
+    for take in holdback.char_indices().map(|(i, _)| i) {
+        let candidate_tail = &holdback[take..];
+        if stop.iter().any(|s| s.starts_with(candidate_tail)) {
+            return take;
+        }
+    }
+    holdback.len()
 }
 
 /// Validate `n_ctx` is a usable (non-zero) context window size.
@@ -186,6 +295,31 @@ fn run_inference(
     n_ctx: u32,
     max_new_tokens: i32,
     temperature: f32,
+) -> Result<(String, usize)> {
+    // The non-streaming path never stops early (callback always returns `true` =
+    // "keep going"), so the full output always matches what streaming would have
+    // emitted piece-by-piece — one decode loop, two ways to consume it.
+    run_inference_streaming(backend, model, prompt, n_ctx, max_new_tokens, temperature, |_piece| true)
+}
+
+/// Same decode loop as `run_inference`, but invokes `on_piece(piece)` for every
+/// generated token piece as it's produced. `on_piece` returns `false` to request an
+/// early stop (used by the streaming path to react to cancellation or a dropped
+/// receiver) — checked once per token, immediately after sampling, the same place
+/// `is_eog_token` is already checked, so cancellation latency is bounded by one
+/// token's decode time.
+///
+/// Returns `(full_output, prompt_token_count)` regardless of whether generation ran
+/// to completion or stopped early — a caller that stopped early via `on_piece`
+/// returning `false` still gets whatever was generated up to that point.
+fn run_inference_streaming(
+    backend: &LlamaBackend,
+    model: &LlamaModel,
+    prompt: &str,
+    n_ctx: u32,
+    max_new_tokens: i32,
+    temperature: f32,
+    mut on_piece: impl FnMut(&str) -> bool,
 ) -> Result<(String, usize)> {
     // n_ctx=0 is a misconfiguration (empty context window) — reject it up front with a
     // clear error instead of panicking inside NonZeroU32::new(..).unwrap() below.
@@ -257,6 +391,14 @@ fn run_inference(
             .context("decode token")?;
         output.push_str(&piece);
 
+        // Checked right after producing the piece, next to the existing is_eog_token
+        // check — a `false` return (cancellation, or the streaming receiver was
+        // dropped) stops generation immediately rather than continuing to burn CPU
+        // on tokens nobody will see.
+        if !on_piece(&piece) {
+            break;
+        }
+
         batch.clear();
         batch.add(token, n_cur, &[0], true)?;
         ctx.decode(&mut batch).context("decode token batch")?;
@@ -317,5 +459,37 @@ mod tests {
         let small_prompt = 300;
         assert_eq!(compute_n_batch(small_prompt, 4096), 512);
         assert_eq!(compute_n_batch(small_prompt, 8192), 512);
+    }
+
+    const CHATML_STOP: &[&str] = &["<|im_end|>"];
+
+    #[test]
+    fn stop_safe_prefix_emits_everything_when_no_partial_stop_sequence() {
+        assert_eq!(stop_safe_prefix_len("hello world", CHATML_STOP), "hello world".len());
+    }
+
+    #[test]
+    fn stop_safe_prefix_withholds_entire_buffer_when_it_is_a_stop_prefix() {
+        assert_eq!(stop_safe_prefix_len("<|im_end", CHATML_STOP), 0);
+    }
+
+    #[test]
+    fn stop_safe_prefix_withholds_only_the_trailing_partial_match() {
+        let holdback = "answer text<|im_e";
+        let safe = stop_safe_prefix_len(holdback, CHATML_STOP);
+        assert_eq!(&holdback[..safe], "answer text");
+    }
+
+    #[test]
+    fn stop_safe_prefix_emits_everything_once_stop_sequence_diverges() {
+        // "<|im_endX" cannot extend into "<|im_end|>" — safe to emit in full.
+        assert_eq!(stop_safe_prefix_len("hi <|im_endX", CHATML_STOP), "hi <|im_endX".len());
+    }
+
+    #[test]
+    fn stop_safe_prefix_handles_multibyte_text_before_the_partial_match() {
+        let holdback = "xin chào <|im_e";
+        let safe = stop_safe_prefix_len(holdback, CHATML_STOP);
+        assert_eq!(&holdback[..safe], "xin chào ");
     }
 }

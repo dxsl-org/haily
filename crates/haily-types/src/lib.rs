@@ -29,6 +29,14 @@ pub enum ResponseChunk {
         name: String,
         ok: bool,
     },
+    /// Turn-ending failure (LLM error, cancelled mid-stream, etc.), distinct from
+    /// `Text` specifically so adapters that BUFFER `Text` chunks until `Complete`
+    /// (`haily-io::telegram`) can tell "discard the partial buffer, show only this
+    /// error" apart from "append this to the buffer" — conflating the two produced a
+    /// real bug (phase-06 red team): a partial answer plus an error both arriving as
+    /// `Text` fused into one "partial-answer⚠️error" message on Complete. Adapters
+    /// that don't buffer (CLI, GUI) may treat this the same as `Text` for rendering.
+    Error(String),
     Complete,
 }
 
@@ -103,6 +111,23 @@ mod tests {
                 assert_eq!(args, "{}");
                 assert_eq!(approval_id, Uuid::nil());
             }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunk_error_variant_roundtrips_and_is_distinct_from_text() {
+        // The frontend's discriminated union (`src/lib/tauri.ts`) and
+        // `haily-io::telegram`'s buffer-discard logic both depend on `Error` never
+        // collapsing into the same wire tag as `Text`.
+        let chunk = ResponseChunk::Error("boom".to_string());
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"type\":\"Error\""));
+        assert!(!json.contains("\"type\":\"Text\""));
+
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::Error(msg) => assert_eq!(msg, "boom"),
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
     }

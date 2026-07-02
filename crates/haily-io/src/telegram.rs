@@ -231,6 +231,26 @@ impl Adapter for TelegramAdapter {
                     .or_default()
                     .push_str(&text);
             }
+            ResponseChunk::Error(error_text) => {
+                // DISCARD (not flush) whatever partial text is buffered — a turn that
+                // streamed some real output before failing must show the user ONLY
+                // the error, never "partial-answer⚠️error" fused into one message
+                // (the bug this variant exists to fix; see `ResponseChunk::Error`'s
+                // doc comment). `Complete` always follows an `Error` on this path
+                // (`haily-app::dispatch`'s error arm sends both), so removing the
+                // entry here — rather than leaving it for `Complete` to flush — is
+                // what actually prevents the fusion.
+                self.text_buffer.remove(&session_id);
+                if let Some(chat_id) = self.session_to_chat.get(&session_id) {
+                    let trimmed = error_text.trim();
+                    if !trimmed.is_empty() {
+                        self.bot
+                            .send_message(ChatId(*chat_id), escape_html(trimmed))
+                            .parse_mode(ParseMode::Html)
+                            .await?;
+                    }
+                }
+            }
             ResponseChunk::Complete => {
                 if let Some((_, text)) = self.text_buffer.remove(&session_id) {
                     if let Some(chat_id) = self.session_to_chat.get(&session_id) {
@@ -377,5 +397,67 @@ mod tests {
         // The chat this callback claims to be from was never bound to any session.
         let foreign_chat_id = 999i64;
         assert!(chat_to_session.get(&foreign_chat_id).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 — ResponseChunk::Error must discard the buffer, not flush it.
+    // -----------------------------------------------------------------------
+
+    /// `TelegramAdapter::new` with a fake token never makes a network call
+    /// (`teloxide::Bot::new` only stores the token string) — safe to construct in a
+    /// unit test as long as no test drives `deliver()` for a session with a chat_id
+    /// actually bound (which is the only path that reaches `send_message`).
+    fn test_adapter() -> TelegramAdapter {
+        TelegramAdapter::new(Some("test-token".to_string()))
+    }
+
+    #[tokio::test]
+    async fn error_chunk_discards_buffered_partial_text() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+        // No chat bound for this session — `deliver()`'s send_message branches are
+        // skipped, so this test exercises only the buffer bookkeeping, no network I/O.
+
+        adapter.deliver(session_id, ResponseChunk::Text("partial ans".to_string())).await.unwrap();
+        adapter.deliver(session_id, ResponseChunk::Text("wer".to_string())).await.unwrap();
+        assert_eq!(
+            adapter.text_buffer.get(&session_id).map(|e| e.value().clone()),
+            Some("partial answer".to_string()),
+            "buffer must accumulate Text chunks before any Error arrives"
+        );
+
+        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        assert!(
+            adapter.text_buffer.get(&session_id).is_none(),
+            "Error must discard the buffered partial text, not leave it for Complete to flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_after_error_does_not_resurrect_discarded_text() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+
+        adapter.deliver(session_id, ResponseChunk::Text("partial".to_string())).await.unwrap();
+        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        // Mirrors haily-app::dispatch's real sequencing: Error is always followed by
+        // Complete on the error path.
+        adapter.deliver(session_id, ResponseChunk::Complete).await.unwrap();
+
+        assert!(
+            adapter.text_buffer.get(&session_id).is_none(),
+            "buffer must stay empty — Complete must not resurrect text discarded by Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_with_no_prior_text_is_a_clean_no_op_on_the_buffer() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+
+        // No Text chunk ever arrived for this session (e.g. the LLM failed before
+        // streaming a single token) — Error must not panic on a missing entry.
+        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        assert!(adapter.text_buffer.get(&session_id).is_none());
     }
 }

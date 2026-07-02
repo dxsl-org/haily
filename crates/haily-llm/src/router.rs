@@ -1,10 +1,11 @@
 use crate::CloudClient;
 #[cfg(feature = "llama")]
 use crate::prompt::PromptFormat;
-use crate::{CompletionRequest, LlmClient};
+use crate::{CompletionRequest, LlmClient, StreamChunk};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Placeholder used when no backend is configured.
 /// Returns a user-visible error on every completion so the app still starts.
@@ -17,6 +18,13 @@ impl LlmClient for NoopClient {
             "Chưa cấu hình LLM. Mở Settings → Model LLM để chọn model."
         ))
     }
+
+    async fn complete_stream(&self, _req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
+        Err(anyhow::anyhow!(
+            "Chưa cấu hình LLM. Mở Settings → Model LLM để chọn model."
+        ))
+    }
+
     fn provider_name(&self) -> &str { "unconfigured" }
     fn context_window(&self) -> u32 {
         // Never actually budgeted against — every `complete()` call errors first.
@@ -173,6 +181,56 @@ impl LlmRouter {
     pub fn context_window(&self) -> u32 {
         self.primary.context_window()
     }
+
+    /// Tries the cloud fallback (if configured) after a pre-first-token primary
+    /// failure; returns `primary_err` unchanged if there is no fallback configured.
+    /// Never called once the primary has emitted a token — see `complete_stream`'s
+    /// doc comment for the fallback-scope rule this enforces.
+    async fn fallback_stream_or_err(
+        &self,
+        req: CompletionRequest,
+        primary_err: anyhow::Error,
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        match &self.fallback {
+            Some(fallback) => {
+                tracing::warn!(
+                    "trying cloud fallback stream after primary ({}) pre-first-token failure",
+                    self.primary.provider_name()
+                );
+                fallback.complete_stream(req).await
+            }
+            None => Err(primary_err),
+        }
+    }
+}
+
+/// Bound on the router's own passthrough channel — mirrors the bound each backend
+/// uses internally (llama: 64, cloud: 32); the router just relays, so any bound in
+/// that ballpark is fine (KISS — no need to match exactly).
+const ROUTER_STREAM_BOUND: usize = 64;
+
+/// Re-emits `first` (already pulled off `src` to inspect it) followed by the rest of
+/// `src`, on a fresh bounded channel. Runs as a spawned forwarding task so the
+/// caller can return the receiver immediately without holding `src` open in the
+/// trait method's own stack frame.
+fn relay_with_first_item(
+    backend_name: String,
+    mut src: mpsc::Receiver<StreamChunk>,
+    first: StreamChunk,
+) -> mpsc::Receiver<StreamChunk> {
+    let (tx, rx) = mpsc::channel(ROUTER_STREAM_BOUND);
+    tokio::spawn(async move {
+        if tx.send(first).await.is_err() {
+            return; // consumer dropped — nothing left to relay
+        }
+        while let Some(chunk) = src.recv().await {
+            if tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+        tracing::debug!(backend = %backend_name, "primary LLM stream relay finished");
+    });
+    rx
 }
 
 #[async_trait]
@@ -190,6 +248,50 @@ impl LlmClient for LlmRouter {
                 } else {
                     Err(primary_err)
                 }
+            }
+        }
+    }
+
+    /// FALLBACK SCOPE (red-team constraint, phase-06): falls back to cloud ONLY when
+    /// the primary backend fails before emitting a single token — either by
+    /// returning `Err` from `complete_stream` itself, or by the FIRST item off its
+    /// channel being `StreamChunk::Error`. Once any `Token` has been forwarded, a
+    /// later primary-stream error is relayed as-is and the fallback is never
+    /// consulted — re-running the whole request through a second backend at that
+    /// point would re-stream the answer and duplicate user-visible text.
+    async fn complete_stream(&self, req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
+        let primary_name = self.primary.provider_name().to_string();
+        let mut primary_rx = match self.primary.complete_stream(req.clone()).await {
+            Ok(rx) => rx,
+            Err(primary_err) => {
+                tracing::warn!("primary LLM ({primary_name}) stream init failed: {primary_err:#}");
+                return self.fallback_stream_or_err(req, primary_err).await;
+            }
+        };
+
+        // Peek the first item to decide pre-first-token vs. post-first-token failure.
+        match primary_rx.recv().await {
+            None => {
+                // Channel closed with no message at all — treat as a pre-first-token
+                // init failure (same bucket as an immediate `Err`).
+                let err = anyhow::anyhow!("{primary_name} stream closed before producing any output");
+                tracing::warn!("primary LLM ({primary_name}) stream: {err:#}");
+                self.fallback_stream_or_err(req, err).await
+            }
+            Some(StreamChunk::Error(msg)) => {
+                let err = anyhow::anyhow!("{msg}");
+                tracing::warn!("primary LLM ({primary_name}) stream failed before first token: {msg}");
+                self.fallback_stream_or_err(req, err).await
+            }
+            Some(first @ StreamChunk::Token(_)) => {
+                tracing::info!(backend = %primary_name, "streaming from primary LLM");
+                Ok(relay_with_first_item(primary_name, primary_rx, first))
+            }
+            Some(first @ StreamChunk::Done { .. }) => {
+                // Zero-token completion (e.g. empty response) — still a legitimate
+                // primary stream, not a failure; forward as-is, no fallback.
+                tracing::info!(backend = %primary_name, "streaming from primary LLM (empty output)");
+                Ok(relay_with_first_item(primary_name, primary_rx, first))
             }
         }
     }

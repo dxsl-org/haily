@@ -91,9 +91,13 @@ impl Adapter for MockAdapter {
     }
 }
 
-/// Minimal OpenAI-compatible HTTP/1.1 responder. Reads and discards the request,
-/// waits `delay` (simulating LLM latency), then writes a fixed completion. Returns
-/// the bound `http://127.0.0.1:PORT` base URL.
+/// Minimal OpenAI-compatible SSE responder. Reads and discards the request, waits
+/// `delay` (simulating LLM latency), then streams a fixed completion as `data:`
+/// events terminated by `[DONE]`. `run_turn` (phase-06 streaming) always requests
+/// `"stream": true`, so the mock speaks the same SSE dialect `cloud.rs` actually
+/// parses — a non-streaming JSON blob response here would silently pass a
+/// pre-streaming test double against post-streaming production code. Returns the
+/// bound `http://127.0.0.1:PORT` base URL.
 pub async fn spawn_slow_llm_server(delay: std::time::Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -110,16 +114,60 @@ pub async fn spawn_slow_llm_server(delay: std::time::Duration) -> String {
 
                 tokio::time::sleep(delay).await;
 
-                let body = serde_json::json!({
-                    "choices": [{ "message": { "content": "mock completion" } }]
+                let delta = serde_json::json!({
+                    "choices": [{ "delta": { "content": "mock completion" } }]
                 })
                 .to_string();
+                let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// SSE responder that drips `token_count` separate `data:` events, sleeping
+/// `inter_token_delay` between each — unlike `spawn_slow_llm_server` (whose delay is
+/// entirely BEFORE the response starts), this lets a test fire cancellation
+/// mid-stream, after some tokens have already arrived but before `[DONE]`. Returns
+/// the bound base URL.
+pub async fn spawn_streaming_llm_server(token_count: u32, inter_token_delay: std::time::Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+
+                let status_and_headers =
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                if stream.write_all(status_and_headers.as_bytes()).await.is_err() {
+                    return;
+                }
+
+                for i in 0..token_count {
+                    tokio::time::sleep(inter_token_delay).await;
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": format!("tok{i} ") } }]
+                    })
+                    .to_string();
+                    let frame = format!("data: {delta}\n\n");
+                    if stream.write_all(frame.as_bytes()).await.is_err() {
+                        // Client dropped the connection (e.g. cancelled mid-stream) —
+                        // stop writing rather than erroring; this mirrors a real
+                        // network disconnect from the client side.
+                        return;
+                    }
+                }
+                let _ = stream.write_all(b"data: [DONE]\n\n").await;
                 let _ = stream.shutdown().await;
             });
         }

@@ -1,7 +1,7 @@
 //! Integration tests for bootstrap + shutdown. See `test_support` for the mock
 //! adapter and the hand-rolled slow-LLM HTTP responder shared across these tests.
 use crate::bootstrap::{AppHandle, BootstrapOptions};
-use crate::test_support::{cloud_config, spawn_slow_llm_server, MockAdapter};
+use crate::test_support::{cloud_config, spawn_slow_llm_server, spawn_streaming_llm_server, MockAdapter};
 use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, ResponseChunk};
 use std::sync::Arc;
@@ -118,6 +118,64 @@ async fn shutdown_blocks_until_an_in_flight_turn_finishes() {
     assert!(
         chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)),
         "the in-flight turn should have been allowed to finish and deliver Complete"
+    );
+}
+
+/// Critical (phase-06): shutdown fired WHILE tokens are actively streaming (not just
+/// before the first byte, as in `shutdown_blocks_until_an_in_flight_turn_finishes`)
+/// must end the turn quickly rather than waiting for the full 10-token stream to
+/// finish — proves the per-turn `CancellationToken` (derived from the shutdown root,
+/// see `dispatch.rs`) actually reaches `stream_llm_response`'s `select!` and the
+/// cloud SSE task's own cancellation check, not just gating pre-stream connect.
+#[tokio::test]
+async fn shutdown_mid_stream_ends_the_turn_quickly_not_after_full_completion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 10 tokens at 300ms apart = ~3s to finish uninterrupted; cancelling after the
+    // first couple of tokens must return well under that.
+    let token_count = 10;
+    let inter_token_delay = std::time::Duration::from_millis(300);
+    let base_url = spawn_streaming_llm_server(token_count, inter_token_delay).await;
+
+    let adapter = MockAdapter::new();
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    handle.orchestrator.reload_llm(cloud_config(base_url)).await;
+    let session_id = adapter.send("stream then cancel").await;
+
+    // Let a couple of tokens land before cancelling, so this genuinely interrupts an
+    // in-progress stream rather than racing a turn that hasn't started receiving yet.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let shutdown_started = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown(std::time::Duration::from_secs(5)))
+        .await
+        .expect("shutdown must not hang");
+    let shutdown_elapsed = shutdown_started.elapsed();
+
+    let full_stream_duration = inter_token_delay * token_count;
+    assert!(
+        shutdown_elapsed < full_stream_duration,
+        "shutdown took {shutdown_elapsed:?}, expected well under the full \
+         {full_stream_duration:?} uninterrupted stream duration — cancellation did not \
+         reach the in-progress stream"
+    );
+
+    let chunks = adapter.chunks_for(session_id);
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)),
+        "a cancelled turn must still finalize with Complete, not leave the adapter hanging: {chunks:?}"
+    );
+    // Some tokens should have streamed live before the cancellation cut it short —
+    // proves this exercised real incremental delivery, not a turn that never started.
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("tok0"))),
+        "expected at least the first streamed token to have reached the adapter: {chunks:?}"
     );
 }
 

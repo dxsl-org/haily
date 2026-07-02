@@ -105,3 +105,38 @@ pub fn to_ollama_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 pub fn to_openai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     to_ollama_messages(messages) // same schema
 }
+
+/// Formats messages for the Anthropic /v1/messages JSON body.
+///
+/// Anthropic has no `system` role inside the `messages` array — system content is a
+/// top-level `system` string field on the request body instead. Returns
+/// `(system_text, messages)`; `system_text` is `None` if there was no system message
+/// (multiple system messages, if ever present, are joined — mirrors `gemma4`'s
+/// same accommodation for a system-role-less wire format).
+pub fn to_anthropic_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
+    let system_text: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    let system = (!system_text.is_empty()).then(|| system_text.join("\n\n"));
+
+    let turns = messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|m| {
+            let role = match m.role {
+                Role::Assistant => "assistant",
+                // Anthropic's `messages` array only has user/assistant roles; a
+                // `Tool` role (not otherwise produced by this codebase's protocol,
+                // which feeds tool results back as plain user-role text — see
+                // `agent.rs`'s `<tool_result>` construction) maps to "user" as the
+                // safe default rather than being silently dropped.
+                Role::User | Role::Tool | Role::System => "user",
+            };
+            serde_json::json!({ "role": role, "content": m.content })
+        })
+        .collect();
+
+    (system, turns)
+}

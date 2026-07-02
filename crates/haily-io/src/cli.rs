@@ -181,6 +181,13 @@ impl Adapter for CliAdapter {
                 stdout.write_all(text.as_bytes()).await?;
                 stdout.flush().await?;
             }
+            ResponseChunk::Error(text) => {
+                // CLI doesn't buffer (each Text chunk is written immediately), so
+                // there's no fused-message risk here — just render it distinctly.
+                let line = format!("\n⚠️ {text}\n");
+                stdout.write_all(line.as_bytes()).await?;
+                stdout.flush().await?;
+            }
             ResponseChunk::Complete => {
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
