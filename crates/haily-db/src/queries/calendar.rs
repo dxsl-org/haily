@@ -18,16 +18,19 @@ pub struct CalendarEvent {
     pub deleted_at: Option<String>,
 }
 
-pub async fn insert(
-    db: &DbHandle,
-    title: &str,
-    description: Option<&str>,
-    location: Option<&str>,
-    start_at: &str,
-    end_at: &str,
-    all_day: bool,
-    recurrence: Option<&str>,
-) -> Result<CalendarEvent> {
+/// Fields for creating a calendar event. Grouped into a struct to keep
+/// `insert` within a sane arity and to make call sites self-documenting.
+pub struct NewCalendarEvent<'a> {
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub location: Option<&'a str>,
+    pub start_at: &'a str,
+    pub end_at: &'a str,
+    pub all_day: bool,
+    pub recurrence: Option<&'a str>,
+}
+
+pub async fn insert(db: &DbHandle, event: NewCalendarEvent<'_>) -> Result<CalendarEvent> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     Ok(sqlx::query_as::<_, CalendarEvent>(
@@ -38,13 +41,13 @@ pub async fn insert(
          RETURNING *",
     )
     .bind(&id)
-    .bind(title)
-    .bind(description)
-    .bind(location)
-    .bind(start_at)
-    .bind(end_at)
-    .bind(all_day as i64)
-    .bind(recurrence)
+    .bind(event.title)
+    .bind(event.description)
+    .bind(event.location)
+    .bind(event.start_at)
+    .bind(event.end_at)
+    .bind(event.all_day as i64)
+    .bind(event.recurrence)
     .bind(&now)
     .bind(&now)
     .fetch_one(db.pool())

@@ -94,7 +94,19 @@ impl Tool for CalendarAddTool {
         let location = args["location"].as_str();
         let all_day  = args["all_day"].as_bool().unwrap_or(false);
 
-        let event = calendar::insert(&ctx.db, title, desc, location, start_at, end_at, all_day, None).await?;
+        let event = calendar::insert(
+            &ctx.db,
+            calendar::NewCalendarEvent {
+                title,
+                description: desc,
+                location,
+                start_at,
+                end_at,
+                all_day,
+                recurrence: None,
+            },
+        )
+        .await?;
         Ok(format!("Đã tạo sự kiện: {} (id: {})", event.title, event.id))
     }
 }

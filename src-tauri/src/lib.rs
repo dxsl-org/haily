@@ -170,7 +170,7 @@ async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         cfg.llama_model_path = Some(std::path::PathBuf::from(path));
     }
     if let Ok(Some(fmt)) = meta::get_preference(db, "llm.llama_prompt_format").await {
-        cfg.llama_prompt_format = PromptFormat::from_str(&fmt);
+        cfg.llama_prompt_format = PromptFormat::from_name(&fmt);
     }
     if let Ok(Some(v)) = meta::get_preference(db, "llm.llama_n_gpu_layers").await {
         if let Ok(n) = v.parse::<u32>() {
@@ -257,7 +257,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
 
             let (db, _kms, orc) = tauri::async_runtime::block_on(init_stack(&data_dir))
-                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| Box::new(std::io::Error::other(e.to_string())))?;
 
             let (gui_adapter, gui_req_tx, gui_resp_rx) = haily_io::GuiAdapter::new();
             let am = AdapterManager::builder()

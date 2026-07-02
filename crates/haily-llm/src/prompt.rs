@@ -19,7 +19,10 @@ impl PromptFormat {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a prompt format from its config string. Infallible — unknown
+    /// values fall back to `PromptFormat::ChatML`, so this deliberately does not
+    /// implement `std::str::FromStr` (which would force a meaningless error type).
+    pub fn from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "gemma4" | "gemma" => PromptFormat::Gemma4,
             _ => PromptFormat::ChatML,

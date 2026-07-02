@@ -113,13 +113,15 @@ impl KmsHandle {
             let blob = Embedder::to_bytes(&embedding);
             let fact = facts::insert_fact(
                 &self.db,
-                domain_id,
-                subject,
-                predicate,
-                object,
-                source,
-                source_ref,
-                Some(&blob),
+                facts::NewFact {
+                    domain_id,
+                    subject,
+                    predicate,
+                    object,
+                    source,
+                    source_ref,
+                    embedding: Some(&blob),
+                },
             )
             .await?;
 
@@ -130,13 +132,15 @@ impl KmsHandle {
         {
             let fact = facts::insert_fact(
                 &self.db,
-                domain_id,
-                subject,
-                predicate,
-                object,
-                source,
-                source_ref,
-                None,
+                facts::NewFact {
+                    domain_id,
+                    subject,
+                    predicate,
+                    object,
+                    source,
+                    source_ref,
+                    embedding: None,
+                },
             )
             .await?;
             Ok(fact.id)
@@ -156,7 +160,7 @@ impl KmsHandle {
             .await?
             .unwrap_or_else(|| "haily".to_string());
 
-        let soul = Soul::from_str(&soul_str);
+        let soul = Soul::from_name(&soul_str);
 
         let user_address = meta::get_preference(&self.db, "user.address")
             .await?
@@ -261,7 +265,10 @@ pub enum Soul {
 }
 
 impl Soul {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a soul from its Vietnamese or ASCII name. Infallible — unknown
+    /// names fall back to `Soul::Haily`, so this deliberately does not implement
+    /// `std::str::FromStr` (which would force a meaningless error type).
+    pub fn from_name(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "tete" | "tê tê" => Soul::Tete,
             "hoami" | "họa mi" => Soul::Hoami,

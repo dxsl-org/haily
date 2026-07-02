@@ -20,16 +20,19 @@ pub struct Fact {
     pub archived_at: Option<String>,
 }
 
-pub async fn insert_fact(
-    db: &DbHandle,
-    domain_id: &str,
-    subject: &str,
-    predicate: &str,
-    object: &str,
-    source: &str,
-    source_ref: Option<&str>,
-    embedding: Option<&[u8]>,
-) -> Result<Fact> {
+/// Fields for creating a fact. Grouped into a struct to keep `insert_fact`
+/// within a sane arity and to make call sites self-documenting.
+pub struct NewFact<'a> {
+    pub domain_id: &'a str,
+    pub subject: &'a str,
+    pub predicate: &'a str,
+    pub object: &'a str,
+    pub source: &'a str,
+    pub source_ref: Option<&'a str>,
+    pub embedding: Option<&'a [u8]>,
+}
+
+pub async fn insert_fact(db: &DbHandle, fact: NewFact<'_>) -> Result<Fact> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     Ok(sqlx::query_as::<_, Fact>(
@@ -39,13 +42,13 @@ pub async fn insert_fact(
          RETURNING *",
     )
     .bind(&id)
-    .bind(domain_id)
-    .bind(subject)
-    .bind(predicate)
-    .bind(object)
-    .bind(source)
-    .bind(source_ref)
-    .bind(embedding)
+    .bind(fact.domain_id)
+    .bind(fact.subject)
+    .bind(fact.predicate)
+    .bind(fact.object)
+    .bind(fact.source)
+    .bind(fact.source_ref)
+    .bind(fact.embedding)
     .bind(&now)
     .bind(&now)
     .fetch_one(db.pool())
