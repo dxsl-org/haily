@@ -4,7 +4,7 @@ use haily_db::{
     queries::{sessions, skills as db_skills, work_items},
     DbHandle,
 };
-use haily_io::{Request, ResponseChunk};
+use haily_types::{Request, ResponseChunk};
 use haily_kms::KmsHandle;
 use haily_llm::{CompletionRequest, LlmClient, LlmRouter, Message, Role};
 use haily_tools::{ToolContext, ToolRegistry};

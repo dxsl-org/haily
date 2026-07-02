@@ -7,7 +7,7 @@ description = "Orchestrator and agent loop"
 [dependencies]
 haily-db    = { workspace = true }
 haily-llm   = { workspace = true }
-haily-io    = { workspace = true }
+haily-types = { workspace = true }
 haily-kms   = { workspace = true }
 haily-tools = { workspace = true }
 tokio        = { workspace = true }

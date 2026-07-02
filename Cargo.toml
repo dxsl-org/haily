@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/haily-types",
     "crates/haily-db",
     "crates/haily-llm",
     "crates/haily-io",
@@ -36,6 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
 # Internal crates (path deps for workspace members that import each other)
+haily-types = { path = "crates/haily-types" }
 haily-db    = { path = "crates/haily-db" }
 haily-llm   = { path = "crates/haily-llm" }
 haily-io    = { path = "crates/haily-io" }

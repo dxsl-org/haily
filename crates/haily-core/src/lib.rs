@@ -9,7 +9,7 @@ pub mod worktree;
 
 use anyhow::Result;
 use haily_db::DbHandle;
-use haily_io::{Request, ResponseChunk};
+use haily_types::{Request, ResponseChunk};
 use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;

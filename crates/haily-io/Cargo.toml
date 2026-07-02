@@ -10,6 +10,7 @@ default = []
 telegram = ["dep:teloxide"]
 
 [dependencies]
+haily-types = { workspace = true }
 tokio       = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }

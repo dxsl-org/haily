@@ -1,6 +1,6 @@
 /// Tool call parsing, loop-guard, and dispatch.
 use anyhow::{bail, Result};
-use haily_io::ResponseChunk;
+use haily_types::ResponseChunk;
 use haily_tools::{ToolClass, ToolContext, ToolRegistry};
 use tokio::sync::mpsc;
 use tracing::{info, warn};

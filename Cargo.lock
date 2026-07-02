@@ -2231,10 +2231,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "haily-db",
- "haily-io",
  "haily-kms",
  "haily-llm",
  "haily-tools",
+ "haily-types",
  "serde",
  "serde_json",
  "tempfile",
@@ -2269,6 +2269,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dashmap",
+ "haily-types",
  "serde",
  "serde_json",
  "teloxide",
@@ -2366,6 +2367,16 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "haily-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
