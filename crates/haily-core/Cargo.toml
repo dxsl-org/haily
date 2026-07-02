@@ -21,6 +21,7 @@ serde_json   = { workspace = true }
 uuid         = { workspace = true }
 chrono       = { workspace = true }
 async-trait  = "0.1"
+dashmap      = "6"
 
 [dev-dependencies]
 tempfile = "3"

@@ -69,6 +69,10 @@ async fn dispatch_loop(
         let (resp_tx, mut resp_rx) = mpsc::channel::<ResponseChunk>(256);
         let orc_clone = Arc::clone(&orc);
         let am_clone = am.clone();
+        // Per-turn child of the root shutdown token: cancelling the root cancels every
+        // in-flight turn's token too, so a pending tool approval (ApprovalBroker::request)
+        // denies immediately on shutdown instead of blocking the drain for up to 120s.
+        let turn_cancel = shutdown.child_token();
 
         tasks.spawn(async move {
             // Forward chunks from orchestrator → adapter while the agent loop runs.
@@ -86,7 +90,7 @@ async fn dispatch_loop(
             };
 
             let resp_tx_err = resp_tx.clone();
-            if let Err(e) = orc_clone.process(req, resp_tx).await {
+            if let Err(e) = orc_clone.process(req, resp_tx, turn_cancel).await {
                 tracing::error!("orchestrator error: {e:#}");
                 resp_tx_err.send(ResponseChunk::Text(format!("⚠️ {e:#}"))).await.ok();
                 resp_tx_err.send(ResponseChunk::Complete).await.ok();

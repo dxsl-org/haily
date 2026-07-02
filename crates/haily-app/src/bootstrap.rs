@@ -4,6 +4,7 @@
 //! (CLI `main.rs`, Tauri `lib.rs`). It is the single shutdown surface: dropping it
 //! without calling `shutdown()` leaves background tasks running until the process
 //! exits — always call `shutdown()` on the signal/exit-event path.
+use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::load_llm_config;
 use crate::{dispatch, watchers};
 use anyhow::Result;
@@ -11,6 +12,7 @@ use haily_core::Orchestrator;
 use haily_db::DbHandle;
 use haily_io::{AdapterManager, Adapter};
 use haily_kms::KmsHandle;
+use haily_tools::ToolRegistry;
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -71,6 +73,12 @@ impl AppHandle {
         let kms = Arc::new(kms);
         let llm_cfg = load_llm_config(&kms).await;
 
+        // Validate the auto_approve allowlist against the same tool set the
+        // orchestrator will build from. A destructive/exfil tool listed here is a
+        // config error at boot — never silently ignored, never auto-approved.
+        let auto_approve_raw = load_auto_approve(&kms).await;
+        let auto_approve = validate_auto_approve(&auto_approve_raw, &ToolRegistry::build_v1())?;
+
         let orchestrator = Arc::new(
             Orchestrator::init(
                 Arc::clone(&kms),
@@ -78,11 +86,20 @@ impl AppHandle {
                 llm_cfg,
                 shutdown.child_token(),
                 tasks.clone(),
+                auto_approve,
             )
             .await?,
         );
 
         info!(llm = orchestrator.llm_provider(), "ready");
+
+        // Adapters are constructed by the caller before the orchestrator (and its
+        // approval broker) exist, so the resolver is injected here — after `init`,
+        // before `start_all` begins accepting requests — rather than at construction.
+        let resolver = orchestrator.approval_resolver();
+        for adapter in &adapters {
+            adapter.set_approval_resolver(Arc::clone(&resolver));
+        }
 
         let mut builder = AdapterManager::builder();
         for adapter in adapters {

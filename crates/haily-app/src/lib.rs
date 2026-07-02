@@ -4,12 +4,14 @@
 //! Tauri GUI) — see `AppHandle::bootstrap`. This crate depends on `haily-io` (adapter
 //! trait + manager) so it must sit above `haily-core` in the dependency graph;
 //! `haily-core` itself stays io-free per the workspace's layering invariant.
+mod auto_approve;
 mod config;
 mod dispatch;
 mod watchers;
 
 pub mod bootstrap;
 
+pub use auto_approve::{load_auto_approve, validate_auto_approve};
 pub use bootstrap::{AppHandle, BootstrapOptions};
 pub use config::load_llm_config;
 

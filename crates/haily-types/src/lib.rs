@@ -60,6 +60,22 @@ pub enum Notification {
 pub type RequestSender = tokio::sync::mpsc::Sender<Request>;
 pub type RequestReceiver = tokio::sync::mpsc::Receiver<Request>;
 
+/// Adapter-facing half of the tool-approval flow. Lives here (not `haily-core`) so
+/// `haily-io` adapters can resolve a pending approval without depending on
+/// `haily-core` — see CLAUDE.md's layering invariant. `haily-core::ApprovalBroker`
+/// is the sole implementer; adapters hold it as `Arc<dyn ApprovalResolver>`.
+///
+/// `approval_id` is shown to the user (not a secret) — `session_id` is the actual
+/// auth boundary, so implementations MUST verify the pending approval was registered
+/// under this exact `session_id` before honoring `approved`.
+pub trait ApprovalResolver: Send + Sync {
+    /// Resolve a pending approval. Returns `true` if a matching pending approval was
+    /// found for `session_id` and resolved by this call, `false` if `approval_id` is
+    /// unknown, already resolved, or bound to a different session (forged/foreign-chat
+    /// attempt — callers should log and otherwise ignore a `false` result).
+    fn resolve(&self, approval_id: Uuid, session_id: Uuid, approved: bool) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

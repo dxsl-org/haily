@@ -5,7 +5,7 @@ mod models;
 
 use haily_app::{AppHandle, BootstrapOptions};
 use haily_db::{queries::meta, DbHandle};
-use haily_io::{Adapter, GuiRequestSender, GuiResponseReceiver, Request};
+use haily_io::{Adapter, ApprovalResolver, GuiRequestSender, GuiResponseReceiver, Request};
 use haily_kms::KmsHandle;
 use std::{sync::Arc, time::Duration};
 use tauri::{AppHandle as TauriAppHandle, Emitter, Manager, RunEvent, State};
@@ -21,6 +21,10 @@ struct AppState {
     gui_req_tx: GuiRequestSender,
     db: Arc<DbHandle>,
     kms: Arc<KmsHandle>,
+    /// Resolves pending tool approvals — same broker `Orchestrator::process` awaits
+    /// on. Cloned out of `app` once at setup so `approve_tool` doesn't need to lock
+    /// `app` (which is also the shutdown surface) for every button tap.
+    approval_resolver: Arc<dyn ApprovalResolver>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -30,6 +34,24 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
     let req = Request { session_id, adapter_id: "gui".to_string(), message, user_ref: None };
     state.gui_req_tx.send(req).await.map_err(|e| e.to_string())?;
     Ok(session_id.to_string())
+}
+
+/// Resolve a pending tool approval raised for `session_id`. `session_id` is the
+/// auth boundary (see `haily-core::approval`) — the frontend already has it from the
+/// `ToolApprovalRequest` chunk's envelope (`ChunkPayload.session_id`), so this does
+/// not need (and must not add) a global "current session" concept. Returns `false`
+/// (not an error) if the approval was already resolved, unknown, or bound to a
+/// different session — the caller should treat that as "nothing to do".
+#[tauri::command]
+async fn approve_tool(
+    session_id: String,
+    approval_id: String,
+    approved: bool,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
+    let approval_id = Uuid::parse_str(&approval_id).map_err(|e| e.to_string())?;
+    Ok(state.approval_resolver.resolve(approval_id, session_id, approved))
 }
 
 /// Re-read LLM preferences and hot-swap the active backend. Returns the active
@@ -98,12 +120,14 @@ pub fn run() {
                 .map_err(|e| Box::new(std::io::Error::other(e.to_string())))?;
             let db = Arc::clone(&app_handle.db);
             let kms = Arc::clone(&app_handle.kms);
-            app.manage(AppState { gui_req_tx, db, kms, app: Mutex::new(Some(app_handle)) });
+            let approval_resolver = app_handle.orchestrator.approval_resolver();
+            app.manage(AppState { gui_req_tx, db, kms, approval_resolver, app: Mutex::new(Some(app_handle)) });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             send_message,
+            approve_tool,
             get_preferences,
             set_preference,
             list_local_models,

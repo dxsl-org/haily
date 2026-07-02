@@ -1,8 +1,10 @@
 /// Tool call parsing, loop-guard, and dispatch.
+use crate::approval::ApprovalBroker;
 use anyhow::{bail, Result};
 use haily_types::ResponseChunk;
 use haily_tools::{ToolClass, ToolContext, ToolRegistry};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -92,17 +94,28 @@ pub fn strip_tool_tags(text: &str) -> String {
 ///
 /// Returns `(result_text, ok)` — `ok` is the typed success/failure signal (previously
 /// inferred by callers via `result.starts_with("Error:")`, which misclassified any
-/// legitimate tool output that happened to start with that literal string).
+/// legitimate tool output that happened to start with that literal string). A denied
+/// or timed-out approval is reported as `ok = false` with a Vietnamese decline
+/// message — the tool never runs, and the turn continues normally rather than
+/// erroring out.
 ///
 /// The loop-guard is checked by the caller *before* dispatch so a tripped guard
 /// can terminate the turn — feeding a guard error back here would let a looping
 /// model spin. Dispatch therefore no longer owns the guard.
+///
+/// `broker`/`cancel` gate `ToolClass::RequireApproval` tools: `ctx.session_id` is the
+/// turn's session, `cancel` is the turn's cancellation token (fired on shutdown so a
+/// pending approval never blocks the drain). Sub-agents (`ctx.depth > 0`) are hard-
+/// blocked from this class entirely, before the broker is ever consulted — a
+/// sub-agent runs headless with a sink channel and no user to ask.
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
     registry: &ToolRegistry,
     ctx: &ToolContext,
     tx: &mpsc::Sender<ResponseChunk>,
+    broker: &ApprovalBroker,
+    cancel: &CancellationToken,
 ) -> Result<(String, bool)> {
     let tool = registry
         .get(tool_name)
@@ -118,17 +131,29 @@ pub async fn dispatch(
             if ctx.depth > 0 {
                 bail!("tool '{tool_name}' requires user approval and cannot run inside a sub-agent");
             }
-            let approval_id = Uuid::new_v4();
-            // In V1: send approval request chunk, then auto-approve after 0ms.
-            // Phase 10 (GUI) will add real approval UI by intercepting this chunk.
-            let _ = tx
-                .send(ResponseChunk::ToolApprovalRequest {
-                    tool: tool_name.to_string(),
-                    args: args.to_string(),
-                    approval_id,
-                })
-                .await;
-            // Auto-approve: continue immediately.
+            // Pre-validated allowlist (destructive/exfil tools can never be listed —
+            // enforced at startup, not here) lets specific low-risk RequireApproval
+            // tools skip the interactive prompt. Every bypass is logged at warn: it
+            // is a deliberate, auditable trust decision, not silent.
+            if broker.is_auto_approved(tool_name) {
+                warn!(tool = tool_name, "tool call auto-approved via config allowlist");
+            } else {
+                let approval_id = Uuid::new_v4();
+                let _ = tx
+                    .send(ResponseChunk::ToolApprovalRequest {
+                        tool: tool_name.to_string(),
+                        args: args.to_string(),
+                        approval_id,
+                    })
+                    .await;
+
+                let approved = broker.request(approval_id, ctx.session_id, cancel).await;
+                if !approved {
+                    info!(tool = tool_name, %approval_id, "tool call denied (declined, timed out, or cancelled)");
+                    let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
+                    return Ok(("Người dùng đã từ chối yêu cầu này.".to_string(), false));
+                }
+            }
         }
         ToolClass::AutoApprove => {}
     }
@@ -247,8 +272,10 @@ mod tests {
         registry.register(std::sync::Arc::new(LiteralErrorPrefixTool));
         let (ctx, _dir) = test_tool_ctx().await;
         let (tx, _rx) = mpsc::channel(8);
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
 
-        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx, &tx)
+        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
             .await
             .unwrap();
 
@@ -262,12 +289,129 @@ mod tests {
         registry.register(std::sync::Arc::new(FailingTool));
         let (ctx, _dir) = test_tool_ctx().await;
         let (tx, _rx) = mpsc::channel(8);
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
 
-        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx, &tx)
+        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
             .await
             .unwrap();
 
         assert!(!ok, "a genuinely failing tool must report ok=false");
         assert!(text.contains("boom"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 — approval-gated dispatch.
+    // -----------------------------------------------------------------------
+
+    struct RequireApprovalTool;
+
+    #[async_trait]
+    impl Tool for RequireApprovalTool {
+        fn name(&self) -> &str { "delete_thing" }
+        fn description(&self) -> &str { "a destructive tool that must be approved" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("deleted".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_blocks_execution_and_returns_decline_text() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(RequireApprovalTool));
+        let (ctx, _dir) = test_tool_ctx().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+
+        // Drain the ToolApprovalRequest chunk and deny it via the broker, mirroring
+        // what an adapter's resolver would do.
+        let broker_clone = std::sync::Arc::clone(&broker);
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker_clone.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+            .await
+            .unwrap();
+
+        responder.await.unwrap();
+        assert!(!ok, "denied approval must report ok=false");
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+    }
+
+    #[tokio::test]
+    async fn approve_executes_tool_exactly_once() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(RequireApprovalTool));
+        let (ctx, _dir) = test_tool_ctx().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+
+        let broker_clone = std::sync::Arc::clone(&broker);
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker_clone.resolve(approval_id, session_id, true);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+            .await
+            .unwrap();
+
+        responder.await.unwrap();
+        assert!(ok, "approved tool call must succeed");
+        assert_eq!(text, "deleted");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_pending_approval_denies_without_executing() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(RequireApprovalTool));
+        let (ctx, _dir) = test_tool_ctx().await;
+        let (tx, _rx) = mpsc::channel(8); // never drained/resolved — only cancellation can end this
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // simulates shutdown firing before/while the approval is pending
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel),
+        )
+        .await
+        .expect("cancellation must deny promptly, not hang toward the 120s timeout")
+        .unwrap();
+
+        assert!(!ok);
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+    }
+
+    #[tokio::test]
+    async fn depth_greater_than_zero_still_hard_blocks_before_the_broker() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(RequireApprovalTool));
+        let (mut ctx, _dir) = test_tool_ctx().await;
+        ctx.depth = 1;
+        let (tx, _rx) = mpsc::channel(8);
+        let broker = ApprovalBroker::new();
+        let cancel = CancellationToken::new();
+
+        let result = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel).await;
+        assert!(result.is_err(), "sub-agent depth>0 must bail before ever consulting the broker");
     }
 }

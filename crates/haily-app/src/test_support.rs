@@ -7,7 +7,7 @@
 //! way to make a turn genuinely slow enough to prove the shutdown drain waits on it.
 use anyhow::Result;
 use async_trait::async_trait;
-use haily_io::{Adapter, Notification, Request, RequestSender, ResponseChunk};
+use haily_io::{Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk};
 use haily_llm::LlmConfig;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,11 +20,25 @@ use uuid::Uuid;
 pub struct MockAdapter {
     req_tx: Mutex<Option<mpsc::Sender<Request>>>,
     delivered: Arc<Mutex<Vec<(Uuid, ResponseChunk)>>>,
+    /// Set by `set_approval_resolver` — lets bootstrap tests confirm
+    /// `haily-app::bootstrap` actually injects the resolver into every adapter,
+    /// not just the ones with a real interactive approval surface.
+    approval_resolver: Mutex<Option<Arc<dyn ApprovalResolver>>>,
 }
 
 impl MockAdapter {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { req_tx: Mutex::new(None), delivered: Arc::new(Mutex::new(Vec::new())) })
+        Arc::new(Self {
+            req_tx: Mutex::new(None),
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            approval_resolver: Mutex::new(None),
+        })
+    }
+
+    /// Whether `set_approval_resolver` has been called — proves bootstrap wired the
+    /// broker into this adapter before `start()` began accepting requests.
+    pub fn has_approval_resolver(&self) -> bool {
+        self.approval_resolver.lock().expect("lock").is_some()
     }
 
     pub async fn send(&self, message: &str) -> Uuid {
@@ -66,6 +80,10 @@ impl Adapter for MockAdapter {
 
     async fn notify(&self, _msg: Notification) -> Result<()> {
         Ok(())
+    }
+
+    fn set_approval_resolver(&self, resolver: Arc<dyn ApprovalResolver>) {
+        *self.approval_resolver.lock().expect("lock") = Some(resolver);
     }
 
     fn id(&self) -> &str {

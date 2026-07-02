@@ -15,10 +15,11 @@ pub use telegram::TelegramAdapter;
 // Message/DTO types live in `haily-types` (leaf crate) so `haily-core` can depend on them
 // without importing this adapter layer. Re-exported here so existing call sites
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
-pub use haily_types::{Notification, Request, RequestSender, ResponseChunk, WorkItemStatus};
+pub use haily_types::{ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[async_trait]
@@ -32,6 +33,14 @@ pub trait Adapter: Send + Sync {
 
     /// Send a proactive notification (morning brief, alert, reminder fired).
     async fn notify(&self, msg: Notification) -> Result<()>;
+
+    /// Inject the tool-approval resolver. Called once by `haily-app::bootstrap`
+    /// after the `Orchestrator` (and therefore its broker) exists — adapters are
+    /// constructed before that point, so this is a post-construction wiring step,
+    /// not a constructor arg. Default no-op: adapters with no interactive approval
+    /// surface (or that resolve some other way, e.g. the GUI's direct Tauri command)
+    /// don't need to override this.
+    fn set_approval_resolver(&self, _resolver: Arc<dyn ApprovalResolver>) {}
 
     fn id(&self) -> &str;
 }

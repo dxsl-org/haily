@@ -10,9 +10,10 @@ use haily_llm::{CompletionRequest, LlmClient, LlmRouter, Message, Role};
 use haily_tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
 
-use crate::{context, feedback_parser, tool_call};
+use crate::{approval::ApprovalBroker, context, feedback_parser, tool_call};
 
 fn estimate_tokens(s: &str) -> i64 {
     (s.len() / 4) as i64
@@ -88,6 +89,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let mut tool_call_log: Vec<serde_json::Value> = Vec::new();
     let (tx, _rx) = tokio::sync::mpsc::channel(32); // sink — sub-agents don't stream to user
 
+    // Sub-turns run at depth > 0, which `dispatch` hard-blocks from
+    // `ToolClass::RequireApproval` before either of these is ever touched — a
+    // throwaway broker/token (not threaded from the parent turn) is intentional,
+    // not a shortcut: a sub-agent must never reach the approval path at all.
+    let sub_turn_broker = ApprovalBroker::new();
+    let sub_turn_cancel = CancellationToken::new();
+
     let final_response = loop {
         let llm_req = CompletionRequest::simple(msgs.clone());
         let response = llm.complete(llm_req).await?;
@@ -103,9 +111,17 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 break tool_call::strip_tool_markup(&response);
             }
 
-            let (result, tool_ok) = tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx)
-                .await
-                .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
+            let (result, tool_ok) = tool_call::dispatch(
+                &tool_name,
+                args.clone(),
+                &tools,
+                &tool_ctx,
+                &tx,
+                &sub_turn_broker,
+                &sub_turn_cancel,
+            )
+            .await
+            .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
@@ -146,16 +162,30 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     Ok(final_response)
 }
 
+/// Shared runtime handles for a full turn — grouped so `run_turn` stays within a
+/// sane arity (mirrors `SubTurnRequest`'s reasoning for sub-turns). These are the
+/// same handles `Orchestrator` already holds as fields; `process` just forwards them.
+pub struct TurnRuntime {
+    pub db: Arc<DbHandle>,
+    pub kms: Arc<KmsHandle>,
+    pub llm: Arc<LlmRouter>,
+    pub tools: Arc<ToolRegistry>,
+}
+
 /// Full agent turn. Called once per incoming Request.
+///
+/// `broker` gates `ToolClass::RequireApproval` tool calls at depth 0; `cancel` is the
+/// turn's cancellation token — firing it (shutdown) denies any pending approval
+/// immediately instead of holding up the drain for up to the 120s approval timeout.
 #[instrument(skip_all, fields(session = %req.session_id))]
 pub async fn run_turn(
     req: &Request,
-    db: Arc<DbHandle>,
-    kms: Arc<KmsHandle>,
-    llm: Arc<LlmRouter>,
-    tools: Arc<ToolRegistry>,
+    runtime: TurnRuntime,
     tx: mpsc::Sender<ResponseChunk>,
+    broker: &ApprovalBroker,
+    cancel: &CancellationToken,
 ) -> Result<()> {
+    let TurnRuntime { db, kms, llm, tools } = runtime;
     let session_id = req.session_id.to_string();
     let turn_start = std::time::Instant::now();
 
@@ -231,7 +261,7 @@ pub async fn run_turn(
                 }
 
                 let (result, tool_ok) =
-                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx)
+                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx, broker, cancel)
                         .await
                         .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 

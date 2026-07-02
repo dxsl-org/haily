@@ -1,4 +1,5 @@
 mod agent;
+pub mod approval;
 mod context;
 mod delegate;
 mod domains;
@@ -7,9 +8,11 @@ mod specialists;
 mod tool_call;
 pub mod worktree;
 
+pub use approval::ApprovalBroker;
+
 use anyhow::Result;
 use haily_db::DbHandle;
-use haily_types::{Request, ResponseChunk};
+use haily_types::{ApprovalResolver, Request, ResponseChunk};
 use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;
@@ -25,6 +28,10 @@ pub struct Orchestrator {
     /// Lock is held only for the duration of cloning the inner Arc — never across await.
     llm: Arc<RwLock<Arc<LlmRouter>>>,
     tools: Arc<ToolRegistry>,
+    /// Shared across every turn — approvals are keyed by `approval_id`, so one
+    /// broker instance for the whole orchestrator lifetime is correct (not
+    /// per-turn); see `approval.rs` for the session-bound resolution contract.
+    approval_broker: Arc<ApprovalBroker>,
 }
 
 impl Orchestrator {
@@ -34,12 +41,17 @@ impl Orchestrator {
     /// workers select on `shutdown.cancelled()` and exit promptly instead of waiting
     /// out their sleep interval, and are registered on `tasks` so `TaskTracker::wait()`
     /// only resolves once they have actually exited.
+    ///
+    /// `auto_approve` MUST already be validated by the caller (`haily_app::auto_approve
+    /// ::validate_auto_approve` — rejects any `RequireApproval`-class tool name at
+    /// startup) — this constructor trusts it and does not re-check.
     pub async fn init(
         kms: Arc<KmsHandle>,
         db: Arc<DbHandle>,
         config: LlmConfig,
         shutdown: CancellationToken,
         tasks: TaskTracker,
+        auto_approve: std::collections::HashSet<String>,
     ) -> Result<Self> {
         let llm_inner = Arc::new(LlmRouter::init(config).await);
 
@@ -117,7 +129,13 @@ impl Orchestrator {
         Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm_inner), shutdown, tasks);
         let llm = Arc::new(RwLock::new(llm_inner));
 
-        Ok(Self { kms, db, llm, tools })
+        Ok(Self {
+            kms,
+            db,
+            llm,
+            tools,
+            approval_broker: Arc::new(ApprovalBroker::with_auto_approve(auto_approve)),
+        })
     }
 
     /// Swap in a new LLM backend without restarting. Safe to call while requests are in flight.
@@ -131,26 +149,38 @@ impl Orchestrator {
         *guard = new_router;
     }
 
+    /// `cancel` is this turn's cancellation token — the caller (`haily-app`'s
+    /// dispatch loop) mints a child token from its root shutdown token per turn, so
+    /// firing it here (shutdown) denies any pending tool approval immediately rather
+    /// than holding up the drain for up to the 120s approval timeout. `process`'s
+    /// final shape (Phase 6) folds this into the signature permanently; this is that
+    /// signature landed early so the approval broker has something to select on.
     pub async fn process(
         &self,
         req: Request,
         tx: mpsc::Sender<ResponseChunk>,
+        cancel: CancellationToken,
     ) -> Result<()> {
         // Clone the Arc under a brief read-lock — never hold the lock across await.
         let llm = self.llm.read().unwrap_or_else(|e| e.into_inner()).clone();
-        agent::run_turn(
-            &req,
-            Arc::clone(&self.db),
-            Arc::clone(&self.kms),
+        let runtime = agent::TurnRuntime {
+            db: Arc::clone(&self.db),
+            kms: Arc::clone(&self.kms),
             llm,
-            Arc::clone(&self.tools),
-            tx,
-        )
-        .await
+            tools: Arc::clone(&self.tools),
+        };
+        agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
     }
 
     pub fn llm_provider(&self) -> String {
         self.llm.read().unwrap_or_else(|e| e.into_inner()).provider_name().to_string()
+    }
+
+    /// Adapter-facing handle for resolving pending tool approvals (GUI/CLI/Telegram
+    /// inject this at bootstrap). Returns the same broker instance `process` awaits
+    /// on, upcast to the layering-safe trait object defined in `haily-types`.
+    pub fn approval_resolver(&self) -> Arc<dyn ApprovalResolver> {
+        Arc::clone(&self.approval_broker) as Arc<dyn ApprovalResolver>
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).

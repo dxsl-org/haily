@@ -2,6 +2,7 @@
 //! adapter and the hand-rolled slow-LLM HTTP responder shared across these tests.
 use crate::bootstrap::{AppHandle, BootstrapOptions};
 use crate::test_support::{cloud_config, spawn_slow_llm_server, MockAdapter};
+use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, ResponseChunk};
 use std::sync::Arc;
 
@@ -151,5 +152,67 @@ async fn daemon_option_registers_additional_background_tasks() {
         count_with > count_without,
         "enabling the proactive daemon should register additional background tasks \
          (with={count_with}, without={count_without})"
+    );
+}
+
+/// Critical (Phase 4): every adapter passed to `bootstrap` must have the tool-
+/// approval resolver injected before it starts accepting requests — otherwise a
+/// `ToolApprovalRequest` reaching that adapter would have no way to be answered.
+#[tokio::test]
+async fn bootstrap_injects_the_approval_resolver_into_every_adapter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let adapter = MockAdapter::new();
+
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    assert!(
+        adapter.has_approval_resolver(),
+        "bootstrap must call Adapter::set_approval_resolver on every registered adapter"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+/// Critical (Phase 4): listing a destructive/exfil tool in the `auto_approve`
+/// allowlist must fail bootstrap outright — never silently ignored, never
+/// downgraded to a warning. Pre-seeds the KMS preference directly in the DB file
+/// bootstrap will open, since there is no running `KmsHandle` before bootstrap.
+#[tokio::test]
+async fn auto_approve_listing_a_destructive_tool_fails_bootstrap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("haily.db");
+
+    {
+        // Opened and dropped before `bootstrap` so its own pool isn't contending
+        // with this seed write (SQLite WAL mode tolerates it either way, but
+        // sequencing avoids any doubt about which write lands first).
+        let seed_db = DbHandle::init(&db_path).await.expect("seed db init");
+        meta::upsert_preference(
+            &seed_db,
+            "approval.auto_approve",
+            &serde_json::to_string(&["worktree_apply"]).unwrap(),
+            "test",
+        )
+        .await
+        .expect("seed preference");
+    }
+
+    let result = AppHandle::bootstrap(
+        dir.path(),
+        vec![MockAdapter::new() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await;
+
+    let err = result.err().expect("bootstrap must fail when auto_approve lists a destructive tool");
+    assert!(
+        err.to_string().contains("worktree_apply"),
+        "error should name the offending tool, got: {err:#}"
     );
 }

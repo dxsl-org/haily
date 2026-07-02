@@ -3,6 +3,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
+  import ApprovalModal from '$lib/components/ApprovalModal.svelte';
+  import type { ChunkPayload, PendingApproval } from '$lib/tauri';
 
   type Role = 'user' | 'assistant' | 'system';
 
@@ -13,19 +15,10 @@
     pending: boolean;
   }
 
-  interface Chunk {
-    type: 'Text' | 'ToolResult' | 'ToolApprovalRequest' | 'Complete';
-    data?: string;
-  }
-
-  interface ChunkEvent {
-    session_id: string;
-    chunk: Chunk;
-  }
-
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
   let settingsOpen = $state(false);
+  let pendingApproval = $state<PendingApproval | null>(null);
 
   let messages = $state<Message[]>([
     {
@@ -44,8 +37,21 @@
   const sessionIndex = new Map<string, number>();
 
   onMount(() => {
-    const unlistenPromise = listen<ChunkEvent>('haily-chunk', ({ payload }) => {
+    const unlistenPromise = listen<ChunkPayload>('haily-chunk', ({ payload }) => {
       const { session_id, chunk } = payload;
+
+      // A pending approval blocks the backend turn regardless of which bubble it's
+      // tied to, so it's handled before the bubble lookup (which requires an
+      // already-tracked session index).
+      if (chunk.type === 'ToolApprovalRequest') {
+        pendingApproval = {
+          sessionId: session_id,
+          approvalId: chunk.data.approval_id,
+          tool: chunk.data.tool,
+          args: chunk.data.args,
+        };
+        return;
+      }
 
       // Determine which message bubble to update
       let idx: number | undefined;
@@ -59,12 +65,15 @@
 
       if (idx === undefined) return;
 
-      if (chunk.type === 'Text' && chunk.data) {
+      if (chunk.type === 'Text') {
         messages[idx].content += chunk.data;
       } else if (chunk.type === 'Complete') {
         messages[idx].pending = false;
         sessionIndex.delete(session_id);
       }
+      // ToolResult chunks are status-only (✓/✗ tool name) — the CLI/Telegram
+      // adapters surface them inline; the GUI has no dedicated status line for them
+      // yet and intentionally ignores them here rather than half-rendering.
 
       scrollToBottom();
     });
@@ -75,7 +84,10 @@
 
   async function send() {
     const text = input.trim();
-    if (!text || sending) return;
+    // Block new turns while a tool approval is pending: the backend turn is paused
+    // waiting on the modal, and starting a second turn would overwrite the pending
+    // approval state (orphaning the first request to a silent 120s timeout-deny).
+    if (!text || sending || pendingApproval) return;
 
     input = '';
     sending = true;
@@ -130,6 +142,7 @@
   </header>
 
   <Settings bind:open={settingsOpen} />
+  <ApprovalModal bind:pending={pendingApproval} />
 
   <div class="messages">
     {#each messages as msg (msg.id)}
@@ -153,11 +166,11 @@
       bind:value={input}
       onkeydown={onKeydown}
       oninput={autoResize}
-      placeholder="Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)"
+      placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
       rows="1"
-      disabled={sending}
+      disabled={sending || pendingApproval !== null}
     ></textarea>
-    <button onclick={send} disabled={sending || !input.trim()}>
+    <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
       {sending ? '…' : '↑'}
     </button>
   </div>

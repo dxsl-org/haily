@@ -11,6 +11,7 @@ haily-db        = { workspace = true }
 haily-kms       = { workspace = true }
 haily-llm       = { workspace = true }
 haily-proactive = { workspace = true }
+haily-tools     = { workspace = true }
 haily-types     = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
