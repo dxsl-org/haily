@@ -263,7 +263,7 @@ mod reload_propagation_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
 
         let base_url = spawn_model_echo_server().await;
         let llm = Arc::new(RwLock::new(Arc::new(

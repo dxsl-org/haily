@@ -5,7 +5,7 @@ use haily_db::{
     DbHandle,
 };
 use haily_types::{Request, ResponseChunk};
-use haily_kms::KmsHandle;
+use haily_kms::{skills::TaskOutcome, KmsHandle};
 use haily_llm::{CompletionRequest, LlmClient, LlmRouter, Message, Role, StreamChunk};
 use haily_tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
@@ -17,6 +17,30 @@ use crate::{approval::ApprovalBroker, budget, context, feedback_parser, tag_matc
 
 fn estimate_tokens(s: &str) -> i64 {
     (s.len() / 4) as i64
+}
+
+/// VN/EN phrases a model uses when it is explicitly giving up on a task, as opposed
+/// to merely mentioning a tool failure in passing while still delivering a partial
+/// answer. Deliberately narrow (phase-08, F22) — this feeds `TaskOutcome::compute`'s
+/// "final response signals inability" input, and a false positive here would
+/// mislabel a legitimately completed turn as a failure, dragging down EMA confidence
+/// for skills that had nothing to do with the (nonexistent) failure.
+const INABILITY_PHRASES: &[&str] = &[
+    "không thể", "không làm được", "xin lỗi, tôi không",
+    "i cannot", "i can't", "i'm unable to", "i am unable to", "unable to complete",
+];
+
+/// Whether `response` (the turn's final, already tag-stripped text) reads as the
+/// model giving up on the task entirely, rather than a normal answer.
+fn signals_inability(response: &str) -> bool {
+    let lower = response.to_lowercase();
+    INABILITY_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Failed-call count from the same `Vec<serde_json::Value>` shape both `run_turn`
+/// and `run_sub_turn` accumulate (`{"tool":..,"args":..,"ok":bool}` per call).
+fn count_failed_calls(tool_call_log: &[serde_json::Value]) -> usize {
+    tool_call_log.iter().filter(|e| e["ok"] == false).count()
 }
 
 /// Splits `buffer` into `(emit, hold)` at the hold-back boundary: `hold` is the
@@ -383,14 +407,19 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // so the skill system learns from delegated work too.
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
     let tool_calls_json = serde_json::to_string(&tool_call_log).unwrap_or_default();
-    let outcome = if tool_call_log.iter().any(|e| e["ok"] == false) { "failure" } else { "success" };
+    let failed_calls = count_failed_calls(&tool_call_log);
+    let outcome = TaskOutcome::compute(
+        signals_inability(&final_response),
+        failed_calls,
+        tool_call_log.len(),
+    );
     let sub_task = format!("[{domain_name}] {task}");
     let _ = db_skills::insert_trace(
         &db,
         &session_id.to_string(),
         &sub_task,
         &tool_calls_json,
-        outcome,
+        outcome.as_str(),
         Some(elapsed_ms),
     )
     .await;
@@ -602,16 +631,26 @@ pub async fn run_turn(
     let tokens = estimate_tokens(&final_response);
     sessions::insert_message(&db, &session_id, "assistant", &final_response, Some(tokens)).await?;
 
-    // Record task trace for skill synthesis
+    // Record task trace for skill synthesis — 3-way outcome (phase-08, F22):
+    // Failure only when the final response itself signals inability or more than
+    // half the tool calls in this turn failed; Partial when some (but not most)
+    // failed; Success otherwise. Replaces the old binary "failure if ANY call
+    // errored," which made a 9-out-of-10-success turn indistinguishable from a
+    // total failure in the EMA reward this trace eventually drives.
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
     let tool_calls_json = serde_json::to_string(&tool_call_log).unwrap_or_default();
-    let outcome = if tool_call_log.iter().any(|e| e["ok"] == false) { "failure" } else { "success" };
+    let failed_calls = count_failed_calls(&tool_call_log);
+    let outcome = TaskOutcome::compute(
+        signals_inability(&final_response),
+        failed_calls,
+        tool_call_log.len(),
+    );
     let _ = db_skills::insert_trace(
         &db,
         &session_id,
         &req.message,
         &tool_calls_json,
-        outcome,
+        outcome.as_str(),
         Some(elapsed_ms),
     )
     .await;
@@ -941,7 +980,7 @@ mod sub_turn_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
         (db, kms, dir)
     }
 
@@ -1052,5 +1091,267 @@ mod sub_turn_tests {
         // The informational content (minus the tag tokens) must still be present —
         // neutralization strips the tag, not the fact.
         assert!(response.contains("payload"), "non-tag fact content must survive neutralization");
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    //! F22 — 3-way outcome computation end-to-end through `run_sub_turn`, seeding a
+    //! REAL session row before asserting on the persisted `kms_task_traces.outcome`
+    //! (phase-08 red team A8: outcome/feedback tests must not run against a bare
+    //! UUID with no backing `sessions` row, matching the post-phase-1 convention
+    //! every other turn-level test in this file already follows via `run_turn`'s own
+    //! `sessions::create_session` call — `run_sub_turn` itself has no session-row
+    //! dependency of its own, but the trace it writes is meant to be attributable
+    //! to a real session, so tests exercising that attribution seed one explicitly).
+    use super::*;
+    use async_trait::async_trait;
+    use haily_db::DbHandle;
+    use haily_kms::KmsHandle;
+    use haily_llm::LlmConfig;
+    use haily_tools::{Tool, ToolClass, ToolRegistry};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct AlwaysFailsTool;
+
+    #[async_trait]
+    impl Tool for AlwaysFailsTool {
+        fn name(&self) -> &str { "always_fails" }
+        fn description(&self) -> &str { "test tool that always errors" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Err(anyhow::anyhow!("boom"))
+        }
+    }
+
+    struct AlwaysSucceedsTool;
+
+    #[async_trait]
+    impl Tool for AlwaysSucceedsTool {
+        fn name(&self) -> &str { "always_succeeds" }
+        fn description(&self) -> &str { "test tool that always succeeds" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("done".to_string())
+        }
+    }
+
+    /// Scripted OpenAI-compatible responder: emits one `<tool_call>` for `tool_name`
+    /// per request up to `tool_calls`, then a plain-text final answer on the next
+    /// request — letting a test control exactly how many tool calls a `run_sub_turn`
+    /// loop makes without depending on a real model's behavior.
+    async fn spawn_scripted_tool_call_server(tool_name: &'static str, tool_calls: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let call_count = Arc::clone(&call_count);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    let content = if n < tool_calls {
+                        format!(r#"<tool_call>{{"tool":"{tool_name}","args":{{}}}}</tool_call>"#)
+                    } else {
+                        "Final answer.".to_string()
+                    };
+
+                    let payload = serde_json::json!({
+                        "choices": [{ "message": { "content": content } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn cloud_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    /// Real DB + KMS + a REAL session row under `session_id` (the red-team-required
+    /// setup) — returns the session id so callers can query `kms_task_traces` by it.
+    async fn seeded_session() -> (Arc<DbHandle>, Arc<KmsHandle>, uuid::Uuid, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+
+        let session_id = uuid::Uuid::new_v4();
+        sessions::create_session(&db, &session_id.to_string(), "test-adapter", None)
+            .await
+            .expect("seed real session row");
+
+        (db, kms, session_id, dir)
+    }
+
+    async fn latest_trace_outcome(db: &DbHandle, session_id: uuid::Uuid) -> String {
+        let traces = db_skills::recent_traces(db, 10).await.expect("recent_traces");
+        traces
+            .into_iter()
+            .find(|t| t.session_id == session_id.to_string())
+            .expect("a trace for this session must have been recorded")
+            .outcome
+    }
+
+    #[tokio::test]
+    async fn sub_turn_records_success_outcome_when_the_only_tool_call_succeeds() {
+        let (db, kms, session_id, _dir) = seeded_session().await;
+        let base_url = spawn_scripted_tool_call_server("always_succeeds", 1).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(AlwaysSucceedsTool));
+
+        let req = SubTurnRequest {
+            task: "do the thing".to_string(),
+            system_prompt: "test",
+            domain_name: "test",
+            depth: 1,
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(tools),
+            session_id,
+            model_tier: None,
+        };
+        run_sub_turn(req).await.expect("run_sub_turn");
+
+        assert_eq!(latest_trace_outcome(&db, session_id).await, "success");
+    }
+
+    #[tokio::test]
+    async fn sub_turn_records_failure_outcome_when_the_only_tool_call_fails() {
+        let (db, kms, session_id, _dir) = seeded_session().await;
+        let base_url = spawn_scripted_tool_call_server("always_fails", 1).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(AlwaysFailsTool));
+
+        let req = SubTurnRequest {
+            task: "do the thing".to_string(),
+            system_prompt: "test",
+            domain_name: "test",
+            depth: 1,
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(tools),
+            session_id,
+            model_tier: None,
+        };
+        run_sub_turn(req).await.expect("run_sub_turn");
+
+        // 1/1 calls failed = 100% > 50% → Failure per `TaskOutcome::compute`.
+        assert_eq!(latest_trace_outcome(&db, session_id).await, "failure");
+    }
+
+    #[tokio::test]
+    async fn sub_turn_records_partial_outcome_when_some_but_not_most_calls_fail() {
+        let (db, kms, session_id, _dir) = seeded_session().await;
+        // 4 tool-call rounds: fails, succeeds, succeeds, succeeds — 1/4 = 25% failed,
+        // which is "some but not most" → Partial.
+        let listener_url = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let call_count = Arc::new(AtomicUsize::new(0));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    let call_count = Arc::clone(&call_count);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65536];
+                        let _ = stream.read(&mut buf).await;
+                        let n = call_count.fetch_add(1, Ordering::SeqCst);
+                        let content = match n {
+                            0 => r#"<tool_call>{"tool":"always_fails","args":{}}</tool_call>"#.to_string(),
+                            1..=3 => r#"<tool_call>{"tool":"always_succeeds","args":{}}</tool_call>"#.to_string(),
+                            _ => "Final answer.".to_string(),
+                        };
+                        let payload = serde_json::json!({
+                            "choices": [{ "message": { "content": content } }]
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            format!("http://{addr}")
+        };
+
+        let llm = Arc::new(LlmRouter::init(cloud_config(listener_url)).await);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(AlwaysFailsTool));
+        tools.register(Arc::new(AlwaysSucceedsTool));
+
+        let req = SubTurnRequest {
+            task: "do the thing".to_string(),
+            system_prompt: "test",
+            domain_name: "test",
+            depth: 1,
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(tools),
+            session_id,
+            model_tier: None,
+        };
+        run_sub_turn(req).await.expect("run_sub_turn");
+
+        assert_eq!(latest_trace_outcome(&db, session_id).await, "partial");
+    }
+
+    // ------------------------------------------------------------------
+    // `signals_inability` / `count_failed_calls` — pure helpers, no I/O.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn signals_inability_detects_vietnamese_and_english_giveup_phrases() {
+        assert!(signals_inability("Xin lỗi, tôi không thể giúp việc này."));
+        assert!(signals_inability("I'm unable to complete this task."));
+    }
+
+    #[test]
+    fn signals_inability_false_on_a_normal_answer() {
+        assert!(!signals_inability("Đây là kết quả bạn cần: 42."));
+        assert!(!signals_inability("Here is the answer you asked for."));
+    }
+
+    #[test]
+    fn count_failed_calls_counts_only_ok_false_entries() {
+        let log = serde_json::json!([
+            {"tool": "a", "args": "{}", "ok": true},
+            {"tool": "b", "args": "{}", "ok": false},
+            {"tool": "c", "args": "{}", "ok": false},
+        ]);
+        let log = log.as_array().unwrap().clone();
+        assert_eq!(count_failed_calls(&log), 2);
     }
 }

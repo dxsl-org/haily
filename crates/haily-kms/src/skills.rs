@@ -21,6 +21,56 @@ pub struct SynthesizedSkill {
     pub steps: Vec<String>,
 }
 
+/// Three-way task outcome (phase-08, F22) — replaces the old binary
+/// success/failure ("failure" if ANY tool call errored), which made a 9-out-of-10
+/// success turn indistinguishable from a total failure in both the stored trace and
+/// the EMA reward it drives. Stored as its `AsRef<str>` form in `kms_task_traces.outcome`
+/// (schema is unchanged — still a free-text column) so no migration is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcome {
+    Success,
+    Partial,
+    Failure,
+}
+
+impl TaskOutcome {
+    /// `total_calls == 0` (a no-tool-call turn) is `Success` — there is nothing to
+    /// have failed. Otherwise: `Failure` when the final response signals inability
+    /// OR more than half the tool calls failed; `Partial` when some (but not most)
+    /// failed; `Success` otherwise.
+    pub fn compute(final_response_signals_inability: bool, failed_calls: usize, total_calls: usize) -> Self {
+        if total_calls == 0 {
+            return TaskOutcome::Success;
+        }
+        let failure_ratio = failed_calls as f32 / total_calls as f32;
+        if final_response_signals_inability || failure_ratio > 0.5 {
+            TaskOutcome::Failure
+        } else if failed_calls > 0 {
+            TaskOutcome::Partial
+        } else {
+            TaskOutcome::Success
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskOutcome::Success => "success",
+            TaskOutcome::Partial => "partial",
+            TaskOutcome::Failure => "failure",
+        }
+    }
+
+    /// EMA reward this outcome drives: success=1.0, partial=0.5, failure=0.0
+    /// (phase-08 spec).
+    pub fn ema_reward(&self) -> f64 {
+        match self {
+            TaskOutcome::Success => 1.0,
+            TaskOutcome::Partial => 0.5,
+            TaskOutcome::Failure => 0.0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Injection screening
 // ---------------------------------------------------------------------------
@@ -36,6 +86,86 @@ const BLOCKED_PHRASES: &[&str] = &[
     "exec(",
 ];
 
+/// Structural bounds enforced by `validate_skill_structure` (F20). These exist
+/// independent of the phrase blocklist — a field that is oversized, tag-laden, or
+/// carries raw control characters is untrustworthy regardless of whether it happens
+/// to contain a currently-known blocked phrase, since the phrase list can never be
+/// exhaustive against a creative injection attempt.
+const MAX_NAME_LEN: usize = 64;
+const MAX_DESCRIPTION_LEN: usize = 280;
+const MAX_STEP_LEN: usize = 200;
+
+/// Structural validator — runs BEFORE persistence (security boundary: a poisoned
+/// skill row should never exist, not merely be screened out at injection time; see
+/// phase-08's Security Considerations). Checks, independent of `screen_skill_for_injection`:
+///   - `name` ≤ `MAX_NAME_LEN`, `description` ≤ `MAX_DESCRIPTION_LEN` chars
+///   - every step ≤ `MAX_STEP_LEN` chars and contains no `<`/`>` (no embedded tags)
+///   - every field free of control characters (no allowance — a synthesized field
+///     has no legitimate reason to contain any control byte other than the newlines/
+///     tabs the LLM might use for its own formatting, which `is_control()` also
+///     flags: we deliberately still reject those too, since a skill's structural
+///     fields are short single-purpose strings, not free-form prose that needs them)
+///   - the same case-folded blocked-phrase scan as `screen_skill_for_injection`,
+///     applied per-field so a mismatch localizes to the field that caused it
+///
+/// Returns the first violation found (not an aggregate) — synthesis already treats
+/// any `Err` here as "drop this skill and move to the next cluster" (see
+/// `synthesize_skills_from_traces`), so there is no caller that benefits from a full
+/// violation list, and returning early keeps this simple (YAGNI).
+pub fn validate_skill_structure(skill: &SynthesizedSkill) -> Result<()> {
+    if skill.name.chars().count() > MAX_NAME_LEN {
+        return Err(anyhow!(
+            "skill validation failed: name exceeds {MAX_NAME_LEN} chars"
+        ));
+    }
+    if skill.description.chars().count() > MAX_DESCRIPTION_LEN {
+        return Err(anyhow!(
+            "skill validation failed: description exceeds {MAX_DESCRIPTION_LEN} chars"
+        ));
+    }
+    for (i, step) in skill.steps.iter().enumerate() {
+        if step.chars().count() > MAX_STEP_LEN {
+            return Err(anyhow!(
+                "skill validation failed: step {i} exceeds {MAX_STEP_LEN} chars"
+            ));
+        }
+        if step.contains('<') || step.contains('>') {
+            return Err(anyhow!(
+                "skill validation failed: step {i} contains an embedded tag character"
+            ));
+        }
+    }
+
+    let fields: Vec<(&str, &str)> = std::iter::once(("name", skill.name.as_str()))
+        .chain(std::iter::once(("description", skill.description.as_str())))
+        .chain(std::iter::once(("pattern", skill.pattern.as_str())))
+        .chain(skill.steps.iter().map(|s| ("step", s.as_str())))
+        .collect();
+
+    for (field_name, value) in &fields {
+        if value.chars().any(|c| c.is_control()) {
+            return Err(anyhow!(
+                "skill validation failed: {field_name} contains a control character"
+            ));
+        }
+        let folded = value.to_lowercase();
+        for phrase in BLOCKED_PHRASES {
+            if folded.contains(*phrase) {
+                return Err(anyhow!(
+                    "skill validation failed: {field_name} contains forbidden phrase '{phrase}'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Injection screening on the WHOLE assembled blob — kept alongside (not replaced
+/// by) `validate_skill_structure` as a second pass over the concatenated text: a
+/// phrase split across a field boundary in a way `validate_skill_structure`'s
+/// per-field scan would miss (e.g. "ignore previous" in `pattern` immediately
+/// followed by "instructions" in the first step) is still caught here.
 pub fn screen_skill_for_injection(skill: &SynthesizedSkill) -> Result<()> {
     let blob = format!(
         "{} {} {} {}",
@@ -54,9 +184,8 @@ pub fn screen_skill_for_injection(skill: &SynthesizedSkill) -> Result<()> {
         }
     }
 
-    let ctrl = blob.chars().filter(|c| c.is_control() && *c != '\n' && *c != '\t').count();
-    if ctrl > 5 {
-        return Err(anyhow!("Skill injection screening failed: excessive control characters"));
+    if blob.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(anyhow!("Skill injection screening failed: control characters present"));
     }
     Ok(())
 }
@@ -187,6 +316,13 @@ pub async fn synthesize_skills_from_traces(
             }
         };
 
+        // Structural validation runs BEFORE the phrase-based injection screen and
+        // BEFORE persistence (F20 / phase-08 Security Considerations: a poisoned
+        // skill row must never exist, not merely be screened out at injection time).
+        if let Err(e) = validate_skill_structure(&skill) {
+            warn!("skill rejected by structural validator: {e:#}");
+            continue;
+        }
         if let Err(e) = screen_skill_for_injection(&skill) {
             warn!("skill rejected by injection screen: {e:#}");
             continue;

@@ -364,7 +364,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = std::sync::Arc::new(haily_db::DbHandle::init(&db_path).await.unwrap());
-        let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone()).await.unwrap());
+        let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone(), dir.path()).await.unwrap());
         let ctx = ToolContext { db, kms, session_id: Uuid::new_v4(), depth: 0 };
         (ctx, dir)
     }

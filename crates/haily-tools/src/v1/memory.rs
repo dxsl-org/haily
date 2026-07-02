@@ -212,7 +212,10 @@ impl Tool for MemoryForgetTool {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
-        if facts::soft_delete(&ctx.db, id).await? {
+        // Routes through `KmsHandle::forget_fact` (not `facts::soft_delete` directly)
+        // so the fact is tombstoned out of ANN search in this same process — a bare
+        // DB soft-delete would leave it reachable via HNSW until the next rebuild.
+        if ctx.kms.forget_fact(id).await? {
             Ok(format!("Đã xóa fact id={id} khỏi memory."))
         } else {
             Ok(format!("Không tìm thấy fact id={id}."))

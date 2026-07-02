@@ -66,8 +66,8 @@ impl AppHandle {
         info!("DB: {}", db_path.display());
         let db = DbHandle::init(&db_path).await?;
 
-        info!("KMS: building index from DB…");
-        let kms = KmsHandle::init(db.clone()).await?;
+        info!("KMS: loading HNSW index (dump if present, else rebuild from DB)…");
+        let kms = KmsHandle::init(db.clone(), data_dir).await?;
 
         let db = Arc::new(db);
         let kms = Arc::new(kms);
@@ -156,7 +156,10 @@ impl AppHandle {
     ///    worker loops observes this and stops accepting new work.
     /// 2. Close the tracker (no new tasks may register) and wait for every tracked
     ///    task to finish, bounded by `timeout`.
-    /// 3. Best-effort SQLite WAL checkpoint so no large `-wal` file lingers.
+    /// 3. Dump the HNSW index (phase-08) so next startup can load instead of
+    ///    rebuilding from DB. Best-effort — a failure here only costs the next
+    ///    startup a rebuild, never data, so it must not block or fail shutdown.
+    /// 4. Best-effort SQLite WAL checkpoint so no large `-wal` file lingers.
     ///
     /// Scope note (see phase risk notes): a llama.cpp generation in flight is a
     /// synchronous `spawn_blocking` token loop with no cancellation check — it is not
@@ -175,6 +178,8 @@ impl AppHandle {
                 "shutdown: timed out waiting for tasks — proceeding with exit"
             ),
         }
+
+        self.kms.flush_index().await;
 
         match self.db.wal_checkpoint_truncate().await {
             Ok(false) => info!("shutdown: WAL checkpoint complete"),

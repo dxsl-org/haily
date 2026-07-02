@@ -39,6 +39,10 @@ src-tauri/.logs/
 # Claude Code personal config
 .claude/
 
+# Downloaded model caches (fastembed ONNX weights — pulled at runtime, never committed)
+.fastembed_cache/
+**/.fastembed_cache/
+
 # OS
 .DS_Store
 Thumbs.db

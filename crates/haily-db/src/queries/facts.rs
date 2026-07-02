@@ -57,7 +57,7 @@ pub async fn insert_fact(db: &DbHandle, fact: NewFact<'_>) -> Result<Fact> {
 
 pub async fn get_fact(db: &DbHandle, id: &str) -> Result<Option<Fact>> {
     Ok(sqlx::query_as::<_, Fact>(
-        "SELECT * FROM kms_facts WHERE id = ? AND deleted_at IS NULL",
+        "SELECT * FROM kms_facts WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL",
     )
     .bind(id)
     .fetch_optional(db.pool())
@@ -90,6 +90,60 @@ pub async fn embeddings_for_hnsw(db: &DbHandle) -> Result<Vec<(String, Vec<u8>)>
     .fetch_all(db.pool())
     .await?;
     Ok(rows)
+}
+
+/// Facts with embeddings created strictly after `since` (RFC3339) — the delta insert
+/// half of HNSW dump/load reconciliation. `created_at` (not `updated_at`) is the
+/// right anchor here: a fact edited-in-place after the dump but created before it is
+/// still findable by ANN (its embedding blob and id are unchanged), whereas a fact
+/// created after the dump has never been inserted into the loaded graph at all.
+pub async fn embeddings_created_since(
+    db: &DbHandle,
+    since: &str,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT id, embedding FROM kms_facts
+         WHERE embedding IS NOT NULL AND deleted_at IS NULL AND archived_at IS NULL
+           AND created_at > ?",
+    )
+    .bind(since)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
+}
+
+/// Fact ids soft-deleted or archived strictly after `since` (RFC3339) — the tombstone
+/// half of HNSW dump/load reconciliation, for facts that were live when the dump was
+/// taken but must not surface from the loaded (stale) graph.
+pub async fn ids_deleted_or_archived_since(db: &DbHandle, since: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM kms_facts
+         WHERE (deleted_at IS NOT NULL AND deleted_at > ?)
+            OR (archived_at IS NOT NULL AND archived_at > ?)",
+    )
+    .bind(since)
+    .bind(since)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Archive a fact directly (distinct from the EMA-driven `update_confidence` path) —
+/// used by explicit archival flows. Idempotent: archiving an already-archived or
+/// soft-deleted fact affects 0 rows and returns `false`.
+pub async fn archive(db: &DbHandle, id: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE kms_facts SET archived_at = ?, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 pub async fn list_by_domain(db: &DbHandle, domain_id: &str, limit: i64) -> Result<Vec<Fact>> {

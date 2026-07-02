@@ -9,7 +9,9 @@ pub mod embedder;
 
 use anyhow::Result;
 use haily_db::{queries::facts, queries::meta, queries::skills as db_skills, DbHandle};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 #[cfg(feature = "embeddings")]
@@ -17,40 +19,41 @@ use embedder::Embedder;
 
 use hnsw::HnswIndex;
 
+/// Embedding model identifier recorded in the HNSW dump manifest. Bumping this string
+/// (e.g. on a model upgrade) makes an old dump's `model_id` mismatch detectable —
+/// today it is informational only (no cross-model reconciliation path exists), but
+/// a future check can key off it to force a rebuild instead of loading vectors from
+/// a different embedding space.
+const EMBEDDING_MODEL_ID: &str = "multilingual-e5-base";
+
 pub struct KmsHandle {
     pub(crate) db: DbHandle,
-    hnsw: Arc<HnswIndex>,
+    /// `RwLock<Arc<..>>` (not a bare `Arc`) so a background rebuild can construct a
+    /// fresh index off to the side and swap the pointer atomically — in-flight
+    /// searches hold their own `Arc` clone taken before the swap and are unaffected.
+    hnsw: RwLock<Arc<HnswIndex>>,
+    /// Directory holding the HNSW dump files (`hnsw::dump_dir(data_dir)`).
+    dump_dir: PathBuf,
+    /// Prevents two rebuilds (e.g. a tombstone-ratio trigger firing twice in quick
+    /// succession from concurrent `index_remove` calls) from running concurrently.
+    rebuild_in_progress: AtomicBool,
     #[cfg(feature = "embeddings")]
     embedder: Arc<Embedder>,
 }
 
 impl KmsHandle {
-    /// Initialise KMS: build HNSW index from persisted embeddings.
-    /// With `embeddings` feature: also init fastembed model (downloads ~150 MB on first run).
-    pub async fn init(db: DbHandle) -> Result<Self> {
-        let hnsw = Arc::new(HnswIndex::new());
-
-        // Load blobs from DB and populate HNSW (works without embeddings feature too —
-        // blobs are just stored LE f32 arrays regardless of how they were generated)
-        let rows = facts::embeddings_for_hnsw(&db).await?;
-        if !rows.is_empty() {
-            let hnsw_clone = Arc::clone(&hnsw);
-            tokio::task::spawn_blocking(move || {
-                let items: Vec<(String, Vec<f32>)> = rows
-                    .into_iter()
-                    .map(|(id, blob)| {
-                        let floats = blob
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        (id, floats)
-                    })
-                    .collect();
-                hnsw_clone.batch_insert(&items);
-            })
-            .await?;
-            tracing::info!(count = hnsw.len(), "HNSW index rebuilt from DB");
-        }
+    /// Initialise KMS: load the HNSW index from its on-disk dump under
+    /// `data_dir` (fast path) or rebuild it from persisted embeddings (fallback —
+    /// also the path taken on first run, before any dump exists). With `embeddings`
+    /// feature: also init the fastembed model (downloads ~150 MB on first run).
+    ///
+    /// Load failure (missing dump, corrupt/torn files, count mismatch, or a version
+    /// mismatch in `hnsw_rs`'s own dump format) is caught and logged, then falls back
+    /// to the full rebuild — this makes the dump a pure optimization with no new
+    /// failure mode, per phase-08's design.
+    pub async fn init(db: DbHandle, data_dir: &Path) -> Result<Self> {
+        let dump_dir = hnsw::dump_dir(data_dir);
+        let hnsw = Self::load_or_rebuild(&db, &dump_dir).await?;
 
         #[cfg(feature = "embeddings")]
         let embedder = {
@@ -60,10 +63,163 @@ impl KmsHandle {
 
         Ok(Self {
             db,
-            hnsw,
+            hnsw: RwLock::new(Arc::new(hnsw)),
+            dump_dir,
+            rebuild_in_progress: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
             embedder,
         })
+    }
+
+    /// Attempt to load a valid dump; on any failure (including "no dump yet"), fall
+    /// back to a full rebuild from `facts::embeddings_for_hnsw`. On a successful
+    /// load, reconciles the delta between the dump timestamp and now (facts created
+    /// since are inserted; facts deleted/archived since are tombstoned) so a clean
+    /// restart never serves stale-but-live or resurrected-dead results.
+    async fn load_or_rebuild(db: &DbHandle, dump_dir: &Path) -> Result<HnswIndex> {
+        match HnswIndex::load(dump_dir) {
+            Ok(Some((index, manifest))) => {
+                tracing::info!(count = index.len(), dumped_at = %manifest.dumped_at, "hnsw loaded");
+
+                let created = facts::embeddings_created_since(db, &manifest.dumped_at)
+                    .await
+                    .unwrap_or_default();
+                let removed = facts::ids_deleted_or_archived_since(db, &manifest.dumped_at)
+                    .await
+                    .unwrap_or_default();
+                if !created.is_empty() || !removed.is_empty() {
+                    let created_floats: Vec<(String, Vec<f32>)> = created
+                        .into_iter()
+                        .map(|(id, blob)| (id, blob_to_floats(&blob)))
+                        .collect();
+                    tracing::info!(
+                        inserted = created_floats.len(),
+                        tombstoned = removed.len(),
+                        "hnsw delta reconciliation"
+                    );
+                    index.apply_delta(&created_floats, &removed);
+                }
+                Ok(index)
+            }
+            Ok(None) => {
+                tracing::info!("no hnsw dump found — building from DB");
+                Self::rebuild_from_db(db).await
+            }
+            Err(e) => {
+                tracing::warn!("hnsw dump load failed, rebuilding from DB: {e:#}");
+                Self::rebuild_from_db(db).await
+            }
+        }
+    }
+
+    /// Full rebuild from `facts::embeddings_for_hnsw` — the DB is always the source
+    /// of truth, so this is naturally tombstone-free (the query already excludes
+    /// soft-deleted/archived rows).
+    async fn rebuild_from_db(db: &DbHandle) -> Result<HnswIndex> {
+        let rows = facts::embeddings_for_hnsw(db).await?;
+        let count = rows.len();
+        let index = tokio::task::spawn_blocking(move || {
+            let items: Vec<(String, Vec<f32>)> = rows
+                .into_iter()
+                .map(|(id, blob)| (id, blob_to_floats(&blob)))
+                .collect();
+            HnswIndex::build_from(&items)
+        })
+        .await?;
+        tracing::info!(count, "hnsw rebuilt from DB");
+        Ok(index)
+    }
+
+    /// Snapshot `Arc` clone of the current index — callers hold this for the
+    /// duration of one operation (search/insert) so a concurrent rebuild-and-swap
+    /// never invalidates a search already in flight.
+    fn hnsw_snapshot(&self) -> Arc<HnswIndex> {
+        Arc::clone(&self.hnsw.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Tombstone a fact id in the live index — called after `facts::soft_delete`,
+    /// `facts::archive`, or `memory_forget` removes it from the DB, so it stops
+    /// surfacing from ANN search in THIS process immediately (no restart needed).
+    ///
+    /// Opportunistically kicks off a background compaction rebuild when the
+    /// tombstone ratio (or 7-day age) threshold is crossed. Takes `self: &Arc<Self>`
+    /// (rather than plain `&self`) so the background task can hold its own `Arc`
+    /// clone and run fully detached — every real caller already reaches `KmsHandle`
+    /// through an `Arc` (`ToolContext.kms`, `Orchestrator.kms`), so this is not a
+    /// wider constraint than the codebase already has.
+    pub fn index_remove(self: &Arc<Self>, id: &str) {
+        let snapshot = self.hnsw_snapshot();
+        snapshot.tombstone(id);
+
+        if snapshot.should_rebuild()
+            && self
+                .rebuild_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let this = Arc::clone(self);
+            let old = snapshot; // outgoing index — carries tombstones added so far
+            tracing::info!("hnsw tombstone/age threshold crossed — starting background rebuild");
+            tokio::spawn(async move {
+                // Capture the reconciliation boundary BEFORE `rebuild_from_db` reads the
+                // DB. A `remember`/`forget` committing while the rebuild runs would
+                // otherwise mutate only the outgoing index and be lost at the swap; the
+                // deltas below fold those mutations into the fresh index instead.
+                let since = chrono::Utc::now().to_rfc3339();
+                match Self::rebuild_from_db(&this.db).await {
+                    Ok(fresh) => {
+                        let created = facts::embeddings_created_since(&this.db, &since)
+                            .await
+                            .unwrap_or_default();
+                        let removed = facts::ids_deleted_or_archived_since(&this.db, &since)
+                            .await
+                            .unwrap_or_default();
+                        let created_floats: Vec<(String, Vec<f32>)> = created
+                            .into_iter()
+                            .map(|(id, blob)| (id, blob_to_floats(&blob)))
+                            .collect();
+                        fresh.apply_delta(&created_floats, &removed);
+                        // Union tombstones the outgoing index accumulated during the
+                        // window — covers a forget whose DB delete raced the `since`
+                        // boundary, so a fact forgotten mid-rebuild stays gone.
+                        fresh.apply_delta(&[], &old.tombstoned_ids());
+
+                        let mut guard = this.hnsw.write().unwrap_or_else(|e| e.into_inner());
+                        *guard = Arc::new(fresh);
+                        tracing::info!(
+                            reconciled_inserts = created_floats.len(),
+                            "hnsw background rebuild complete — index swapped"
+                        );
+                    }
+                    Err(e) => tracing::warn!("hnsw background rebuild failed: {e:#}"),
+                }
+                this.rebuild_in_progress.store(false, Ordering::SeqCst);
+            });
+        }
+    }
+
+    /// Dump the current index to disk. Called from the app's graceful-shutdown flush
+    /// hook (`AppHandle::shutdown`). Dump failure is logged, not propagated: losing
+    /// the on-disk cache only costs the next startup a full rebuild, never data
+    /// (SQLite remains the source of truth), so it must never block or fail shutdown.
+    pub async fn flush_index(&self) {
+        let dir = self.dump_dir.clone();
+        let snapshot = self.hnsw_snapshot();
+        let result = tokio::task::spawn_blocking(move || snapshot.dump(&dir, EMBEDDING_MODEL_ID)).await;
+        match result {
+            Ok(Ok(())) => tracing::info!("hnsw index dumped for next startup"),
+            Ok(Err(e)) => tracing::warn!("hnsw dump failed (next start will rebuild): {e:#}"),
+            Err(e) => tracing::warn!("hnsw dump task panicked (next start will rebuild): {e:#}"),
+        }
+    }
+
+    /// Direct ANN search against a caller-supplied vector, bypassing the embedder
+    /// entirely — the underlying HNSW path works identically with or without the
+    /// `embeddings` feature (it stores/searches whatever `f32` vectors it is given),
+    /// so this stays available in every build rather than being feature-gated.
+    /// Returns `(fact_id, cosine_distance)` pairs.
+    pub async fn search_ann_by_vector(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
+        self.hnsw_snapshot().search(query, k)
     }
 
     /// Hybrid search: FTS5 BM25 always; HNSW ANN when embeddings feature is active.
@@ -73,17 +229,18 @@ impl KmsHandle {
         query: &str,
         limit: usize,
     ) -> Result<Vec<search::SearchResult>> {
+        let snapshot = self.hnsw_snapshot();
         #[cfg(feature = "embeddings")]
         {
             let embedder = Arc::clone(&self.embedder);
             let query_owned = query.to_string();
             let qv = tokio::task::spawn_blocking(move || embedder.embed_query(&query_owned))
                 .await??;
-            search::hybrid(&self.db, &self.hnsw, Some(&qv), query, limit).await
+            search::hybrid(&self.db, &snapshot, Some(&qv), query, limit).await
         }
         #[cfg(not(feature = "embeddings"))]
         {
-            search::hybrid(&self.db, &self.hnsw, None, query, limit).await
+            search::hybrid(&self.db, &snapshot, None, query, limit).await
         }
     }
 
@@ -125,7 +282,7 @@ impl KmsHandle {
             )
             .await?;
 
-            self.hnsw.insert(&fact.id, &embedding);
+            self.hnsw_snapshot().insert(&fact.id, &embedding);
             Ok(fact.id)
         }
         #[cfg(not(feature = "embeddings"))]
@@ -145,6 +302,32 @@ impl KmsHandle {
             .await?;
             Ok(fact.id)
         }
+    }
+
+    /// Soft-delete a fact and remove it from ANN search immediately (same process,
+    /// no restart) — the tombstone-then-DB ordering here is deliberate: if the
+    /// process is killed between the two, the DB row (source of truth) is not yet
+    /// deleted and a later ANN hit is merely a false-positive candidate that
+    /// `search::hybrid`'s DB refetch (for ANN-only hits) or `search_fts`'s
+    /// `deleted_at IS NULL` filter (for FTS hits) will still filter out on the read
+    /// path — reversing the order (DB first) risks a crash leaving the fact deleted
+    /// in SQLite but still ANN-reachable until the next rebuild, which is worse.
+    pub async fn forget_fact(self: &Arc<Self>, id: &str) -> Result<bool> {
+        let removed = facts::soft_delete(&self.db, id).await?;
+        if removed {
+            self.index_remove(id);
+        }
+        Ok(removed)
+    }
+
+    /// Archive a fact (distinct from soft-delete — see `facts::archive`) and remove
+    /// it from ANN search immediately. Same ordering rationale as `forget_fact`.
+    pub async fn archive_fact(self: &Arc<Self>, id: &str) -> Result<bool> {
+        let archived = facts::archive(&self.db, id).await?;
+        if archived {
+            self.index_remove(id);
+        }
+        Ok(archived)
     }
 
     /// Build a LifeContext snapshot for a session.
@@ -276,4 +459,14 @@ impl Soul {
             _ => Soul::Haily,
         }
     }
+}
+
+/// Decode a little-endian `f32` blob (SQLite BLOB storage format for embeddings —
+/// see `Embedder::to_bytes`/`from_bytes`) without requiring the `embeddings` feature,
+/// since HNSW rebuild/reconcile paths need to read stored vectors regardless of
+/// whether this build can generate new ones.
+fn blob_to_floats(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }

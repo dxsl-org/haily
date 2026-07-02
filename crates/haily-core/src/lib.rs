@@ -266,7 +266,7 @@ mod shutdown_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
         let llm = Arc::new(RwLock::new(Arc::new(LlmRouter::init(LlmConfig::default()).await)));
 
         let shutdown = CancellationToken::new();
@@ -304,7 +304,7 @@ mod shutdown_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
         let original = Arc::new(LlmRouter::init(LlmConfig::default()).await);
         let llm = Arc::new(RwLock::new(Arc::clone(&original)));
 
