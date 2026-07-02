@@ -1,0 +1,16 @@
+# cargo-audit configuration — https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Vulnerabilities fail CI. The single ignore below is a transitive advisory with
+# no fix that is NOT in Haily's compiled dependency graph (verified with
+# `cargo tree -i rsa` → "nothing to print"): `rsa` is only reachable through
+# `sqlx-mysql`, and Haily enables only the `sqlite` feature of sqlx. Revisit if
+# a MySQL/Postgres backend is ever added.
+#
+# Unmaintained/unsound advisories (the gtk-rs GTK3 stack pulled in by Tauri,
+# plus paste/bincode/proc-macro-error) are reported as warnings by cargo-audit
+# and do not fail the run — no action needed unless a real vuln is published.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa Marvin timing side-channel — not in build graph (sqlite-only), no fixed release
+]
