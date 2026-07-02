@@ -7,11 +7,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased] — Phase 12: Agentic Optimization
 
+### Added
+- core: three-tier agent delegation hierarchy
+- core: delegate tools for six domains
+- core: stateless sub-agent turn execution
+- tools: per-tier tool whitelist sub-registry
+- agent: work item tracking with checkpoints
+- agent: ephemeral worktree sandbox for tasks
+- cli: work item status panel above prompt
+
+### Security
+- core: block approval tools inside sub-agents
+- core: strip tool markup from results
+
+### Fixed
+- core: loop guard terminates runaway turns
+- telegram: handle work items changed notification
+
+### Changed
+- db: calendar and facts use param structs
+
 ### In Progress
-- Smart LLM routing: auto-select model tier (fast/medium/thinking/ultra) by task complexity
-- Cost optimization per deployment cohort
-- Sub-agent spawning with <50ms overhead
-- Sub-agent lifecycle management (cleanup, resource limits)
+- routing: auto-select model tier by complexity
+- routing: cost optimization per deployment cohort
 
 ---
 
