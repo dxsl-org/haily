@@ -439,6 +439,9 @@ mod tier_tests {
         format!("http://{addr}")
     }
 
+    // `..LlmConfig::default()` is needed when the `llama` feature adds its fields, but
+    // needless when it's off — a feature-conditional false positive for this lint.
+    #[allow(clippy::needless_update)]
     fn tiered_config(base_url: String) -> LlmConfig {
         LlmConfig {
             cloud_api_keys: vec!["test-key".to_string()],

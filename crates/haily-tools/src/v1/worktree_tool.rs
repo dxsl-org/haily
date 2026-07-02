@@ -104,18 +104,12 @@ impl Tool for WorktreeApplyTool {
         for rel_path in &all_rel_paths {
             // Reject paths with '..' components or absolute paths — git would
             // never emit these, but defend against a compromised worktree.
-            let rel = Path::new(rel_path);
-            if rel.is_absolute()
-                || rel.components().any(|c| c == std::path::Component::ParentDir)
-            {
-                bail!("path traversal detected in worktree output: {rel_path}");
-            }
+            crate::security::validate_rel_path(rel_path)?;
 
             let src = wt_path.join(rel_path);
 
             // Reject symlinks — following them could write outside the worktree.
-            let src_meta = tokio::fs::symlink_metadata(&src).await?;
-            if src_meta.file_type().is_symlink() {
+            if crate::security::is_symlink(&src).await? {
                 tracing::warn!(path = rel_path, "skipping symlink in worktree_apply");
                 continue;
             }
@@ -190,7 +184,25 @@ async fn resolve_main_worktree(wt_path: &Path) -> Result<PathBuf> {
 
 /// Produce a unified diff: tracked changes via `git diff HEAD` plus untracked
 /// files inlined as pseudo-diff blocks. Returns an empty string when clean.
+///
+/// # Safety
+/// Each untracked path is validated with [`crate::security::validate_rel_path`]
+/// (rejects `..`/absolute paths) and checked with [`crate::security::is_symlink`]
+/// before being read — a compromised worktree could otherwise report an untracked
+/// "file" that is actually a symlink to something outside the worktree (e.g.
+/// `/etc/shadow`), which `read_to_string` would happily follow. Both checks skip
+/// (with a `warn` log) rather than failing the whole diff, matching `execute()`'s
+/// per-file skip semantics for the apply path.
+///
+/// # Size caps
+/// Each file is capped at [`crate::security::DIFF_MAX_FILE_BYTES`] and the total
+/// diff at [`crate::security::DIFF_MAX_TOTAL_BYTES`] — an oversized untracked file
+/// (e.g. an accidentally-committed binary or log dump) must not make the diff
+/// preview unusable or blow up context when handed to an LLM. Both caps append
+/// [`crate::security::TRUNCATED_MARKER`] so truncation is visible, not silent.
 async fn compute_diff(wt_path: &PathBuf) -> Result<String> {
+    use crate::security::{is_symlink, validate_rel_path, DIFF_MAX_FILE_BYTES, DIFF_MAX_TOTAL_BYTES, TRUNCATED_MARKER};
+
     let tracked = Command::new("git")
         .args(["-C"])
         .arg(wt_path)
@@ -204,6 +216,11 @@ async fn compute_diff(wt_path: &PathBuf) -> Result<String> {
     }
 
     let mut diff = String::from_utf8_lossy(&tracked.stdout).into_owned();
+    if diff.len() >= DIFF_MAX_TOTAL_BYTES {
+        diff.truncate(DIFF_MAX_TOTAL_BYTES);
+        diff.push_str(TRUNCATED_MARKER);
+        return Ok(diff);
+    }
 
     let untracked = Command::new("git")
         .args(["-C"])
@@ -222,24 +239,151 @@ async fn compute_diff(wt_path: &PathBuf) -> Result<String> {
         if rel_path.is_empty() {
             continue;
         }
+        if let Err(e) = validate_rel_path(rel_path) {
+            tracing::warn!(path = rel_path, "skipping untracked file in diff: {e}");
+            continue;
+        }
+
         let abs_path = wt_path.join(rel_path);
-        let contents = match tokio::fs::read_to_string(&abs_path).await {
-            Ok(s) => s,
+
+        match is_symlink(&abs_path).await {
+            Ok(true) => {
+                tracing::warn!(path = rel_path, "skipping symlink in diff preview");
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), "skipping untracked file in diff: {e}");
+                continue;
+            }
+        }
+
+        let raw = match tokio::fs::read(&abs_path).await {
+            Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(path = %abs_path.display(), "skipping untracked file in diff: {e}");
                 continue;
             }
         };
-        diff.push_str(&format!(
+
+        let file_truncated = raw.len() > DIFF_MAX_FILE_BYTES;
+        let capped = if file_truncated { &raw[..DIFF_MAX_FILE_BYTES] } else { &raw[..] };
+        let contents = String::from_utf8_lossy(capped);
+
+        let mut block = format!(
             "--- /dev/null\n+++ b/{rel_path}\n@@ -0,0 +1,{lines} @@\n",
             lines = contents.lines().count()
-        ));
+        );
         for line in contents.lines() {
-            diff.push('+');
-            diff.push_str(line);
-            diff.push('\n');
+            block.push('+');
+            block.push_str(line);
+            block.push('\n');
         }
+        if file_truncated {
+            block.push_str(TRUNCATED_MARKER);
+        }
+
+        if diff.len() + block.len() > DIFF_MAX_TOTAL_BYTES {
+            diff.push_str(TRUNCATED_MARKER);
+            return Ok(diff);
+        }
+        diff.push_str(&block);
     }
 
     Ok(diff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a minimal git repo with one empty commit so `HEAD` is valid — mirrors
+    /// the fixture in `haily-core/tests/worktree.rs` (same shape, kept file-local so
+    /// this crate doesn't take a dev-dependency on `haily-core`).
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+
+        let init = std::process::Command::new("git").args(["init"]).current_dir(p).output().expect("git init");
+        assert!(init.status.success(), "git init failed: {}", String::from_utf8_lossy(&init.stderr));
+
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c", "user.email=test@haily.test",
+                "-c", "user.name=Test",
+                "commit", "--allow-empty", "-m", "initial",
+            ])
+            .current_dir(p)
+            .output()
+            .expect("git commit");
+        assert!(commit.status.success(), "initial commit failed: {}", String::from_utf8_lossy(&commit.stderr));
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn compute_diff_includes_valid_untracked_file() {
+        let repo = init_git_repo();
+        tokio::fs::write(repo.path().join("hello.txt"), "world\n").await.unwrap();
+
+        let diff = compute_diff(&repo.path().to_path_buf()).await.unwrap();
+        assert!(diff.contains("hello.txt"));
+        assert!(diff.contains("+world"));
+    }
+
+    #[tokio::test]
+    async fn compute_diff_skips_path_traversal_escape() {
+        // `validate_rel_path` only rejects paths it's handed — git itself would
+        // never emit a `..`-bearing `ls-files` line, so this test exercises the
+        // guard function directly on the value compute_diff would have received,
+        // proving the guard (not git's own well-behavedness) is what blocks it.
+        assert!(crate::security::validate_rel_path("../escape.txt").is_err());
+    }
+
+    #[tokio::test]
+    async fn compute_diff_skips_absolute_path() {
+        #[cfg(unix)]
+        let abs = "/etc/passwd";
+        #[cfg(windows)]
+        let abs = "C:\\Windows\\System32\\config";
+        assert!(crate::security::validate_rel_path(abs).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_diff_skips_symlink_to_outside_but_keeps_valid_files() {
+        use std::os::unix::fs::symlink;
+
+        let repo = init_git_repo();
+        let outside = tempfile::tempdir().unwrap();
+        tokio::fs::write(outside.path().join("secret.txt"), "should not leak\n").await.unwrap();
+
+        // A symlink inside the worktree pointing outside it, plus one normal file.
+        symlink(outside.path().join("secret.txt"), repo.path().join("link.txt")).unwrap();
+        tokio::fs::write(repo.path().join("real.txt"), "real content\n").await.unwrap();
+
+        let diff = compute_diff(&repo.path().to_path_buf()).await.unwrap();
+        assert!(diff.contains("real.txt"), "valid file must still be diffed:\n{diff}");
+        assert!(diff.contains("real content"));
+        assert!(!diff.contains("should not leak"), "symlink target content must never appear in the diff:\n{diff}");
+    }
+
+    #[tokio::test]
+    async fn compute_diff_truncates_oversized_untracked_file() {
+        let repo = init_git_repo();
+        // One byte over the per-file cap.
+        let oversized = "a".repeat(crate::security::DIFF_MAX_FILE_BYTES + 1);
+        tokio::fs::write(repo.path().join("big.txt"), &oversized).await.unwrap();
+
+        let diff = compute_diff(&repo.path().to_path_buf()).await.unwrap();
+        assert!(diff.contains("big.txt"));
+        assert!(diff.contains(crate::security::TRUNCATED_MARKER.trim()), "oversized file must carry the truncated marker:\n{}", &diff[..diff.len().min(200)]);
+    }
+
+    #[tokio::test]
+    async fn compute_diff_empty_on_clean_worktree() {
+        let repo = init_git_repo();
+        let diff = compute_diff(&repo.path().to_path_buf()).await.unwrap();
+        assert!(diff.is_empty());
+    }
 }

@@ -1,7 +1,9 @@
+use crate::security;
 use crate::{Tool, ToolClass, ToolContext};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Parse the raw DuckDuckGo Instant Answer API response body.
 ///
@@ -38,21 +40,20 @@ impl Tool for WebSearchTool {
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query is required"))?;
-        // SSRF guard on the base URL — DDG is a known safe external host.
-        crate::security::ssrf_guard("https://api.duckduckgo.com/").await?;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Haily/1.0")
-            .build()?;
-        let resp = client
-            .get("https://api.duckduckgo.com/")
-            .query(&[("q", query), ("format", "json"), ("no_html", "1"), ("skip_disambig", "1")])
-            .send()
-            .await?
-            .text()
-            .await?;
-        let parsed: Value = parse_ddg_response(&resp)?;
+        let base_url = format!(
+            "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+            urlencoding_query(query)
+        );
+        let resp = security::follow_redirects_with_guard(
+            &base_url,
+            Duration::from_secs(10),
+            |client, url| client.get(url),
+        )
+        .await?;
+        let resp = resp.error_for_status().map_err(|e| anyhow::anyhow!("web_search: DuckDuckGo request failed: {e}"))?;
+        let body = resp.text().await?;
+        let parsed: Value = parse_ddg_response(&body)?;
 
         let mut results = Vec::new();
 
@@ -84,6 +85,22 @@ impl Tool for WebSearchTool {
     }
 }
 
+/// Minimal query-string percent-encoding for the single `q` param DDG needs.
+/// Avoids pulling in a full URL-encoding crate for one call site — `reqwest`'s
+/// `.query(&[...])` builder would normally do this, but the redirect-walker takes a
+/// fully-formed URL string up front (it must re-parse/re-join the URL on every
+/// redirect hop, which `.query()` doesn't compose with).
+fn urlencoding_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // UrlFetchTool
 // ---------------------------------------------------------------------------
@@ -111,22 +128,22 @@ impl Tool for UrlFetchTool {
         let url = args["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required"))?;
         let max_chars = args["max_chars"].as_u64().unwrap_or(4000) as usize;
 
-        crate::security::ssrf_guard(url).await?;
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Haily/1.0")
-            .build()?;
-        let resp = client.get(url).send().await?;
+        let resp = security::follow_redirects_with_guard(
+            url,
+            Duration::from_secs(15),
+            |client, url| client.get(url),
+        )
+        .await?;
         let content_type = resp.headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp.text().await?;
+        let body = resp.text().await
+            .map_err(|e| anyhow::anyhow!("url_fetch: failed to read response body: {e}"))?;
 
         let text = if content_type.contains("text/html") {
-            crate::security::html_to_text(&body)
+            security::html_to_text(&body)
         } else {
             body
         };
@@ -162,34 +179,49 @@ impl Tool for HttpRequestTool {
     fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
-        let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
+        let method_str = args["method"].as_str().unwrap_or("GET").to_uppercase();
         let url = args["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required"))?;
-
-        crate::security::ssrf_guard(url).await?;
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("Haily/1.0")
-            .build()?;
-
-        let method = reqwest::Method::from_bytes(method.as_bytes())
+        let method = reqwest::Method::from_bytes(method_str.as_bytes())
             .map_err(|_| anyhow::anyhow!("invalid HTTP method"))?;
-        let mut req = client.request(method, url);
 
-        if let Some(headers) = args["headers"].as_object() {
-            for (k, v) in headers {
+        // Reject headers that could defeat the SSRF pin (Host override) or enable
+        // request smuggling — see `security::is_denied_header` for the full
+        // rationale per header. Checked before any network activity.
+        let headers: Vec<(String, String)> = if let Some(obj) = args["headers"].as_object() {
+            let mut collected = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                if security::is_denied_header(k) {
+                    bail!("http_request: header '{k}' is not permitted (would defeat SSRF protections or enable request smuggling)");
+                }
                 if let Some(val) = v.as_str() {
-                    req = req.header(k.as_str(), val);
+                    collected.push((k.clone(), val.to_string()));
                 }
             }
-        }
-        if let Some(body) = args["body"].as_str() {
-            req = req.body(body.to_string());
-        }
+            collected
+        } else {
+            Vec::new()
+        };
+        let body = args["body"].as_str().map(str::to_string);
 
-        let resp = req.send().await?;
+        let resp = security::follow_redirects_with_guard(
+            url,
+            Duration::from_secs(30),
+            move |client, url| {
+                let mut req = client.request(method.clone(), url);
+                for (k, v) in &headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                if let Some(b) = &body {
+                    req = req.body(b.clone());
+                }
+                req
+            },
+        )
+        .await?;
+
         let status = resp.status().as_u16();
-        let body = resp.text().await?;
+        let body = resp.text().await
+            .map_err(|e| anyhow::anyhow!("http_request: failed to read response body: {e}"))?;
         let truncated: String = body.chars().take(4000).collect();
 
         if status >= 400 {
@@ -222,5 +254,22 @@ mod tests {
     #[test]
     fn parse_ddg_response_errors_on_empty_body() {
         assert!(parse_ddg_response("").is_err());
+    }
+
+    #[test]
+    fn urlencoding_query_percent_encodes_reserved_chars() {
+        assert_eq!(urlencoding_query("a b"), "a%20b");
+        assert_eq!(urlencoding_query("rust&go"), "rust%26go");
+        assert_eq!(urlencoding_query("safe-chars_1.0~x"), "safe-chars_1.0~x");
+    }
+
+    #[test]
+    fn http_request_tool_is_permanently_require_approval() {
+        // Authorization/Cookie headers remain allowed on this tool ONLY because it
+        // is gated by human approval on every call — if this tool were ever
+        // downgraded to auto-approve, the header allowlist decision above would
+        // need to be revisited (this test is the tripwire for that).
+        let tool = HttpRequestTool;
+        assert_eq!(tool.approval_class(), ToolClass::RequireApproval);
     }
 }

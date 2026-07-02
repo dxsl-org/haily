@@ -1,3 +1,4 @@
+use crate::breaker::{Admission, CircuitBreaker};
 use crate::sse::{self, Dialect, ParsedEvent};
 use crate::{prompt, CompletionRequest, LlmClient, StreamChunk};
 use anyhow::{anyhow, Result};
@@ -30,6 +31,22 @@ pub struct CloudClient {
     model: String,
     /// Monotonic counter; key selected by `counter % len`. Wraps naturally.
     next_key_idx: AtomicUsize,
+    /// Per-key transport-failure breaker (index-aligned with `api_keys`). 429 is a
+    /// routing signal, not a transport failure, and must never touch this — see
+    /// `breaker` module docs for the full contract.
+    breaker: CircuitBreaker,
+}
+
+/// Outcome of one key attempt, distinguishing the breaker-relevant transport failure
+/// from an HTTP-status failure (auth error, malformed response, etc.) that reached
+/// the server and therefore proves the key/network path is up.
+enum KeyOutcome<T> {
+    Success(T),
+    RateLimited,
+    /// Connection/timeout/DNS failure — never got an HTTP response at all.
+    TransportError(anyhow::Error),
+    /// Non-429 HTTP error or a malformed-but-received response body.
+    HttpError(anyhow::Error),
 }
 
 #[derive(Deserialize)]
@@ -57,6 +74,7 @@ impl CloudClient {
         api_keys: Vec<String>,
         model: impl Into<String>,
     ) -> Result<Self> {
+        let breaker = CircuitBreaker::new(api_keys.len());
         Ok(Self {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
@@ -65,12 +83,15 @@ impl CloudClient {
             api_keys,
             model: model.into(),
             next_key_idx: AtomicUsize::new(0),
+            breaker,
         })
     }
 
-    /// Single attempt with one key. Returns `Ok(None)` on 429 (caller rotates),
-    /// `Ok(Some(text))` on success, `Err` on any other failure.
-    async fn try_key(&self, req: &CompletionRequest, key: &str) -> Result<Option<String>> {
+    /// Single attempt with one key. Distinguishes a connect/timeout failure (never
+    /// reached the server — breaker-relevant) from an HTTP-status failure (server
+    /// responded, so the network path and key transport are proven up) so the caller
+    /// can report the correct outcome to the circuit breaker.
+    async fn try_key(&self, req: &CompletionRequest, key: &str) -> KeyOutcome<String> {
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": prompt::to_openai_messages(&req.messages),
@@ -83,26 +104,34 @@ impl CloudClient {
             body["tools"] = serde_json::json!(tools);
         }
 
-        let resp = self
+        let resp = match self
             .http
             .post(format!("{}/v1/chat/completions", self.base_url))
             .bearer_auth(key)
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return KeyOutcome::TransportError(e.into()),
+        };
 
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(None);
+            return KeyOutcome::RateLimited;
         }
 
-        let parsed: ChatResponse = resp.error_for_status()?.json().await?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| anyhow!("cloud API returned no content"))?;
-        Ok(Some(content))
+        let resp = match resp.error_for_status() {
+            Ok(resp) => resp,
+            Err(e) => return KeyOutcome::HttpError(e.into()),
+        };
+        let parsed: ChatResponse = match resp.json().await {
+            Ok(p) => p,
+            Err(e) => return KeyOutcome::HttpError(e.into()),
+        };
+        match parsed.choices.into_iter().next().and_then(|c| c.message.content) {
+            Some(content) => KeyOutcome::Success(content),
+            None => KeyOutcome::HttpError(anyhow!("cloud API returned no content")),
+        }
     }
 
     fn dialect(&self) -> Dialect {
@@ -159,21 +188,26 @@ impl CloudClient {
     /// Single streaming attempt with one key. 429 is a pre-stream HTTP status for
     /// both dialects (never an in-band SSE event) — detected from the response
     /// status before `.bytes_stream()` is ever called, so it rotates exactly like
-    /// `try_key`'s non-streaming counterpart. Returns `Ok(None)` on 429 (caller
-    /// rotates and retries the WHOLE request on the next key), `Ok(Some(rx))` once
-    /// the response status is confirmed OK and the SSE forwarder task is spawned,
-    /// `Err` on any other pre-stream failure (connect error, non-429 HTTP error).
+    /// `try_key`'s non-streaming counterpart. `TransportError` covers connect/timeout
+    /// failures before any response was received (breaker-relevant); `HttpError`
+    /// covers a non-429 status from a server that did respond (not breaker-relevant).
     async fn try_key_stream(
         &self,
         req: &CompletionRequest,
         key: &str,
-    ) -> Result<Option<mpsc::Receiver<StreamChunk>>> {
-        let resp = self.build_stream_request(req, key).send().await?;
+    ) -> KeyOutcome<mpsc::Receiver<StreamChunk>> {
+        let resp = match self.build_stream_request(req, key).send().await {
+            Ok(resp) => resp,
+            Err(e) => return KeyOutcome::TransportError(e.into()),
+        };
 
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(None);
+            return KeyOutcome::RateLimited;
         }
-        let resp = resp.error_for_status()?;
+        let resp = match resp.error_for_status() {
+            Ok(resp) => resp,
+            Err(e) => return KeyOutcome::HttpError(e.into()),
+        };
 
         let dialect = self.dialect();
         let cancel = req.cancel.clone().unwrap_or_default();
@@ -226,7 +260,7 @@ impl CloudClient {
             }
         });
 
-        Ok(Some(rx))
+        KeyOutcome::Success(rx)
     }
 }
 
@@ -240,19 +274,41 @@ impl LlmClient for CloudClient {
             ));
         }
 
-        // Round-robin: pick a starting key, then rotate on 429.
+        // Round-robin: pick a starting key, then rotate on 429 or an open breaker.
         let start = self.next_key_idx.fetch_add(1, Ordering::Relaxed) % n;
-        let last_err = anyhow!("tất cả API keys đều bị rate-limit (429)");
+        let last_err = anyhow!("tất cả API keys đều bị rate-limit hoặc tạm ngưng (breaker mở)");
 
         for i in 0..n {
             let idx = (start + i) % n;
+            if self.breaker.try_acquire(idx) == Admission::Blocked {
+                tracing::warn!(key_idx = idx, total = n, "API key breaker open — bỏ qua");
+                continue;
+            }
             let key = &self.api_keys[idx];
             match self.try_key(&req, key).await {
-                Ok(Some(text)) => return Ok(text),
-                Ok(None) => {
+                KeyOutcome::Success(text) => {
+                    self.breaker.record_success(idx);
+                    return Ok(text);
+                }
+                KeyOutcome::RateLimited => {
+                    // 429 is a routing signal, not a transport failure — must not
+                    // trip or close the breaker (would blacklist a key that is
+                    // merely busy). Only releases a held probe slot, if any.
+                    self.breaker.record_inconclusive(idx);
                     tracing::warn!(key_idx = idx, total = n, "API key 429 — thử key tiếp theo");
                 }
-                Err(e) => return Err(e), // non-429: do not rotate
+                KeyOutcome::TransportError(e) => {
+                    self.breaker.record_failure(idx);
+                    return Err(e); // non-429: do not rotate
+                }
+                KeyOutcome::HttpError(e) => {
+                    // Server responded (proves the transport path is up) but the
+                    // request itself failed — releases any held probe slot without
+                    // touching the failure streak, then propagates per existing
+                    // non-429 semantics (no rotation).
+                    self.breaker.record_inconclusive(idx);
+                    return Err(e);
+                }
             }
         }
 
@@ -265,11 +321,6 @@ impl LlmClient for CloudClient {
     /// goes wrong after the SSE forwarder task is spawned surfaces as
     /// `StreamChunk::Error` on the returned channel instead.
     async fn complete_stream(&self, req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
-        // BREAKER HOOK (owned by Phase 9): a future per-key circuit breaker check
-        // belongs here, before `try_key_stream` is attempted for a given key — e.g.
-        // `if breaker.is_open(key) { continue; }` inside the loop below. Not
-        // implemented in this phase; named so Phase 9 has an exact insertion point
-        // rather than needing to re-thread the key-rotation loop.
         let n = self.api_keys.len();
         if n == 0 {
             return Err(anyhow!(
@@ -278,17 +329,32 @@ impl LlmClient for CloudClient {
         }
 
         let start = self.next_key_idx.fetch_add(1, Ordering::Relaxed) % n;
-        let last_err = anyhow!("tất cả API keys đều bị rate-limit (429)");
+        let last_err = anyhow!("tất cả API keys đều bị rate-limit hoặc tạm ngưng (breaker mở)");
 
         for i in 0..n {
             let idx = (start + i) % n;
+            if self.breaker.try_acquire(idx) == Admission::Blocked {
+                tracing::warn!(key_idx = idx, total = n, "API key breaker open (stream) — bỏ qua");
+                continue;
+            }
             let key = &self.api_keys[idx];
             match self.try_key_stream(&req, key).await {
-                Ok(Some(rx)) => return Ok(rx),
-                Ok(None) => {
+                KeyOutcome::Success(rx) => {
+                    self.breaker.record_success(idx);
+                    return Ok(rx);
+                }
+                KeyOutcome::RateLimited => {
+                    self.breaker.record_inconclusive(idx);
                     tracing::warn!(key_idx = idx, total = n, "API key 429 (stream) — thử key tiếp theo");
                 }
-                Err(e) => return Err(e), // non-429: do not rotate
+                KeyOutcome::TransportError(e) => {
+                    self.breaker.record_failure(idx);
+                    return Err(e); // non-429: do not rotate
+                }
+                KeyOutcome::HttpError(e) => {
+                    self.breaker.record_inconclusive(idx);
+                    return Err(e); // non-429: do not rotate
+                }
             }
         }
 

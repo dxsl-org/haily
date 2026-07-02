@@ -106,16 +106,37 @@ impl EphemeralWorktree {
             if rel_path.is_empty() {
                 continue;
             }
+            // Harden the untracked-file read the same way the worktree tool's
+            // `compute_diff` does (Phase 9): git can list a path with `..`/absolute
+            // components or a symlink pointing outside the worktree, and reading it
+            // blindly would pull arbitrary repo/host files into the diff. Skip such
+            // entries, and cap sizes so a huge untracked file can't OOM the diff.
+            if haily_tools::security::validate_rel_path(rel_path).is_err() {
+                tracing::warn!(%rel_path, "skipping untracked file with an unsafe path in diff");
+                continue;
+            }
             let abs_path = self.path.join(rel_path);
+            if haily_tools::security::is_symlink(&abs_path).await.unwrap_or(true) {
+                tracing::warn!(path = %abs_path.display(), "skipping symlinked untracked file in diff");
+                continue;
+            }
             // Read file; skip on I/O error — binary or permission-denied files
             // should not abort the entire diff.
-            let contents = match tokio::fs::read_to_string(&abs_path).await {
+            let mut contents = match tokio::fs::read_to_string(&abs_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(path = %abs_path.display(), "skipping untracked file in diff: {e}");
                     continue;
                 }
             };
+            if contents.len() > haily_tools::security::DIFF_MAX_FILE_BYTES {
+                let mut cut = haily_tools::security::DIFF_MAX_FILE_BYTES;
+                while !contents.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                contents.truncate(cut);
+                contents.push_str(haily_tools::security::TRUNCATED_MARKER);
+            }
             // Emit a minimal unified-diff-style header so callers can parse it.
             diff.push_str(&format!(
                 "--- /dev/null\n+++ b/{rel_path}\n@@ -0,0 +1,{lines} @@\n",
@@ -125,6 +146,11 @@ impl EphemeralWorktree {
                 diff.push('+');
                 diff.push_str(line);
                 diff.push('\n');
+            }
+            if diff.len() > haily_tools::security::DIFF_MAX_TOTAL_BYTES {
+                diff.push_str(haily_tools::security::TRUNCATED_MARKER);
+                tracing::warn!("worktree diff exceeded total size cap — truncated");
+                break;
             }
         }
 
