@@ -12,6 +12,9 @@ pub struct ToolContext {
     pub db: Arc<DbHandle>,
     pub kms: Arc<KmsHandle>,
     pub session_id: Uuid,
+    /// Agent nesting depth: 0 = L0 orchestrator, 1 = L1 domain agent, 2 = L2 specialist.
+    /// Delegate tools check this to enforce max depth and prevent infinite recursion.
+    pub depth: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +85,19 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Build a sub-registry containing only the named tools.
+    /// Used by delegate tools to enforce per-domain tool whitelists.
+    /// Unknown names are silently skipped.
+    pub fn sub_registry(&self, allowed: &[&str]) -> Self {
+        let mut reg = Self::new();
+        for name in allowed {
+            if let Some(tool) = self.tools.get(*name) {
+                reg.tools.insert((*name).to_string(), Arc::clone(tool));
+            }
+        }
+        reg
+    }
+
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
@@ -102,5 +118,71 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::build_v1()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockTool(&'static str);
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str { self.0 }
+        fn description(&self) -> &str { "mock" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    fn registry_with(names: &[&'static str]) -> ToolRegistry {
+        let mut reg = ToolRegistry::new();
+        for n in names {
+            reg.register(Arc::new(MockTool(n)));
+        }
+        reg
+    }
+
+    #[test]
+    fn sub_registry_keeps_only_whitelisted() {
+        let base = registry_with(&["a", "b", "c", "d"]);
+        let sub = base.sub_registry(&["a", "c"]);
+        assert_eq!(sub.len(), 2);
+        assert!(sub.get("a").is_some());
+        assert!(sub.get("c").is_some());
+        assert!(sub.get("b").is_none());
+    }
+
+    #[test]
+    fn sub_registry_silently_skips_unknown_names() {
+        let base = registry_with(&["a", "b"]);
+        let sub = base.sub_registry(&["a", "does_not_exist"]);
+        assert_eq!(sub.len(), 1);
+        assert!(sub.get("a").is_some());
+        assert!(sub.get("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn sub_registry_empty_whitelist_yields_empty() {
+        let base = registry_with(&["a", "b"]);
+        let sub = base.sub_registry(&[]);
+        assert!(sub.is_empty());
+    }
+
+    #[test]
+    fn build_v1_registers_all_quick_tools() {
+        // Guards against silent whitelist drift: the L0 quick-tool names the
+        // orchestrator relies on must all exist in the base V1 registry.
+        let base = ToolRegistry::build_v1();
+        for name in [
+            "web_search", "memory_search", "memory_remember",
+            "reminder_add", "calendar_list", "note_save",
+            "work_item_list", "work_item_resume", "feedback_react",
+        ] {
+            assert!(base.get(name).is_some(), "missing quick tool: {name}");
+        }
     }
 }

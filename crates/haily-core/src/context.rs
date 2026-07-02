@@ -30,6 +30,15 @@ Khi cần dùng tool, output ĐÚNG format này (không có text nào trước h
 
 Sau khi nhận tool result, tiếp tục trả lời bình thường.
 
+## Delegation Strategy
+- **Quick tasks** (tra cứu nhanh, nhắc nhở, ghi chú, check lịch): dùng quick tools trực tiếp.
+- **Domain tasks** (kỹ thuật, nghiên cứu, tài chính, v.v.): gọi delegate_to_<domain> với task mô tả rõ yêu cầu.
+- **Compound requests** (yêu cầu gồm 2-3 việc khác nhau): gọi delegate tools **tuần tự** — từng bước một, dùng kết quả bước trước làm context cho bước sau.
+
+Ví dụ: yêu cầu nghiên cứu về ETF rồi lên kế hoạch tiết kiệm
+  Bước 1: delegate_to_researcher với task = nghiên cứu ETF index fund phù hợp cho nhà đầu tư mới
+  Bước 2: delegate_to_finance với task = lên kế hoạch tiết kiệm đầu tư ETF, context = kết quả từ bước 1
+
 ## Available Tools
 {tool_block}"
     )
