@@ -114,7 +114,11 @@ impl Orchestrator {
     pub async fn reload_llm(&self, config: LlmConfig) {
         let new_router = Arc::new(LlmRouter::init(config).await);
         tracing::info!(llm = new_router.provider_name(), "LLM reloaded");
-        *self.llm.write().expect("llm lock") = new_router;
+        // Recover from a poisoned lock rather than panicking: the guarded value is an
+        // `Arc` clone with no partial state, so a prior panicking holder cannot have
+        // left it inconsistent — taking the inner value and continuing is safe.
+        let mut guard = self.llm.write().unwrap_or_else(|e| e.into_inner());
+        *guard = new_router;
     }
 
     pub async fn process(
@@ -123,7 +127,7 @@ impl Orchestrator {
         tx: mpsc::Sender<ResponseChunk>,
     ) -> Result<()> {
         // Clone the Arc under a brief read-lock — never hold the lock across await.
-        let llm = self.llm.read().expect("llm lock").clone();
+        let llm = self.llm.read().unwrap_or_else(|e| e.into_inner()).clone();
         agent::run_turn(
             &req,
             Arc::clone(&self.db),
@@ -136,7 +140,7 @@ impl Orchestrator {
     }
 
     pub fn llm_provider(&self) -> String {
-        self.llm.read().expect("llm lock").provider_name().to_string()
+        self.llm.read().unwrap_or_else(|e| e.into_inner()).provider_name().to_string()
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).

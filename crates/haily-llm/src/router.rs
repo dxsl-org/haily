@@ -89,23 +89,32 @@ impl LlmRouter {
     /// user actually sends a message.
     pub async fn init(config: LlmConfig) -> Self {
         let cloud: Option<Arc<dyn LlmClient>> = if !config.cloud_api_keys.is_empty() {
-            Some(Arc::new(CloudClient::new(
+            match CloudClient::new(
                 config.cloud_base_url.clone(),
                 config.cloud_api_keys.clone(),
                 config.cloud_model.clone(),
-            )) as Arc<dyn LlmClient>)
+            ) {
+                Ok(client) => Some(Arc::new(client) as Arc<dyn LlmClient>),
+                Err(e) => {
+                    tracing::warn!("failed to build cloud HTTP client: {e:#}");
+                    None
+                }
+            }
         } else {
             None
         };
 
         #[cfg(feature = "llama")]
         {
-            let llama_ok = config.llama_model_path.as_ref()
-                .map(|p| p.exists())
-                .unwrap_or(false);
+            // `filter(|p| p.exists())` keeps the path and existence check tied together —
+            // no separate boolean flag that could drift from the `Option` it was derived
+            // from, and no `.unwrap()` needed to re-extract the path afterward.
+            let existing_model_path = config
+                .llama_model_path
+                .clone()
+                .filter(|p| p.exists());
 
-            if llama_ok {
-                let path = config.llama_model_path.clone().unwrap();
+            if let Some(path) = existing_model_path {
                 let fmt = config.llama_prompt_format;
                 let n_gpu_layers = config.llama_n_gpu_layers;
                 tracing::info!(

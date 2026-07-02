@@ -23,19 +23,24 @@ pub struct Message {
     pub created_at: String,
 }
 
+/// Create a session row under the caller-supplied `id`.
+///
+/// Callers must pass the same id used for subsequent `insert_message`/`work_items::create`
+/// calls (typically `req.session_id`) — the FK on `work_items.session_id` requires the
+/// row to exist under that exact id, not a freshly generated one.
 pub async fn create_session(
     db: &DbHandle,
+    id: &str,
     adapter_id: &str,
     user_ref: Option<&str>,
 ) -> Result<Session> {
-    let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     Ok(sqlx::query_as::<_, Session>(
         "INSERT INTO sessions (id, adapter_id, user_ref, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)
          RETURNING *",
     )
-    .bind(&id)
+    .bind(id)
     .bind(adapter_id)
     .bind(user_ref)
     .bind(&now)

@@ -3,6 +3,17 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+/// Parse the raw DuckDuckGo Instant Answer API response body.
+///
+/// Extracted as a standalone function (rather than inlined `unwrap_or_default()`) so a
+/// malformed/unexpected response body surfaces as an explicit, testable error instead of
+/// silently degrading to `Value::Null` — which downstream code could not distinguish from
+/// "no instant answer found".
+fn parse_ddg_response(body: &str) -> Result<Value> {
+    serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("web_search: failed to parse DuckDuckGo response: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // WebSearchTool
 // ---------------------------------------------------------------------------
@@ -41,7 +52,7 @@ impl Tool for WebSearchTool {
             .await?
             .text()
             .await?;
-        let parsed: Value = serde_json::from_str(&resp).unwrap_or_default();
+        let parsed: Value = parse_ddg_response(&resp)?;
 
         let mut results = Vec::new();
 
@@ -185,5 +196,31 @@ impl Tool for HttpRequestTool {
             bail!("HTTP {status}: {truncated}");
         }
         Ok(format!("HTTP {status}\n{truncated}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ddg_response_accepts_valid_json() {
+        let body = r#"{"AbstractText":"hello","Heading":"H","AbstractURL":"u","RelatedTopics":[]}"#;
+        let parsed = parse_ddg_response(body).unwrap();
+        assert_eq!(parsed["AbstractText"].as_str(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_ddg_response_errors_explicitly_on_malformed_body() {
+        // Previously `unwrap_or_default()` silently degraded this to `Value::Null`,
+        // making a malformed upstream response indistinguishable from "nothing found".
+        let result = parse_ddg_response("not valid json {{{");
+        assert!(result.is_err(), "malformed body must surface as an explicit error");
+        assert!(result.unwrap_err().to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn parse_ddg_response_errors_on_empty_body() {
+        assert!(parse_ddg_response("").is_err());
     }
 }

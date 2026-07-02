@@ -207,12 +207,12 @@ pub async fn synthesize_skills_from_traces(
 
 /// EMA confidence update after a tool outcome.
 /// `reward` = 1.0 for success, 0.0 for failure.
+///
+/// The EMA math runs inside a single atomic SQL UPDATE (`db_skills::update_skill_confidence`)
+/// rather than a Rust-side read-modify-write, so two concurrent updates for the same skill
+/// both apply instead of one clobbering the other.
 pub async fn update_skill_confidence(db: &DbHandle, skill_id: &str, reward: f64) -> Result<()> {
-    if let Some(skill) = db_skills::get_skill(db, skill_id).await? {
-        let new_conf = EMA_ALPHA * reward + (1.0 - EMA_ALPHA) * skill.confidence;
-        db_skills::update_skill_confidence(db, skill_id, new_conf.clamp(0.0, 1.0)).await?;
-    }
-    Ok(())
+    db_skills::update_skill_confidence(db, skill_id, reward, EMA_ALPHA).await
 }
 
 /// Apply exponential decay to all active skills. Archive any whose confidence

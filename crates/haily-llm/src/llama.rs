@@ -134,6 +134,15 @@ impl LlmClient for LlamaClient {
     }
 }
 
+/// Validate `n_ctx` is a usable (non-zero) context window size.
+///
+/// Extracted as a pure function so the n_ctx=0 misconfiguration path is unit-testable
+/// without a loaded GGUF model (`run_inference` needs a real `LlamaModel`/`LlamaBackend`).
+fn validate_n_ctx(n_ctx: u32) -> Result<NonZeroU32> {
+    NonZeroU32::new(n_ctx)
+        .ok_or_else(|| anyhow!("llama.cpp context window (n_ctx) must be non-zero"))
+}
+
 fn run_inference(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -142,6 +151,10 @@ fn run_inference(
     max_new_tokens: i32,
     temperature: f32,
 ) -> Result<String> {
+    // n_ctx=0 is a misconfiguration (empty context window) — reject it up front with a
+    // clear error instead of panicking inside NonZeroU32::new(..).unwrap() below.
+    let n_ctx_nonzero = validate_n_ctx(n_ctx)?;
+
     // Tokenize
     let tokens = model
         .str_to_token(prompt, AddBos::Always)
@@ -159,7 +172,7 @@ fn run_inference(
     // (an abort, not a recoverable error). The full system prompt + tool reference
     // routinely exceeds the old 512 default, so size the batch to the context.
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(Some(NonZeroU32::new(n_ctx).unwrap()))
+        .with_n_ctx(Some(n_ctx_nonzero))
         .with_n_batch(n_ctx);
     let mut ctx = model
         .new_context(backend, ctx_params)
@@ -223,4 +236,20 @@ fn run_inference(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_n_ctx_rejects_zero() {
+        assert!(validate_n_ctx(0).is_err());
+    }
+
+    #[test]
+    fn validate_n_ctx_accepts_positive_values() {
+        let n = validate_n_ctx(4096).unwrap();
+        assert_eq!(n.get(), 4096);
+    }
 }

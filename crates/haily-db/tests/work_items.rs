@@ -11,7 +11,8 @@ async fn setup() -> (DbHandle, tempfile::TempDir) {
 }
 
 async fn make_session(db: &DbHandle) -> String {
-    sessions::create_session(db, "test-adapter", None)
+    let id = uuid::Uuid::new_v4().to_string();
+    sessions::create_session(db, &id, "test-adapter", None)
         .await
         .unwrap()
         .id

@@ -103,11 +103,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 break tool_call::strip_tool_markup(&response);
             }
 
-            let result = tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx)
+            let (result, tool_ok) = tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx)
                 .await
-                .unwrap_or_else(|e| format!("Error: {e:#}"));
+                .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
-            let tool_ok = !result.starts_with("Error:");
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
                 "args": args.to_string(),
@@ -160,9 +159,11 @@ pub async fn run_turn(
     let session_id = req.session_id.to_string();
     let turn_start = std::time::Instant::now();
 
-    // Ensure session exists in DB
+    // Ensure session exists in DB, created under req.session_id so that
+    // work_items.session_id (FK to sessions.id) resolves for this turn.
     if sessions::get_session(&db, &session_id).await?.is_none() {
-        sessions::create_session(&db, &req.adapter_id, req.user_ref.as_deref()).await?;
+        sessions::create_session(&db, &session_id, &req.adapter_id, req.user_ref.as_deref())
+            .await?;
     } else {
         sessions::touch_session(&db, &session_id).await?;
     }
@@ -229,12 +230,11 @@ pub async fn run_turn(
                     }
                 }
 
-                let result =
+                let (result, tool_ok) =
                     tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx)
                         .await
-                        .unwrap_or_else(|e| format!("Error: {e:#}"));
+                        .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
-                let tool_ok = !result.starts_with("Error:");
                 tool_call_log.push(serde_json::json!({
                     "tool": &tool_name,
                     "args": args.to_string(),

@@ -66,8 +66,12 @@ pub async fn recent_traces(db: &DbHandle, limit: i64) -> Result<Vec<TaskTrace>> 
     .await?)
 }
 
-/// Insert a skill, skipping silently if `name` already exists (unique index guard).
-/// Always returns the row — newly inserted or the pre-existing one.
+/// Insert a skill, or un-archive a same-name archived skill (fresh synthesis is
+/// evidence the pattern is alive again). Skipped silently if an active (non-archived)
+/// row with `name` already exists (unique index guard on `name`).
+///
+/// # Errors
+/// Returns an error if the DB insert/update/fetch fails.
 pub async fn insert_skill(
     db: &DbHandle,
     name: &str,
@@ -91,12 +95,41 @@ pub async fn insert_skill(
     .bind(&now)
     .execute(db.pool())
     .await?;
-    Ok(sqlx::query_as::<_, Skill>(
-        "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL",
+
+    // The UNIQUE index on `name` means INSERT OR IGNORE leaves no fresh row when a
+    // same-name row (active or archived) already exists — fetch_one against
+    // `archived_at IS NULL` would then error RowNotFound for the archived case.
+    // fetch_optional + explicit branch turns that into un-archival instead.
+    match sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL AND archived_at IS NULL",
     )
     .bind(name)
-    .fetch_one(db.pool())
-    .await?)
+    .fetch_optional(db.pool())
+    .await?
+    {
+        Some(active) => Ok(active),
+        None => {
+            // Either the row is archived (resurrect it) or somehow missing —
+            // in the missing case this UPDATE affects 0 rows and the final
+            // fetch_one below surfaces a clear error instead of silent resurrection.
+            sqlx::query(
+                "UPDATE kms_skills
+                 SET archived_at = NULL, confidence = 1.0, updated_at = ?
+                 WHERE name = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(name)
+            .execute(db.pool())
+            .await?;
+
+            Ok(sqlx::query_as::<_, Skill>(
+                "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL",
+            )
+            .bind(name)
+            .fetch_one(db.pool())
+            .await?)
+        }
+    }
 }
 
 pub async fn increment_use_count(db: &DbHandle, id: &str) -> Result<()> {
@@ -146,13 +179,22 @@ pub async fn active_skills_top(db: &DbHandle, limit: i64) -> Result<Vec<Skill>> 
     .await?)
 }
 
-/// EMA confidence update: new_conf is the pre-computed value (caller owns the formula).
-pub async fn update_skill_confidence(db: &DbHandle, id: &str, new_conf: f64) -> Result<()> {
+/// Atomic EMA confidence update: `confidence = alpha*reward + (1-alpha)*confidence`.
+///
+/// The whole formula runs as one UPDATE so concurrent calls for the same skill each
+/// read-modify-write against the DB's current row version instead of a value snapshotted
+/// in Rust — two concurrent calls both land, rather than one clobbering the other.
+pub async fn update_skill_confidence(db: &DbHandle, id: &str, reward: f64, alpha: f64) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE kms_skills SET confidence = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+        "UPDATE kms_skills
+         SET confidence = MIN(1.0, MAX(0.0, ? * ? + (1.0 - ?) * confidence)),
+             updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(new_conf)
+    .bind(alpha)
+    .bind(reward)
+    .bind(alpha)
     .bind(&now)
     .bind(id)
     .execute(db.pool())
@@ -171,14 +213,57 @@ pub async fn active_skills(db: &DbHandle) -> Result<Vec<Skill>> {
     .await?)
 }
 
+/// Preference key (via `queries::meta`) recording the RFC3339 timestamp of the last
+/// successful decay run — guards `apply_exponential_decay` against being fired twice
+/// within `MIN_DECAY_INTERVAL_HOURS` (e.g. an overlapping worker restart).
+const LAST_DECAY_RUN_KEY: &str = "kms.skills.last_decay_run";
+const MIN_DECAY_INTERVAL_HOURS: i64 = 20;
+
 /// Apply exponential decay to all active skills. Archive those below `archive_below`.
 /// `lambda` ≈ 0.693/24 gives half-life of 24 h when called hourly.
+///
+/// No-op (returns `Ok(0)`) if less than `MIN_DECAY_INTERVAL_HOURS` have elapsed since
+/// the last successful run, making the operation idempotent under duplicate/overlapping
+/// scheduler ticks.
 pub async fn apply_exponential_decay(
     db: &DbHandle,
     lambda: f64,
     archive_below: f64,
 ) -> Result<usize> {
+    // Atomically CLAIM the decay slot before doing any work. A conditional upsert of the
+    // run-timestamp — insert on first run, else update only when the stored run is older
+    // than the guard window — collapses the previous read-then-act guard into one statement,
+    // so two overlapping workers cannot both pass the check (the TOCTOU the guard exists to
+    // close). `rows_affected == 0` means another run already claimed within the window.
+    // RFC3339 UTC strings from `to_rfc3339()` share a fixed format, so lexical `<` orders them
+    // by time. The claim is written BEFORE decay: a failed decay simply skips this cycle
+    // rather than allowing a duplicate, which is the safer trade-off for a periodic worker.
     let now = chrono::Utc::now().to_rfc3339();
+    let threshold = (chrono::Utc::now() - chrono::Duration::hours(MIN_DECAY_INTERVAL_HOURS))
+        .to_rfc3339();
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    let claimed = sqlx::query(
+        "INSERT INTO kms_preferences (id, key, value, confidence, source, created_at, updated_at)
+         VALUES (?, ?, ?, 1.0, 'system', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+             value      = excluded.value,
+             updated_at = excluded.updated_at
+         WHERE kms_preferences.value < ?",
+    )
+    .bind(&claim_id)
+    .bind(LAST_DECAY_RUN_KEY)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&threshold)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+
+    if claimed == 0 {
+        return Ok(0);
+    }
+
     let factor = (-lambda).exp();
     let rows = sqlx::query(
         "UPDATE kms_skills
@@ -195,5 +280,6 @@ pub async fn apply_exponential_decay(
     .execute(db.pool())
     .await?
     .rows_affected();
+
     Ok(rows as usize)
 }

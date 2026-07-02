@@ -34,21 +34,24 @@ struct ChoiceMessage {
 }
 
 impl CloudClient {
+    /// # Errors
+    /// Returns an error if the underlying `reqwest::Client` fails to build (e.g. TLS
+    /// backend initialization failure) — propagated instead of panicking so the caller
+    /// can fall back to another LLM backend.
     pub fn new(
         base_url: impl Into<String>,
         api_keys: Vec<String>,
         model: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("reqwest client build"),
+                .build()?,
             base_url: base_url.into(),
             api_keys,
             model: model.into(),
             next_key_idx: AtomicUsize::new(0),
-        }
+        })
     }
 
     /// Single attempt with one key. Returns `Ok(None)` on 429 (caller rotates),

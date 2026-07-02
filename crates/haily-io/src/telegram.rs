@@ -6,6 +6,14 @@ use std::sync::Arc;
 use teloxide::{prelude::*, types::ParseMode};
 use uuid::Uuid;
 
+/// Escape the three characters Telegram's HTML `parse_mode` treats as markup so
+/// untrusted text (tool args, LLM output, DB-stored titles/bodies) cannot break out
+/// of the intended tags or inject new ones. Telegram's HTML subset has no attribute
+/// surface, so `&`/`<`/`>` are sufficient — quotes need no escaping here.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Telegram bot adapter. Requires `TELOXIDE_TOKEN` env var at runtime.
 ///
 /// Routing: chat_id (Telegram i64) ↔ session_id (Haily UUID).
@@ -107,8 +115,11 @@ impl Adapter for TelegramAdapter {
                     if let Some(chat_id) = self.session_to_chat.get(&session_id) {
                         let trimmed = text.trim().to_string();
                         if !trimmed.is_empty() {
+                            // Buffered LLM output is untrusted — it may contain
+                            // characters that would otherwise be read as HTML markup
+                            // (or a breakout of the message context) by Telegram.
                             self.bot
-                                .send_message(ChatId(*chat_id), trimmed)
+                                .send_message(ChatId(*chat_id), escape_html(&trimmed))
                                 .parse_mode(ParseMode::Html)
                                 .await?;
                         }
@@ -117,7 +128,11 @@ impl Adapter for TelegramAdapter {
             }
             ResponseChunk::ToolApprovalRequest { tool, args, .. } => {
                 if let Some(chat_id) = self.session_to_chat.get(&session_id) {
-                    let msg = format!("⚙️ <b>Tool approval needed</b>\n<code>{tool}</code>\n{args}");
+                    let msg = format!(
+                        "⚙️ <b>Tool approval needed</b>\n<code>{}</code>\n{}",
+                        escape_html(&tool),
+                        escape_html(&args)
+                    );
                     self.bot
                         .send_message(ChatId(*chat_id), msg)
                         .parse_mode(ParseMode::Html)
@@ -140,14 +155,14 @@ impl Adapter for TelegramAdapter {
         }
         let text = match msg {
             Notification::MorningBrief(brief) => {
-                format!("🌅 <b>Morning Brief</b>\n{brief}")
+                format!("🌅 <b>Morning Brief</b>\n{}", escape_html(&brief))
             }
             Notification::Alert { title, body, urgent } => {
                 let icon = if urgent { "🔴" } else { "📢" };
-                format!("{icon} <b>{title}</b>\n{body}")
+                format!("{icon} <b>{}</b>\n{}", escape_html(&title), escape_html(&body))
             }
             Notification::ReminderFired { title, .. } => {
-                format!("⏰ <b>Reminder</b>: {title}")
+                format!("⏰ <b>Reminder</b>: {}", escape_html(&title))
             }
             Notification::WorkItemsChanged(_) => unreachable!(),
         };
@@ -169,5 +184,39 @@ impl Adapter for TelegramAdapter {
 
     fn id(&self) -> &str {
         "telegram"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_html_neutralizes_closing_bold_tag() {
+        let payload = "</b>pwned<b>";
+        let out = escape_html(payload);
+        assert!(!out.contains("</b>"));
+        assert!(!out.contains("<b>"));
+        assert_eq!(out, "&lt;/b&gt;pwned&lt;b&gt;");
+    }
+
+    #[test]
+    fn escape_html_neutralizes_code_and_bold_breakout() {
+        // Simulates a reminder title crafted to break out of the surrounding <code>/<b> tags.
+        let payload = "</code><b>x</b>";
+        let out = escape_html(payload);
+        assert!(!out.contains("</code>"));
+        assert!(!out.contains("<b>"));
+        assert!(!out.contains("</b>"));
+    }
+
+    #[test]
+    fn escape_html_escapes_ampersand() {
+        assert_eq!(escape_html("Tom & Jerry"), "Tom &amp; Jerry");
+    }
+
+    #[test]
+    fn escape_html_leaves_plain_text_unchanged() {
+        assert_eq!(escape_html("Nhắc nhở lúc 9h sáng"), "Nhắc nhở lúc 9h sáng");
     }
 }

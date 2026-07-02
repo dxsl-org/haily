@@ -40,9 +40,21 @@ impl Adapter for CliAdapter {
                 // Render active work items above the prompt (cache updated by notify).
                 // Build the panel string while holding the lock, then drop the guard
                 // before .await so MutexGuard is not held across a suspension point.
+                // A poisoned lock (a panic while held elsewhere) still holds a valid
+                // Vec — recover it and keep rendering rather than crashing the REPL.
                 let panel: Option<String> = {
-                    let items = status.lock().unwrap();
-                    if items.is_empty() { None } else { Some(render_status_panel(&items)) }
+                    let items_snapshot = match status.lock() {
+                        Ok(items) => items,
+                        Err(poisoned) => {
+                            tracing::warn!("work item status lock poisoned — recovering");
+                            poisoned.into_inner()
+                        }
+                    };
+                    if items_snapshot.is_empty() {
+                        None
+                    } else {
+                        Some(render_status_panel(&items_snapshot))
+                    }
                 };
                 if let Some(panel) = panel {
                     stdout.write_all(panel.as_bytes()).await.ok();
@@ -121,7 +133,13 @@ impl Adapter for CliAdapter {
         let text = match msg {
             // Update the cached status; the REPL loop will render it before the next prompt.
             Notification::WorkItemsChanged(items) => {
-                *self.status.lock().unwrap() = items;
+                match self.status.lock() {
+                    Ok(mut guard) => *guard = items,
+                    Err(poisoned) => {
+                        tracing::warn!("work item status lock poisoned — recovering");
+                        *poisoned.into_inner() = items;
+                    }
+                }
                 return Ok(());
             }
             Notification::MorningBrief(brief) => format!("\n[Morning Brief]\n{brief}\n"),

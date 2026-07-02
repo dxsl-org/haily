@@ -1,5 +1,5 @@
 /// Daily morning brief — calendar + tasks + reminders summary, sent once per day.
-use chrono::{Duration, Local, NaiveTime};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime};
 use haily_db::{
     queries::{calendar, meta, reminders, tasks},
     DbHandle,
@@ -17,21 +17,27 @@ fn parse_hhmm(s: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(h, m, 0)
 }
 
+/// Resolve a local wall-clock instant, tolerating DST ambiguity/gaps.
+///
+/// `and_local_timezone(Local)` returns `LocalResult::None` for times that don't exist
+/// (spring-forward gap) and `LocalResult::Ambiguous` for times that occur twice
+/// (fall-back overlap) — `.unwrap()` panics on both. `.earliest()` picks a
+/// deterministic instant for the ambiguous case and yields `None` for the gap case,
+/// which the caller must handle by skipping the occurrence rather than crashing.
+fn local_at(date: NaiveDate, time: NaiveTime) -> Option<DateTime<Local>> {
+    date.and_time(time).and_local_timezone(Local).earliest()
+}
+
 /// Compute the next wall-clock firing of `time` (today if still future, else tomorrow).
-fn next_occurrence(time: NaiveTime) -> chrono::DateTime<Local> {
+/// Returns `None` if neither today's nor tomorrow's occurrence resolves to a valid
+/// local instant (DST gap) — caller skips this cycle and retries on the next loop tick.
+fn next_occurrence(time: NaiveTime) -> Option<chrono::DateTime<Local>> {
     let now = Local::now();
-    let candidate = now
-        .date_naive()
-        .and_time(time)
-        .and_local_timezone(Local)
-        .unwrap();
-    if candidate > now {
-        candidate
+    let today = local_at(now.date_naive(), time)?;
+    if today > now {
+        Some(today)
     } else {
-        (now.date_naive() + Duration::days(1))
-            .and_time(time)
-            .and_local_timezone(Local)
-            .unwrap()
+        local_at(now.date_naive() + Duration::days(1), time)
     }
 }
 
@@ -45,19 +51,13 @@ async fn load_brief_time(db: &DbHandle) -> NaiveTime {
 
 async fn generate_brief(db: &DbHandle) -> String {
     let now = Local::now();
-    let today_start = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
+    // Midnight and 23:59:59 can both land in a DST transition on rare dates; fall back
+    // to `now` itself (still within today) rather than panicking or skipping the brief.
+    let today_start = local_at(now.date_naive(), NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+        .unwrap_or(now)
         .to_rfc3339();
-    let today_end = now
-        .date_naive()
-        .and_hms_opt(23, 59, 59)
-        .unwrap()
-        .and_local_timezone(Local)
-        .unwrap()
+    let today_end = local_at(now.date_naive(), NaiveTime::from_hms_opt(23, 59, 59).unwrap())
+        .unwrap_or(now)
         .to_rfc3339();
 
     let mut parts: Vec<String> = Vec::new();
@@ -144,7 +144,13 @@ async fn generate_brief(db: &DbHandle) -> String {
 pub async fn loop_forever(db: Arc<DbHandle>, am: AdapterManager) {
     loop {
         let brief_time = load_brief_time(&db).await;
-        let next = next_occurrence(brief_time);
+        let Some(next) = next_occurrence(brief_time) else {
+            // Both today's and tomorrow's occurrence fell in a DST gap — extremely rare.
+            // Skip this cycle and re-evaluate in an hour rather than busy-looping.
+            warn!("morning brief: occurrence time falls in a DST gap — skipping, retrying in 1h");
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            continue;
+        };
         let delay = (next - Local::now()).to_std().unwrap_or_default();
 
         info!(at = %next, "morning brief scheduled");
@@ -161,5 +167,41 @@ pub async fn loop_forever(db: Arc<DbHandle>, am: AdapterManager) {
         } else {
             info!("morning brief sent");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_at_resolves_an_ordinary_time_without_panicking() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let time = NaiveTime::from_hms_opt(7, 30, 0).unwrap();
+        let resolved = local_at(date, time);
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().naive_local().time(), time);
+    }
+
+    #[test]
+    fn next_occurrence_never_panics_for_any_hhmm_in_a_full_day() {
+        // Sweep every minute of the day; `.earliest()` must never panic even though
+        // some of these times fall inside a DST gap/overlap on the host's local
+        // timezone (whatever that happens to be in CI).
+        for h in 0..24 {
+            for m in [0, 15, 30, 45] {
+                let time = NaiveTime::from_hms_opt(h, m, 0).unwrap();
+                // Either resolves to a valid instant or is skipped — both are
+                // acceptable outcomes; a panic is the only failure mode being guarded.
+                let _ = next_occurrence(time);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_hhmm_rejects_malformed_input_instead_of_panicking() {
+        assert!(parse_hhmm("07:30").is_some());
+        assert!(parse_hhmm("garbage").is_none());
+        assert!(parse_hhmm("25:99").is_none());
     }
 }

@@ -72,14 +72,27 @@ pub fn strip_tool_markup(text: &str) -> String {
 /// tool result before it is fed back to the LLM, defusing second-order prompt
 /// injection from untrusted sources (web pages, fetched URLs).
 pub fn strip_tool_tags(text: &str) -> String {
-    text.replace("<tool_call>", "")
-        .replace("</tool_call>", "")
-        .replace("<tool_result>", "")
-        .replace("</tool_result>", "")
+    // Loop to a fixpoint: a single pass on a nested token like `<tool_<tool_call>call>`
+    // would reassemble into a live `<tool_call>`. Repeat until the text stops changing.
+    let mut out = text.to_string();
+    loop {
+        let stripped = out
+            .replace("<tool_call>", "")
+            .replace("</tool_call>", "")
+            .replace("<tool_result>", "")
+            .replace("</tool_result>", "");
+        if stripped == out {
+            return out;
+        }
+        out = stripped;
+    }
 }
 
 /// Execute a parsed tool call: check class, run, send status chunk.
-/// Returns the tool result string to inject as a tool_result message.
+///
+/// Returns `(result_text, ok)` — `ok` is the typed success/failure signal (previously
+/// inferred by callers via `result.starts_with("Error:")`, which misclassified any
+/// legitimate tool output that happened to start with that literal string).
 ///
 /// The loop-guard is checked by the caller *before* dispatch so a tripped guard
 /// can terminate the turn — feeding a guard error back here would let a looping
@@ -90,7 +103,7 @@ pub async fn dispatch(
     registry: &ToolRegistry,
     ctx: &ToolContext,
     tx: &mpsc::Sender<ResponseChunk>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let tool = registry
         .get(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{tool_name}'"))?;
@@ -121,19 +134,19 @@ pub async fn dispatch(
     }
 
     info!(tool = tool_name, "executing tool");
-    let result = match tool.execute(args, ctx).await {
+    let (result, ok) = match tool.execute(args, ctx).await {
         Ok(output) => {
             let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: true }).await;
-            output
+            (output, true)
         }
         Err(e) => {
             warn!(tool = tool_name, error = %e, "tool failed");
             let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
-            format!("Tool error: {e:#}")
+            (format!("Tool error: {e:#}"), false)
         }
     };
 
-    Ok(result)
+    Ok((result, ok))
 }
 
 #[cfg(test)]
@@ -182,5 +195,79 @@ mod tests {
             let _ = g.check("web_search", &args);
         }
         assert!(g.check("web_search", &serde_json::json!({"q": "final"})).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // F17 — dispatch returns a typed (text, ok) signal, not a string-prefix contract.
+    // -----------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use haily_tools::Tool;
+
+    /// A tool whose success text happens to start with "Error:" — the old contract
+    /// (`result.starts_with("Error:")`) would have misclassified this as a failure.
+    struct LiteralErrorPrefixTool;
+
+    #[async_trait]
+    impl Tool for LiteralErrorPrefixTool {
+        fn name(&self) -> &str { "literal_error_prefix" }
+        fn description(&self) -> &str { "returns legit text starting with 'Error:'" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("Error: this is the literal log line the user asked to fetch".to_string())
+        }
+    }
+
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str { "failing_tool" }
+        fn description(&self) -> &str { "always errors" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Err(anyhow::anyhow!("boom"))
+        }
+    }
+
+    async fn test_tool_ctx() -> (ToolContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = std::sync::Arc::new(haily_db::DbHandle::init(&db_path).await.unwrap());
+        let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone()).await.unwrap());
+        let ctx = ToolContext { db, kms, session_id: Uuid::new_v4(), depth: 0 };
+        (ctx, dir)
+    }
+
+    #[tokio::test]
+    async fn dispatch_marks_legit_text_starting_with_error_prefix_as_ok() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(LiteralErrorPrefixTool));
+        let (ctx, _dir) = test_tool_ctx().await;
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx, &tx)
+            .await
+            .unwrap();
+
+        assert!(ok, "typed signal must be true even though the text starts with 'Error:'");
+        assert!(text.starts_with("Error:"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_marks_actual_tool_failure_as_not_ok() {
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(FailingTool));
+        let (ctx, _dir) = test_tool_ctx().await;
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx, &tx)
+            .await
+            .unwrap();
+
+        assert!(!ok, "a genuinely failing tool must report ok=false");
+        assert!(text.contains("boom"));
     }
 }

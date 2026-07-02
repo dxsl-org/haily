@@ -75,8 +75,12 @@ pub async fn build_messages(
     session_id: &str,
     user_message: &str,
 ) -> anyhow::Result<(Vec<Message>, LifeContext)> {
-    // Load identity + preferences
-    let mut ctx = kms.build_life_context(uuid::Uuid::parse_str(session_id).unwrap_or_default()).await?;
+    // Load identity + preferences. A malformed session_id must fail loudly here —
+    // silently substituting Uuid::nil() (the old `unwrap_or_default()` behavior) would
+    // route this turn's memory/preferences lookups to the wrong (nil) identity.
+    let parsed_session_id = uuid::Uuid::parse_str(session_id)
+        .map_err(|e| anyhow::anyhow!("invalid session_id '{session_id}': {e}"))?;
+    let mut ctx = kms.build_life_context(parsed_session_id).await?;
 
     // Hybrid search to surface relevant facts for this message
     let search_results = kms.search_hybrid(user_message, 8).await.unwrap_or_default();
