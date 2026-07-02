@@ -1,0 +1,34 @@
+[package]
+name = "haily-app"
+version.workspace = true
+edition.workspace = true
+description = "Shared application bootstrap, dispatch loop, and graceful shutdown — one implementation reused by CLI, headless, and Tauri GUI modes"
+
+[dependencies]
+haily-core      = { workspace = true }
+haily-io        = { workspace = true }
+haily-db        = { workspace = true }
+haily-kms       = { workspace = true }
+haily-llm       = { workspace = true }
+haily-proactive = { workspace = true }
+haily-types     = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+anyhow      = { workspace = true }
+tracing     = { workspace = true }
+serde_json  = { workspace = true }
+
+[features]
+default = []
+# Enable embedded llama.cpp inference config fields (mirrors haily-llm/llama).
+# When off, `haily-app` must still compile — the CLI's default (no-llama) build
+# depends on this.
+llama  = ["haily-llm/llama"]
+cuda   = ["haily-llm/cuda"]
+metal  = ["haily-llm/metal"]
+vulkan = ["haily-llm/vulkan"]
+
+[dev-dependencies]
+tempfile = "3"
+async-trait = "0.1"
+uuid = { workspace = true }

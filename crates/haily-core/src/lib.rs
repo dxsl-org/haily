@@ -15,6 +15,8 @@ use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub struct Orchestrator {
     pub kms: Arc<KmsHandle>,
@@ -26,10 +28,18 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
+    /// Initialise the orchestrator and spawn its background self-improvement workers.
+    ///
+    /// `shutdown`/`tasks` wire the workers into the caller's shutdown sequence: the
+    /// workers select on `shutdown.cancelled()` and exit promptly instead of waiting
+    /// out their sleep interval, and are registered on `tasks` so `TaskTracker::wait()`
+    /// only resolves once they have actually exited.
     pub async fn init(
         kms: Arc<KmsHandle>,
         db: Arc<DbHandle>,
         config: LlmConfig,
+        shutdown: CancellationToken,
+        tasks: TaskTracker,
     ) -> Result<Self> {
         let llm_inner = Arc::new(LlmRouter::init(config).await);
 
@@ -104,7 +114,7 @@ impl Orchestrator {
             _ => {}
         }
 
-        Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm_inner));
+        Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm_inner), shutdown, tasks);
         let llm = Arc::new(RwLock::new(llm_inner));
 
         Ok(Self { kms, db, llm, tools })
@@ -144,31 +154,91 @@ impl Orchestrator {
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).
-    fn spawn_self_improvement_workers(kms: Arc<KmsHandle>, llm: Arc<LlmRouter>) {
+    ///
+    /// Both loops select on `shutdown.cancelled()` so they wake and exit immediately
+    /// on shutdown rather than finishing out a up-to-24h sleep, and are registered on
+    /// `tasks` so the caller's `TaskTracker::wait()` blocks until they have exited.
+    fn spawn_self_improvement_workers(
+        kms: Arc<KmsHandle>,
+        llm: Arc<LlmRouter>,
+        shutdown: CancellationToken,
+        tasks: TaskTracker,
+    ) {
         // Skill synthesis — every 1 hour
         let kms_s = Arc::clone(&kms);
         let llm_s = Arc::clone(&llm);
-        tokio::spawn(async move {
+        let shutdown_s = shutdown.clone();
+        tasks.spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                match kms_s.synthesize_skills(llm_s.as_ref()).await {
-                    Ok(v) if !v.is_empty() => tracing::info!(count = v.len(), "skills synthesized"),
-                    Err(e) => tracing::warn!("skill synthesis failed: {e:#}"),
-                    _ => {}
+                tokio::select! {
+                    _ = shutdown_s.cancelled() => {
+                        tracing::info!("skill synthesis worker shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
+                        match kms_s.synthesize_skills(llm_s.as_ref()).await {
+                            Ok(v) if !v.is_empty() => tracing::info!(count = v.len(), "skills synthesized"),
+                            Err(e) => tracing::warn!("skill synthesis failed: {e:#}"),
+                            _ => {}
+                        }
+                    }
                 }
             }
         });
 
         // Skill decay — every 24 hours
         let kms_d = Arc::clone(&kms);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
-                if let Err(e) = kms_d.decay_skills().await {
-                    tracing::warn!("skill decay failed: {e:#}");
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("skill decay worker shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(86400)) => {
+                        if let Err(e) = kms_d.decay_skills().await {
+                            tracing::warn!("skill decay failed: {e:#}");
+                        }
+                    }
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    //! Verifies the self-improvement workers actually observe cancellation instead of
+    //! sleeping out their full interval — the bug this phase fixes (workers spawned
+    //! detached with no shutdown hook at all).
+    use super::*;
+
+    #[tokio::test]
+    async fn self_improvement_workers_exit_promptly_on_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone()).await.expect("kms init"));
+        let llm = Arc::new(LlmRouter::init(LlmConfig::default()).await);
+
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+
+        Orchestrator::spawn_self_improvement_workers(
+            Arc::clone(&kms),
+            Arc::clone(&llm),
+            shutdown.clone(),
+            tasks.clone(),
+        );
+
+        // Both workers sleep for 1h/24h; if cancellation isn't observed, this would
+        // hang until the test harness times out. Bound the wait tightly to prove the
+        // `select!` arm — not the sleep — is what ends the loop.
+        shutdown.cancel();
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .expect("workers must exit promptly on cancellation, not after their sleep interval");
     }
 }
 

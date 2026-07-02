@@ -7,12 +7,13 @@ use haily_db::{queries::{calendar, tasks}, DbHandle};
 use haily_io::{AdapterManager, Notification};
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 const POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
 const MEETING_PREP_MINS: i64 = 15;
 
-pub async fn alert_loop(db: Arc<DbHandle>, am: AdapterManager) {
+pub async fn alert_loop(db: Arc<DbHandle>, am: AdapterManager, shutdown: CancellationToken) {
     let alerted_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let alerted_tasks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -22,7 +23,10 @@ pub async fn alert_loop(db: Arc<DbHandle>, am: AdapterManager) {
             check_overdue_tasks(&db, &am, &alerted_tasks).await;
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => { info!("cross-domain alert loop shutting down"); break; }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+        }
     }
 }
 

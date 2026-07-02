@@ -9,13 +9,10 @@ name = "haily-cli"
 path = "src/main.rs"
 
 [dependencies]
-haily-db        = { workspace = true }
-haily-llm       = { workspace = true }
+haily-app       = { workspace = true }
 haily-io        = { workspace = true }
-haily-kms       = { workspace = true }
-haily-core      = { workspace = true }
-haily-proactive = { workspace = true }
 tokio     = { workspace = true }
+tokio-util = { workspace = true }
 anyhow    = { workspace = true }
 tracing   = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -32,7 +29,7 @@ default = []
 telegram = ["haily-io/telegram"]
 # Enable embedded llama.cpp inference (requires C++ compiler + cmake).
 # Pass a GGUF model path via the `llm.llama_model_path` preference.
-llama  = ["haily-llm/llama"]
-cuda   = ["haily-llm/cuda"]
-metal  = ["haily-llm/metal"]
-vulkan = ["haily-llm/vulkan"]
+llama  = ["haily-app/llama"]
+cuda   = ["haily-app/cuda"]
+metal  = ["haily-app/metal"]
+vulkan = ["haily-app/vulkan"]

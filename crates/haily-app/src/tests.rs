@@ -1,0 +1,155 @@
+//! Integration tests for bootstrap + shutdown. See `test_support` for the mock
+//! adapter and the hand-rolled slow-LLM HTTP responder shared across these tests.
+use crate::bootstrap::{AppHandle, BootstrapOptions};
+use crate::test_support::{cloud_config, spawn_slow_llm_server, MockAdapter};
+use haily_io::{Adapter, ResponseChunk};
+use std::sync::Arc;
+
+/// Critical: bootstrap with a mock adapter, send a request, and confirm a response
+/// (`Complete` chunk) comes back through the same adapter — proves the dispatch loop
+/// wiring (adapter → orchestrator → adapter) works end to end.
+#[tokio::test]
+async fn bootstrap_roundtrips_a_request_through_the_mock_adapter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base_url = spawn_slow_llm_server(std::time::Duration::ZERO).await;
+
+    let adapter = MockAdapter::new();
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    // Real LLM config only reachable after bootstrap (KMS preferences start empty),
+    // so reload with the test server's URL for this specific turn.
+    handle.orchestrator.reload_llm(cloud_config(base_url)).await;
+
+    let session_id = adapter.send("hello").await;
+
+    // Poll for the Complete chunk rather than a fixed sleep — bounded by an overall
+    // timeout so a wiring regression fails fast instead of hanging the suite.
+    let chunks = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let chunks = adapter.chunks_for(session_id);
+            if chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)) {
+                return chunks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("turn did not complete in time");
+
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("mock completion"))),
+        "expected the mock LLM's completion text to be delivered, got: {chunks:?}"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+/// Critical: after `shutdown()`, every tracked task (dispatch loop, watcher, daemon
+/// loops, self-improvement workers) must have exited — none leaked running past the
+/// call.
+#[tokio::test]
+async fn shutdown_drains_all_tracked_tasks_within_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let adapter = MockAdapter::new();
+
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    assert!(handle.task_count() > 0, "bootstrap should have registered background tasks");
+
+    // shutdown() itself asserts internally (via TaskTracker::wait under a timeout);
+    // reaching this line without hanging is the pass condition for "no task leaked".
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown(std::time::Duration::from_secs(5)))
+        .await
+        .expect("shutdown must not hang past its own timeout budget");
+}
+
+/// Critical: shutdown() during an in-flight turn blocks until the turn task returns —
+/// proves the per-turn spawn (dispatch.rs) goes through the TaskTracker, not a bare
+/// detached `tokio::spawn`. A 1.5s artificial LLM latency together with a bounded
+/// shutdown timeout would fail this test if the per-turn task were untracked
+/// (shutdown would return almost immediately instead of waiting ~1.5s).
+#[tokio::test]
+async fn shutdown_blocks_until_an_in_flight_turn_finishes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let turn_latency = std::time::Duration::from_millis(1500);
+    let base_url = spawn_slow_llm_server(turn_latency).await;
+
+    let adapter = MockAdapter::new();
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    handle.orchestrator.reload_llm(cloud_config(base_url)).await;
+    let session_id = adapter.send("slow turn").await;
+
+    // Give the request time to reach the orchestrator and start the (slow) LLM call
+    // before triggering shutdown, so this genuinely races an in-flight turn rather
+    // than one that hasn't started yet.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let shutdown_started = std::time::Instant::now();
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+    let shutdown_elapsed = shutdown_started.elapsed();
+
+    assert!(
+        shutdown_elapsed >= std::time::Duration::from_millis(1000),
+        "shutdown returned after {shutdown_elapsed:?}, expected it to block for ~{turn_latency:?} \
+         waiting on the in-flight turn — the per-turn task is not being tracked"
+    );
+
+    let chunks = adapter.chunks_for(session_id);
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)),
+        "the in-flight turn should have been allowed to finish and deliver Complete"
+    );
+}
+
+/// High: CLI mode enables the proactive daemon (mode asymmetry fix — F6). Verified by
+/// task count delta rather than log scraping: with the daemon enabled, bootstrap
+/// registers strictly more tasks than with it disabled (watcher + dispatch only).
+#[tokio::test]
+async fn daemon_option_registers_additional_background_tasks() {
+    let dir_with = tempfile::tempdir().expect("tempdir");
+    let with_daemon = AppHandle::bootstrap(
+        dir_with.path(),
+        vec![MockAdapter::new() as Arc<dyn Adapter>],
+        BootstrapOptions { enable_daemon: true, enable_watcher: true },
+    )
+    .await
+    .expect("bootstrap with daemon");
+    let count_with = with_daemon.task_count();
+    with_daemon.shutdown(std::time::Duration::from_secs(5)).await;
+
+    let dir_without = tempfile::tempdir().expect("tempdir");
+    let without_daemon = AppHandle::bootstrap(
+        dir_without.path(),
+        vec![MockAdapter::new() as Arc<dyn Adapter>],
+        BootstrapOptions { enable_daemon: false, enable_watcher: true },
+    )
+    .await
+    .expect("bootstrap without daemon");
+    let count_without = without_daemon.task_count();
+    without_daemon.shutdown(std::time::Duration::from_secs(5)).await;
+
+    assert!(
+        count_with > count_without,
+        "enabling the proactive daemon should register additional background tasks \
+         (with={count_with}, without={count_without})"
+    );
+}

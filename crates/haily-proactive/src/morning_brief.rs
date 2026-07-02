@@ -6,6 +6,7 @@ use haily_db::{
 };
 use haily_io::{AdapterManager, Notification};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 const DEFAULT_BRIEF_TIME: &str = "07:30";
@@ -140,21 +141,29 @@ async fn generate_brief(db: &DbHandle) -> String {
     )
 }
 
-/// Runs forever: sleeps until the configured morning-brief time, sends the brief, repeats.
-pub async fn loop_forever(db: Arc<DbHandle>, am: AdapterManager) {
+/// Runs until `shutdown` is cancelled: sleeps until the configured morning-brief
+/// time, sends the brief, repeats. Cancellation is observed at every sleep point so
+/// shutdown does not wait out the (up to 24h) delay until the next brief.
+pub async fn loop_forever(db: Arc<DbHandle>, am: AdapterManager, shutdown: CancellationToken) {
     loop {
         let brief_time = load_brief_time(&db).await;
         let Some(next) = next_occurrence(brief_time) else {
             // Both today's and tomorrow's occurrence fell in a DST gap — extremely rare.
             // Skip this cycle and re-evaluate in an hour rather than busy-looping.
             warn!("morning brief: occurrence time falls in a DST gap — skipping, retrying in 1h");
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => { info!("morning brief loop shutting down"); break; }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+            }
             continue;
         };
         let delay = (next - Local::now()).to_std().unwrap_or_default();
 
         info!(at = %next, "morning brief scheduled");
-        tokio::time::sleep(delay).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => { info!("morning brief loop shutting down"); break; }
+            _ = tokio::time::sleep(delay) => {}
+        }
 
         if crate::dnd::is_active(&db).await {
             info!("morning brief suppressed by DND");

@@ -2203,21 +2203,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "haily-cli"
+name = "haily-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "dirs 5.0.1",
+ "async-trait",
  "haily-core",
  "haily-db",
  "haily-io",
  "haily-kms",
  "haily-llm",
  "haily-proactive",
+ "haily-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "haily-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "haily-app",
+ "haily-io",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2241,6 +2259,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2275,6 +2294,7 @@ dependencies = [
  "teloxide",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2323,7 +2343,9 @@ dependencies = [
  "chrono",
  "haily-db",
  "haily-io",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -2334,12 +2356,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
- "haily-core",
+ "haily-app",
  "haily-db",
  "haily-io",
  "haily-kms",
- "haily-llm",
- "haily-proactive",
  "serde",
  "serde_json",
  "tauri",
@@ -6712,6 +6732,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

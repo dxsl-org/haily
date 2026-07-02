@@ -12,6 +12,7 @@ telegram = ["dep:teloxide"]
 [dependencies]
 haily-types = { workspace = true }
 tokio       = { workspace = true }
+tokio-util  = { workspace = true }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }

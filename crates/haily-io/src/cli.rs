@@ -3,17 +3,27 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub struct CliAdapter {
     /// Active work items cached by notify(WorkItemsChanged). Read before each prompt.
     /// Only the REPL loop writes to stdout, so updating this from notify() is race-free.
     status: Arc<Mutex<Vec<WorkItemStatus>>>,
+    /// Cancelled when the stdin reader hits EOF (Ctrl+D) or a fatal read error, so the
+    /// app entry point can treat "input stream closed" as a shutdown request.
+    eof: CancellationToken,
 }
 
 impl CliAdapter {
     pub fn new() -> Self {
-        Self { status: Arc::new(Mutex::new(Vec::new())) }
+        Self { status: Arc::new(Mutex::new(Vec::new())), eof: CancellationToken::new() }
+    }
+
+    /// A token that fires when stdin closes (Ctrl+D). The entry point races this
+    /// alongside OS signals so Ctrl+D quits cleanly instead of leaving an idle process.
+    pub fn eof_token(&self) -> CancellationToken {
+        self.eof.clone()
     }
 }
 
@@ -30,6 +40,7 @@ impl Adapter for CliAdapter {
     async fn start(&self, tx: RequestSender) -> Result<()> {
         let session_id = Uuid::new_v4();
         let status = Arc::clone(&self.status);
+        let eof = self.eof.clone();
 
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
@@ -65,10 +76,14 @@ impl Adapter for CliAdapter {
 
                 let mut line = String::new();
                 match reader.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        eof.cancel(); // EOF (Ctrl+D) → request app shutdown
+                        break;
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         tracing::error!("stdin read error: {e}");
+                        eof.cancel();
                         break;
                     }
                 }

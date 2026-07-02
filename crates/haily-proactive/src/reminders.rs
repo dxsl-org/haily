@@ -3,6 +3,7 @@ use chrono::{Duration, Utc};
 use haily_db::{queries::reminders, DbHandle};
 use haily_io::{AdapterManager, Notification};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -20,8 +21,9 @@ fn next_recurrence(base: &str, rule: &str) -> Option<String> {
     Some(next.to_rfc3339())
 }
 
-/// Runs forever: polls every POLL_INTERVAL_SECS for due reminders and fires them.
-pub async fn poll_loop(db: Arc<DbHandle>, am: AdapterManager) {
+/// Runs until `shutdown` is cancelled: polls every `POLL_INTERVAL_SECS` for due
+/// reminders and fires them.
+pub async fn poll_loop(db: Arc<DbHandle>, am: AdapterManager, shutdown: CancellationToken) {
     loop {
         let now = Utc::now().to_rfc3339();
 
@@ -34,7 +36,10 @@ pub async fn poll_loop(db: Arc<DbHandle>, am: AdapterManager) {
             Err(e) => warn!("reminder poll failed: {e:#}"),
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => { info!("reminder poll loop shutting down"); break; }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+        }
     }
 }
 

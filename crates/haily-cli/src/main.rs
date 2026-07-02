@@ -1,9 +1,9 @@
-mod runtime;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use haily_io::AdapterManager;
-use std::{path::PathBuf, sync::Arc};
+use haily_app::{AppHandle, BootstrapOptions};
+use haily_io::{Adapter, CliAdapter};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 #[derive(Parser)]
@@ -27,6 +27,11 @@ enum Mode {
     Gui,
 }
 
+/// Windows console-close (`CTRL_CLOSE_EVENT`) gives a hard ~5s OS kill window before
+/// a force-kill — budget the drain well under that. Unix has no equivalent hard
+/// deadline; the same constant is reused there for consistency, not necessity.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -34,7 +39,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Cli::parse();
-    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    let data_dir = args.data_dir.unwrap_or_else(haily_app::default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
     match args.mode.unwrap_or(Mode::Cli) {
@@ -44,42 +49,32 @@ async fn main() -> Result<()> {
     }
 }
 
-fn default_data_dir() -> PathBuf {
-    // Portable-first: store data next to the exe in ./data/
-    // Falls back to relative "data/" if current_exe() fails (e.g. unit tests).
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("data")))
-        .unwrap_or_else(|| PathBuf::from("data"))
-}
-
 async fn run_cli(data_dir: PathBuf) -> Result<()> {
-    let (_, _, orc) = runtime::init(&data_dir).await?;
+    let cli = Arc::new(CliAdapter::new());
+    let eof = cli.eof_token();
+    let adapters: Vec<Arc<dyn Adapter>> = vec![cli];
+    let handle = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default()).await?;
 
-    eprintln!("Haily — CLI  |  LLM: {}  |  data: {}", orc.llm_provider(), data_dir.display());
+    eprintln!(
+        "Haily — CLI  |  LLM: {}  |  data: {}",
+        handle.orchestrator.llm_provider(),
+        data_dir.display()
+    );
     eprintln!("Type a message and press Enter. Ctrl+D to quit.\n");
 
-    let am = AdapterManager::builder()
-        .register(Arc::new(haily_io::CliAdapter::new()))
-        .build();
-
-    runtime::dispatch_loop(am, orc).await
+    wait_for_shutdown_signal(eof).await;
+    handle.shutdown(SHUTDOWN_TIMEOUT).await;
+    Ok(())
 }
 
 async fn run_headless(data_dir: PathBuf) -> Result<()> {
-    let (db, _kms, orc) = runtime::init(&data_dir).await?;
-
     #[allow(unused_mut)]
-    let mut builder = AdapterManager::builder();
+    let mut adapters: Vec<Arc<dyn Adapter>> = Vec::new();
 
     #[cfg(feature = "telegram")]
     match std::env::var("TELEGRAM_BOT_TOKEN") {
-        Ok(token) => {
-            builder = builder.register(Arc::new(haily_io::TelegramAdapter::new(Some(token))));
-        }
-        Err(_) => {
-            warn!("TELEGRAM_BOT_TOKEN not set — Telegram adapter disabled");
-        }
+        Ok(token) => adapters.push(Arc::new(haily_io::TelegramAdapter::new(Some(token)))),
+        Err(_) => warn!("TELEGRAM_BOT_TOKEN not set — Telegram adapter disabled"),
     }
 
     #[cfg(not(feature = "telegram"))]
@@ -88,12 +83,18 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
          Rebuild with `--features telegram` to enable the Telegram adapter."
     );
 
-    eprintln!("Haily — Headless  |  LLM: {}  |  data: {}", orc.llm_provider(), data_dir.display());
+    let handle = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default()).await?;
 
-    let am = builder.build();
+    eprintln!(
+        "Haily — Headless  |  LLM: {}  |  data: {}",
+        handle.orchestrator.llm_provider(),
+        data_dir.display()
+    );
 
-    haily_proactive::ProactiveDaemon::new(db, am.clone()).start();
-    runtime::dispatch_loop(am, orc).await
+    // Headless has no interactive stdin; a never-cancelled token means "OS signals only".
+    wait_for_shutdown_signal(CancellationToken::new()).await;
+    handle.shutdown(SHUTDOWN_TIMEOUT).await;
+    Ok(())
 }
 
 fn run_gui() -> Result<()> {
@@ -102,4 +103,59 @@ fn run_gui() -> Result<()> {
         "GUI mode is implemented in Phase 10 (Tauri). \
          Run `haily cli` for the terminal interface, or `haily headless` for daemon mode."
     )
+}
+
+/// Races every OS-delivered "please stop" signal and returns on the first one.
+///
+/// `tokio::signal::ctrl_c()` alone only catches `CTRL_C_EVENT` on Windows — console
+/// window close, logoff, and system shutdown are distinct signals
+/// (`CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN`) that must be registered separately.
+/// On non-Windows, `SIGTERM` is the equivalent "please stop" signal Ctrl+C alone
+/// would miss (e.g. from a process manager or `kill`).
+async fn wait_for_shutdown_signal(eof: CancellationToken) {
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_logoff, ctrl_shutdown};
+        // Registering console control handlers can fail when no console is attached
+        // (e.g. launched under a Windows service manager). Degrade to Ctrl+C + EOF
+        // rather than aborting the process.
+        match (ctrl_close(), ctrl_logoff(), ctrl_shutdown()) {
+            (Ok(mut close), Ok(mut logoff), Ok(mut shutdown)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = close.recv() => {}
+                    _ = logoff.recv() => {}
+                    _ = shutdown.recv() => {}
+                    _ = eof.cancelled() => {}
+                }
+            }
+            _ => {
+                warn!("could not register console control handlers — using Ctrl+C + EOF only");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = eof.cancelled() => {}
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                    _ = eof.cancelled() => {}
+                }
+            }
+            Err(e) => {
+                warn!("could not register SIGTERM handler ({e}) — using Ctrl+C + EOF only");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = eof.cancelled() => {}
+                }
+            }
+        }
+    }
 }

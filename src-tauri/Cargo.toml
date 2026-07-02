@@ -16,8 +16,8 @@ default = []
 # GPU acceleration for embedded llama.cpp. Enabling one of these requires the
 # matching native toolchain at build time (CUDA Toolkit / Vulkan SDK). Pass via
 # `cargo tauri build --features cuda` — or use `build.ps1 -Gpu cuda`.
-cuda   = ["haily-llm/cuda"]
-vulkan = ["haily-llm/vulkan"]
+cuda   = ["haily-app/cuda"]
+vulkan = ["haily-app/vulkan"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,12 +25,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
-haily-core      = { path = "../crates/haily-core" }
-haily-io        = { path = "../crates/haily-io" }
-haily-db        = { path = "../crates/haily-db" }
-haily-kms       = { path = "../crates/haily-kms" }
-haily-proactive = { path = "../crates/haily-proactive" }
-haily-llm  = { path = "../crates/haily-llm", features = ["llama"] }
+haily-app  = { path = "../crates/haily-app", features = ["llama"] }
+haily-io   = { path = "../crates/haily-io" }
+haily-db   = { path = "../crates/haily-db" }
+haily-kms  = { path = "../crates/haily-kms" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio      = { version = "1", features = ["full"] }
