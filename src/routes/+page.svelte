@@ -42,6 +42,13 @@
   // session_id → index in messages[] of the pending assistant bubble
   const sessionIndex = new Map<string, number>();
 
+  // Every session id this GUI instance has started, oldest first — each turn mints a
+  // fresh UUID (see `send()`), so there is no single "current session" the Safety tab's
+  // recent-actions list could scope to. Passed to `Settings` as a getter so it always
+  // reads the live array rather than a snapshot taken when the drawer first opened.
+  const seenSessionIds: string[] = [];
+  const getSessionIds = () => seenSessionIds;
+
   onMount(() => {
     const unlistenPromise = listen<ChunkPayload>('haily-chunk', ({ payload }) => {
       const { session_id, chunk } = payload;
@@ -121,6 +128,7 @@
     try {
       const sessionId = await invoke<string>('send_message', { message: text });
       sessionIndex.set(sessionId, assistantIdx);
+      seenSessionIds.push(sessionId);
       activeSession = sessionId;
     } catch (e) {
       messages[assistantIdx].content = `⚠️ Lỗi kết nối: ${e}`;
@@ -180,7 +188,7 @@
     </button>
   </header>
 
-  <Settings bind:open={settingsOpen} />
+  <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
   <ApprovalModal bind:pending={pendingApproval} />
 
   <div class="messages">

@@ -2,10 +2,11 @@
   import { invoke } from '@tauri-apps/api/core';
   import ModelTab from './settings/ModelTab.svelte';
   import PersonaTab from './settings/PersonaTab.svelte';
+  import SafetyTab from './settings/SafetyTab.svelte';
 
-  let { open = $bindable(false) } = $props();
+  let { open = $bindable(false), sessionIds = () => [] as string[] } = $props();
 
-  type Tab = 'model' | 'persona' | 'other';
+  type Tab = 'model' | 'persona' | 'safety';
   let tab = $state<Tab>('model');
   let prefs = $state<Record<string, string>>({});
   let loading = $state(false);
@@ -37,7 +38,7 @@
   const tabs: { id: Tab; label: string }[] = [
     { id: 'model',   label: 'Model LLM' },
     { id: 'persona', label: 'Persona' },
-    { id: 'other',   label: 'Khác' },
+    { id: 'safety',  label: 'Safety' },
   ];
 </script>
 
@@ -72,10 +73,7 @@
       {:else if tab === 'persona'}
         <PersonaTab {prefs} {save} />
       {:else}
-        <div class="placeholder">
-          <span class="ph-icon">🔧</span>
-          <p>Sẽ bổ sung thêm trong các phiên bản tới.</p>
-        </div>
+        <SafetyTab {prefs} {save} {sessionIds} />
       {/if}
     </div>
   </div>
@@ -166,16 +164,4 @@
   }
 
   .spinner { color: #6b6b8a; font-size: 13px; text-align: center; padding: 40px 0; }
-
-  .placeholder {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    padding: 48px 0;
-    color: #6b6b8a;
-    font-size: 13px;
-    text-align: center;
-  }
-  .ph-icon { font-size: 28px; }
 </style>

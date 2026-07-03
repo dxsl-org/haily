@@ -140,6 +140,38 @@ impl Adapter for CliAdapter {
                     continue;
                 }
 
+                // `/undo <journal_id>` is a shorthand for a precise chat instruction — there
+                // is no dedicated undo backend command (phase 6 is surface-only); this just
+                // rewrites to the same wording the GUI's Undo button sends, so the LLM's
+                // existing `journal_undo` tool call and the approval gate handle the rest.
+                if let Some(arg) = message.strip_prefix("/undo") {
+                    match parse_undo_command(arg) {
+                        Some(undo_message) => {
+                            stdout.write_all(b"Haily: ").await.ok();
+                            stdout.flush().await.ok();
+                            if tx
+                                .send(Request {
+                                    session_id,
+                                    adapter_id: "cli".to_string(),
+                                    message: undo_message,
+                                    user_ref: None,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break; // orchestrator shut down
+                            }
+                        }
+                        None => {
+                            let _ = stdout
+                                .write_all(b"[undo] usage: /undo <journal_id>\n")
+                                .await;
+                            stdout.flush().await.ok();
+                        }
+                    }
+                    continue;
+                }
+
                 // If a tool approval is pending, the next non-empty line is the y/n
                 // answer to it — NOT a new chat message. Consumed (taken) here so a
                 // stray extra line afterward falls through to normal chat handling.
@@ -347,6 +379,17 @@ fn handle_writes_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>, arg: &str) 
     }
 }
 
+/// Parse a `/undo` REPL command. `arg` is the text after `/undo`. Returns the chat
+/// message to forward to the orchestrator, or `None` (print usage, send nothing) if no
+/// id was given — pure and unit-testable, mirroring `handle_writes_command`.
+fn parse_undo_command(arg: &str) -> Option<String> {
+    let id = arg.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!("Undo the action with journal id \"{id}\"."))
+}
+
 /// Compact status panel rendered above the `You:` prompt when tasks are active.
 ///
 /// Each line: `  ⚙ "title" [last_tool] 30%`
@@ -471,5 +514,30 @@ mod tests {
             cli.awaiting.lock().unwrap().is_none(),
             "awaiting state must be cleared (taken) after being consumed"
         );
+    }
+
+    /// A well-formed `/undo <id>` builds a precise chat instruction naming that id — the
+    /// same wording the GUI's Undo button sends, so both surfaces drive the LLM's
+    /// `journal_undo` tool call identically.
+    #[test]
+    fn parse_undo_command_builds_message_for_given_id() {
+        let msg = parse_undo_command(" abc-123 ").expect("id present");
+        assert_eq!(msg, "Undo the action with journal id \"abc-123\".");
+    }
+
+    /// An unknown/garbage id is still just forwarded as text — the tool layer (not the
+    /// CLI) is responsible for a clean "not found" reply, so this must never panic.
+    #[test]
+    fn parse_undo_command_forwards_unknown_id_without_panicking() {
+        let msg = parse_undo_command("does-not-exist").expect("id present");
+        assert!(msg.contains("does-not-exist"));
+    }
+
+    /// Missing id → `None` (print usage), not a malformed "Undo the action with journal
+    /// id \"\"." request sent to the orchestrator.
+    #[test]
+    fn parse_undo_command_missing_id_returns_none() {
+        assert_eq!(parse_undo_command(""), None);
+        assert_eq!(parse_undo_command("   "), None);
     }
 }

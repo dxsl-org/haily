@@ -25,10 +25,15 @@
 {#if pending}
   <div class="backdrop" role="presentation"></div>
   <div class="modal" role="alertdialog" aria-modal="true" aria-label="Yêu cầu phê duyệt công cụ">
-    <h2>⚙️ Yêu cầu phê duyệt</h2>
+    <!-- Every approval that reaches this modal is an IrreversibleWrite (Read and
+         ReversibleWrite tools never gate — see haily-core::tool_call::dispatch), so
+         the badge is a constant, not a per-tool computed value. Plain, non-technical
+         copy per the phase-6 spec — no "RiskTier"/"IrreversibleWrite" jargon in the UI. -->
+    <span class="tier-badge">⚠ Can't be undone</span>
+    <h2>I'll ask you first</h2>
     <p class="tool-name"><code>{pending.tool}</code></p>
     {#if pending.origin}
-      <p class="origin">Yêu cầu bởi: <code>{pending.origin}</code></p>
+      <p class="origin">Requested by: <code>{pending.origin}</code></p>
     {/if}
     <pre class="args">{pending.args}</pre>
     <div class="actions">
@@ -58,6 +63,19 @@
     width: min(420px, 90vw);
     z-index: 101;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  .tier-badge {
+    display: inline-block;
+    background: #3a1f2e;
+    color: #f87171;
+    border: 1px solid #7f1d1d;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    padding: 3px 10px;
+    margin-bottom: 10px;
   }
 
   h2 {

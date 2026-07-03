@@ -4,7 +4,10 @@
 mod models;
 
 use haily_app::{AppHandle, BootstrapOptions, TurnRegistry};
-use haily_db::{queries::meta, DbHandle};
+use haily_db::{
+    queries::{journal, meta},
+    DbHandle,
+};
 use haily_io::{Adapter, ApprovalResolver, GuiRequestSender, GuiResponseReceiver, Request};
 use haily_kms::KmsHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +105,29 @@ fn list_local_models() -> Vec<serde_json::Value> {
     models::list_local_models()
 }
 
+/// Recent action-journal rows for the Safety tab's undo surface (phase 6). Each GUI turn
+/// mints a fresh `session_id` (see `send_message`), so there is no single "current
+/// session" to scope a recent-actions list to — the frontend instead tracks every
+/// session id it has started this run and passes them here. Reuses `journal::list_by_session`
+/// per id (no new query logic, per the phase-6 architecture note) and merges by recency;
+/// an empty/unknown id list or an id with no rows both just contribute nothing, never an error.
+#[tauri::command]
+async fn list_journal(
+    session_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<journal::ActionJournalRow>, String> {
+    let mut rows = Vec::new();
+    for id in &session_ids {
+        rows.extend(
+            journal::list_by_session(&state.db, id)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(rows)
+}
+
 /// Persist a preference AND, for `safety.disable_writes`, flip the runtime kill switch so
 /// the change takes effect immediately (no restart). The Bool is the runtime source of
 /// truth; the persisted row is only next-boot state — both are updated here because
@@ -175,6 +201,7 @@ pub fn run() {
             set_preference,
             list_local_models,
             reload_llm,
+            list_journal,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

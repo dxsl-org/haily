@@ -104,3 +104,39 @@ export async function getPreferences(): Promise<Record<string, string>> {
 export async function setPreference(key: string, value: string): Promise<void> {
   return invoke('set_preference', { key, value });
 }
+
+/** One recorded connector write, as read back for the Safety tab's undo surface.
+ * Mirrors `haily_db::queries::journal::ActionJournalRow` (camelCase over the wire). */
+export interface JournalEntry {
+  id: string;
+  sessionId: string;
+  toolName: string;
+  toolTier: string;
+  compensability: string;
+  idempotencyKey: string;
+  correlationRef: string;
+  requestParams: string;
+  preState: string | null;
+  preStateVersion: string | null;
+  postState: string | null;
+  postStateVersion: string | null;
+  readbackStatus: string;
+  /** Raw plan JSON — surfaced verbatim for a `stuck` row so the user can act on it
+   * manually; never parsed/re-rendered as anything richer (R4 does that). */
+  compensationPlan: string | null;
+  undoStatus: string;
+  undoAttempts: number;
+  createdAt: string;
+  undoneAt: string | null;
+  retentionExpiresAt: string;
+}
+
+/**
+ * Recent action-journal rows across every session this GUI instance has started.
+ * `sessionIds` should be every session id seen so far in this run (there is no single
+ * "current session" — each turn mints a fresh one, see `sendMessage`). Reuses the
+ * backend's per-session query; an id with no rows just contributes nothing.
+ */
+export async function listJournal(sessionIds: string[]): Promise<JournalEntry[]> {
+  return invoke('list_journal', { sessionIds });
+}

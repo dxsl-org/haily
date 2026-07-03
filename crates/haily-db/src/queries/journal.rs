@@ -6,6 +6,7 @@
 //! `set_readback`/`advance_undo_status`/`increment_undo_attempt`.
 use crate::DbHandle;
 use anyhow::Result;
+use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -13,7 +14,11 @@ use uuid::Uuid;
 /// opaque JSON strings; the tool layer owns their shape. `request_params` is already
 /// REDACTED (C4) and third-party strings are tag-stripped (C5) by the caller BEFORE it
 /// reaches `insert` — this layer never sees a raw secret or a live `<tool_call>` tag.
-#[derive(Debug, Clone, FromRow)]
+///
+/// `Serialize` (phase 6) lets this cross the Tauri IPC boundary unchanged for the GUI's
+/// recent-actions/undo surface (`list_journal`) — read-only exposure, no new write path.
+#[derive(Debug, Clone, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionJournalRow {
     pub id: String,
     pub session_id: String,
@@ -260,4 +265,50 @@ pub async fn purge_expired(db: &DbHandle) -> Result<u64> {
         .await?
         .rows_affected();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `src-tauri`'s `list_journal` command (phase 6) serializes rows straight over the
+    /// Tauri IPC boundary, and the frontend's `JournalEntry` type (`src/lib/tauri.ts`)
+    /// expects camelCase keys — proves the `#[serde(rename_all = "camelCase")]` derive
+    /// actually produces that shape rather than the Rust snake_case field names.
+    #[test]
+    fn action_journal_row_serializes_to_camel_case() {
+        let row = ActionJournalRow {
+            id: "j1".into(),
+            session_id: "s1".into(),
+            tool_name: "odoo_create".into(),
+            tool_tier: "IrreversibleWrite".into(),
+            compensability: "compensatable".into(),
+            idempotency_key: "idem-1".into(),
+            correlation_ref: "corr-1".into(),
+            request_params: "{}".into(),
+            pre_state: None,
+            pre_state_version: None,
+            post_state: None,
+            post_state_version: None,
+            readback_status: "pending".into(),
+            compensation_plan: Some(r#"{"op":"unlink"}"#.into()),
+            undo_status: "not_requested".into(),
+            undo_attempts: 0,
+            created_at: "2026-07-03T00:00:00Z".into(),
+            undone_at: None,
+            retention_expires_at: "2026-08-02T00:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(json["sessionId"], "s1");
+        assert_eq!(json["toolName"], "odoo_create");
+        assert_eq!(json["compensationPlan"], r#"{"op":"unlink"}"#);
+        assert_eq!(json["undoStatus"], "not_requested");
+        // Absent keys must serialize as JSON null, not be dropped, so the frontend's
+        // `JournalEntry` (which types these as `string | null`) never sees `undefined`.
+        assert_eq!(json["preState"], serde_json::Value::Null);
+        assert!(
+            json.get("tool_name").is_none(),
+            "snake_case key must not also appear"
+        );
+    }
 }
