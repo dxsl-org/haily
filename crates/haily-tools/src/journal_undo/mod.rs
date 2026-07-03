@@ -15,7 +15,8 @@ pub mod reconcile;
 
 pub use local_compensator::{is_local_row, local_attempt_undo};
 pub use logic::{
-    attempt_undo, batch_undo, refusal_reason, BatchCounts, UndoOutcome, MAX_UNDO_ATTEMPTS,
+    attempt_undo, batch_undo, refusal_reason, undo_turn, BatchCounts, UndoOutcome,
+    MAX_UNDO_ATTEMPTS,
 };
 
 use crate::connector::ConnectorExecutor;
@@ -46,7 +47,8 @@ impl Tool for JournalUndoTool {
 
     fn description(&self) -> &str {
         "Hoàn tác một hoặc nhiều hành động đã ghi trong nhật ký (undo). \
-         Tham số: {\"id\":\"<journal_id>\"} hoặc {\"ids\":[\"id1\",\"id2\"]} cho nhiều hành động."
+         Tham số: {\"id\":\"<journal_id>\"}, {\"ids\":[\"id1\",\"id2\"]} cho nhiều hành động, \
+         hoặc {\"turn_id\":\"<turn_id>\"} để hoàn tác TẤT CẢ hành động trong một lượt trò chuyện."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -54,7 +56,8 @@ impl Tool for JournalUndoTool {
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "single action journal id to undo" },
-                "ids": { "type": "array", "items": { "type": "string" }, "description": "batch of ids" }
+                "ids": { "type": "array", "items": { "type": "string" }, "description": "batch of ids" },
+                "turn_id": { "type": "string", "description": "undo every action recorded during one agent turn" }
             }
         })
     }
@@ -67,6 +70,16 @@ impl Tool for JournalUndoTool {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         let session_id = ctx.session_id.to_string();
+
+        // Turn form (Harness Completion phase 2): undo every row minted under one agent
+        // turn, session-scoped by `list_by_turn` (M1) — a `turn_id` from another session
+        // collects zero rows rather than leaking that session's group. Loop-guard-EXEMPT
+        // for the same reason `ids` batch is (one logical op).
+        if let Some(turn_id) = args.get("turn_id").and_then(|v| v.as_str()) {
+            let counts = undo_turn(&ctx.db, self.executor.as_ref(), turn_id, &session_id).await?;
+            return Ok(format_batch_counts(&counts, " (theo lượt)"));
+        }
+
         // Batch form: iterate server-side, per-row try/catch, report three counts. This
         // entrypoint is loop-guard-EXEMPT (a batch is one logical op, enforced by the
         // caller not re-dispatching per row).
@@ -76,16 +89,13 @@ impl Tool for JournalUndoTool {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
             let counts = batch_undo(&ctx.db, self.executor.as_ref(), &ids, &session_id).await;
-            return Ok(format!(
-                "Đã hoàn tác {} hành động, {} thất bại, {} không thực hiện được.",
-                counts.undone, counts.failed, counts.not_attempted
-            ));
+            return Ok(format_batch_counts(&counts, ""));
         }
 
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("journal_undo yêu cầu 'id' hoặc 'ids'"))?;
+            .ok_or_else(|| anyhow::anyhow!("journal_undo yêu cầu 'id', 'ids', hoặc 'turn_id'"))?;
 
         // M1: session-scoped lookup — a crafted id from another session's journal reports
         // the SAME "not found" as a nonexistent id (no existence-vs-ownership oracle).
@@ -106,9 +116,18 @@ impl Tool for JournalUndoTool {
     }
 }
 
+/// Shared three-count summary for the `ids` and `turn_id` forms — identical wording except
+/// for `suffix` (the turn form appends " (theo lượt)" to disambiguate it from a plain batch).
+fn format_batch_counts(counts: &BatchCounts, suffix: &str) -> String {
+    format!(
+        "Đã hoàn tác {} hành động, {} thất bại, {} không thực hiện được{suffix}.",
+        counts.undone, counts.failed, counts.not_attempted
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::logic::{attempt_undo, batch_undo, UndoOutcome, MAX_UNDO_ATTEMPTS};
+    use super::logic::{attempt_undo, batch_undo, undo_turn, UndoOutcome, MAX_UNDO_ATTEMPTS};
     use super::reconcile::reconcile_incomplete;
     use crate::connector::executor::mock::MockExecutor;
     use crate::connector::redact;
@@ -150,6 +169,7 @@ mod tests {
                 pre_state: Some(r#"{"id":42}"#),
                 pre_state_version: version,
                 compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
+                turn_id: None,
                 retention_days: 30,
             },
         )
@@ -315,6 +335,7 @@ mod tests {
                 compensation_plan: Some(
                     r#"{"op":"archive","model":"res.partner","method":"write","values":{"active":false}}"#,
                 ),
+                turn_id: None,
                 retention_days: 30,
             },
         )
@@ -417,6 +438,162 @@ mod tests {
         assert_eq!(counts.undone + counts.failed + counts.not_attempted, 15);
     }
 
+    /// m3: a batch of 3 whose MIDDLE row refuses (compensability=final) must still process
+    /// rows 1 and 3 to completion and report the exact three-way split — undone=2, failed=1
+    /// — rather than short-circuiting on the first failure or mis-tallying the surrounding
+    /// successes.
+    #[tokio::test]
+    async fn batch_undo_mid_list_refusal_reports_two_undone_one_failed() {
+        let (db, _d) = db().await;
+        let first = insert_row(&db, "mid-1", "compensatable", None, "match").await;
+        let middle_refused = insert_row(&db, "mid-2", "final", None, "match").await;
+        let last = insert_row(&db, "mid-3", "compensatable", None, "match").await;
+        let ids = vec![first.id.clone(), middle_refused.id.clone(), last.id.clone()];
+
+        // Two successful compensations (first + last), each: pre-comp read-back present →
+        // compensate → own read-back present → undone. The refused middle row never reaches
+        // the executor at all (refusal fires before any read-back/call).
+        let exec = MockExecutor::new(
+            vec![
+                ExecOutcome::Ok {
+                    returned_id: None,
+                    body: json!({}),
+                },
+                ExecOutcome::Ok {
+                    returned_id: None,
+                    body: json!({}),
+                },
+            ],
+            vec![
+                Some(json!({"id": 42})),
+                Some(json!({"unlinked": true})),
+                Some(json!({"id": 43})),
+                Some(json!({"unlinked": true})),
+            ],
+        );
+        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
+        assert_eq!(counts.undone, 2, "first and last rows undone");
+        assert_eq!(counts.failed, 1, "middle refusal counts as failed");
+        assert_eq!(counts.not_attempted, 0);
+
+        let refused_after = journal::get_by_id(&db, &middle_refused.id).await.unwrap().unwrap();
+        assert_eq!(
+            refused_after.undo_status, "refused",
+            "the refusal must be surfaced/persisted, not swallowed"
+        );
+    }
+
+    /// `undo_turn` end-to-end (Harness Completion phase 2): two LOCAL writes sharing one
+    /// `turn_id` must both reverse via a single `undo_turn` call — proving the group-undo
+    /// path threads `turn_id` through `local_journaled_write` and collects it correctly via
+    /// `list_by_turn` before delegating to the existing `batch_undo`.
+    #[tokio::test]
+    async fn undo_turn_reverses_both_writes_of_a_two_write_turn() {
+        use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
+
+        let (db, _d) = db().await;
+        let turn_id = "turn-2writes";
+
+        // Write 1: create a task under this turn.
+        let (create_row, _v) = local_journaled_write(
+            &db,
+            LocalMutation::TaskCreate {
+                id: "task-turn-1",
+                title: "First",
+                description: None,
+                priority: "medium",
+                due_at: None,
+            },
+            "sess-1",
+            "task_create",
+            "ReversibleWrite",
+            "{}",
+            Some(turn_id),
+            30,
+        )
+        .await
+        .unwrap()
+        .expect("target exists");
+
+        // Write 2: create a SECOND, independent task under the SAME turn.
+        let (create_row_2, _v2) = local_journaled_write(
+            &db,
+            LocalMutation::TaskCreate {
+                id: "task-turn-2",
+                title: "Second",
+                description: None,
+                priority: "medium",
+                due_at: None,
+            },
+            "sess-1",
+            "task_create",
+            "ReversibleWrite",
+            "{}",
+            Some(turn_id),
+            30,
+        )
+        .await
+        .unwrap()
+        .expect("target exists");
+
+        assert_ne!(create_row.id, create_row_2.id, "two distinct journal rows");
+
+        // A dummy executor: both rows are LOCAL (is_local_row) so undo never touches it.
+        let exec = MockExecutor::new(vec![], vec![]);
+        let counts = undo_turn(&db, &exec, turn_id, "sess-1").await.unwrap();
+        assert_eq!(counts.undone, 2, "both writes of the turn must reverse");
+        assert_eq!(counts.failed, 0);
+        assert_eq!(counts.not_attempted, 0);
+
+        let active = haily_db::queries::tasks::active(&db).await.unwrap();
+        assert!(
+            active.iter().all(|t| t.id != "task-turn-1" && t.id != "task-turn-2"),
+            "both created tasks must be soft-deleted after undo_turn (create's undo = delete)"
+        );
+    }
+
+    /// M1 at the tool-logic layer: `undo_turn` scoped to a DIFFERENT session than the one
+    /// that owns the turn must yield an empty result (zero undone/failed), never transitively
+    /// reaching or resurrecting the owning session's rows.
+    #[tokio::test]
+    async fn undo_turn_cross_session_yields_nothing() {
+        use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
+
+        let (db, _d) = db().await;
+        let turn_id = "turn-cross-sess";
+        local_journaled_write(
+            &db,
+            LocalMutation::TaskCreate {
+                id: "task-owned",
+                title: "Owned",
+                description: None,
+                priority: "medium",
+                due_at: None,
+            },
+            "sess-owner",
+            "task_create",
+            "ReversibleWrite",
+            "{}",
+            Some(turn_id),
+            30,
+        )
+        .await
+        .unwrap()
+        .expect("target exists");
+
+        let exec = MockExecutor::new(vec![], vec![]);
+        let counts = undo_turn(&db, &exec, turn_id, "sess-attacker").await.unwrap();
+        assert_eq!(counts.undone, 0);
+        assert_eq!(counts.failed, 0);
+        assert_eq!(counts.not_attempted, 0, "a foreign session sees an EMPTY group, not a failure");
+
+        let active = haily_db::queries::tasks::active(&db).await.unwrap();
+        assert!(
+            active.iter().any(|t| t.id == "task-owned"),
+            "the owning session's task must remain untouched"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_classifies_killed_mid_write_row() {
         let (db, _d) = db().await;
@@ -435,6 +612,7 @@ mod tests {
             pre_state: None,
             pre_state_version: None,
             compensation_plan: Some(r#"{"op":"unlink"}"#),
+            turn_id: None,
             retention_days: 30,
         };
         act.tool_name = "odoo_create";
@@ -521,6 +699,7 @@ mod tests {
                 pre_state: None,
                 pre_state_version: None,
                 compensation_plan: None, // lost write-back — the exact crash scenario
+                turn_id: None,
                 retention_days: 30,
             },
         )
@@ -584,6 +763,7 @@ mod tests {
                 pre_state: None,
                 pre_state_version: None,
                 compensation_plan: None,
+                turn_id: None,
                 retention_days: 30,
             },
         )
@@ -613,6 +793,7 @@ mod tests {
             pre_state: Some(r#"{"id":42}"#),
             pre_state_version: None,
             compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
+            turn_id: None,
             retention_days: 30,
         }
     }

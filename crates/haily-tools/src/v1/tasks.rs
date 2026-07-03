@@ -65,6 +65,7 @@ impl Tool for TaskCreateTool {
             "task_create",
             "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             LOCAL_RETENTION_DAYS,
         )
         .await?;
@@ -153,6 +154,7 @@ impl Tool for TaskCompleteTool {
             "task_complete",
             "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             LOCAL_RETENTION_DAYS,
         )
         .await?;
@@ -186,8 +188,10 @@ impl Tool for TaskDeleteTool {
             "required": ["id"]
         })
     }
+    /// Re-tiered `ReversibleWrite` (Harness Completion phase 2) — see the safety-net
+    /// rationale on `RiskTier::ReversibleWrite`.
     fn risk_tier(&self, _args: &Value) -> RiskTier {
-        RiskTier::IrreversibleWrite
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
@@ -200,8 +204,9 @@ impl Tool for TaskDeleteTool {
             LocalMutation::TaskDelete { id },
             &ctx.session_id.to_string(),
             "task_delete",
-            "IrreversibleWrite",
+            "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             LOCAL_RETENTION_DAYS,
         )
         .await?;

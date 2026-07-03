@@ -2,7 +2,7 @@
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
 use haily_tools::journal_undo::IS_COMPENSATION_TOOL;
-use haily_tools::{RiskTier, ToolContext, ToolRegistry};
+use haily_tools::{RiskTier, ToolContext, ToolRegistry, MAX_AUTO_DELETES_PER_TURN};
 use haily_types::ResponseChunk;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,6 +10,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const MAX_TOOL_CALLS: u32 = 10;
+
+/// The re-tiered `ReversibleWrite` soft-delete tools the M2 per-turn cap applies to
+/// (Harness Completion phase 2). A CLOSED list keyed on tool NAME, not `risk_tier()` —
+/// the tier must stay constant per tool (the `no_v1_tool_tier_varies_by_args` probe's
+/// soundness depends on it), so the cap is dispatch-layer policy, applied here by name.
+const RETIERED_DELETE_TOOLS: &[&str] = &["task_delete", "note_delete", "reminder_delete"];
 
 /// Guards against runaway loops: identical consecutive calls and call-count ceiling.
 pub struct LoopGuard {
@@ -156,6 +162,18 @@ fn find_matching_close(text: &str, open: &TagMatch) -> Option<TagMatch> {
 /// depth>0 observes the same switch. The message is honest: it blocks NEW writes, not one
 /// already in flight. The real executor re-checks `kill` again just before its network
 /// call (M5 TOCTOU) — that re-check lives in the phase-4 HTTP executor.
+///
+/// M2 (Harness Completion phase 2): `task_delete`/`note_delete`/`reminder_delete` are
+/// re-tiered `ReversibleWrite` (auto-run, journaled, undoable) — see the `RiskTier` doc.
+/// This function computes a per-call `effective_tier` that escalates ONE of these tools
+/// to `IrreversibleWrite` once `ctx.turn_deletes` has already reached
+/// `MAX_AUTO_DELETES_PER_TURN` successful auto-runs this turn; `tool.risk_tier()` itself
+/// is never mutated, so the constant-tier invariant `no_v1_tool_tier_varies_by_args`
+/// checks holds. Every successful auto-run delete still gets its existing
+/// `ResponseChunk::ToolResult{ok:true}` send below — that IS the "notify the user" chunk
+/// for a write that ran without a prompt (CLI/Telegram render it as `[✓ name]`; no new
+/// chunk variant needed). The kill switch (C8) remains the safety net for a re-tiered
+/// delete both below and above the cap.
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
@@ -168,11 +186,39 @@ pub async fn dispatch(
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{tool_name}'"))?;
 
     let tier = tool.risk_tier(&args);
+
+    // M2 per-turn destructive-op cap: a re-tiered delete tool is DISPATCH-LAYER escalated
+    // to `IrreversibleWrite` for THIS call once `ctx.turn_deletes` has already reached
+    // `MAX_AUTO_DELETES_PER_TURN` successful auto-runs this turn. `tool.risk_tier()` itself
+    // never changes (read, not mutated, here) — the escalation only affects the local
+    // `effective_tier` this call gates on, preserving the constant-tier invariant the
+    // `no_v1_tool_tier_varies_by_args` probe relies on. A relaxed load is sufficient: the
+    // counter only needs to be monotonically visible within one turn's sequential dispatch
+    // calls (and any concurrent sub-turn shares the SAME `Arc`, so a stale read only ever
+    // under-counts by calls truly racing at this instant, never resets/bypasses the cap).
+    let is_retiered_delete = RETIERED_DELETE_TOOLS.contains(&tool_name);
+    let effective_tier = if is_retiered_delete
+        && tier == RiskTier::ReversibleWrite
+        && ctx.turn_deletes.load(Ordering::Relaxed) >= MAX_AUTO_DELETES_PER_TURN
+    {
+        info!(
+            tool = tool_name,
+            cap = MAX_AUTO_DELETES_PER_TURN,
+            "per-turn destructive-op cap reached — escalating to approval"
+        );
+        RiskTier::IrreversibleWrite
+    } else {
+        tier
+    };
+
     // Kill-switch gate, layered onto the tier match below. Compensation is EXEMPT — else
     // the switch would block undo. `Acquire` pairs with the `Release` store in the
-    // toggle path so a live flip is observed without a restart.
+    // toggle path so a live flip is observed without a restart. Gates on `effective_tier`
+    // so an escalated-past-cap delete is held to the SAME kill-switch bar as any other
+    // write — and gates on `tier` for the un-escalated case, which is the ONLY remaining
+    // safety net for an auto-run re-tiered delete below the cap.
     let is_compensation = tool_name == IS_COMPENSATION_TOOL;
-    if tier != RiskTier::Read && !is_compensation && kill.load(Ordering::Acquire) {
+    if effective_tier != RiskTier::Read && !is_compensation && kill.load(Ordering::Acquire) {
         info!(
             tool = tool_name,
             "write blocked by kill switch (safety.disable_writes)"
@@ -192,7 +238,7 @@ pub async fn dispatch(
         ));
     }
 
-    match tier {
+    match effective_tier {
         RiskTier::Blocked => {
             bail!("tool '{tool_name}' is blocked");
         }
@@ -244,6 +290,13 @@ pub async fn dispatch(
     info!(tool = tool_name, "executing tool");
     let (result, ok) = match tool.execute(args, ctx).await {
         Ok(output) => {
+            // M2: count every SUCCESSFUL re-tiered-delete execution this turn, whether it
+            // ran auto (under the cap) or after an escalated approval — the cap must keep
+            // escalating monotonically for every delete beyond the Nth, not just the first.
+            // Incremented only here (post-success), never by a tool or from LLM/task text.
+            if is_retiered_delete {
+                ctx.turn_deletes.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = ctx
                 .approval_tx
                 .send(ResponseChunk::ToolResult {
@@ -498,11 +551,13 @@ mod tests {
             db,
             kms,
             session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
             depth,
             domain: if depth == 0 { None } else { Some("developer") },
             approval_gate: broker as std::sync::Arc<dyn haily_types::ApprovalGate>,
             approval_tx,
             cancel,
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         (ctx, rx, dir)
     }
@@ -1054,5 +1109,218 @@ mod tests {
             "the same dispatch must now block the write after a live flip"
         );
         assert!(t2.contains("safety.disable_writes"), "{t2}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Harness Completion phase 2 — M2 per-turn destructive-op cap. A re-tiered delete
+    // (task_delete/note_delete/reminder_delete) is `ReversibleWrite` and auto-runs, but
+    // dispatch escalates the (N+1)th such delete in one turn to the approval gate, and
+    // the kill switch remains a safety net at every count.
+    // -----------------------------------------------------------------------
+
+    /// Stand-in for a re-tiered delete tool (e.g. `task_delete`) — constant
+    /// `ReversibleWrite` tier, registered under a name in `RETIERED_DELETE_TOOLS` so
+    /// dispatch's M2 cap logic applies to it exactly as it would to the real tool.
+    struct RetieredDeleteTool;
+
+    #[async_trait]
+    impl Tool for RetieredDeleteTool {
+        fn name(&self) -> &str {
+            "task_delete"
+        }
+        fn description(&self) -> &str {
+            "stand-in for a re-tiered soft-delete"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::ReversibleWrite
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("deleted".to_string())
+        }
+    }
+
+    /// Build a `ToolContext` whose `turn_deletes` counter is pre-seeded to `n` — lets a
+    /// test start "already at the cap" without dispatching N real calls first.
+    async fn test_ctx_with_deletes(
+        broker: std::sync::Arc<ApprovalBroker>,
+        n: usize,
+    ) -> (ToolContext, mpsc::Receiver<ResponseChunk>, tempfile::TempDir) {
+        let (ctx, rx, dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        ctx.turn_deletes.store(n, Ordering::Relaxed);
+        (ctx, rx, dir)
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_a_retiered_delete_even_under_the_cap() {
+        // M2 proof: a re-tiered `ReversibleWrite` delete normally auto-runs with no
+        // approval prompt — the kill switch is its ONLY remaining safety net. Prove it
+        // blocks the write exactly like any other tier, with the counter nowhere near
+        // the cap (isolating the kill-switch behavior from the M2 escalation).
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx_with_deletes(broker, 0).await;
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ok,
+            "a re-tiered delete must still be blocked by the kill switch"
+        );
+        assert!(text.contains("safety.disable_writes"), "{text}");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            0,
+            "a blocked delete must not increment the destructive counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_cap_retiered_delete_auto_runs_without_approval() {
+        // Baseline: below `MAX_AUTO_DELETES_PER_TURN`, a re-tiered delete executes with
+        // NO approval prompt (the whole point of the re-tier) and the counter advances.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) =
+            test_ctx_with_deletes(broker, MAX_AUTO_DELETES_PER_TURN - 1).await;
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+
+        assert!(ok, "under the cap, the delete must auto-run: {text}");
+        assert_eq!(text, "deleted");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN,
+            "a successful auto-run delete must increment the counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_escalates_delete_past_limit_to_approval_while_risk_tier_stays_constant() {
+        // M2: once `turn_deletes` has already reached the cap, the NEXT re-tiered delete
+        // must route through the approval gate for THAT call — proving dispatch's
+        // escalation is a local `effective_tier`, never a mutation of `risk_tier()`.
+        let tool = Arc::new(RetieredDeleteTool);
+        assert_eq!(
+            tool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "sanity: the tool's own tier is ReversibleWrite before dispatch"
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::clone(&tool) as Arc<dyn Tool>);
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        // Drain the approval request the escalation must raise, and DENY it — proving the
+        // escalated call actually reached the gate rather than silently auto-running.
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch(
+                "task_delete",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
+        )
+        .await
+        .expect("must resolve via the approval deny, not hang")
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            !ok,
+            "past the cap, the delete must require (and here, be denied) approval"
+        );
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+
+        // The invariant `no_v1_tool_tier_varies_by_args` depends on: risk_tier() itself
+        // is UNCHANGED by the cap escalation.
+        assert_eq!(
+            tool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "risk_tier() must stay constant — the cap is dispatch-layer policy, not a tier mutation"
+        );
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN,
+            "a denied (never executed) escalated delete must NOT increment the counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_escalation_approved_still_executes_and_increments_counter() {
+        // Mirror of the deny case: an escalated delete that IS approved still executes
+        // (the cap gates on approval, it does not permanently block), and its success
+        // still counts toward the cap for the NEXT call this turn.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, true);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(ok, "an approved escalated delete must still execute: {text}");
+        assert_eq!(text, "deleted");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN + 1,
+            "the cap must keep escalating monotonically for every delete beyond the cap"
+        );
     }
 }

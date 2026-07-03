@@ -238,6 +238,7 @@ impl Tool for HttpConnectorTool {
                 pre_state: pre_state.as_deref(),
                 pre_state_version: pre_state_version.as_deref(),
                 compensation_plan: compensation_plan.as_deref(),
+                turn_id: Some(&ctx.turn_id.to_string()),
                 retention_days: CONNECTOR_RETENTION_DAYS,
             },
         )
@@ -544,11 +545,13 @@ mod tests {
             db,
             kms,
             session_id: uuid::Uuid::new_v4(),
+            turn_id: uuid::Uuid::new_v4(),
             depth: 0,
             domain: None,
             approval_gate: Arc::new(NoopGate),
             approval_tx: tx,
             cancel: tokio_util::sync::CancellationToken::new(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         (c, dir)
     }

@@ -31,6 +31,11 @@ pub struct ActionJournalRow {
     pub pre_state: Option<String>,
     pub pre_state_version: Option<String>,
     pub post_state: Option<String>,
+    /// Server-derived correlation id shared by every journal row written during ONE agent
+    /// turn (migration 0016) — lets `list_by_turn` collect a turn's writes for group undo.
+    /// `None` for any row written before this column existed, or by a caller that never
+    /// threaded a turn identity through.
+    pub turn_id: Option<String>,
     /// The opaque version token (Odoo `write_date`) AS OF our forward write's completion —
     /// the C10 concurrency baseline for a self-undo. Set post-write (mutable, migration 0014),
     /// so the undo refuses only on a THIRD-PARTY change beyond our own write. `None` until the
@@ -61,6 +66,9 @@ pub struct NewAction<'a> {
     pub pre_state: Option<&'a str>,
     pub pre_state_version: Option<&'a str>,
     pub compensation_plan: Option<&'a str>,
+    /// Server-derived turn correlation id (migration 0016) — see `ActionJournalRow::turn_id`.
+    /// `None` is valid (row excluded from any turn's undo group, never mis-grouped).
+    pub turn_id: Option<&'a str>,
     /// Days until PII in this row is eligible for purge.
     pub retention_days: i64,
 }
@@ -81,8 +89,8 @@ where
              (id, session_id, tool_name, tool_tier, compensability, idempotency_key,
               correlation_ref, request_params, pre_state, pre_state_version,
               readback_status, compensation_plan, undo_status, undo_attempts,
-              created_at, retention_expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?)
+              created_at, retention_expires_at, turn_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -98,6 +106,7 @@ where
     .bind(a.compensation_plan)
     .bind(&created_at)
     .bind(&retention_expires_at)
+    .bind(a.turn_id)
     .fetch_one(exec)
     .await?)
 }
@@ -333,6 +342,29 @@ pub async fn list_by_session(db: &DbHandle, session_id: &str) -> Result<Vec<Acti
     .await?)
 }
 
+/// All rows sharing `turn_id`, scoped to `session_id` (M1 — mirrors `get_by_id_scoped`):
+/// a `turn_id` is only ever meaningful within the session that minted it, and scoping
+/// here (rather than trusting the caller to pre-filter) means a cross-session `turn_id`
+/// collision or a forged id from another session's turn yields an empty result, not a
+/// leak of that session's rows. Used by `undo_turn` to collect the group before calling
+/// the existing `batch_undo` (no ordering — see the local-write FK-free rationale there).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_by_turn(
+    db: &DbHandle,
+    turn_id: &str,
+    session_id: &str,
+) -> Result<Vec<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE turn_id = ? AND session_id = ? ORDER BY created_at ASC",
+    )
+    .bind(turn_id)
+    .bind(session_id)
+    .fetch_all(db.pool())
+    .await?)
+}
+
 /// Rows still `pending` read-back past a grace window — orphans the startup
 /// reconciliation sweep must classify (C6). The grace window avoids racing a write that
 /// is legitimately still in flight at boot.
@@ -389,6 +421,7 @@ mod tests {
             pre_state: None,
             pre_state_version: None,
             post_state: None,
+            turn_id: None,
             post_state_version: None,
             readback_status: "pending".into(),
             compensation_plan: Some(r#"{"op":"unlink"}"#.into()),

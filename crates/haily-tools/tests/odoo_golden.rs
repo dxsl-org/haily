@@ -124,11 +124,13 @@ async fn tool_ctx(db: Arc<DbHandle>) -> (ToolContext, tempfile::TempDir) {
         db,
         kms,
         session_id: uuid::Uuid::new_v4(),
+        turn_id: uuid::Uuid::new_v4(),
         depth: 0,
         domain: None,
         approval_gate: Arc::new(NoopGate),
         approval_tx: tx,
         cancel: tokio_util::sync::CancellationToken::new(),
+        turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     (ctx, dir)
 }
@@ -575,6 +577,7 @@ async fn batch_partial_failure_three_counts() {
             pre_state: None,
             pre_state_version: None,
             compensation_plan: None,
+            turn_id: None,
             retention_days: 30,
         },
     )

@@ -294,6 +294,14 @@ pub struct SubTurnRequest {
     /// (not read from a global) for the same reason the broker is — one runtime source of
     /// truth, live-toggleable, shared by every depth.
     pub kill: Arc<AtomicBool>,
+    /// Harness Completion phase 2: the PARENT turn's `turn_id`, reused (not re-minted) —
+    /// a delegated sub-turn is part of the turn that requested it, so its journal rows
+    /// must group with the parent's under one `undo_turn` call. See `ToolContext::turn_id`.
+    pub turn_id: uuid::Uuid,
+    /// The SAME per-turn destructive-delete counter the parent turn holds (M2), shared so
+    /// a sub-agent's re-tiered deletes count toward the ONE cap for the whole turn, not a
+    /// fresh one that would let delegation bypass the ceiling. See `ToolContext::turn_deletes`.
+    pub turn_deletes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -323,6 +331,8 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         cancel,
         approval_tx,
         kill,
+        turn_id,
+        turn_deletes,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -384,11 +394,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         db: db.clone(),
         kms,
         session_id,
+        turn_id,
         depth,
         domain: Some(domain_name),
         approval_gate: Arc::clone(&approval_gate),
         approval_tx: approval_tx.clone(),
         cancel: cancel.clone(),
+        turn_deletes: Arc::clone(&turn_deletes),
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -533,10 +545,17 @@ pub async fn run_turn(
         context::build_messages(&kms, &db, &tools, &session_id, &req.message, context_window)
             .await?;
 
+    // Minted ONCE per turn (never from LLM/task text) — every tool call this turn, and
+    // every sub-turn `delegate.rs` spawns from it, shares this id/counter so the whole
+    // turn's writes group under one `undo_turn` and one M2 destructive-op cap.
+    let turn_id = uuid::Uuid::new_v4();
+    let turn_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let tool_ctx = ToolContext {
         db: db.clone(),
         kms: kms.clone(),
         session_id: req.session_id,
+        turn_id,
         depth: 0,
         // L0 has no single domain — `origin` renders as bare `"L0"`.
         domain: None,
@@ -546,6 +565,7 @@ pub async fn run_turn(
         approval_gate: Arc::clone(broker) as Arc<dyn haily_types::ApprovalGate>,
         approval_tx: tx.clone(),
         cancel: cancel.clone(),
+        turn_deletes: Arc::clone(&turn_deletes),
     };
 
     let mut guard = tool_call::LoopGuard::new();
@@ -1134,6 +1154,8 @@ mod sub_turn_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            turn_id: uuid::Uuid::new_v4(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1419,6 +1441,8 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            turn_id: uuid::Uuid::new_v4(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1450,6 +1474,8 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            turn_id: uuid::Uuid::new_v4(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1522,6 +1548,8 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            turn_id: uuid::Uuid::new_v4(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1553,5 +1581,412 @@ mod outcome_tests {
         ]);
         let log = log.as_array().unwrap().clone();
         assert_eq!(count_failed_calls(&log), 2);
+    }
+}
+
+#[cfg(test)]
+mod turn_integration_tests {
+    //! Harness Completion phase 2 gap-closure: unlike `sub_turn_tests`/`outcome_tests`
+    //! above (which drive `run_sub_turn` directly against a scripted cloud completion),
+    //! these tests drive the FULL `run_turn` entrypoint end-to-end — the one that mints
+    //! `turn_id`/`turn_deletes` and is what `Orchestrator::process` actually calls — over
+    //! a REAL SSE stream (the wire format `complete_stream`/`cloud.rs` speak, not the
+    //! plain-JSON shape `complete_tiered`'s mock servers above use), through REAL
+    //! `tool_call::dispatch` calls against REAL tools (`TaskCreateTool`/`TaskDeleteTool`/
+    //! `DelegateTool`), asserting on what actually landed in a REAL `action_journal` table.
+    //!
+    //! This closes two gaps a haily-tester review found in the phase-2 unit tests: (1)
+    //! `turn_id` grouping was only proven with hand-constructed `ToolContext`s sharing a
+    //! literal string, never `run_turn`'s own minted id; (2) the M2 cap's cross-delegation
+    //! cumulative count was only proven with a hand-seeded counter, never a real
+    //! `run_turn` → `delegate_to_*` → `run_sub_turn` chain.
+    use super::*;
+    use crate::delegate::DelegateTool;
+    use haily_db::queries::journal;
+    use haily_db::DbHandle;
+    use haily_kms::KmsHandle;
+    use haily_llm::LlmConfig;
+    use haily_tools::v1::tasks::{TaskCreateTool, TaskDeleteTool};
+    use haily_tools::ToolRegistry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::RwLock;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn cloud_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    async fn test_db_kms() -> (Arc<DbHandle>, Arc<KmsHandle>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
+        (db, kms, dir)
+    }
+
+    /// Real SSE (`text/event-stream`) responder speaking the SAME wire dialect
+    /// `cloud.rs`'s `complete_stream` parses (unlike the plain-JSON mocks used by
+    /// `outcome_tests`/`sub_turn_tests` above, which only ever exercise
+    /// `complete_tiered`/`complete`). One accepted TCP connection = one LLM call;
+    /// `contents[n]` is streamed as a single `data:` delta for the Nth call this
+    /// server receives, then `data: [DONE]`. A call index beyond the scripted list
+    /// repeats the LAST entry, so a test can under-script and still get a
+    /// deterministic final answer instead of a hung/reset connection.
+    async fn spawn_scripted_sse_server(contents: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let contents = Arc::new(contents);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let call_count = Arc::clone(&call_count);
+                let contents = Arc::clone(&contents);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    let idx = n.min(contents.len().saturating_sub(1));
+                    let content = contents
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| "Final answer.".to_string());
+
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": content } }]
+                    })
+                    .to_string();
+                    let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn tool_call_content(tool: &str, args: serde_json::Value) -> String {
+        format!(r#"<tool_call>{{"tool":"{tool}","args":{args}}}</tool_call>"#)
+    }
+
+    /// Plain-JSON (NON-streaming) scripted responder — the dialect `LlmRouter::complete`/
+    /// `complete_tiered` speak (`cloud.rs`'s `complete`, not `complete_stream`). A
+    /// delegated `run_sub_turn` calls `llm.complete_tiered(..)`, never `complete_stream`,
+    /// so its mock server must NOT be the SSE one `run_turn`'s own L0 loop requires —
+    /// using the SSE responder here would silently hand back an unparsed SSE body as a
+    /// literal `"choices"`-less JSON blob and the sub-turn's tool-call loop would never
+    /// see a tool call at all.
+    async fn spawn_scripted_json_server(contents: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let contents = Arc::new(contents);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let call_count = Arc::clone(&call_count);
+                let contents = Arc::clone(&contents);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    let idx = n.min(contents.len().saturating_sub(1));
+                    let content = contents
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| "Final answer.".to_string());
+
+                    let payload = serde_json::json!({
+                        "choices": [{ "message": { "content": content } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// **Test 1 (Gap 1).** Drives a REAL `run_turn` whose mock L0 LLM makes TWO real
+    /// `task_create` tool calls in the SAME turn, then queries the journal by
+    /// `session_id` (not a hand-picked `turn_id`) and proves both rows share the ONE
+    /// `turn_id` `run_turn` itself minted — collectible together via `list_by_turn`,
+    /// exactly as `journal_undo`'s `turn_id` form (and `undo_turn`) rely on.
+    #[tokio::test]
+    async fn run_turn_groups_two_real_tool_calls_under_one_minted_turn_id() {
+        let (db, kms, _dir) = test_db_kms().await;
+
+        let base_url = spawn_scripted_sse_server(vec![
+            tool_call_content("task_create", serde_json::json!({"title": "First"})),
+            tool_call_content("task_create", serde_json::json!({"title": "Second"})),
+            "Đã tạo xong hai việc.".to_string(),
+        ])
+        .await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TaskCreateTool));
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(registry),
+            kill: Arc::new(AtomicBool::new(false)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        // Drain response chunks concurrently so `run_turn`'s streaming sends never
+        // block on a full/unread channel.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let req = Request {
+            session_id: uuid::Uuid::new_v4(),
+            adapter_id: "test-adapter".to_string(),
+            message: "please create two tasks".to_string(),
+            user_ref: None,
+        };
+
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+        drain.await.expect("drain task");
+
+        let rows = journal::list_by_session(&db, &req.session_id.to_string())
+            .await
+            .expect("list_by_session");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both task_create calls of this turn must be journaled"
+        );
+
+        let turn_ids: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|r| r.turn_id.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            turn_ids.len(),
+            1,
+            "both rows must share the SAME turn_id run_turn minted, got: {turn_ids:?}"
+        );
+        let turn_id = *turn_ids.iter().next().unwrap();
+        assert!(
+            !turn_id.is_empty(),
+            "turn_id must actually be stamped (not left null)"
+        );
+        assert!(
+            uuid::Uuid::parse_str(turn_id).is_ok(),
+            "turn_id must be the real minted UUID, not a placeholder: {turn_id}"
+        );
+
+        // Collectible together via list_by_turn — the exact query journal_undo's
+        // `turn_id` form (and undo_turn) rely on for group-undo.
+        let via_turn = journal::list_by_turn(&db, turn_id, &req.session_id.to_string())
+            .await
+            .expect("list_by_turn");
+        assert_eq!(via_turn.len(), 2, "list_by_turn must collect both rows");
+    }
+
+    /// **Test 2 (Gap 2).** Drives a REAL `run_turn` where the L0 mock LLM issues
+    /// `MAX_AUTO_DELETES_PER_TURN - 1` (4) real re-tiered `task_delete` calls directly,
+    /// then calls a REAL `delegate_to_helper` tool, whose sub-turn (a SEPARATE mock
+    /// LLM, proving the two levels are genuinely distinct completions) issues 2 more
+    /// real `task_delete` calls. The M2 per-turn cap (`MAX_AUTO_DELETES_PER_TURN = 5`)
+    /// must trigger on the 6th delete OVERALL — the 2nd one inside the sub-turn — proving
+    /// `ctx.turn_deletes` is the SAME shared counter across the delegation boundary, not
+    /// reset when `run_sub_turn` starts. The escalated call is auto-denied here (the
+    /// approval-gate mechanics are already covered by `tool_call.rs`'s unit tests); what
+    /// this test proves is that the escalation fires AT ALL, and fires at the cumulative
+    /// 6th call rather than a fresh per-sub-turn 2nd call.
+    #[tokio::test]
+    async fn cross_delegation_delete_cap_is_cumulative_not_reset_per_subturn() {
+        let (db, kms, _dir) = test_db_kms().await;
+
+        // Pre-seed 6 real tasks so each scripted task_delete call has a real row to
+        // find (a delete against a nonexistent id is a silent no-op that never reaches
+        // the journal or increments turn_deletes — see local_journaled_write's
+        // pre-check). ids[0..4) are deleted at L0, ids[4..6) inside the sub-turn.
+        let mut ids = Vec::with_capacity(6);
+        for i in 0..6 {
+            let t = haily_db::queries::tasks::insert(
+                &db,
+                &format!("cap-task-{i}"),
+                None,
+                "medium",
+                None,
+                None,
+            )
+            .await
+            .expect("seed task");
+            ids.push(t.id);
+        }
+
+        // L0 script: 4 deletes, then delegate, then a final answer once the delegate
+        // tool result comes back.
+        let l0_url = spawn_scripted_sse_server(vec![
+            tool_call_content("task_delete", serde_json::json!({"id": ids[0]})),
+            tool_call_content("task_delete", serde_json::json!({"id": ids[1]})),
+            tool_call_content("task_delete", serde_json::json!({"id": ids[2]})),
+            tool_call_content("task_delete", serde_json::json!({"id": ids[3]})),
+            tool_call_content(
+                "delegate_to_helper",
+                serde_json::json!({"task": "cleanup more"}),
+            ),
+            "Đã dọn dẹp xong.".to_string(),
+        ])
+        .await;
+        let l0_llm = Arc::new(LlmRouter::init(cloud_config(l0_url)).await);
+
+        // Sub-turn script: a DIFFERENT mock server/completion stream — proves the two
+        // levels are genuinely distinct LLM calls, not the same response reused. Uses
+        // the plain-JSON dialect (`spawn_scripted_json_server`), not SSE: `run_sub_turn`
+        // calls `llm.complete_tiered` (→ `complete`), never `complete_stream`.
+        let sub_url = spawn_scripted_json_server(vec![
+            tool_call_content("task_delete", serde_json::json!({"id": ids[4]})),
+            tool_call_content("task_delete", serde_json::json!({"id": ids[5]})),
+            "Đã dọn xong phần còn lại.".to_string(),
+        ])
+        .await;
+        let sub_llm = Arc::new(LlmRouter::init(cloud_config(sub_url)).await);
+
+        let mut sub_registry = ToolRegistry::new();
+        sub_registry.register(Arc::new(TaskDeleteTool));
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let delegate = DelegateTool {
+            tool_name: "delegate_to_helper",
+            description: "delegates cleanup work to a helper sub-agent",
+            system_prompt: "You are a helper sub-agent.",
+            domain_name: "helper",
+            db: db.clone(),
+            kms: kms.clone(),
+            llm: Arc::new(RwLock::new(sub_llm)),
+            sub_registry: Arc::new(sub_registry),
+            max_depth: 2,
+            model_tier: None,
+            kill: Arc::clone(&kill),
+        };
+
+        let mut l0_registry = ToolRegistry::new();
+        l0_registry.register(Arc::new(TaskDeleteTool));
+        l0_registry.register(Arc::new(delegate));
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm: l0_llm,
+            tools: Arc::new(l0_registry),
+            kill,
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let session_id = uuid::Uuid::new_v4();
+        // Drain + auto-deny the escalated approval this test expects to be raised —
+        // mirrors tool_call.rs's own cap-escalation tests' responder pattern.
+        let broker_for_responder = Arc::clone(&broker);
+        let approval_seen = Arc::new(AtomicUsize::new(0));
+        let approval_seen_writer = Arc::clone(&approval_seen);
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    approval_seen_writer.fetch_add(1, Ordering::SeqCst);
+                    use haily_types::ApprovalResolver;
+                    broker_for_responder.resolve(approval_id, session_id, false);
+                }
+            }
+        });
+
+        let req = Request {
+            session_id,
+            adapter_id: "test-adapter".to_string(),
+            message: "delete these six tasks, delegate the rest".to_string(),
+            user_ref: None,
+        };
+
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+        responder.await.expect("responder task");
+
+        assert_eq!(
+            approval_seen.load(Ordering::SeqCst),
+            1,
+            "exactly one delete (the 6th overall, 2nd inside the sub-turn) must have \
+             escalated to the approval gate — proving turn_deletes is cumulative across \
+             the delegation boundary rather than reset per sub-turn"
+        );
+
+        // Corroborate via the journal: only 5 deletes actually executed (the escalated
+        // 6th was denied, so local_journaled_write's transaction never ran for it) and
+        // every executed delete shares the ONE turn_id, spanning both L0 and the
+        // delegated sub-turn.
+        let rows = journal::list_by_session(&db, &session_id.to_string())
+            .await
+            .expect("list_by_session");
+        let delete_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.tool_name == "task_delete")
+            .collect();
+        assert_eq!(
+            delete_rows.len(),
+            5,
+            "only the 5 auto-run deletes (under the cap) reach the journal; the denied \
+             6th never executes: {delete_rows:?}"
+        );
+        let turn_ids: std::collections::HashSet<&str> = delete_rows
+            .iter()
+            .map(|r| r.turn_id.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            turn_ids.len(),
+            1,
+            "L0 deletes and the sub-turn's deletes must share the SAME turn_id: {turn_ids:?}"
+        );
+
+        // The 5th task (last one under the cap) was actually deleted...
+        let remaining_active = haily_db::queries::tasks::active(&db).await.expect("active");
+        assert!(
+            !remaining_active.iter().any(|t| t.id == ids[4]),
+            "the 5th (under-cap) delete must have actually executed"
+        );
+        // ...but the 6th's delete was DENIED, so its task must still be active — the
+        // cap-escalation must have actually blocked execution, not just raised a prompt
+        // nobody's answer affected.
+        assert!(
+            remaining_active.iter().any(|t| t.id == ids[5]),
+            "the 6th (denied, over-cap) task must survive undeleted"
+        );
     }
 }

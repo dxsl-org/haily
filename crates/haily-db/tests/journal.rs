@@ -34,6 +34,7 @@ fn new_action<'a>(session_id: &'a str, key: &'a str) -> journal::NewAction<'a> {
         pre_state: Some(r#"{"id":null}"#),
         pre_state_version: Some("2026-07-03 10:00:00"),
         compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
+        turn_id: None,
         retention_days: 30,
     }
 }
@@ -223,4 +224,59 @@ async fn purge_removes_expired_row() {
         .unwrap()
         .is_none());
     assert!(journal::get_by_id(&db, &fresh.id).await.unwrap().is_some());
+}
+
+/// Migration 0016: `turn_id` groups every journal row from one agent turn so
+/// `list_by_turn` can collect them for the group-undo path (Harness Completion phase 2).
+#[tokio::test]
+async fn list_by_turn_collects_only_rows_sharing_the_turn_id() {
+    let (db, _dir) = setup().await;
+    let sid = make_session(&db).await;
+
+    let mut turn_a_1 = new_action(&sid, "turn-a-1");
+    turn_a_1.turn_id = Some("turn-A");
+    let a1 = journal::insert(&db, turn_a_1).await.unwrap();
+
+    let mut turn_a_2 = new_action(&sid, "turn-a-2");
+    turn_a_2.turn_id = Some("turn-A");
+    let a2 = journal::insert(&db, turn_a_2).await.unwrap();
+
+    let mut turn_b_1 = new_action(&sid, "turn-b-1");
+    turn_b_1.turn_id = Some("turn-B");
+    journal::insert(&db, turn_b_1).await.unwrap();
+
+    // A row minted before this migration (or by a caller that never threaded turn_id).
+    journal::insert(&db, new_action(&sid, "no-turn")).await.unwrap();
+
+    let group = journal::list_by_turn(&db, "turn-A", &sid).await.unwrap();
+    let ids: Vec<&str> = group.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(group.len(), 2, "only turn-A's two rows must be collected");
+    assert!(ids.contains(&a1.id.as_str()));
+    assert!(ids.contains(&a2.id.as_str()));
+}
+
+/// M1: a `turn_id` that exists but under a DIFFERENT session must yield nothing — the
+/// same session-scoping boundary `get_by_id_scoped` already enforces for single-id lookup.
+#[tokio::test]
+async fn list_by_turn_cross_session_yields_nothing() {
+    let (db, _dir) = setup().await;
+    let owner_session = make_session(&db).await;
+    let other_session = uuid::Uuid::new_v4().to_string();
+
+    let mut action = new_action(&owner_session, "cross-sess-1");
+    action.turn_id = Some("shared-turn-id");
+    journal::insert(&db, action).await.unwrap();
+
+    let as_owner = journal::list_by_turn(&db, "shared-turn-id", &owner_session)
+        .await
+        .unwrap();
+    assert_eq!(as_owner.len(), 1, "the owning session sees its row");
+
+    let as_other = journal::list_by_turn(&db, "shared-turn-id", &other_session)
+        .await
+        .unwrap();
+    assert!(
+        as_other.is_empty(),
+        "a foreign session must never see another session's turn group"
+    );
 }

@@ -508,6 +508,13 @@ async fn apply_mutation(tx: &mut Transaction<'_, Sqlite>, m: &LocalMutation<'_>)
 /// # Errors
 /// Any failure rolls back the whole transaction (sqlx drops an uncommitted `Transaction`),
 /// so a failed mutate never leaves an orphaned journal row.
+///
+/// `turn_id` (Harness Completion phase 2) pushed this signature past clippy's default
+/// 7-arg ceiling; every parameter maps 1:1 onto a `NewAction`/journal-insert field this
+/// function's caller already owns individually (mirrors the same `#[allow]` precedent at
+/// `OdooExecutorConfig::production`), so grouping into a param struct here would just move
+/// the same fields into a second short-lived type with no clearer call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn local_journaled_write(
     db: &DbHandle,
     mutation: LocalMutation<'_>,
@@ -515,6 +522,10 @@ pub async fn local_journaled_write(
     tool_name: &str,
     tool_tier: &str,
     request_params: &str,
+    // Server-derived turn correlation id (migration 0016) — stamped on the outbox row so
+    // `list_by_turn`/`undo_turn` can group this write with the rest of its turn. `None`
+    // is valid (row excluded from any turn's group).
+    turn_id: Option<&str>,
     retention_days: i64,
 ) -> Result<Option<(ActionJournalRow, String)>> {
     let table = mutation.table();
@@ -554,6 +565,7 @@ pub async fn local_journaled_write(
             pre_state: pre_state_str.as_deref(),
             pre_state_version: None,
             compensation_plan: None,
+            turn_id,
             retention_days,
         },
     )
@@ -612,6 +624,7 @@ mod tests {
             "task_create",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -644,6 +657,7 @@ mod tests {
             "task_create",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await

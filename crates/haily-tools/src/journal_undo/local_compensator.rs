@@ -243,6 +243,7 @@ mod tests {
             "task_create",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -276,6 +277,7 @@ mod tests {
             "task_complete",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -321,6 +323,7 @@ mod tests {
             "task_delete",
             "IrreversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -353,6 +356,7 @@ mod tests {
             "task_complete",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -391,6 +395,7 @@ mod tests {
             "task_create",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -430,6 +435,7 @@ mod tests {
             "note_save",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -473,6 +479,7 @@ mod tests {
             "note_update",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -502,6 +509,7 @@ mod tests {
             "reminder_add",
             "ReversibleWrite",
             "{}",
+            None,
             30,
         )
         .await
@@ -545,6 +553,7 @@ mod tests {
             pre_state: None,
             pre_state_version: None,
             post_state: None,
+            turn_id: None,
             post_state_version: None,
             readback_status: "pending".into(),
             compensation_plan: None,

@@ -387,3 +387,30 @@ pub async fn batch_undo(
     }
     counts
 }
+
+/// Undo every journal row minted under ONE agent turn (Harness Completion phase 2, M2/m3).
+///
+/// `list_by_turn` is ALREADY session-scoped (mirrors `get_by_id_scoped`'s M1 boundary) — a
+/// `turn_id` collision or forgery from another session yields an empty row set, never a
+/// leak of that session's rows, so this function's own security property is inherited
+/// entirely from the query layer, not re-implemented here.
+///
+/// Deliberately NO reverse-chronological ordering (m3 red-team finding): the local tool
+/// tables this covers (tasks/notes/reminders) are FK-free soft-deletes — there is no
+/// referential-integrity constraint between two rows of the same turn, so undoing them in
+/// `list_by_turn`'s `created_at ASC` order (or any other order) is exactly as safe as a
+/// reverse-chronological pass would be. Adding sort logic here would be YAGNI cargo-cult
+/// carried over from FK-linked-create saga guidance that does not apply to this data shape.
+///
+/// Delegates to the existing [`batch_undo`] once the group is collected — no new undo
+/// logic, just a different way to name the row set.
+pub async fn undo_turn(
+    db: &DbHandle,
+    executor: &dyn ConnectorExecutor,
+    turn_id: &str,
+    session_id: &str,
+) -> Result<BatchCounts> {
+    let rows = journal::list_by_turn(db, turn_id, session_id).await?;
+    let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
+    Ok(batch_undo(db, executor, &ids, session_id).await)
+}

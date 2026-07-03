@@ -82,6 +82,7 @@ impl Tool for NoteSaveTool {
             "note_save",
             "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
@@ -190,6 +191,7 @@ impl Tool for NoteUpdateTool {
             "note_update",
             "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
@@ -223,8 +225,10 @@ impl Tool for NoteDeleteTool {
             "required": ["id"]
         })
     }
+    /// Re-tiered `ReversibleWrite` (Harness Completion phase 2) — see the safety-net
+    /// rationale on `RiskTier::ReversibleWrite`.
     fn risk_tier(&self, _args: &Value) -> RiskTier {
-        RiskTier::IrreversibleWrite
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
@@ -237,8 +241,9 @@ impl Tool for NoteDeleteTool {
             LocalMutation::NoteDelete { id },
             &ctx.session_id.to_string(),
             "note_delete",
-            "IrreversibleWrite",
+            "ReversibleWrite",
             &request_params,
+            Some(&ctx.turn_id.to_string()),
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
