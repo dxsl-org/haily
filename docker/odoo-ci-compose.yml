@@ -1,0 +1,66 @@
+# Odoo CI sandbox for the Safe Operator Harness golden tests (phase 5).
+#
+# Brings up a throwaway Odoo 18.0 + PostgreSQL 15 pair on an isolated bridge network so
+# the env-gated `odoo_golden.rs` tests can run `execute_kw` against a real API. This is the
+# end-to-end proof (R3) that the approval seam (R1), the journal/reconcile/undo path (R2),
+# and the fault classifier work against a live third-party ERP.
+#
+# NOTE (m2): the returned API key is masked in CI logs by the bootstrap script (::add-mask::);
+# never echo the login response or the key here. The `odoo` service runs on `ci-net` with no
+# external egress needed — the golden tests reach it via the host port only.
+#
+# Cold start is 30-90s (image pull + module install + DB init); the CI job is NON-BLOCKING /
+# nightly until that is benchmarked (see .github/workflows/ci.yml `odoo-golden`).
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+    networks:
+      - ci-net
+    healthcheck:
+      # pg_isready gates ODOO STARTUP only — it is NOT the test-readiness probe. The bootstrap
+      # script polls an AUTHENTICATED RPC login (see scripts/odoo-ci-bootstrap.sh) because the
+      # DB being up says nothing about whether Odoo has finished installing base/contacts/crm.
+      test: ["CMD-SHELL", "pg_isready -U odoo -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  odoo:
+    image: odoo:18.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Odoo's official image reads these to connect to Postgres.
+      HOST: postgres
+      USER: odoo
+      PASSWORD: odoo
+    ports:
+      # Host 8069 → the golden tests connect to http://127.0.0.1:8069/jsonrpc.
+      - "127.0.0.1:8069:8069"
+    networks:
+      - ci-net
+    # [UNVERIFIED CLI flags — spike against the pinned odoo:18.0 image before locking]:
+    #   -d haily_ci            : initialize/use the `haily_ci` database
+    #   -i base,contacts,crm   : install the modules the 11 CRM ops touch
+    #   --without-demo=all     : skip demo data so read-backs are deterministic
+    #   --stop-after-init is DELIBERATELY OMITTED — the server must stay up to serve RPC.
+    #   tracking_disable is a CI SEED concern (set per-write during seeding), NOT a server
+    #   flag, and must NOT be globally enabled (it would break the audit chatter the harness
+    #   relies on in production).
+    command:
+      - odoo
+      - -d
+      - haily_ci
+      - -i
+      - base,contacts,crm
+      - --without-demo=all
+
+networks:
+  # Isolated bridge — no published egress beyond the mapped host port.
+  ci-net:
+    driver: bridge

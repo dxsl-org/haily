@@ -240,14 +240,54 @@ fn v6_mask(prefix: u8) -> u128 {
     }
 }
 
+/// Core allowance check with an explicit `allow_loopback` escape hatch.
+///
 /// `true` when `ip` is permitted under a per-manifest allowance: it matches at least one
-/// pinned CIDR AND is not on the never-allowable metadata/link-local surface. A public IP
-/// is permitted by the default guard regardless (it doesn't need to be on the allowance).
-fn allowance_permits(ip: IpAddr, allowed_ip_cidrs: &[String]) -> bool {
-    if is_never_allowable(ip) {
+/// pinned CIDR AND is not on the never-allowable metadata/link-local surface. A public IP is
+/// permitted by the default guard regardless (it doesn't need to be on the allowance).
+///
+/// `allow_loopback` is TEST-ONLY (the golden suite reaching a local Odoo sandbox) — it is
+/// NEVER true in production (see [`ssrf_guard_with_allowance_loopback`]). Even when set, it
+/// ONLY permits a loopback address that ALSO matches a pinned CIDR; it does NOT relax the
+/// metadata/link-local surface (169.254/16, 100.100.100/24, fd00:ec2::/64, fe80::/10), which
+/// stays never-allowable. Loopback is treated as never-allowable ONLY when `allow_loopback`
+/// is false — every other never-allowable class is unconditional.
+fn allowance_permits_inner(ip: IpAddr, allowed_ip_cidrs: &[String], allow_loopback: bool) -> bool {
+    if is_never_allowable_except_loopback(ip, allow_loopback) {
         return false;
     }
     allowed_ip_cidrs.iter().any(|c| cidr_contains(c, ip))
+}
+
+/// [`is_never_allowable`] with a single, narrow carve-out: when `allow_loopback` is true, a
+/// LOOPBACK address is no longer treated as never-allowable (it may then be re-permitted by a
+/// matching pinned CIDR). ALL other never-allowable classes — metadata, link-local, ULA-mapped
+/// — remain blocked. `allow_loopback` is TEST-ONLY.
+fn is_never_allowable_except_loopback(ip: IpAddr, allow_loopback: bool) -> bool {
+    if !allow_loopback {
+        return is_never_allowable(ip);
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            // Loopback is carved out; the metadata/link-local surface is NOT.
+            v4.is_link_local() || v4.octets().starts_with(&[100, 100, 100])
+        }
+        IpAddr::V6(v6) => {
+            // Canonicalize an embedded V4 and re-check it under the same carve-out.
+            let o = v6.octets();
+            let embedded = if o[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+            } else {
+                v6.to_ipv4()
+            };
+            if let Some(v4) = embedded {
+                return is_never_allowable_except_loopback(IpAddr::V4(v4), allow_loopback);
+            }
+            // Loopback (::1) is carved out; link-local + AWS IPv6 IMDS are NOT.
+            (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+                || o[..8] == [0xfd, 0x00, 0x0e, 0xc2, 0, 0, 0, 0]
+        }
+    }
 }
 
 /// SSRF guard for a manifest-approved connector URL, honoring a per-manifest IP/CIDR
@@ -270,6 +310,35 @@ pub async fn ssrf_guard_with_allowance(
     raw_url: &str,
     allowed_ip_cidrs: &[String],
 ) -> Result<VettedAddr> {
+    ssrf_guard_with_allowance_loopback(raw_url, allowed_ip_cidrs, false).await
+}
+
+/// [`ssrf_guard_with_allowance`] with a TEST-ONLY `allow_loopback` escape hatch.
+///
+/// **TEST ONLY — `allow_loopback` must NEVER be true in production.** It exists solely so the
+/// Odoo golden suite can reach a local sandbox at `127.0.0.1:8069`. When true, a LOOPBACK
+/// address that ALSO matches a pinned CIDR is permitted; when false this is byte-for-byte
+/// [`ssrf_guard_with_allowance`]. The carve-out is narrow by construction: it NEVER relaxes
+/// the metadata/link-local surface (169.254/16 IMDS, 100.100.100/24, fd00:ec2::/64,
+/// fe80::/10) — those stay never-allowable even with the flag set. Production connector
+/// wiring (`Orchestrator::init` → `HttpExecutor`/`OdooExecutor`) always constructs with
+/// `allow_loopback=false`.
+///
+/// # Errors
+/// Returns an error for a non-http(s) scheme, a missing host, a DNS failure, a
+/// metadata/link-local target (never allowable), or a non-public address not on the pin
+/// (and, unless `allow_loopback`, a loopback address).
+pub async fn ssrf_guard_with_allowance_loopback(
+    raw_url: &str,
+    allowed_ip_cidrs: &[String],
+    allow_loopback: bool,
+) -> Result<VettedAddr> {
+    // Defensive invariant: this must never be reached with the loopback carve-out enabled in
+    // a release build. The flag is set ONLY by the golden test's executor construction.
+    debug_assert!(
+        !allow_loopback || cfg!(debug_assertions),
+        "allow_loopback is TEST-ONLY and must never be true in a production path"
+    );
     let url = Url::parse(raw_url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
 
     let scheme = url.scheme();
@@ -303,10 +372,13 @@ pub async fn ssrf_guard_with_allowance(
     }
 
     // Every resolved address must pass EITHER the default guard (public) OR the allowance
-    // (a pinned private CIDR that is not metadata/link-local). A single failing address
-    // fails the whole check — an attacker cannot slip a bad IP into a multi-A record.
+    // (a pinned private CIDR that is not metadata/link-local; loopback only when the TEST-ONLY
+    // flag is set). A single failing address fails the whole check — an attacker cannot slip
+    // a bad IP into a multi-A record.
     for ip in &addrs {
-        if check_ip(*ip, host).is_err() && !allowance_permits(*ip, allowed_ip_cidrs) {
+        if check_ip(*ip, host).is_err()
+            && !allowance_permits_inner(*ip, allowed_ip_cidrs, allow_loopback)
+        {
             bail!(
                 "SSRF: '{ip}' (host '{host}') is neither public nor on the manifest's pinned \
                  allowance (or is a never-allowable metadata/link-local address)"
@@ -457,10 +529,40 @@ pub async fn follow_redirects_with_guard_allowance(
     timeout: Duration,
     build_request: impl Fn(&reqwest::Client, &str) -> RequestBuilder,
 ) -> Result<Response> {
+    follow_redirects_with_guard_allowance_loopback(
+        initial_url,
+        allowed_ip_cidrs,
+        timeout,
+        false,
+        build_request,
+    )
+    .await
+}
+
+/// [`follow_redirects_with_guard_allowance`] with a TEST-ONLY `allow_loopback` escape hatch,
+/// re-applied on EVERY hop via [`ssrf_guard_with_allowance_loopback`].
+///
+/// **TEST ONLY — `allow_loopback` must NEVER be true in production.** It exists only so the
+/// Odoo golden suite reaches a local sandbox. Even set, a `302 → 169.254.169.254` is still
+/// denied on the next hop (metadata stays never-allowable); only loopback-that-is-also-pinned
+/// is permitted. Production executors pass `false`.
+///
+/// # Errors
+/// Returns an error if any hop fails the allowance guard, the redirect chain exceeds
+/// [`MAX_REDIRECT_HOPS`], or a transport error occurs.
+pub async fn follow_redirects_with_guard_allowance_loopback(
+    initial_url: &str,
+    allowed_ip_cidrs: &[String],
+    timeout: Duration,
+    allow_loopback: bool,
+    build_request: impl Fn(&reqwest::Client, &str) -> RequestBuilder,
+) -> Result<Response> {
     let mut current_url = initial_url.to_string();
 
     for hop in 0..=MAX_REDIRECT_HOPS {
-        let vetted = ssrf_guard_with_allowance(&current_url, allowed_ip_cidrs).await?;
+        let vetted =
+            ssrf_guard_with_allowance_loopback(&current_url, allowed_ip_cidrs, allow_loopback)
+                .await?;
         let parsed = Url::parse(&current_url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
         let host = parsed
             .host_str()
@@ -910,6 +1012,98 @@ mod tests {
     fn check_ip_allows_public_ipv4() {
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         assert!(check_ip(ip, "8.8.8.8").is_ok());
+    }
+
+    #[tokio::test]
+    async fn loopback_allowance_is_narrow_and_test_only() {
+        // TEST-ONLY loopback carve-out (the golden suite reaching a local Odoo sandbox).
+        let pin = vec!["127.0.0.1/32".to_string()];
+
+        // Permitted ONLY with the flag AND a matching pinned CIDR.
+        let vetted = ssrf_guard_with_allowance_loopback("http://127.0.0.1:8069/", &pin, true)
+            .await
+            .expect("loopback permitted with flag + pin");
+        assert_eq!(
+            vetted.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8069)
+        );
+
+        // Blocked with the flag but NO matching pin (loopback carved out of never-allowable,
+        // but still not on the allowance → not permitted).
+        assert!(
+            ssrf_guard_with_allowance_loopback("http://127.0.0.1:8069/", &[], true)
+                .await
+                .is_err(),
+            "loopback with no pin must stay blocked even with the flag"
+        );
+
+        // Blocked WITHOUT the flag even though it is pinned — the default path never permits
+        // loopback (the production default).
+        assert!(
+            ssrf_guard_with_allowance_loopback("http://127.0.0.1:8069/", &pin, false)
+                .await
+                .is_err(),
+            "loopback must stay blocked when the flag is off"
+        );
+        // And the public entrypoint (no loopback param) is identical to flag-off.
+        assert!(
+            ssrf_guard_with_allowance("http://127.0.0.1:8069/", &pin)
+                .await
+                .is_err()
+        );
+
+        // Metadata is STILL blocked even with the flag on and listed in the allowance — the
+        // carve-out is loopback-only, never the metadata/link-local surface.
+        let meta_pin = vec!["169.254.0.0/16".to_string(), "127.0.0.1/32".to_string()];
+        assert!(
+            ssrf_guard_with_allowance_loopback(
+                "http://169.254.169.254/latest/meta-data/",
+                &meta_pin,
+                true
+            )
+            .await
+            .is_err(),
+            "metadata must stay never-allowable even with the loopback flag on"
+        );
+        // Alibaba metadata + link-local also stay blocked with the flag on.
+        let ali_pin = vec!["100.100.100.0/24".to_string()];
+        assert!(
+            ssrf_guard_with_allowance_loopback("http://100.100.100.200/", &ali_pin, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn is_never_allowable_except_loopback_carves_out_only_loopback() {
+        // With the flag on, loopback is no longer never-allowable...
+        assert!(!is_never_allowable_except_loopback(
+            "127.0.0.1".parse().unwrap(),
+            true
+        ));
+        assert!(!is_never_allowable_except_loopback("::1".parse().unwrap(), true));
+        // ...but every other class remains never-allowable regardless of the flag.
+        assert!(is_never_allowable_except_loopback(
+            "169.254.169.254".parse().unwrap(),
+            true
+        ));
+        assert!(is_never_allowable_except_loopback(
+            "100.100.100.200".parse().unwrap(),
+            true
+        ));
+        assert!(is_never_allowable_except_loopback(
+            "fe80::1".parse().unwrap(),
+            true
+        ));
+        assert!(is_never_allowable_except_loopback(
+            "::ffff:169.254.169.254".parse().unwrap(),
+            true
+        ));
+        // With the flag OFF it is exactly is_never_allowable (loopback blocked again).
+        assert!(is_never_allowable_except_loopback(
+            "127.0.0.1".parse().unwrap(),
+            false
+        ));
     }
 
     // ---- shell_injection_guard --------------------------------------------------

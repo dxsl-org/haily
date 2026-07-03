@@ -44,6 +44,14 @@ pub struct OpSpec {
     /// verbatim into the journal's `compensation_plan` BEFORE the external call (outbox).
     #[serde(default)]
     pub compensation: Option<serde_json::Value>,
+    /// The model field that holds the client `correlation_ref` for C7 lost-response recovery
+    /// (e.g. `res.partner`/`crm.lead` have a writable `ref` field). ABSENT means the model has
+    /// no such field (e.g. `mail.activity` has no `ref`) — the executor must NOT write a
+    /// correlation field into that model's create (Odoo rejects an unknown field) and cannot
+    /// read that record back by correlation; a lost activity create then falls back to the
+    /// fail-closed `unverified` read-back, recovered by the returned id only.
+    #[serde(default)]
+    pub correlation_field: Option<String>,
 }
 
 impl OpSpec {
@@ -107,6 +115,7 @@ mod tests {
             risk_tier: risk_tier.map(str::to_string),
             compensability: Some("compensatable".into()),
             compensation: Some(json!({"op": "write"})),
+            correlation_field: Some("ref".into()),
         }
     }
 

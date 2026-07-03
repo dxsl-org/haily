@@ -48,14 +48,34 @@ pub trait ConnectorExecutor: Send + Sync {
     /// A server-returned structured fault is `Ok(ExecOutcome::Fault)`, not `Err`.
     async fn call(&self, op: &str, params: &Value) -> Result<ExecOutcome>;
 
-    /// Read back the current state of the record identified by `correlation_ref` (or a
-    /// returned id embedded in it). Used for post-write verification, reconciliation
-    /// (C6), lost-response recovery (C7), and undo idempotency (read-back-before-comp).
+    /// Read back the current state of the record identified by `correlation_ref` (or by
+    /// `id_hint` when the record has no correlation field / the ref was never written).
+    /// Used for post-write verification, reconciliation (C6), lost-response recovery (C7),
+    /// and undo idempotency (read-back-before-comp).
+    ///
+    /// `model_hint` names the model to query when `op` is a bare COMPENSATION keyword
+    /// (`write`/`unlink`) rather than a manifest op NAME — the undo logic passes the
+    /// compensation plan's `model` here so the read-back queries the CORRECT model instead of
+    /// falling back to the manifest's first model (which would query e.g. `res.partner` for a
+    /// `mail.activity` unlink). `None` for a manifest-op read-back (the model resolves from the
+    /// manifest by op name).
+    ///
+    /// `id_hint` names the concrete record id to look up when the record cannot be located by
+    /// `correlation_ref` — the primary path for an UPDATE (its pre_state read has no client
+    /// ref, only the target id) and for a create whose model has no correlation field (e.g.
+    /// `mail.activity`). When both are absent the read-back yields an empty body (record not
+    /// locatable) and the caller marks the row `unverified`.
     ///
     /// # Errors
     /// Returns `Err` if the read-back GET itself fails — the caller marks the row
     /// `unverified` (does NOT block a later undo).
-    async fn read_back(&self, op: &str, correlation_ref: &str) -> Result<Value>;
+    async fn read_back(
+        &self,
+        op: &str,
+        correlation_ref: &str,
+        model_hint: Option<&str>,
+        id_hint: Option<&str>,
+    ) -> Result<Value>;
 }
 
 #[cfg(test)]
@@ -120,7 +140,13 @@ pub mod mock {
             Ok(self.pop_call())
         }
 
-        async fn read_back(&self, _op: &str, _correlation_ref: &str) -> Result<Value> {
+        async fn read_back(
+            &self,
+            _op: &str,
+            _correlation_ref: &str,
+            _model_hint: Option<&str>,
+            _id_hint: Option<&str>,
+        ) -> Result<Value> {
             match self.pop_read_back() {
                 Some(v) => Ok(v),
                 None => anyhow::bail!("mock read-back failure"),

@@ -4,7 +4,8 @@
 //!
 //! NEVER blind-retries a create (Odoo has no idempotency — M4): reconciliation only
 //! READS. An unknown external outcome maps to a `readback_status`, not a re-issue.
-use crate::connector::{redact, ConnectorExecutor};
+use crate::connector::{readback_diff, redact, ConnectorExecutor};
+use crate::journal_undo::logic::plan_target_id;
 use haily_db::{queries::journal, DbHandle};
 use serde_json::Value;
 
@@ -58,8 +59,18 @@ async fn classify_one(
     executor: &dyn ConnectorExecutor,
     row: &journal::ActionJournalRow,
 ) -> (&'static str, Option<Value>) {
+    // Reconcile always reads back by the ORIGINAL op name (row.tool_name is a manifest op),
+    // so the executor resolves the model from the manifest — no compensation model hint. The
+    // compensation plan's target id (when present) is passed as the id locator so a row whose
+    // model has no correlation field, or an update whose ref was never embedded, is still
+    // located by id rather than falsely classified `unknown`.
+    let id_hint = row
+        .compensation_plan
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|plan| plan_target_id(&plan));
     match executor
-        .read_back(&row.tool_name, &row.correlation_ref)
+        .read_back(&row.tool_name, &row.correlation_ref, None, id_hint.as_deref())
         .await
     {
         Ok(body) => {
@@ -84,7 +95,9 @@ fn record_absent(body: &Value) -> bool {
 }
 
 /// Diff ONLY the fields present in request_params against the read-back body — a
-/// server-added field (e.g. `create_date`) must not trigger a false `mismatch`.
+/// server-added field (e.g. `create_date`) must not trigger a false `mismatch`. Delegates to
+/// the shared [`readback_diff`] normalizer so a crash-recovery classification uses the SAME
+/// representation-aware comparison as the post-write verify (no divergence between the paths).
 fn request_fields_present(request_params: &str, body: &Value) -> bool {
     let req: Value = match serde_json::from_str(request_params) {
         Ok(v) => v,
@@ -92,22 +105,7 @@ fn request_fields_present(request_params: &str, body: &Value) -> bool {
     };
     // Odoo writes live under a `values` object; fall back to the top-level object.
     let expected = req.get("values").unwrap_or(&req);
-    let expected_map = match expected.as_object() {
-        Some(m) => m,
-        None => return true,
-    };
-    for (k, v) in expected_map {
-        // Skip redacted credential references — they are not record fields.
-        if v.as_str().is_some_and(|s| s.starts_with("<redacted:")) {
-            continue;
-        }
-        match body.get(k) {
-            Some(actual) if actual == v => {}
-            Some(_) => return false, // present but different → mismatch
-            None => return false,    // an expected field is missing → mismatch
-        }
-    }
-    true
+    readback_diff::request_fields_match(expected, body)
 }
 
 fn summarize(body: &Value) -> String {

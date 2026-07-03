@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Nightly + manual trigger for the (slow, cold-start-heavy) Odoo golden job below.
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:
@@ -106,3 +110,37 @@ jobs:
       # Reads ignore list from .cargo/audit.toml.
       - name: cargo audit
         run: cargo audit
+
+  # NON-BLOCKING Odoo golden job (Safe Operator Harness phase 5, R3 e2e proof). Runs on the
+  # nightly schedule OR manual dispatch — NOT on push/PR — because the odoo:18.0 cold start
+  # (image pull + module install + DB init) is 30-90s and not yet benchmarked. It never gates
+  # the main `rust` build: `continue-on-error: true` + the schedule/dispatch condition. The
+  # env-gated golden tests SKIP everywhere else (HAILY_ODOO_URL unset), so the normal
+  # `cargo test --workspace` in the `rust` job stays fast and Docker-free.
+  odoo-golden:
+    name: Odoo golden (nightly, non-blocking)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Odoo + Postgres sandbox
+        run: docker compose -f docker/odoo-ci-compose.yml up -d
+
+      # Bootstrap polls an AUTHENTICATED RPC readiness probe (not just pg_isready), creates a
+      # scoped service user, generates an API key, masks it (::add-mask::), and exports
+      # HAILY_ODOO_URL/DB/UID/API_KEY to $GITHUB_ENV for the test step below.
+      - name: Bootstrap Odoo (readiness + scoped key)
+        run: bash scripts/odoo-ci-bootstrap.sh
+
+      # Only the gated golden tests — HAILY_ODOO_URL is now set, so they run against the
+      # sandbox. --test odoo_golden keeps this focused (the rest of the suite ran in `rust`).
+      - name: Run Odoo golden tests
+        run: cargo test -p haily-tools --test odoo_golden -- --nocapture
+
+      - name: Tear down sandbox
+        if: always()
+        run: docker compose -f docker/odoo-ci-compose.yml down -v

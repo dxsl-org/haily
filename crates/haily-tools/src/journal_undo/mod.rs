@@ -9,7 +9,7 @@
 //! lives in its own top-level module and is registered by an extension of the registry
 //! builder; phase 4 creates the sibling `connector/` HTTP impl. Documented here so the
 //! divergence is intentional, not drift.
-mod logic;
+pub(crate) mod logic;
 pub mod reconcile;
 
 pub use logic::{
@@ -285,6 +285,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undo_refuses_when_compensation_plan_has_no_target_id() {
+        // FIX 1 fail-closed guard: a create whose returned id was never written back into the
+        // compensation plan (lost response / crash between call and write-back) leaves the
+        // plan targeting NO record. A write/archive/unlink with no id must be REFUSED before
+        // any external call — never run `write(null, {active:false})`, which could hit every
+        // record. This is the exact create→archive-undo defect the review flagged.
+        let (db, _d) = db().await;
+        // Insert a row whose compensation plan is a create's archive-style plan with NO id.
+        let params = redact::redact_to_string(json!({"values": {"name": "Ghost"}}), "odoo.api_key");
+        let row = journal::insert(
+            &db,
+            NewAction {
+                session_id: "sess-noid",
+                tool_name: "odoo_contact_create",
+                tool_tier: "ReversibleWrite",
+                compensability: "compensatable",
+                idempotency_key: "noid-1",
+                correlation_ref: "corr-noid",
+                request_params: &params,
+                pre_state: None,
+                pre_state_version: None,
+                // Archive compensation with model+method but NO id (write-back never landed).
+                compensation_plan: Some(
+                    r#"{"op":"archive","model":"res.partner","method":"write","values":{"active":false}}"#,
+                ),
+                retention_days: 30,
+            },
+        )
+        .await
+        .unwrap();
+        journal::set_readback(&db, &row.id, "match", None).await.unwrap();
+        let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+
+        // A dummy executor: the guard must fire BEFORE any call, so no outcome is scripted.
+        let exec = MockExecutor::new(vec![], vec![Some(json!({"id": 42}))]);
+        let outcome = attempt_undo(&db, &exec, &row).await.unwrap();
+        assert!(
+            matches!(outcome, UndoOutcome::Refused(_)),
+            "a targetless compensation must be refused, not compensated blind: {outcome:?}"
+        );
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "no external write may run against a null target"
+        );
+        let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert_eq!(after.undo_status, "refused");
+    }
+
+    #[tokio::test]
     async fn undo_attempts_capped_at_3() {
         let (db, _d) = db().await;
         let row = insert_row(&db, "cap-1", "compensatable", None, "match").await;
@@ -471,7 +520,13 @@ mod tests {
         async fn call(&self, _op: &str, _p: &serde_json::Value) -> anyhow::Result<ExecOutcome> {
             anyhow::bail!("transport failure")
         }
-        async fn read_back(&self, _op: &str, _c: &str) -> anyhow::Result<serde_json::Value> {
+        async fn read_back(
+            &self,
+            _op: &str,
+            _c: &str,
+            _model_hint: Option<&str>,
+            _id_hint: Option<&str>,
+        ) -> anyhow::Result<serde_json::Value> {
             Ok(self.read.clone())
         }
     }

@@ -81,12 +81,31 @@ pub async fn write_date_unchanged(
     executor: &dyn ConnectorExecutor,
     row: &ActionJournalRow,
 ) -> Result<bool> {
-    let recorded = match row.pre_state_version.as_deref() {
+    // Prefer the POST-write version as the concurrency baseline: it is the write_date AS OF
+    // our own forward write, so the undo refuses only on a THIRD-PARTY change beyond it. Fall
+    // back to the pre-write version only when the post-write read-back never landed (a record
+    // written but unverified). No version at all → nothing to compare (creates) → allow.
+    let recorded = match row
+        .post_state_version
+        .as_deref()
+        .or(row.pre_state_version.as_deref())
+    {
         Some(v) => v,
-        None => return Ok(true), // no version captured — nothing to compare (creates)
+        None => return Ok(true),
     };
+    // Version re-check reads back by the ORIGINAL op name (a manifest op) — the executor
+    // resolves the model from the manifest, so no compensation model hint is needed. The
+    // compensation plan's target id is passed as the id locator: an UPDATE's row carries a
+    // generated correlation_ref that was NEVER written into the record (only creates embed the
+    // ref), so the record can only be re-read by its id.
+    let plan: Value = row
+        .compensation_plan
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let id_hint = plan_target_id(&plan);
     let current = executor
-        .read_back(&row.tool_name, &row.correlation_ref)
+        .read_back(&row.tool_name, &row.correlation_ref, None, id_hint.as_deref())
         .await?;
     let live = current
         .get("write_date")
@@ -135,7 +154,6 @@ pub async fn attempt_undo(
         )));
     }
 
-    journal::advance_undo_status(db, &row.id, "compensating").await?;
     let plan: Value = row
         .compensation_plan
         .as_deref()
@@ -145,11 +163,40 @@ pub async fn attempt_undo(
         .get("op")
         .and_then(Value::as_str)
         .unwrap_or("compensate");
+    // The compensation plan's model — passed to every compensation read-back so the executor
+    // queries the CORRECT model for a bare op keyword (a `mail.activity` unlink must read back
+    // `mail.activity`, not the manifest's first model). `None` for a legacy plan with no model.
+    let comp_model = plan.get("model").and_then(Value::as_str);
+    // The compensation plan's target id — passed as the read-back id locator so a compensation
+    // whose model has no correlation field (e.g. `mail.activity`, no `ref`) is still found by
+    // id. For a model WITH a correlation field the executor prefers the ref; the id is the
+    // fallback. `None` for a plan carrying no concrete id (guarded above for target ops).
+    let comp_id = plan_target_id(&plan);
+
+    // Fail-closed target guard: a write/unlink/archive compensation MUST carry the concrete
+    // record id it targets. A create journals its plan BEFORE the call (no id yet) and the
+    // tool writes the returned id back post-call — but if that write-back never landed (lost
+    // create, crash between call and write-back), the plan still has no id. Running
+    // `write(null, {active:false})` / `unlink(null)` here would target NO record — or, on
+    // Odoo, potentially EVERY record — so refuse BEFORE any external call rather than
+    // compensate blind. Checked before `advance_undo_status(compensating)` so the row is not
+    // left mid-transition on a refusal.
+    if compensation_needs_target(comp_op) && !plan_has_target(&plan) {
+        journal::advance_undo_status(db, &row.id, "refused").await?;
+        return Ok(UndoOutcome::Refused(
+            "kế hoạch bồi hoàn thiếu id bản ghi mục tiêu (create bị mất phản hồi) — từ chối để tránh ghi nhầm".to_string(),
+        ));
+    }
+
+    journal::advance_undo_status(db, &row.id, "compensating").await?;
 
     // Read-back-before-compensation (M4/M7): if the record is already at the target
     // state (e.g. already unlinked), skip the write — Odoo has no idempotency, so a
     // second unlink of a gone record would fault.
-    if let Ok(current) = executor.read_back(comp_op, &row.correlation_ref).await {
+    if let Ok(current) = executor
+        .read_back(comp_op, &row.correlation_ref, comp_model, comp_id.as_deref())
+        .await
+    {
         if already_at_target(&plan, &current) {
             journal::set_readback(db, &row.id, "match", Some(&summarize(&current))).await?;
             journal::advance_undo_status(db, &row.id, "undone").await?;
@@ -160,7 +207,10 @@ pub async fn attempt_undo(
     match executor.call(comp_op, &plan).await {
         Ok(ExecOutcome::Ok { .. }) => {
             // OWN read-back is REQUIRED before declaring `undone` — a 200 is not proof.
-            match executor.read_back(comp_op, &row.correlation_ref).await {
+            match executor
+                .read_back(comp_op, &row.correlation_ref, comp_model, comp_id.as_deref())
+                .await
+            {
                 Ok(after) => {
                     journal::set_readback(db, &row.id, "match", Some(&summarize(&after))).await?;
                     journal::advance_undo_status(db, &row.id, "undone").await?;
@@ -229,6 +279,42 @@ async fn classify_fault(
     Ok(UndoOutcome::Stuck(format!(
         "lỗi không xác định từ hệ thống, không tự động thử lại: {safe}"
     )))
+}
+
+/// True when a compensation op writes to a specific record and therefore REQUIRES a target
+/// id on its plan. `write`/`archive`/`unlink`/`delete` all mutate an identified record; a
+/// non-mutating or unknown keyword (e.g. `compensate`, `none`) is not target-checked here
+/// (it either does nothing or is caught elsewhere).
+fn compensation_needs_target(comp_op: &str) -> bool {
+    matches!(comp_op, "write" | "archive" | "unlink" | "delete")
+}
+
+/// The compensation plan's concrete record id as a string, for the read-back id locator:
+/// the first element of `ids`, else a scalar `id`. `None` when the plan carries no id (a lost
+/// create — guarded by `plan_has_target` before any compensation runs).
+pub(crate) fn plan_target_id(plan: &Value) -> Option<String> {
+    if let Some(first) = plan.get("ids").and_then(Value::as_array).and_then(|a| a.first()) {
+        return first
+            .as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| first.as_str().map(str::to_string));
+    }
+    plan.get("id")
+        .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)))
+}
+
+/// True when the compensation plan carries a concrete record target: a non-empty `ids`
+/// array, or a scalar `id`. Absence means the create's returned id was never written back —
+/// the caller must refuse rather than compensate a null target.
+fn plan_has_target(plan: &Value) -> bool {
+    let ids_present = plan
+        .get("ids")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let id_present = plan
+        .get("id")
+        .is_some_and(|v| !v.is_null() && v != &Value::String(String::new()));
+    ids_present || id_present
 }
 
 /// True when the read-back shows the record already at the compensation's target state.

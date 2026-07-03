@@ -1,0 +1,100 @@
+{
+  "connector_name": "odoo-crm",
+  "version": "1",
+  "base_url": "https://erp.example.com",
+  "allowed_ip_cidrs": [],
+  "ops": [
+    {
+      "name": "odoo_contact_create",
+      "model": "res.partner",
+      "method": "create",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "archive", "model": "res.partner", "method": "write", "values": { "active": false } }
+    },
+    {
+      "name": "odoo_contact_read",
+      "model": "res.partner",
+      "method": "read",
+      "risk_tier": "Read",
+      "compensability": "read",
+      "correlation_field": "ref"
+    },
+    {
+      "name": "odoo_contact_update",
+      "model": "res.partner",
+      "method": "write",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "write", "model": "res.partner", "method": "write" }
+    },
+    {
+      "name": "odoo_contact_archive",
+      "model": "res.partner",
+      "method": "write",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "write", "model": "res.partner", "method": "write", "values": { "active": true } }
+    },
+    {
+      "name": "odoo_lead_create",
+      "model": "crm.lead",
+      "method": "create",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "archive", "model": "crm.lead", "method": "write", "values": { "active": false } }
+    },
+    {
+      "name": "odoo_lead_read",
+      "model": "crm.lead",
+      "method": "read",
+      "risk_tier": "Read",
+      "compensability": "read",
+      "correlation_field": "ref"
+    },
+    {
+      "name": "odoo_lead_update",
+      "model": "crm.lead",
+      "method": "write",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "write", "model": "crm.lead", "method": "write" }
+    },
+    {
+      "name": "odoo_lead_archive",
+      "model": "crm.lead",
+      "method": "write",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "correlation_field": "ref",
+      "compensation": { "op": "write", "model": "crm.lead", "method": "write", "values": { "active": true } }
+    },
+    {
+      "name": "odoo_activity_create",
+      "model": "mail.activity",
+      "method": "create",
+      "risk_tier": "ReversibleWrite",
+      "compensability": "compensatable",
+      "compensation": { "op": "unlink", "model": "mail.activity", "method": "unlink" }
+    },
+    {
+      "name": "odoo_activity_read",
+      "model": "mail.activity",
+      "method": "read",
+      "risk_tier": "Read",
+      "compensability": "read"
+    },
+    {
+      "name": "odoo_activity_done",
+      "model": "mail.activity",
+      "method": "action_feedback",
+      "risk_tier": "IrreversibleWrite",
+      "compensability": "final"
+    }
+  ]
+}

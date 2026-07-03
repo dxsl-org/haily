@@ -26,6 +26,12 @@ pub struct ActionJournalRow {
     pub pre_state: Option<String>,
     pub pre_state_version: Option<String>,
     pub post_state: Option<String>,
+    /// The opaque version token (Odoo `write_date`) AS OF our forward write's completion —
+    /// the C10 concurrency baseline for a self-undo. Set post-write (mutable, migration 0014),
+    /// so the undo refuses only on a THIRD-PARTY change beyond our own write. `None` until the
+    /// post-write read-back lands (creates, lost responses) → the guard falls back to
+    /// `pre_state_version` or skips.
+    pub post_state_version: Option<String>,
     pub readback_status: String,
     pub compensation_plan: Option<String>,
     pub undo_status: String,
@@ -105,6 +111,39 @@ pub async fn set_readback(
     sqlx::query("UPDATE action_journal SET readback_status = ?, post_state = ? WHERE id = ?")
         .bind(readback_status)
         .bind(post_state)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Rewrite the `compensation_plan` after the external call, once the created record's id
+/// is known (a create's plan is journaled BEFORE the call with no id — the id it RETURNS
+/// must be written back or the archive/write compensation has no target). `compensation_plan`
+/// is a PROCESSING column, deliberately outside the migration-0012 append-only trigger
+/// (which guards only request_params/pre_state/pre_state_version/created_at/idempotency_key),
+/// so this update is permitted; the evidentiary columns remain immutable.
+///
+/// # Errors
+/// Returns an error if the update fails. Silently succeeds if no row matches `id`.
+pub async fn update_compensation_plan(db: &DbHandle, id: &str, plan_json: &str) -> Result<()> {
+    sqlx::query("UPDATE action_journal SET compensation_plan = ? WHERE id = ?")
+        .bind(plan_json)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// Record the post-write version token (Odoo `write_date`) captured by the post-write
+/// read-back — the C10 self-undo concurrency baseline. `post_state_version` is a PROCESSING
+/// column (migration 0014, outside the 0012 append-only trigger), so this update is permitted.
+///
+/// # Errors
+/// Returns an error if the update fails. Silently succeeds if no row matches `id`.
+pub async fn set_post_state_version(db: &DbHandle, id: &str, version: &str) -> Result<()> {
+    sqlx::query("UPDATE action_journal SET post_state_version = ? WHERE id = ?")
+        .bind(version)
         .bind(id)
         .execute(db.pool())
         .await?;

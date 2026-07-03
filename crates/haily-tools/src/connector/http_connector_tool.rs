@@ -17,7 +17,7 @@
 //! The Odoo-specific executor (execute_kw / faultString classification) is phase 5; this
 //! module ships the GENERIC HTTP executor and interprets a manifest op over it.
 use crate::connector::manifest::{Manifest, OpSpec};
-use crate::connector::{redact, ConnectorExecutor, ExecOutcome};
+use crate::connector::{readback_diff, redact, ConnectorExecutor, ExecOutcome};
 use crate::security;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
@@ -44,15 +44,95 @@ pub struct HttpConnectorTool {
 }
 
 impl HttpConnectorTool {
-    /// Build the outbox `compensation_plan` JSON for this op from the manifest's declared
-    /// `compensation` template, enriched with the returned id once known. Written BEFORE
-    /// the external call so a crash mid-write still leaves an undo path on disk.
-    fn compensation_plan(&self, returned_id: Option<&str>) -> Option<String> {
+    /// Build the outbox `compensation_plan` from the manifest's declared `compensation`
+    /// template, enriched with the concrete undo TARGET so the recorded plan is executable —
+    /// the whole point of the outbox is that the undo path is complete on disk before the
+    /// write.
+    ///
+    /// Target-id resolution (fail-closed at undo time if still absent, see `journal_undo`):
+    /// - **create**: the id is not known until the call RETURNS, so it is `None` here and
+    ///   written back post-call via [`journal::update_compensation_plan`]. Passing a
+    ///   `returned_id` fills it in.
+    /// - **update/archive** (a write to an existing record): the target ids are in the request
+    ///   `params` (`ids`/`id`) and are copied into the plan up front — a non-create's
+    ///   compensation targets the SAME records the write touched.
+    ///
+    /// For an update whose compensation template carries no `values` (a plain write-back), the
+    /// PREVIOUS field values are lifted from the captured `pre_state` for exactly the fields
+    /// this write changes — that is what makes "restore the previous values" a real undo rather
+    /// than a no-op. Fields absent from pre_state are left out (nothing to restore).
+    fn compensation_plan(
+        &self,
+        params: &Value,
+        pre_state: Option<&Value>,
+        returned_id: Option<&str>,
+    ) -> Option<String> {
         let mut plan = self.op.compensation.clone()?;
-        if let (Some(obj), Some(id)) = (plan.as_object_mut(), returned_id) {
-            obj.insert("id".to_string(), Value::String(id.to_string()));
+        let obj = plan.as_object_mut()?;
+
+        // Target id: returned id for a create, else the request's ids/id. A create's returned
+        // id is coerced to an integer where it parses as one — Odoo record ids are integers and
+        // the executor's `write`/`unlink` args builder wraps the value in a `[id]` list, so a
+        // stringly `"42"` id would build `["42"]` and Odoo would reject the write.
+        if let Some(id) = returned_id {
+            let id_val = id
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::String(id.to_string()));
+            obj.entry("id").or_insert(id_val);
+        } else if !obj.contains_key("ids") && !obj.contains_key("id") {
+            if let Some(ids) = params.get("ids").cloned() {
+                obj.insert("ids".to_string(), ids);
+            } else if let Some(id) = params.get("id").cloned() {
+                obj.insert("id".to_string(), id);
+            }
+        }
+
+        // A write-back compensation with no template values restores the PREVIOUS values of
+        // the fields this op writes, read out of the captured pre_state.
+        let is_write_back =
+            obj.get("op").and_then(Value::as_str) == Some("write") && !obj.contains_key("values");
+        if is_write_back {
+            if let Some(restored) = restore_values(params, pre_state) {
+                obj.insert("values".to_string(), restored);
+            }
         }
         Some(plan.to_string())
+    }
+}
+
+/// The concrete record id a non-create op targets, taken from the request params: the first
+/// element of `ids`, or a scalar `id`. Returned as a string for the `id_hint` read-back
+/// locator (an update/archive has no client correlation ref — it is found by id).
+fn params_target_id(params: &Value) -> Option<String> {
+    if let Some(first) = params.get("ids").and_then(Value::as_array).and_then(|a| a.first()) {
+        return first
+            .as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| first.as_str().map(str::to_string));
+    }
+    params
+        .get("id")
+        .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string)))
+}
+
+/// For each field the request writes (under `values`), look up its PREVIOUS value in
+/// `pre_state` — the object to write back to undo the change. Returns `None` when there is
+/// nothing to restore (no pre_state or no writable fields), so the caller leaves the
+/// compensation template untouched rather than writing an empty `values`.
+fn restore_values(params: &Value, pre_state: Option<&Value>) -> Option<Value> {
+    let pre = pre_state?;
+    let written = params.get("values")?.as_object()?;
+    let mut restored = serde_json::Map::new();
+    for key in written.keys() {
+        if let Some(prev) = pre.get(key) {
+            restored.insert(key.clone(), prev.clone());
+        }
+    }
+    if restored.is_empty() {
+        None
+    } else {
+        Some(Value::Object(restored))
     }
 }
 
@@ -87,31 +167,60 @@ impl Tool for HttpConnectorTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let params = args.get("params").cloned().unwrap_or(args.clone());
-        let correlation_ref = uuid::Uuid::new_v4().to_string();
+        let mut params = args.get("params").cloned().unwrap_or(args.clone());
+        // Honor a caller-supplied correlation_ref so the ref the executor WRITES into the record
+        // and the ref this tool READS BACK by are the same value. Without this the executor
+        // would write the params' ref while read-back searched a freshly generated uuid — the
+        // create's post-read would find nothing and mark a false `mismatch`. Absent → generate
+        // one and inject it into params so the executor embeds it too (C7 discoverability).
+        let correlation_ref = params
+            .get("correlation_ref")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let corr = uuid::Uuid::new_v4().to_string();
+                if let Some(obj) = params.as_object_mut() {
+                    obj.insert("correlation_ref".to_string(), Value::String(corr.clone()));
+                }
+                corr
+            });
         let idempotency_key = format!("{}:{}", self.op.name, correlation_ref);
+        // The concrete target id for a non-create (update/archive) — its pre_state read has no
+        // client ref, so read-back must locate the record by id. Taken from the request params.
+        let target_id = params_target_id(&params);
 
         // 1. GET pre_state (+version token). Skipped for creates — there is no record yet.
-        let (pre_state, pre_state_version) = if self.op.is_create() {
-            (None, None)
+        //    The parsed body is kept so an update's compensation can restore previous values.
+        let (pre_state_body, pre_state, pre_state_version) = if self.op.is_create() {
+            (None, None, None)
         } else {
-            match self.executor.read_back(&self.op.name, &correlation_ref).await {
+            match self
+                .executor
+                .read_back(&self.op.name, &correlation_ref, None, target_id.as_deref())
+                .await
+            {
                 Ok(body) => {
                     let version = body
                         .get("write_date")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
                     // Tag-strip the third-party pre_state before it is persisted (C5).
-                    (Some(redact::strip_tool_tags(&body.to_string())), version)
+                    (
+                        Some(body.clone()),
+                        Some(redact::strip_tool_tags(&body.to_string())),
+                        version,
+                    )
                 }
                 // A failed pre-read is not fatal — record an empty pre_state and proceed;
                 // the post-write read-back is the runtime backstop.
-                Err(_) => (None, None),
+                Err(_) => (None, None, None),
             }
         };
 
-        // 2. Build the compensation plan (returned id filled in post-call for creates).
-        let compensation_plan = self.compensation_plan(None);
+        // 2. Build the compensation plan: an UPDATE/ARCHIVE carries its target ids (from the
+        //    request) + restored previous values now; a CREATE's returned id is filled in
+        //    post-call (step 5b).
+        let compensation_plan = self.compensation_plan(&params, pre_state_body.as_ref(), None);
 
         // 3. OUTBOX insert BEFORE the external call — redacted params (C4). A crash after
         //    this point still leaves the plan + pre_state on disk for reconciliation.
@@ -167,23 +276,64 @@ impl Tool for HttpConnectorTool {
             }
         };
 
-        // 6. GET post_state and diff ONLY the request_params fields (a server-added field
-        //    like create_date must not trigger a false mismatch).
-        let (readback_status, post_summary) =
-            match self.executor.read_back(&self.op.name, &correlation_ref).await {
-                Ok(body) => {
-                    let status = if request_fields_match(&params, &body) {
-                        "match"
-                    } else {
-                        "mismatch"
-                    };
-                    (status, Some(summarize(&body)))
+        // 5b. Write the returned id back into the compensation plan for a create. The plan is
+        //     journaled at step 2 with NO id (a create has no record id yet); its archive/write
+        //     compensation targets that id, so without this write-back the undo would run
+        //     `write(null, {active:false})` — targeting no record (or, worse, every record).
+        //     `compensation_plan` is a mutable processing column (not append-only guarded), so
+        //     rewriting it here is permitted. `journal_undo` fail-closes if the id is still
+        //     absent at undo time (a lost create leaves no compensation target).
+        if self.op.is_create() {
+            if let Some(id) = returned_id.as_deref() {
+                if let Some(plan) = self.compensation_plan(&params, None, Some(id)) {
+                    journal::update_compensation_plan(&ctx.db, &row.id, &plan).await?;
                 }
-                // C7: the read-back GET itself failed — do NOT conclude failure. Mark
-                // unverified (does not block a later undo).
-                Err(_) => ("unverified", None),
-            };
+            }
+        }
+
+        // 6. GET post_state and diff ONLY the request_params fields (a server-added field
+        //    like create_date must not trigger a false mismatch). The record is located by the
+        //    correlation_ref (when the model has a correlation field) OR by its id: a create's
+        //    RETURNED id, else the update/archive target id. A create whose model has no
+        //    correlation field (mail.activity) is thus still verifiable by its returned id;
+        //    with neither locator the read-back is empty → `unverified` (fail-closed, does not
+        //    block a later undo).
+        let post_id = returned_id.as_deref().or(target_id.as_deref());
+        let (readback_status, post_summary, post_version) = match self
+            .executor
+            .read_back(&self.op.name, &correlation_ref, None, post_id)
+            .await
+        {
+            Ok(body) => {
+                let status = if request_fields_match(&params, &body) {
+                    "match"
+                } else {
+                    "mismatch"
+                };
+                // Capture the post-write write_date as the C10 self-undo baseline ONLY for a
+                // non-create update/archive: the undo then refuses on a THIRD-PARTY change
+                // BEYOND our own write, not on the change our forward write itself made (which
+                // always bumps write_date). A CREATE is deliberately NOT versioned — its undo
+                // (archive/unlink) is guarded by read-back-before-comp (already-gone =
+                // already-done) + the target-id guard, and a post-create write_date would
+                // wrongly refuse the undo once the record is legitimately unlinked/archived.
+                let version = if self.op.is_create() {
+                    None
+                } else {
+                    body.get("write_date")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                };
+                (status, Some(summarize(&body)), version)
+            }
+            // C7: the read-back GET itself failed — do NOT conclude failure. Mark
+            // unverified (does not block a later undo).
+            Err(_) => ("unverified", None, None),
+        };
         journal::set_readback(&ctx.db, &row.id, readback_status, post_summary.as_deref()).await?;
+        if let Some(version) = post_version.as_deref() {
+            journal::set_post_state_version(&ctx.db, &row.id, version).await?;
+        }
 
         Ok(format!(
             "Đã thực hiện '{}' (journal {}), read-back: {}{}.",
@@ -209,24 +359,13 @@ fn risk_tier_str(tier: RiskTier) -> &'static str {
 
 /// Diff ONLY the fields present in `params` against the read-back `body`. A field the
 /// server added (e.g. `create_date`) is ignored — only what we asked to write is verified.
-/// Redacted credential markers are skipped (they are not record fields).
+/// Delegates to [`readback_diff`] so the comparison normalizes Odoo's read representation
+/// (many2one `[id, name]` → id, `false` ↔ unset, id-set relations, int/float) — a format-only
+/// difference is not a false mismatch, while a genuine scalar value difference still is.
 fn request_fields_match(params: &Value, body: &Value) -> bool {
     // Writes may live under a `values` object; fall back to the params object itself.
     let expected = params.get("values").unwrap_or(params);
-    let expected_map = match expected.as_object() {
-        Some(m) => m,
-        None => return true, // nothing structured to diff → do not claim mismatch
-    };
-    for (k, v) in expected_map {
-        if v.as_str().is_some_and(|s| s.starts_with("<redacted:")) {
-            continue;
-        }
-        match body.get(k) {
-            Some(actual) if actual == v => {}
-            Some(_) | None => return false,
-        }
-    }
-    true
+    readback_diff::request_fields_match(expected, body)
 }
 
 /// Bounded, tag-stripped one-line summary of a read-back body for the journal post_state.
@@ -311,7 +450,16 @@ impl ConnectorExecutor for HttpExecutor {
         })
     }
 
-    async fn read_back(&self, op: &str, correlation_ref: &str) -> Result<Value> {
+    async fn read_back(
+        &self,
+        op: &str,
+        correlation_ref: &str,
+        _model_hint: Option<&str>,
+        _id_hint: Option<&str>,
+    ) -> Result<Value> {
+        // The generic HTTP executor routes purely by op/correlation_ref; it has no per-model
+        // path, so the model/id hints are not needed here (only the Odoo specialization
+        // resolves a model and locates by id). Kept in the signature for trait uniformity.
         let resp = security::follow_redirects_with_guard_allowance(
             self.endpoint(),
             &self.manifest.allowed_ip_cidrs,

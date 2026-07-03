@@ -83,3 +83,57 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
 
     cfg
 }
+
+/// Preference key holding the Odoo connector's API key (Safe Operator Harness phase 5,
+/// Decision 2: `kms_preferences`, NOT keyring). The value is the SECRET; callers store only
+/// this key NAME as the journal credential reference (C4) and read the secret by reference
+/// at call time — the secret itself must never be logged or copied into a journal row.
+pub const ODOO_API_KEY_PREF: &str = "connector.odoo.api_key";
+
+/// Load the Odoo connector API key from `kms_preferences` (`connector.odoo.api_key`),
+/// falling back to the `HAILY_ODOO_API_KEY` env var (useful for Docker/CI where the CI
+/// bootstrap exports a freshly-generated scoped key). Returns `None` if unset in both.
+///
+/// The returned string is the raw secret — the caller must NOT log it or persist it in a
+/// journal row; only the preference key NAME ([`ODOO_API_KEY_PREF`]) is a safe reference (C4).
+pub async fn load_odoo_api_key(kms: &KmsHandle) -> Option<String> {
+    if let Ok(Some(key)) = meta::get_preference(kms.db(), ODOO_API_KEY_PREF).await {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    std::env::var("HAILY_ODOO_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use haily_db::DbHandle;
+
+    async fn kms(dir: &std::path::Path) -> KmsHandle {
+        let db = DbHandle::init(&dir.join("kms.db")).await.unwrap();
+        KmsHandle::init(db, dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn odoo_api_key_read_from_preference_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = kms(dir.path()).await;
+        // Unset: neither preference nor env → None.
+        std::env::remove_var("HAILY_ODOO_API_KEY");
+        assert!(load_odoo_api_key(&kms).await.is_none());
+
+        // A stored preference under the reference key name is returned verbatim.
+        meta::upsert_preference(kms.db(), ODOO_API_KEY_PREF, "sk-scoped-XYZ", "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_odoo_api_key(&kms).await.as_deref(),
+            Some("sk-scoped-XYZ")
+        );
+        // The reference name is the stable public constant (what the journal records, C4).
+        assert_eq!(ODOO_API_KEY_PREF, "connector.odoo.api_key");
+    }
+}

@@ -1,0 +1,13 @@
+-- C10 self-undo fix (Safe Operator Harness phase 5, live-suite remediation).
+--
+-- `pre_state_version` (0012) is the write_date captured BEFORE our forward write and is
+-- append-only. The C10 concurrency guard must NOT refuse OUR OWN undo — but comparing the
+-- live write_date against the PRE-write version always differs (our forward write bumped
+-- write_date), so a self-undo of an update/archive would be wrongly refused.
+--
+-- The correct baseline is the write_date AS OF our forward write's completion: any change
+-- beyond THAT is a third-party modification the undo must refuse. That value is only known
+-- AFTER the write, so it lives in this MUTABLE processing column (set by the post-write
+-- read-back), deliberately OUTSIDE the 0012 append-only trigger — mirroring post_state /
+-- readback_status. `pre_state_version` stays immutable evidence of the pre-image.
+ALTER TABLE action_journal ADD COLUMN post_state_version TEXT;

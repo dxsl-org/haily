@@ -6,11 +6,15 @@
 pub mod executor;
 pub mod http_connector_tool;
 pub mod manifest;
+pub mod odoo_executor;
+pub mod odoo_fault;
+pub mod readback_diff;
 pub mod redact;
 
 pub use executor::{ConnectorExecutor, ExecOutcome};
 pub use http_connector_tool::{HttpConnectorTool, HttpExecutor};
 pub use manifest::{Manifest, OpSpec};
+pub use odoo_executor::{OdooExecutor, OdooExecutorConfig};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,7 +30,13 @@ impl ConnectorExecutor for UnconfiguredExecutor {
     async fn call(&self, _op: &str, _params: &Value) -> Result<ExecOutcome> {
         anyhow::bail!("connector not configured (phase 4 wires the HTTP executor)")
     }
-    async fn read_back(&self, _op: &str, _correlation_ref: &str) -> Result<Value> {
+    async fn read_back(
+        &self,
+        _op: &str,
+        _correlation_ref: &str,
+        _model_hint: Option<&str>,
+        _id_hint: Option<&str>,
+    ) -> Result<Value> {
         anyhow::bail!("connector not configured (phase 4 wires the HTTP executor)")
     }
 }
