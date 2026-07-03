@@ -4,8 +4,19 @@
 //!
 //! NEVER blind-retries a create (Odoo has no idempotency — M4): reconciliation only
 //! READS. An unknown external outcome maps to a `readback_status`, not a re-issue.
+//!
+//! C1 dispatch split: a LOCAL row (tasks/notes/reminders) is classified from a live SELECT
+//! against this process's OWN SQLite connection, never via `ConnectorExecutor::read_back` —
+//! calling the (possibly `UnconfiguredExecutor`) connector executor for a local row would
+//! bail and misclassify it `unverified` forever. In practice a local write's transaction
+//! (C2) means a row only ever reaches `pending` if the process crashed BEFORE the commit
+//! that would have set it to `match` — in which case the row itself was rolled back and
+//! never exists to be swept. This branch exists as the fail-closed backstop for that
+//! invariant, not a normally-hit path.
 use crate::connector::{readback_diff, redact, ConnectorExecutor};
+use crate::journal_undo::local_compensator::{is_local_row, local_table_for};
 use crate::journal_undo::logic::plan_target_id;
+use haily_db::queries::local_snapshot;
 use haily_db::{queries::journal, DbHandle};
 use serde_json::Value;
 
@@ -38,7 +49,14 @@ pub async fn reconcile_incomplete(
     };
     let mut classified = 0u64;
     for row in rows {
-        let status = classify_one(executor, &row).await;
+        // C1: a LOCAL row is classified from a live SELECT on THIS process's own SQLite
+        // connection — never via `executor.read_back`, which would bail against an
+        // `UnconfiguredExecutor` (or simply the wrong system) and misclassify forever.
+        let status = if is_local_row(&row) {
+            classify_local(db, &row).await
+        } else {
+            classify_one(executor, &row).await
+        };
         // Tag-strip the post_state summary before it is persisted / can reach an LLM (C5).
         let summary = status.1.map(|v| summarize(&v));
         if journal::set_readback(db, &row.id, status.0, summary.as_deref())
@@ -86,6 +104,33 @@ async fn classify_one(
         }
         // C7: the read-back GET itself failed — do NOT conclude the write failed. Mark
         // unverified; this does not block a later undo.
+        Err(_) => ("unverified", None),
+    }
+}
+
+/// Classify a LOCAL orphan row by checking whether its target row still exists in THIS
+/// process's own SQLite — no network call, no `ConnectorExecutor`. In practice
+/// `local_journaled_write` (C2) sets `readback_status = 'match'` inside the SAME transaction
+/// as the forward mutate, so a local row only ever reaches this sweep if the process crashed
+/// between the transaction's commit and... nothing — a committed transaction cannot leave a
+/// row `pending`. This exists as the fail-closed backstop: if a local row is ever found
+/// `pending` (a future code path, a hand-crafted row), the target's existence is what decides
+/// `match` (the row is there — the local write landed) vs. `unknown` (the row is gone — the
+/// journal outbox insert landed but the forward mutate never committed, which cannot happen
+/// under the current one-transaction design but is treated conservatively either way).
+async fn classify_local(
+    db: &DbHandle,
+    row: &journal::ActionJournalRow,
+) -> (&'static str, Option<Value>) {
+    let table = match local_table_for(&row.tool_name) {
+        Some(t) => t,
+        None => return ("unknown", None),
+    };
+    match local_snapshot::row_exists(db, table, &row.correlation_ref).await {
+        Ok(true) => ("match", None),
+        Ok(false) => ("unknown", None),
+        // A local read is against our own DB — a query failure is an infra fault, not a
+        // remote-system ambiguity, but is still treated the same conservative way (C7 parity).
         Err(_) => ("unverified", None),
     }
 }

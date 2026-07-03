@@ -339,7 +339,9 @@ async fn create_undo_roundtrip() {
 
     // Drive the REAL undo against the REAL row — the archive compensation must target the
     // created id and flip active=false.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "create-undo: {outcome:?}"
@@ -399,7 +401,9 @@ async fn update_undo_roundtrip() {
     );
 
     // Drive the REAL undo — function must be restored to "before", C10-guarded by write_date.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "update-undo: {outcome:?}"
@@ -445,7 +449,9 @@ async fn archive_undo_roundtrip() {
     .await;
 
     // Undo → active flips back to true.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "archive-undo: {outcome:?}"
@@ -527,7 +533,9 @@ async fn unlink_compensation_missing_error_is_done() {
     }
 
     // The unlink of an already-gone id must classify as AlreadyDone (MissingError = done).
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::AlreadyDone),
         "MissingError on unlink must be treated as already-done: {outcome:?}"
@@ -574,7 +582,7 @@ async fn batch_partial_failure_three_counts() {
     .unwrap();
 
     let ids = vec![undoable.id.clone(), final_row.id.clone(), "no-such-id".to_string()];
-    let counts = batch_undo(&db, exec.as_ref(), &ids).await;
+    let counts = batch_undo(&db, exec.as_ref(), &ids, &ctx.session_id.to_string()).await;
     assert_eq!(counts.undone, 1, "one row undone");
     assert_eq!(counts.failed, 1, "final row refused = failed");
     assert_eq!(counts.not_attempted, 1, "unknown id not attempted");

@@ -12,6 +12,11 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Days a LOCAL tool's (tasks/notes/reminders) journal row is retained before purge — mirrors
+/// the connector path's `CONNECTOR_RETENTION_DAYS` (USER-VALIDATED parity; this phase does
+/// NOT change retention policy or re-tier any local tool, it only journals them).
+pub const LOCAL_RETENTION_DAYS: i64 = 30;
+
 pub struct ToolContext {
     pub db: Arc<DbHandle>,
     pub kms: Arc<KmsHandle>,

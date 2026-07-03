@@ -9,9 +9,11 @@
 //! lives in its own top-level module and is registered by an extension of the registry
 //! builder; phase 4 creates the sibling `connector/` HTTP impl. Documented here so the
 //! divergence is intentional, not drift.
+pub(crate) mod local_compensator;
 pub(crate) mod logic;
 pub mod reconcile;
 
+pub use local_compensator::{is_local_row, local_attempt_undo};
 pub use logic::{
     attempt_undo, batch_undo, refusal_reason, BatchCounts, UndoOutcome, MAX_UNDO_ATTEMPTS,
 };
@@ -64,6 +66,7 @@ impl Tool for JournalUndoTool {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
+        let session_id = ctx.session_id.to_string();
         // Batch form: iterate server-side, per-row try/catch, report three counts. This
         // entrypoint is loop-guard-EXEMPT (a batch is one logical op, enforced by the
         // caller not re-dispatching per row).
@@ -72,7 +75,7 @@ impl Tool for JournalUndoTool {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            let counts = batch_undo(&ctx.db, self.executor.as_ref(), &ids).await;
+            let counts = batch_undo(&ctx.db, self.executor.as_ref(), &ids, &session_id).await;
             return Ok(format!(
                 "Đã hoàn tác {} hành động, {} thất bại, {} không thực hiện được.",
                 counts.undone, counts.failed, counts.not_attempted
@@ -84,11 +87,13 @@ impl Tool for JournalUndoTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("journal_undo yêu cầu 'id' hoặc 'ids'"))?;
 
-        let row = journal::get_by_id(&ctx.db, id)
+        // M1: session-scoped lookup — a crafted id from another session's journal reports
+        // the SAME "not found" as a nonexistent id (no existence-vs-ownership oracle).
+        let row = journal::get_by_id_scoped(&ctx.db, id, &session_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("không tìm thấy hành động '{id}'"))?;
 
-        let outcome = attempt_undo(&ctx.db, self.executor.as_ref(), &row).await?;
+        let outcome = attempt_undo(&ctx.db, self.executor.as_ref(), &row, &session_id).await?;
         Ok(match outcome {
             UndoOutcome::Undone => "Đã hoàn tác thành công.".to_string(),
             UndoOutcome::AlreadyDone => {
@@ -198,7 +203,7 @@ mod tests {
             vec![Some(body.clone()), Some(body)],
         );
         let row = insert_row(&db, "tag-1", "compensatable", None, "pending").await;
-        attempt_undo(&db, &exec, &row).await.unwrap();
+        attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         let post = after.post_state.unwrap_or_default();
         assert!(
@@ -227,7 +232,7 @@ mod tests {
             }],
             vec![Some(json!({"write_date": "2026-07-03 12:00:00"}))],
         );
-        let outcome = attempt_undo(&db, &exec, &row).await.unwrap();
+        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "must refuse on version change: {outcome:?}"
@@ -251,7 +256,7 @@ mod tests {
             // read-back#1 (pre-comp target check) fails, read-back#2 (own verify) fails.
             vec![None],
         );
-        let outcome = attempt_undo(&db, &exec, &row).await.unwrap();
+        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Failed(_)),
             "a 200 without a verifying read-back must NOT be undone: {outcome:?}"
@@ -274,7 +279,7 @@ mod tests {
             }],
             vec![Some(json!({"id": 42}))],
         );
-        let outcome = attempt_undo(&db, &exec, &row).await.unwrap();
+        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
         assert_eq!(
             outcome,
             UndoOutcome::AlreadyDone,
@@ -320,7 +325,7 @@ mod tests {
 
         // A dummy executor: the guard must fire BEFORE any call, so no outcome is scripted.
         let exec = MockExecutor::new(vec![], vec![Some(json!({"id": 42}))]);
-        let outcome = attempt_undo(&db, &exec, &row).await.unwrap();
+        let outcome = attempt_undo(&db, &exec, &row, "sess-noid").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "a targetless compensation must be refused, not compensated blind: {outcome:?}"
@@ -345,7 +350,7 @@ mod tests {
                 read: json!({"id": 42}),
             };
             let cur = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
-            let outcome = attempt_undo(&db, &failing, &cur).await.unwrap();
+            let outcome = attempt_undo(&db, &failing, &cur, "sess-1").await.unwrap();
             assert!(
                 matches!(outcome, UndoOutcome::Failed(_)),
                 "attempt {i} should be retryable-failed: {outcome:?}"
@@ -356,7 +361,7 @@ mod tests {
             read: json!({"id": 42}),
         };
         let cur = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
-        let outcome = attempt_undo(&db, &failing, &cur).await.unwrap();
+        let outcome = attempt_undo(&db, &failing, &cur, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Stuck(_)),
             "4th attempt must be stuck (cap=3): {outcome:?}"
@@ -384,7 +389,7 @@ mod tests {
             // ok_row: pre-comp read-back present → compensate → own read-back present → undone
             vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
         );
-        let counts = batch_undo(&db, &exec, &ids).await;
+        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
         assert_eq!(counts.undone, 1, "one row undone");
         assert_eq!(counts.failed, 1, "final row refused counts as failed");
         assert_eq!(counts.not_attempted, 1, "unknown id not attempted");
@@ -404,7 +409,7 @@ mod tests {
         }
         // A dummy executor is fine — every row refuses before any external call.
         let exec = MockExecutor::new(vec![], vec![Some(json!({}))]);
-        let counts = batch_undo(&db, &exec, &ids).await;
+        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
         assert_eq!(
             counts.failed, 15,
             "all 15 rows attempted in one batch, none skipped by a loop guard"
@@ -486,10 +491,113 @@ mod tests {
             }],
             vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
         );
-        let outcome = attempt_undo(&db, &comp, &after).await.unwrap();
+        let outcome = attempt_undo(&db, &comp, &after, "sess-1").await.unwrap();
         assert!(
             !matches!(outcome, UndoOutcome::Refused(_)),
             "unverified must NOT permanently block undo: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_plan_connector_tool_routes_to_connector_refusal_not_local() {
+        // M3c end-to-end: a NULL-plan row whose tool_name is a CONNECTOR op (the "create
+        // crashed before its plan write-back landed" scenario) must go through
+        // `attempt_undo`'s CONNECTOR path — hitting the existing "no compensation_plan"
+        // refusal — never `local_attempt_undo`. The connector refusal is a `Refused`, and
+        // (unlike the local path) it is the ONLY refusal reachable here because a genuine
+        // local row is never NULL-plan-refused this way (its own refusal set drops that
+        // rule) — this proves the split routes on the CLOSED allowlist, not just NULL-plan.
+        let (db, _d) = db().await;
+        let row = journal::insert(
+            &db,
+            NewAction {
+                session_id: "sess-1",
+                tool_name: "odoo_contact_create", // NOT in LOCAL_TOOL_TABLES
+                tool_tier: "IrreversibleWrite",
+                compensability: "compensatable",
+                idempotency_key: "m3c-1",
+                correlation_ref: "corr-m3c",
+                request_params: r#"{"values":{"name":"Ghost"}}"#,
+                pre_state: None,
+                pre_state_version: None,
+                compensation_plan: None, // lost write-back — the exact crash scenario
+                retention_days: 30,
+            },
+        )
+        .await
+        .unwrap();
+        journal::set_readback(&db, &row.id, "match", None).await.unwrap();
+        let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert!(!super::is_local_row(&row), "not in the closed allowlist");
+
+        // A dummy executor: the CONNECTOR refusal (no compensation_plan) fires before any
+        // read-back/call, so no outcome needs scripting.
+        let exec = MockExecutor::new(vec![], vec![]);
+        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        assert!(
+            matches!(outcome, UndoOutcome::Refused(_)),
+            "NULL-plan CONNECTOR row must hit the connector's own refusal: {outcome:?}"
+        );
+        let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert_eq!(after.undo_status, "refused");
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_executor_for_local_row() {
+        // C1: reconcile must classify a local orphan from a live SELECT, never via
+        // `executor.read_back` — proven by a `PanicOnCall` executor that fails the test if
+        // touched at all. In practice a local write's own transaction (C2) sets
+        // `readback_status = 'match'` before commit, so we insert a `pending` local-shaped
+        // row DIRECTLY to simulate the fail-closed backstop path (see `reconcile.rs` doc).
+        struct PanicOnCall;
+        #[async_trait::async_trait]
+        impl crate::connector::ConnectorExecutor for PanicOnCall {
+            async fn call(&self, _op: &str, _p: &serde_json::Value) -> anyhow::Result<ExecOutcome> {
+                panic!("reconcile must never call the executor for a local row");
+            }
+            async fn read_back(
+                &self,
+                _op: &str,
+                _c: &str,
+                _m: Option<&str>,
+                _i: Option<&str>,
+            ) -> anyhow::Result<serde_json::Value> {
+                panic!("reconcile must never call the executor for a local row");
+            }
+        }
+
+        let (db, _d) = db().await;
+        haily_db::queries::tasks::insert(&db, "Local orphan", None, "low", None, None)
+            .await
+            .unwrap();
+        let task = haily_db::queries::tasks::active(&db).await.unwrap().remove(0);
+        let row = journal::insert(
+            &db,
+            NewAction {
+                session_id: "sess-1",
+                tool_name: "task_create",
+                tool_tier: "ReversibleWrite",
+                compensability: "compensatable",
+                idempotency_key: "local-recon-1",
+                correlation_ref: &task.id,
+                request_params: "{}",
+                pre_state: None,
+                pre_state_version: None,
+                compensation_plan: None,
+                retention_days: 30,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.readback_status, "pending");
+
+        let exec = PanicOnCall;
+        let n = reconcile_incomplete(&db, &exec, -1).await;
+        assert_eq!(n, 1);
+        let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.readback_status, "match",
+            "local orphan classified match from a live SELECT (the task still exists)"
         );
     }
 

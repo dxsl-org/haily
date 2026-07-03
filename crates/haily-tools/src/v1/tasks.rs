@@ -1,8 +1,15 @@
+use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
+use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
 use haily_db::queries::tasks;
 use serde_json::{json, Value};
+
+/// Days a local-tool journal row's captured content is retained before purge — mirrors the
+/// connector path's default (`CONNECTOR_RETENTION_DAYS`); local and connector rows share one
+/// retention policy (USER-VALIDATED, phase 1 scope: no tier change).
+const LOCAL_RETENTION_DAYS: i64 = crate::LOCAL_RETENTION_DAYS;
 
 // ---------------------------------------------------------------------------
 // TaskCreateTool
@@ -41,11 +48,27 @@ impl Tool for TaskCreateTool {
         let due_at = args["due_at"].as_str();
         let desc = args["description"].as_str();
 
-        let task = tasks::insert(&ctx.db, title, desc, priority, due_at, None).await?;
-        Ok(format!(
-            "Đã tạo task: \"{}\" [{}] (id: {})",
-            task.title, task.priority, task.id
-        ))
+        // The id is minted here (not by `tasks::insert`) because the journal outbox row and
+        // the forward INSERT must reference the SAME id inside one transaction (C2).
+        let id = uuid::Uuid::new_v4().to_string();
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        local_journaled_write(
+            &ctx.db,
+            LocalMutation::TaskCreate {
+                id: &id,
+                title,
+                description: desc,
+                priority,
+                due_at,
+            },
+            &ctx.session_id.to_string(),
+            "task_create",
+            "ReversibleWrite",
+            &request_params,
+            LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        Ok(format!("Đã tạo task: \"{title}\" [{priority}] (id: {id})"))
     }
 }
 
@@ -122,8 +145,22 @@ impl Tool for TaskCompleteTool {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("id required"))?;
-        tasks::update_status(&ctx.db, id, "done").await?;
-        Ok(format!("Task id={id} đã được đánh dấu là done. ✓"))
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::TaskComplete { id },
+            &ctx.session_id.to_string(),
+            "task_complete",
+            "ReversibleWrite",
+            &request_params,
+            LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        Ok(if outcome.is_some() {
+            format!("Task id={id} đã được đánh dấu là done. ✓")
+        } else {
+            format!("Không tìm thấy task id={id}.")
+        })
     }
 }
 
@@ -157,10 +194,21 @@ impl Tool for TaskDeleteTool {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("id required"))?;
-        if tasks::soft_delete(&ctx.db, id).await? {
-            Ok(format!("Đã xóa task id={id}."))
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::TaskDelete { id },
+            &ctx.session_id.to_string(),
+            "task_delete",
+            "IrreversibleWrite",
+            &request_params,
+            LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        Ok(if outcome.is_some() {
+            format!("Đã xóa task id={id}.")
         } else {
-            Ok(format!("Không tìm thấy task id={id}."))
-        }
+            format!("Không tìm thấy task id={id}.")
+        })
     }
 }

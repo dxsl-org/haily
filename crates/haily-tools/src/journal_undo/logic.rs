@@ -7,6 +7,7 @@
 //! `undo_attempts` is hard-capped at `MAX_UNDO_ATTEMPTS`. Retries are USER-initiated —
 //! there is no background worker; a `stuck` row links its raw `compensation_plan` for
 //! manual action.
+use super::local_compensator::{is_local_row, local_attempt_undo};
 use crate::connector::{redact, ConnectorExecutor, ExecOutcome};
 use anyhow::Result;
 use haily_db::{queries::journal, queries::journal::ActionJournalRow, DbHandle};
@@ -116,14 +117,24 @@ pub async fn write_date_unchanged(
 
 /// Drive one undo attempt for `row` through `executor`, persisting each state transition.
 ///
-/// Sequence: refusal rules → C10 version re-check → read-back-before-compensation
-/// (skip-if-already-target) → compensate → OWN read-back → `undone`. Every terminal
-/// state is persisted so a USER-initiated retry resumes from the recorded state.
+/// C1 dispatch split: a LOCAL row (tasks/notes/reminders — `is_local_row`) is routed to
+/// `local_attempt_undo` BEFORE any connector logic runs. This MUST happen before
+/// `refusal_reason`, which refuses any row with `compensation_plan.is_none()` — exactly the
+/// shape every local row legitimately has. `session_id` scopes the local path (M1); the
+/// connector path below is unchanged from phase 3/4/5.
+///
+/// Sequence (connector path): refusal rules → C10 version re-check → read-back-before-
+/// compensation (skip-if-already-target) → compensate → OWN read-back → `undone`. Every
+/// terminal state is persisted so a USER-initiated retry resumes from the recorded state.
 pub async fn attempt_undo(
     db: &DbHandle,
     executor: &dyn ConnectorExecutor,
     row: &ActionJournalRow,
+    session_id: &str,
 ) -> Result<UndoOutcome> {
+    if is_local_row(row) {
+        return local_attempt_undo(db, row, session_id).await;
+    }
     if let Some(reason) = refusal_reason(row) {
         journal::advance_undo_status(db, &row.id, "refused").await?;
         return Ok(UndoOutcome::Refused(reason));
@@ -349,22 +360,26 @@ pub struct BatchCounts {
 
 /// Undo every row in `ids`, per-row try/catch, tallying undone/failed/not_attempted.
 /// A row that cannot be loaded counts as `not_attempted`; a refusal/stuck/failed counts
-/// as `failed`; `undone`/`already-done` count as `undone`.
+/// as `failed`; `undone`/`already-done` count as `undone`. `session_id` scopes every lookup
+/// (M1) — an id belonging to another session is loaded via the SAME scoped query the single-
+/// id path uses, so it reports `not_attempted` exactly like a nonexistent id (no
+/// existence-vs-ownership oracle).
 pub async fn batch_undo(
     db: &DbHandle,
     executor: &dyn ConnectorExecutor,
     ids: &[String],
+    session_id: &str,
 ) -> BatchCounts {
     let mut counts = BatchCounts::default();
     for id in ids {
-        let row = match journal::get_by_id(db, id).await {
+        let row = match journal::get_by_id_scoped(db, id, session_id).await {
             Ok(Some(r)) => r,
             _ => {
                 counts.not_attempted += 1;
                 continue;
             }
         };
-        match attempt_undo(db, executor, &row).await {
+        match attempt_undo(db, executor, &row, session_id).await {
             Ok(UndoOutcome::Undone) | Ok(UndoOutcome::AlreadyDone) => counts.undone += 1,
             Ok(_) => counts.failed += 1,
             Err(_) => counts.failed += 1,
