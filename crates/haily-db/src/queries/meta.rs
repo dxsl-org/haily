@@ -26,21 +26,14 @@ pub struct Feedback {
 }
 
 pub async fn get_preference(db: &DbHandle, key: &str) -> Result<Option<String>> {
-    let row = sqlx::query_as::<_, (String,)>(
-        "SELECT value FROM kms_preferences WHERE key = ?",
-    )
-    .bind(key)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = sqlx::query_as::<_, (String,)>("SELECT value FROM kms_preferences WHERE key = ?")
+        .bind(key)
+        .fetch_optional(db.pool())
+        .await?;
     Ok(row.map(|(v,)| v))
 }
 
-pub async fn upsert_preference(
-    db: &DbHandle,
-    key: &str,
-    value: &str,
-    source: &str,
-) -> Result<()> {
+pub async fn upsert_preference(db: &DbHandle, key: &str, value: &str, source: &str) -> Result<()> {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -63,9 +56,11 @@ pub async fn upsert_preference(
 }
 
 pub async fn all_preferences(db: &DbHandle) -> Result<Vec<Preference>> {
-    Ok(sqlx::query_as::<_, Preference>("SELECT * FROM kms_preferences ORDER BY key")
-        .fetch_all(db.pool())
-        .await?)
+    Ok(
+        sqlx::query_as::<_, Preference>("SELECT * FROM kms_preferences ORDER BY key")
+            .fetch_all(db.pool())
+            .await?,
+    )
 }
 
 /// All preferences whose key starts with `prefix` — used for namespaced reads (e.g. "feedback.correction.").

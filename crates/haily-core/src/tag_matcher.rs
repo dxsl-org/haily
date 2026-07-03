@@ -92,7 +92,7 @@ fn try_match_tag_at(text: &str, start: usize) -> Option<TagMatch> {
     debug_assert_eq!(open, '<');
 
     let mut cursor = 1; // byte offset within `rest`, past '<'
-    // Optional '/' for a closing tag, optionally preceded/followed by whitespace.
+                        // Optional '/' for a closing tag, optionally preceded/followed by whitespace.
     cursor += skip_ws(&rest[cursor..]);
     let closing = rest[cursor..].starts_with('/');
     if closing {

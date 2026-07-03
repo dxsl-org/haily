@@ -1,7 +1,9 @@
 //! Integration tests for bootstrap + shutdown. See `test_support` for the mock
 //! adapter and the hand-rolled slow-LLM HTTP responder shared across these tests.
 use crate::bootstrap::{AppHandle, BootstrapOptions};
-use crate::test_support::{cloud_config, spawn_slow_llm_server, spawn_streaming_llm_server, MockAdapter};
+use crate::test_support::{
+    cloud_config, spawn_slow_llm_server, spawn_streaming_llm_server, MockAdapter,
+};
 use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, ResponseChunk};
 use std::sync::Arc;
@@ -44,7 +46,9 @@ async fn bootstrap_roundtrips_a_request_through_the_mock_adapter() {
     .expect("turn did not complete in time");
 
     assert!(
-        chunks.iter().any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("mock completion"))),
+        chunks
+            .iter()
+            .any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("mock completion"))),
         "expected the mock LLM's completion text to be delivered, got: {chunks:?}"
     );
 
@@ -67,13 +71,19 @@ async fn shutdown_drains_all_tracked_tasks_within_timeout() {
     .await
     .expect("bootstrap");
 
-    assert!(handle.task_count() > 0, "bootstrap should have registered background tasks");
+    assert!(
+        handle.task_count() > 0,
+        "bootstrap should have registered background tasks"
+    );
 
     // shutdown() itself asserts internally (via TaskTracker::wait under a timeout);
     // reaching this line without hanging is the pass condition for "no task leaked".
-    tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown(std::time::Duration::from_secs(5)))
-        .await
-        .expect("shutdown must not hang past its own timeout budget");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle.shutdown(std::time::Duration::from_secs(5)),
+    )
+    .await
+    .expect("shutdown must not hang past its own timeout budget");
 }
 
 /// Critical: shutdown() during an in-flight turn blocks until the turn task returns —
@@ -153,9 +163,12 @@ async fn shutdown_mid_stream_ends_the_turn_quickly_not_after_full_completion() {
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 
     let shutdown_started = std::time::Instant::now();
-    tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown(std::time::Duration::from_secs(5)))
-        .await
-        .expect("shutdown must not hang");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle.shutdown(std::time::Duration::from_secs(5)),
+    )
+    .await
+    .expect("shutdown must not hang");
     let shutdown_elapsed = shutdown_started.elapsed();
 
     let full_stream_duration = inter_token_delay * token_count;
@@ -174,7 +187,9 @@ async fn shutdown_mid_stream_ends_the_turn_quickly_not_after_full_completion() {
     // Some tokens should have streamed live before the cancellation cut it short —
     // proves this exercised real incremental delivery, not a turn that never started.
     assert!(
-        chunks.iter().any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("tok0"))),
+        chunks
+            .iter()
+            .any(|c| matches!(c, ResponseChunk::Text(t) if t.contains("tok0"))),
         "expected at least the first streamed token to have reached the adapter: {chunks:?}"
     );
 }
@@ -318,23 +333,33 @@ async fn daemon_option_registers_additional_background_tasks() {
     let with_daemon = AppHandle::bootstrap(
         dir_with.path(),
         vec![MockAdapter::new() as Arc<dyn Adapter>],
-        BootstrapOptions { enable_daemon: true, enable_watcher: true },
+        BootstrapOptions {
+            enable_daemon: true,
+            enable_watcher: true,
+        },
     )
     .await
     .expect("bootstrap with daemon");
     let count_with = with_daemon.task_count();
-    with_daemon.shutdown(std::time::Duration::from_secs(5)).await;
+    with_daemon
+        .shutdown(std::time::Duration::from_secs(5))
+        .await;
 
     let dir_without = tempfile::tempdir().expect("tempdir");
     let without_daemon = AppHandle::bootstrap(
         dir_without.path(),
         vec![MockAdapter::new() as Arc<dyn Adapter>],
-        BootstrapOptions { enable_daemon: false, enable_watcher: true },
+        BootstrapOptions {
+            enable_daemon: false,
+            enable_watcher: true,
+        },
     )
     .await
     .expect("bootstrap without daemon");
     let count_without = without_daemon.task_count();
-    without_daemon.shutdown(std::time::Duration::from_secs(5)).await;
+    without_daemon
+        .shutdown(std::time::Duration::from_secs(5))
+        .await;
 
     assert!(
         count_with > count_without,
@@ -398,7 +423,9 @@ async fn auto_approve_listing_a_destructive_tool_fails_bootstrap() {
     )
     .await;
 
-    let err = result.err().expect("bootstrap must fail when auto_approve lists a destructive tool");
+    let err = result
+        .err()
+        .expect("bootstrap must fail when auto_approve lists a destructive tool");
     assert!(
         err.to_string().contains("worktree_apply"),
         "error should name the offending tool, got: {err:#}"

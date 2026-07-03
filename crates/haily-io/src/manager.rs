@@ -20,7 +20,9 @@ pub struct AdapterManagerBuilder {
 
 impl AdapterManagerBuilder {
     pub fn new() -> Self {
-        Self { adapters: HashMap::new() }
+        Self {
+            adapters: HashMap::new(),
+        }
     }
 
     pub fn register(mut self, adapter: Arc<dyn Adapter>) -> Self {

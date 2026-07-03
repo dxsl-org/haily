@@ -1,8 +1,11 @@
 /// Tool call parsing, loop-guard, and dispatch.
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
-use haily_types::ResponseChunk;
+use haily_tools::journal_undo::IS_COMPENSATION_TOOL;
 use haily_tools::{RiskTier, ToolContext, ToolRegistry};
+use haily_types::ResponseChunk;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -15,7 +18,12 @@ pub struct LoopGuard {
 }
 
 impl LoopGuard {
-    pub fn new() -> Self { Self { last: None, count: 0 } }
+    pub fn new() -> Self {
+        Self {
+            last: None,
+            count: 0,
+        }
+    }
 
     /// Returns Err if the call is a duplicate or if the ceiling is reached.
     pub fn check(&mut self, tool: &str, args: &serde_json::Value) -> Result<()> {
@@ -50,7 +58,10 @@ pub fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
 
     let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let tool = parsed["tool"].as_str()?.to_string();
-    let args = parsed.get("args").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+    let args = parsed
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(Default::default()));
     Some((tool, args))
 }
 
@@ -137,17 +148,51 @@ fn find_matching_close(text: &str, open: &TagMatch) -> Option<TagMatch> {
 /// (`no_irreversible_write_executes_without_broker_resolution`,
 /// `irreversible_write_at_depth_routes_through_session_broker`) prove the replacement
 /// is equivalent-or-stronger.
+///
+/// `kill` is the `safety.disable_writes` switch (C8): when set, every NEW forward write
+/// (any non-`Read` tier) is refused BEFORE approval/execution — EXCEPT a compensation
+/// (`journal_undo`), which is EXEMPT so throwing the switch does not deadlock the very
+/// undo it was thrown to enable. Threaded (not read from a global) so a sub-turn write at
+/// depth>0 observes the same switch. The message is honest: it blocks NEW writes, not one
+/// already in flight. The real executor re-checks `kill` again just before its network
+/// call (M5 TOCTOU) — that re-check lives in the phase-4 HTTP executor.
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
     registry: &ToolRegistry,
     ctx: &ToolContext,
+    kill: &Arc<AtomicBool>,
 ) -> Result<(String, bool)> {
     let tool = registry
         .get(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{tool_name}'"))?;
 
-    match tool.risk_tier(&args) {
+    let tier = tool.risk_tier(&args);
+    // Kill-switch gate, layered onto the tier match below. Compensation is EXEMPT — else
+    // the switch would block undo. `Acquire` pairs with the `Release` store in the
+    // toggle path so a live flip is observed without a restart.
+    let is_compensation = tool_name == IS_COMPENSATION_TOOL;
+    if tier != RiskTier::Read && !is_compensation && kill.load(Ordering::Acquire) {
+        info!(
+            tool = tool_name,
+            "write blocked by kill switch (safety.disable_writes)"
+        );
+        let _ = ctx
+            .approval_tx
+            .send(ResponseChunk::ToolResult {
+                name: tool_name.to_string(),
+                ok: false,
+            })
+            .await;
+        return Ok((
+            "Chức năng ghi/thay đổi đang bị tạm khóa (safety.disable_writes). \
+             Thao tác này bị chặn — các thao tác đang chạy dở không bị dừng."
+                .to_string(),
+            false,
+        ));
+    }
+
+    match tier {
         RiskTier::Blocked => {
             bail!("tool '{tool_name}' is blocked");
         }
@@ -157,7 +202,10 @@ pub async fn dispatch(
             // tools skip the interactive prompt. Every bypass is logged at warn: it
             // is a deliberate, auditable trust decision, not silent.
             if ctx.approval_gate.is_auto_approved(tool_name) {
-                warn!(tool = tool_name, "tool call auto-approved via config allowlist");
+                warn!(
+                    tool = tool_name,
+                    "tool call auto-approved via config allowlist"
+                );
             } else {
                 let approval_id = Uuid::new_v4();
                 let _ = ctx
@@ -173,10 +221,19 @@ pub async fn dispatch(
                     })
                     .await;
 
-                let approved = ctx.approval_gate.request(approval_id, ctx.session_id, &ctx.cancel).await;
+                let approved = ctx
+                    .approval_gate
+                    .request(approval_id, ctx.session_id, &ctx.cancel)
+                    .await;
                 if !approved {
                     info!(tool = tool_name, %approval_id, "tool call denied (declined, timed out, or cancelled)");
-                    let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
+                    let _ = ctx
+                        .approval_tx
+                        .send(ResponseChunk::ToolResult {
+                            name: tool_name.to_string(),
+                            ok: false,
+                        })
+                        .await;
                     return Ok(("Người dùng đã từ chối yêu cầu này.".to_string(), false));
                 }
             }
@@ -187,12 +244,24 @@ pub async fn dispatch(
     info!(tool = tool_name, "executing tool");
     let (result, ok) = match tool.execute(args, ctx).await {
         Ok(output) => {
-            let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: true }).await;
+            let _ = ctx
+                .approval_tx
+                .send(ResponseChunk::ToolResult {
+                    name: tool_name.to_string(),
+                    ok: true,
+                })
+                .await;
             (output, true)
         }
         Err(e) => {
             warn!(tool = tool_name, error = %e, "tool failed");
-            let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
+            let _ = ctx
+                .approval_tx
+                .send(ResponseChunk::ToolResult {
+                    name: tool_name.to_string(),
+                    ok: false,
+                })
+                .await;
             (format!("Tool error: {e:#}"), false)
         }
     };
@@ -301,7 +370,8 @@ mod tests {
         // real call. The parser must skip the stray close, not bail at it (the leak the
         // Phase-6 review caught).
         let resp = r#"see </tool_result> then <tool_call>{"tool":"note_save","args":{"p":"/x"}}</tool_call>"#;
-        let (tool, args) = parse_tool_call(resp).expect("must find the real call past the stray close");
+        let (tool, args) =
+            parse_tool_call(resp).expect("must find the real call past the stray close");
         assert_eq!(tool, "note_save");
         assert_eq!(args["p"], "/x");
     }
@@ -312,8 +382,14 @@ mod tests {
         // and leave a real tool-call block (with args) in the user-facing text.
         let text = r#"see </tool_result> then <tool_call>{"tool":"x","args":{"path":"/home/secret"}}</tool_call> done"#;
         let out = strip_tool_markup(text);
-        assert!(!out.contains("tool_call"), "tool-call block must be stripped: {out}");
-        assert!(!out.contains("/home/secret"), "tool-call args must not leak: {out}");
+        assert!(
+            !out.contains("tool_call"),
+            "tool-call block must be stripped: {out}"
+        );
+        assert!(
+            !out.contains("/home/secret"),
+            "tool-call args must not leak: {out}"
+        );
         assert!(out.contains("see"));
         assert!(out.contains("done"));
     }
@@ -339,7 +415,9 @@ mod tests {
             let args = serde_json::json!({ "q": i });
             let _ = g.check("web_search", &args);
         }
-        assert!(g.check("web_search", &serde_json::json!({"q": "final"})).is_err());
+        assert!(g
+            .check("web_search", &serde_json::json!({"q": "final"}))
+            .is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -355,10 +433,18 @@ mod tests {
 
     #[async_trait]
     impl Tool for LiteralErrorPrefixTool {
-        fn name(&self) -> &str { "literal_error_prefix" }
-        fn description(&self) -> &str { "returns legit text starting with 'Error:'" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
+        fn name(&self) -> &str {
+            "literal_error_prefix"
+        }
+        fn description(&self) -> &str {
+            "returns legit text starting with 'Error:'"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Read
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("Error: this is the literal log line the user asked to fetch".to_string())
         }
@@ -368,10 +454,18 @@ mod tests {
 
     #[async_trait]
     impl Tool for FailingTool {
-        fn name(&self) -> &str { "failing_tool" }
-        fn description(&self) -> &str { "always errors" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
+        fn name(&self) -> &str {
+            "failing_tool"
+        }
+        fn description(&self) -> &str {
+            "always errors"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Read
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Err(anyhow::anyhow!("boom"))
         }
@@ -386,11 +480,19 @@ mod tests {
         depth: u8,
         broker: std::sync::Arc<ApprovalBroker>,
         cancel: CancellationToken,
-    ) -> (ToolContext, mpsc::Receiver<ResponseChunk>, tempfile::TempDir) {
+    ) -> (
+        ToolContext,
+        mpsc::Receiver<ResponseChunk>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = std::sync::Arc::new(haily_db::DbHandle::init(&db_path).await.unwrap());
-        let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone(), dir.path()).await.unwrap());
+        let kms = std::sync::Arc::new(
+            haily_kms::KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .unwrap(),
+        );
         let (approval_tx, rx) = mpsc::channel(8);
         let ctx = ToolContext {
             db,
@@ -412,11 +514,20 @@ mod tests {
         let broker = std::sync::Arc::new(ApprovalBroker::new());
         let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
 
-        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "literal_error_prefix",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
 
-        assert!(ok, "typed signal must be true even though the text starts with 'Error:'");
+        assert!(
+            ok,
+            "typed signal must be true even though the text starts with 'Error:'"
+        );
         assert!(text.starts_with("Error:"));
     }
 
@@ -427,9 +538,15 @@ mod tests {
         let broker = std::sync::Arc::new(ApprovalBroker::new());
         let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
 
-        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "failing_tool",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
 
         assert!(!ok, "a genuinely failing tool must report ok=false");
         assert!(text.contains("boom"));
@@ -443,10 +560,18 @@ mod tests {
 
     #[async_trait]
     impl Tool for RequireApprovalTool {
-        fn name(&self) -> &str { "delete_thing" }
-        fn description(&self) -> &str { "a destructive tool that must be approved" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::IrreversibleWrite }
+        fn name(&self) -> &str {
+            "delete_thing"
+        }
+        fn description(&self) -> &str {
+            "a destructive tool that must be approved"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::IrreversibleWrite
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("deleted".to_string())
         }
@@ -458,10 +583,18 @@ mod tests {
 
     #[async_trait]
     impl Tool for ExecObserverTool {
-        fn name(&self) -> &str { "delete_thing" }
-        fn description(&self) -> &str { "records whether execute was reached" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::IrreversibleWrite }
+        fn name(&self) -> &str {
+            "delete_thing"
+        }
+        fn description(&self) -> &str {
+            "records whether execute was reached"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::IrreversibleWrite
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok("deleted".to_string())
@@ -473,7 +606,8 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(RequireApprovalTool));
         let broker = std::sync::Arc::new(ApprovalBroker::new());
-        let (ctx, mut rx, _dir) = test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
+        let (ctx, mut rx, _dir) =
+            test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         // Drain the ToolApprovalRequest chunk and deny it via the broker, mirroring
         // what an adapter's resolver would do.
@@ -489,9 +623,15 @@ mod tests {
             }
         });
 
-        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
 
         responder.await.unwrap();
         assert!(!ok, "denied approval must report ok=false");
@@ -503,7 +643,8 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(RequireApprovalTool));
         let broker = std::sync::Arc::new(ApprovalBroker::new());
-        let (ctx, mut rx, _dir) = test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
+        let (ctx, mut rx, _dir) =
+            test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         let broker_clone = std::sync::Arc::clone(&broker);
         let session_id = ctx.session_id;
@@ -517,9 +658,15 @@ mod tests {
             }
         });
 
-        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
 
         responder.await.unwrap();
         assert!(ok, "approved tool call must succeed");
@@ -533,12 +680,18 @@ mod tests {
         let broker = std::sync::Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         cancel.cancel(); // simulates shutdown firing before/while the approval is pending
-        // never drained/resolved — only cancellation can end this
+                         // never drained/resolved — only cancellation can end this
         let (ctx, _rx, _dir) = test_ctx(0, broker, cancel).await;
 
         let (text, ok) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
+            dispatch(
+                "delete_thing",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
         )
         .await
         .expect("cancellation must deny promptly, not hang toward the 120s timeout")
@@ -562,9 +715,12 @@ mod tests {
     async fn irreversible_write_at_depth_routes_through_session_broker() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut registry = ToolRegistry::new();
-        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        registry.register(std::sync::Arc::new(ExecObserverTool(
+            std::sync::Arc::clone(&executed),
+        )));
         let broker = std::sync::Arc::new(ApprovalBroker::new());
-        let (ctx, mut rx, _dir) = test_ctx(1, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
+        let (ctx, mut rx, _dir) =
+            test_ctx(1, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         let broker_clone = std::sync::Arc::clone(&broker);
         let session_id = ctx.session_id;
@@ -572,7 +728,12 @@ mod tests {
         let saw_origin_c = std::sync::Arc::clone(&saw_origin);
         let responder = tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {
-                if let ResponseChunk::ToolApprovalRequest { approval_id, origin, .. } = chunk {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    origin,
+                    ..
+                } = chunk
+                {
                     *saw_origin_c.lock().unwrap() = origin;
                     use haily_types::ApprovalResolver;
                     broker_clone.resolve(approval_id, session_id, false);
@@ -581,14 +742,26 @@ mod tests {
             }
         });
 
-        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
 
         responder.await.unwrap();
-        assert!(!ok, "a sub-agent's denied IrreversibleWrite must report ok=false");
+        assert!(
+            !ok,
+            "a sub-agent's denied IrreversibleWrite must report ok=false"
+        );
         assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
-        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst), "the tool body must NOT have executed on deny");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool body must NOT have executed on deny"
+        );
         // origin is server-derived from depth+domain, never forgeable upward.
         assert_eq!(saw_origin.lock().unwrap().as_deref(), Some("L1:developer"));
     }
@@ -601,7 +774,9 @@ mod tests {
     async fn no_irreversible_write_executes_without_broker_resolution() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut registry = ToolRegistry::new();
-        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        registry.register(std::sync::Arc::new(ExecObserverTool(
+            std::sync::Arc::clone(&executed),
+        )));
         let broker = std::sync::Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         // Pre-cancel to stand in for "no user ever answers" without waiting out 120s —
@@ -612,7 +787,13 @@ mod tests {
 
         let (text, ok) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
+            dispatch(
+                "delete_thing",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
         )
         .await
         .expect("must deny promptly via cancel, not hang toward the 120s timeout")
@@ -633,7 +814,9 @@ mod tests {
     async fn forged_session_id_still_rejected_at_depth() {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut registry = ToolRegistry::new();
-        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        registry.register(std::sync::Arc::new(ExecObserverTool(
+            std::sync::Arc::clone(&executed),
+        )));
         let broker = std::sync::Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         let (ctx, mut rx, _dir) = test_ctx(1, std::sync::Arc::clone(&broker), cancel.clone()).await;
@@ -646,7 +829,10 @@ mod tests {
                     use haily_types::ApprovalResolver;
                     // A foreign session tries to approve — must be rejected.
                     let forged = broker_clone.resolve(approval_id, Uuid::new_v4(), true);
-                    assert!(!forged, "a forged session_id must NOT resolve the pending approval");
+                    assert!(
+                        !forged,
+                        "a forged session_id must NOT resolve the pending approval"
+                    );
                     // The forged attempt left the pending intact; end the wait via cancel
                     // (deny), proving the tool never ran off a foreign approval.
                     cancel_c.cancel();
@@ -657,7 +843,13 @@ mod tests {
 
         let (text, ok) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
+            dispatch(
+                "delete_thing",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
         )
         .await
         .expect("must resolve via the cancel deny, not hang")
@@ -666,6 +858,201 @@ mod tests {
         responder.await.unwrap();
         assert!(!ok, "a forged approval must not let the tool run");
         assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
-        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst), "forged approval must not reach execute");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "forged approval must not reach execute"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — kill switch (C8). `safety.disable_writes` gates NEW forward writes;
+    // compensation (journal_undo) is EXEMPT; the switch is threaded so a depth>0 write
+    // observes it; a live flip changes behavior with no restart.
+    // -----------------------------------------------------------------------
+
+    /// A kill switch in the OFF (writes-allowed) state — the default for every test that
+    /// is not specifically exercising the switch.
+    fn kill_off() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// A pure-read tool used by the kill-switch tests to prove reads still run when writes
+    /// are disabled.
+    struct ReadTool;
+
+    #[async_trait]
+    impl Tool for ReadTool {
+        fn name(&self) -> &str {
+            "read_thing"
+        }
+        fn description(&self) -> &str {
+            "a pure read"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Read
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("read-result".to_string())
+        }
+    }
+
+    /// A compensation tool named `journal_undo` (the C8-exempt name) — proves the kill
+    /// switch does NOT block undo.
+    struct UndoTool(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl Tool for UndoTool {
+        fn name(&self) -> &str {
+            IS_COMPENSATION_TOOL
+        }
+        fn description(&self) -> &str {
+            "compensation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::IrreversibleWrite
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok("undone".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn disable_writes_blocks_new_writes_not_read() {
+        // A pure Read must still run when writes are disabled…
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadTool));
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (read_text, read_ok) =
+            dispatch("read_thing", serde_json::json!({}), &registry, &ctx, &kill)
+                .await
+                .unwrap();
+        assert!(read_ok, "reads must run under the kill switch");
+        assert_eq!(read_text, "read-result");
+
+        // …but a new IrreversibleWrite is refused BEFORE the approval prompt.
+        let (write_text, write_ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+        assert!(!write_ok, "a new write must be blocked by the kill switch");
+        assert!(
+            write_text.contains("safety.disable_writes"),
+            "honest block message: {write_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_on_still_allows_undo() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(UndoTool(Arc::clone(&ran))));
+        // journal_undo is IrreversibleWrite but C8-EXEMPT: auto-approved here so the test
+        // isolates the kill-switch exemption (not the approval path).
+        let broker = Arc::new(ApprovalBroker::with_auto_approve(
+            [IS_COMPENSATION_TOOL.to_string()].into_iter().collect(),
+        ));
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (text, ok) = dispatch(
+            IS_COMPENSATION_TOOL,
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ok,
+            "undo must NOT be blocked by the kill switch (C8 exempt): {text}"
+        );
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the compensation body must execute under the kill switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_observed_at_depth_gt_0() {
+        // A depth=1 (sub-turn) write must observe the SAME threaded kill switch.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx(1, broker, CancellationToken::new()).await;
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok,
+            "a sub-turn write must be blocked when the kill switch is set"
+        );
+        assert!(text.contains("safety.disable_writes"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn kill_switch_live_toggle_no_restart() {
+        // Flipping the AtomicBool mid-process changes dispatch behavior with no re-init.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        // Auto-approve delete_thing so the approval path never blocks the write-allowed leg.
+        let broker = Arc::new(ApprovalBroker::with_auto_approve(
+            ["delete_thing".to_string()].into_iter().collect(),
+        ));
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let kill = Arc::new(AtomicBool::new(false));
+
+        // OFF: the write runs.
+        let (_t1, ok1) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+        assert!(ok1, "write must run while the switch is OFF");
+
+        // Flip ON at runtime — no restart, same Arc.
+        kill.store(true, Ordering::Release);
+        let (t2, ok2) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok2,
+            "the same dispatch must now block the write after a live flip"
+        );
+        assert!(t2.contains("safety.disable_writes"), "{t2}");
     }
 }

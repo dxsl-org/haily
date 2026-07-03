@@ -100,7 +100,9 @@ fn build_trimmed_system_prompt(
     let full_prompt = build_full_system_prompt(ctx, registry);
     let threshold = (prompt_budget as f64 * FACTS_TRIM_BUDGET_FRACTION) as usize;
 
-    if budget::estimate(&full_prompt) <= threshold || ctx.relevant_facts.len() <= FACTS_TRIM_KEEP_TOP_N {
+    if budget::estimate(&full_prompt) <= threshold
+        || ctx.relevant_facts.len() <= FACTS_TRIM_KEEP_TOP_N
+    {
         return full_prompt;
     }
 
@@ -174,7 +176,11 @@ mod tests {
         // Generous budget: nowhere near the 50% threshold.
         let prompt = build_trimmed_system_prompt(&mut ctx, &registry, 100_000);
 
-        assert_eq!(ctx.relevant_facts.len(), 2, "small fact lists must not be trimmed");
+        assert_eq!(
+            ctx.relevant_facts.len(),
+            2,
+            "small fact lists must not be trimmed"
+        );
         assert!(prompt.contains("fact one"));
         assert!(prompt.contains("fact two"));
     }
@@ -192,10 +198,20 @@ mod tests {
         // A tight budget relative to the 50-fact prompt forces the trim path.
         let prompt = build_trimmed_system_prompt(&mut ctx, &registry, 2000);
 
-        assert_eq!(ctx.relevant_facts.len(), FACTS_TRIM_KEEP_TOP_N, "must trim to top-3");
-        assert!(prompt.contains("fact-0-"), "top-ranked fact (index 0) must survive");
+        assert_eq!(
+            ctx.relevant_facts.len(),
+            FACTS_TRIM_KEEP_TOP_N,
+            "must trim to top-3"
+        );
+        assert!(
+            prompt.contains("fact-0-"),
+            "top-ranked fact (index 0) must survive"
+        );
         assert!(prompt.contains("fact-2-"), "third-ranked fact must survive");
-        assert!(!prompt.contains("fact-49-"), "low-ranked facts must be dropped");
+        assert!(
+            !prompt.contains("fact-49-"),
+            "low-ranked facts must be dropped"
+        );
     }
 
     #[test]

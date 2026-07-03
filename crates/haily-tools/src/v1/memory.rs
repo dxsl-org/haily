@@ -12,7 +12,9 @@ pub struct MemoryRememberTool;
 
 #[async_trait]
 impl Tool for MemoryRememberTool {
-    fn name(&self) -> &str { "memory_remember" }
+    fn name(&self) -> &str {
+        "memory_remember"
+    }
     fn description(&self) -> &str {
         "Lưu fact vào long-term memory. Dùng khi user chia sẻ thông tin quan trọng về bản thân."
     }
@@ -28,17 +30,30 @@ impl Tool for MemoryRememberTool {
             "required": ["subject", "predicate", "object"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let subject   = args["subject"].as_str().ok_or_else(|| anyhow::anyhow!("subject required"))?;
-        let predicate = args["predicate"].as_str().ok_or_else(|| anyhow::anyhow!("predicate required"))?;
-        let object    = args["object"].as_str().ok_or_else(|| anyhow::anyhow!("object required"))?;
-        let domain    = args["domain"].as_str().unwrap_or("general");
-        let session   = ctx.session_id.to_string();
+        let subject = args["subject"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("subject required"))?;
+        let predicate = args["predicate"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("predicate required"))?;
+        let object = args["object"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("object required"))?;
+        let domain = args["domain"].as_str().unwrap_or("general");
+        let session = ctx.session_id.to_string();
 
-        let id = ctx.kms.remember(domain, subject, predicate, object, &session, None).await?;
-        Ok(format!("Đã nhớ: \"{subject} {predicate} {object}\" (id: {id})"))
+        let id = ctx
+            .kms
+            .remember(domain, subject, predicate, object, &session, None)
+            .await?;
+        Ok(format!(
+            "Đã nhớ: \"{subject} {predicate} {object}\" (id: {id})"
+        ))
     }
 }
 
@@ -49,7 +64,9 @@ pub struct MemorySearchTool;
 
 #[async_trait]
 impl Tool for MemorySearchTool {
-    fn name(&self) -> &str { "memory_search" }
+    fn name(&self) -> &str {
+        "memory_search"
+    }
     fn description(&self) -> &str {
         "Tìm kiếm trong long-term memory bằng ngôn ngữ tự nhiên (hybrid semantic + keyword)."
     }
@@ -63,10 +80,14 @@ impl Tool for MemorySearchTool {
             "required": ["query"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::Read
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query required"))?;
+        let query = args["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("query required"))?;
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
         let results = ctx.kms.search_hybrid(query, limit).await?;
@@ -74,12 +95,17 @@ impl Tool for MemorySearchTool {
             return Ok(format!("Không tìm thấy memory nào cho: {query}"));
         }
 
-        let items: Vec<Value> = results.iter().map(|r| json!({
-            "id": r.id,
-            "text": r.text,
-            "score": r.score,
-            "source": format!("{:?}", r.source)
-        })).collect();
+        let items: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "text": r.text,
+                    "score": r.score,
+                    "source": format!("{:?}", r.source)
+                })
+            })
+            .collect();
         Ok(serde_json::to_string_pretty(&items)?)
     }
 }
@@ -91,7 +117,9 @@ pub struct MemoryListTool;
 
 #[async_trait]
 impl Tool for MemoryListTool {
-    fn name(&self) -> &str { "memory_list" }
+    fn name(&self) -> &str {
+        "memory_list"
+    }
     fn description(&self) -> &str {
         "Liệt kê facts trong memory. Dùng khi user hỏi 'mày biết gì về tao?'"
     }
@@ -104,7 +132,9 @@ impl Tool for MemoryListTool {
             }
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::Read
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let limit = args["limit"].as_i64().unwrap_or(20);
@@ -119,12 +149,17 @@ impl Tool for MemoryListTool {
             return Ok("Memory chưa có facts nào.".to_string());
         }
 
-        let items: Vec<Value> = rows.iter().map(|f| json!({
-            "id": f.id,
-            "domain": f.domain_id,
-            "fact": format!("{} {} {}", f.subject, f.predicate, f.object),
-            "confidence": f.confidence
-        })).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|f| {
+                json!({
+                    "id": f.id,
+                    "domain": f.domain_id,
+                    "fact": format!("{} {} {}", f.subject, f.predicate, f.object),
+                    "confidence": f.confidence
+                })
+            })
+            .collect();
         Ok(serde_json::to_string_pretty(&items)?)
     }
 }
@@ -136,7 +171,9 @@ pub struct FeedbackReactTool;
 
 #[async_trait]
 impl Tool for FeedbackReactTool {
-    fn name(&self) -> &str { "feedback_react" }
+    fn name(&self) -> &str {
+        "feedback_react"
+    }
     fn description(&self) -> &str {
         "Ghi lại phản hồi rõ ràng của user về câu trả lời vừa rồi: tích cực, tiêu cực hoặc correction. \
          Haily gọi tool này khi user nói 👍/👎 hoặc sửa thông tin."
@@ -166,7 +203,9 @@ impl Tool for FeedbackReactTool {
             "required": ["reaction"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let reaction = args["reaction"].as_str().unwrap_or("positive");
@@ -195,7 +234,9 @@ pub struct MemoryForgetTool;
 
 #[async_trait]
 impl Tool for MemoryForgetTool {
-    fn name(&self) -> &str { "memory_forget" }
+    fn name(&self) -> &str {
+        "memory_forget"
+    }
     fn description(&self) -> &str {
         "Xóa một fact khỏi memory theo ID. Dùng khi user muốn Haily quên thông tin."
     }
@@ -208,10 +249,14 @@ impl Tool for MemoryForgetTool {
             "required": ["id"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::IrreversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("id required"))?;
         // Routes through `KmsHandle::forget_fact` (not `facts::soft_delete` directly)
         // so the fact is tombstoned out of ANN search in this same process — a bare
         // DB soft-delete would leave it reachable via HNSW until the next rebuild.

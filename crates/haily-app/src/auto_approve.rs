@@ -40,7 +40,9 @@ fn malformed_required_field_probe(schema: &serde_json::Value) -> Option<serde_js
     let props = schema.get("properties");
     let mut probe = serde_json::Map::new();
     for field in required {
-        let Some(field_name) = field.as_str() else { continue };
+        let Some(field_name) = field.as_str() else {
+            continue;
+        };
         // Insert a value whose type contradicts the declared schema type, so a tool
         // that parses this field sees malformed input (→ fail-closed IrreversibleWrite)
         // AND a tool that only gates on presence sees the field present.
@@ -131,7 +133,14 @@ mod tests {
     #[test]
     fn rejects_every_delete_and_http_tool() {
         let registry = ToolRegistry::build_v1();
-        for name in ["task_delete", "reminder_delete", "note_delete", "memory_forget", "calendar_delete", "http_request"] {
+        for name in [
+            "task_delete",
+            "reminder_delete",
+            "note_delete",
+            "memory_forget",
+            "calendar_delete",
+            "http_request",
+        ] {
             let names = vec![name.to_string()];
             assert!(
                 validate_auto_approve(&names, &registry).is_err(),
@@ -151,14 +160,16 @@ mod tests {
     fn accepts_an_auto_approve_class_tool() {
         let registry = ToolRegistry::build_v1();
         let names = vec!["web_search".to_string()];
-        let validated = validate_auto_approve(&names, &registry).expect("AutoApprove-class tool should be accepted");
+        let validated = validate_auto_approve(&names, &registry)
+            .expect("AutoApprove-class tool should be accepted");
         assert!(validated.contains("web_search"));
     }
 
     #[test]
     fn empty_list_is_always_valid() {
         let registry = ToolRegistry::build_v1();
-        let validated = validate_auto_approve(&[], &registry).expect("empty allowlist is the default");
+        let validated =
+            validate_auto_approve(&[], &registry).expect("empty allowlist is the default");
         assert!(validated.is_empty());
     }
 
@@ -172,7 +183,8 @@ mod tests {
         let registry = ToolRegistry::build_v1();
         for tool in registry.list() {
             let name = tool.name().to_string();
-            let expect_rejected = tool.risk_tier(&serde_json::json!({})) == RiskTier::IrreversibleWrite;
+            let expect_rejected =
+                tool.risk_tier(&serde_json::json!({})) == RiskTier::IrreversibleWrite;
             let result = validate_auto_approve(std::slice::from_ref(&name), &registry);
             assert_eq!(
                 result.is_err(),
@@ -219,13 +231,27 @@ mod tests {
             "required": ["target_id", "count"]
         });
         let probe = malformed_required_field_probe(&schema).expect("required fields ⇒ Some probe");
-        assert_ne!(probe, serde_json::json!({}), "probe must not duplicate the empty-object probe");
-        assert!(probe.get("target_id").is_some() && probe.get("count").is_some(), "probe must include every required field");
-        assert!(!probe["target_id"].is_string(), "required string field must be type-violated");
-        assert!(!probe["count"].is_number(), "required number field must be type-violated");
+        assert_ne!(
+            probe,
+            serde_json::json!({}),
+            "probe must not duplicate the empty-object probe"
+        );
+        assert!(
+            probe.get("target_id").is_some() && probe.get("count").is_some(),
+            "probe must include every required field"
+        );
+        assert!(
+            !probe["target_id"].is_string(),
+            "required string field must be type-violated"
+        );
+        assert!(
+            !probe["count"].is_number(),
+            "required number field must be type-violated"
+        );
 
         // No required fields ⇒ None (empty probe already covers the tool).
-        let no_req = serde_json::json!({ "type": "object", "properties": { "x": { "type": "string" } } });
+        let no_req =
+            serde_json::json!({ "type": "object", "properties": { "x": { "type": "string" } } });
         assert!(malformed_required_field_probe(&no_req).is_none());
         // Empty `required` array ⇒ None.
         let empty_req = serde_json::json!({ "type": "object", "required": [] });

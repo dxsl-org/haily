@@ -15,7 +15,9 @@ use uuid::Uuid;
 /// of the intended tags or inject new ones. Telegram's HTML subset has no attribute
 /// surface, so `&`/`<`/`>` are sufficient — quotes need no escaping here.
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// `callback_data` prefix for the approve button; the suffix is the approval UUID.
@@ -105,7 +107,10 @@ async fn handle_callback_query(
     // "one human owns this session" auth assumption the broker relies on. A group
     // approval therefore never resolves and the turn fails closed via timeout-deny.
     if !message.chat.is_private() {
-        tracing::warn!(chat_id = message.chat.id.0, "telegram approval from non-private chat — ignoring (approvals require a 1:1 chat)");
+        tracing::warn!(
+            chat_id = message.chat.id.0,
+            "telegram approval from non-private chat — ignoring (approvals require a 1:1 chat)"
+        );
         bot.answer_callback_query(q.id).await?;
         return Ok(());
     }
@@ -116,10 +121,16 @@ async fn handle_callback_query(
         Some(session_id) => {
             let resolved = {
                 let guard = resolver.lock().unwrap_or_else(|e| e.into_inner());
-                guard.as_ref().map(|r| r.resolve(approval_id, session_id, approved))
+                guard
+                    .as_ref()
+                    .map(|r| r.resolve(approval_id, session_id, approved))
             };
             match resolved {
-                Some(true) => Some(if approved { "✅ Đã chấp thuận." } else { "❌ Đã từ chối." }),
+                Some(true) => Some(if approved {
+                    "✅ Đã chấp thuận."
+                } else {
+                    "❌ Đã từ chối."
+                }),
                 Some(false) => {
                     tracing::warn!(%approval_id, chat_id, "telegram approval resolve rejected (already resolved or session mismatch)");
                     None
@@ -133,14 +144,18 @@ async fn handle_callback_query(
         None => {
             // No session bound to this chat at all — cannot possibly be the chat
             // that raised the approval. Ignore rather than guess.
-            tracing::warn!(chat_id, "telegram callback from a chat with no bound session — ignoring");
+            tracing::warn!(
+                chat_id,
+                "telegram callback from a chat with no bound session — ignoring"
+            );
             None
         }
     };
 
     bot.answer_callback_query(q.id).await?;
     if let Some(text) = outcome_text {
-        bot.edit_message_text(message.chat.id, message.id, text).await?;
+        bot.edit_message_text(message.chat.id, message.id, text)
+            .await?;
     }
     Ok(())
 }
@@ -175,9 +190,7 @@ impl Adapter for TelegramAdapter {
                             .map(|u| u.username.clone().unwrap_or_else(|| u.id.to_string()));
 
                         // Stable session per chat_id
-                        let session_id = *c2s
-                            .entry(chat_id)
-                            .or_insert_with(Uuid::new_v4);
+                        let session_id = *c2s.entry(chat_id).or_insert_with(Uuid::new_v4);
                         s2c.insert(session_id, chat_id);
 
                         let req = Request {
@@ -211,7 +224,9 @@ impl Adapter for TelegramAdapter {
                 }
             });
 
-            let handler = dptree::entry().branch(message_handler).branch(callback_handler);
+            let handler = dptree::entry()
+                .branch(message_handler)
+                .branch(callback_handler);
 
             Dispatcher::builder(bot, handler)
                 .enable_ctrlc_handler()
@@ -267,7 +282,12 @@ impl Adapter for TelegramAdapter {
                     }
                 }
             }
-            ResponseChunk::ToolApprovalRequest { tool, args, approval_id, origin } => {
+            ResponseChunk::ToolApprovalRequest {
+                tool,
+                args,
+                approval_id,
+                origin,
+            } => {
                 if let Some(chat_id) = self.session_to_chat.get(&session_id) {
                     // `origin` (e.g. "L1:developer") is display-only — who is asking.
                     let who = origin
@@ -309,9 +329,17 @@ impl Adapter for TelegramAdapter {
             Notification::MorningBrief(brief) => {
                 format!("🌅 <b>Morning Brief</b>\n{}", escape_html(&brief))
             }
-            Notification::Alert { title, body, urgent } => {
+            Notification::Alert {
+                title,
+                body,
+                urgent,
+            } => {
                 let icon = if urgent { "🔴" } else { "📢" };
-                format!("{icon} <b>{}</b>\n{}", escape_html(&title), escape_html(&body))
+                format!(
+                    "{icon} <b>{}</b>\n{}",
+                    escape_html(&title),
+                    escape_html(&body)
+                )
             }
             Notification::ReminderFired { title, .. } => {
                 format!("⏰ <b>Reminder</b>: {}", escape_html(&title))
@@ -380,8 +408,14 @@ mod tests {
     #[test]
     fn parse_callback_data_recognizes_approve_and_deny() {
         let id = Uuid::new_v4();
-        assert_eq!(parse_callback_data(&format!("approve:{id}")), Some((true, id)));
-        assert_eq!(parse_callback_data(&format!("deny:{id}")), Some((false, id)));
+        assert_eq!(
+            parse_callback_data(&format!("approve:{id}")),
+            Some((true, id))
+        );
+        assert_eq!(
+            parse_callback_data(&format!("deny:{id}")),
+            Some((false, id))
+        );
     }
 
     #[test]
@@ -424,15 +458,27 @@ mod tests {
         // No chat bound for this session — `deliver()`'s send_message branches are
         // skipped, so this test exercises only the buffer bookkeeping, no network I/O.
 
-        adapter.deliver(session_id, ResponseChunk::Text("partial ans".to_string())).await.unwrap();
-        adapter.deliver(session_id, ResponseChunk::Text("wer".to_string())).await.unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Text("partial ans".to_string()))
+            .await
+            .unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Text("wer".to_string()))
+            .await
+            .unwrap();
         assert_eq!(
-            adapter.text_buffer.get(&session_id).map(|e| e.value().clone()),
+            adapter
+                .text_buffer
+                .get(&session_id)
+                .map(|e| e.value().clone()),
             Some("partial answer".to_string()),
             "buffer must accumulate Text chunks before any Error arrives"
         );
 
-        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Error("boom".to_string()))
+            .await
+            .unwrap();
         assert!(
             adapter.text_buffer.get(&session_id).is_none(),
             "Error must discard the buffered partial text, not leave it for Complete to flush"
@@ -444,11 +490,20 @@ mod tests {
         let adapter = test_adapter();
         let session_id = Uuid::new_v4();
 
-        adapter.deliver(session_id, ResponseChunk::Text("partial".to_string())).await.unwrap();
-        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Text("partial".to_string()))
+            .await
+            .unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Error("boom".to_string()))
+            .await
+            .unwrap();
         // Mirrors haily-app::dispatch's real sequencing: Error is always followed by
         // Complete on the error path.
-        adapter.deliver(session_id, ResponseChunk::Complete).await.unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Complete)
+            .await
+            .unwrap();
 
         assert!(
             adapter.text_buffer.get(&session_id).is_none(),
@@ -463,7 +518,10 @@ mod tests {
 
         // No Text chunk ever arrived for this session (e.g. the LLM failed before
         // streaming a single token) — Error must not panic on a missing entry.
-        adapter.deliver(session_id, ResponseChunk::Error("boom".to_string())).await.unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Error("boom".to_string()))
+            .await
+            .unwrap();
         assert!(adapter.text_buffer.get(&session_id).is_none());
     }
 }

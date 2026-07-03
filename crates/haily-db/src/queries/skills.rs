@@ -184,7 +184,12 @@ pub async fn active_skills_top(db: &DbHandle, limit: i64) -> Result<Vec<Skill>> 
 /// The whole formula runs as one UPDATE so concurrent calls for the same skill each
 /// read-modify-write against the DB's current row version instead of a value snapshotted
 /// in Rust — two concurrent calls both land, rather than one clobbering the other.
-pub async fn update_skill_confidence(db: &DbHandle, id: &str, reward: f64, alpha: f64) -> Result<()> {
+pub async fn update_skill_confidence(
+    db: &DbHandle,
+    id: &str,
+    reward: f64,
+    alpha: f64,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE kms_skills
@@ -239,8 +244,8 @@ pub async fn apply_exponential_decay(
     // by time. The claim is written BEFORE decay: a failed decay simply skips this cycle
     // rather than allowing a duplicate, which is the safer trade-off for a periodic worker.
     let now = chrono::Utc::now().to_rfc3339();
-    let threshold = (chrono::Utc::now() - chrono::Duration::hours(MIN_DECAY_INTERVAL_HOURS))
-        .to_rfc3339();
+    let threshold =
+        (chrono::Utc::now() - chrono::Duration::hours(MIN_DECAY_INTERVAL_HOURS)).to_rfc3339();
     let claim_id = uuid::Uuid::new_v4().to_string();
     let claimed = sqlx::query(
         "INSERT INTO kms_preferences (id, key, value, confidence, source, created_at, updated_at)

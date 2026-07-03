@@ -72,18 +72,25 @@ pub async fn search_fts(db: &DbHandle, query: &str, limit: i64) -> Result<Vec<No
 pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let rows = sqlx::query(
-        "UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        "UPDATE notes SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(&now).bind(&now).bind(id)
-    .execute(db.pool()).await?.rows_affected();
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
     Ok(rows > 0)
 }
 
 pub async fn set_wikilinks(db: &DbHandle, id: &str, wikilinks: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("UPDATE notes SET wikilinks = ?, updated_at = ? WHERE id = ?")
-        .bind(wikilinks).bind(&now).bind(id)
-        .execute(db.pool()).await?;
+        .bind(wikilinks)
+        .bind(&now)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
     Ok(())
 }
 

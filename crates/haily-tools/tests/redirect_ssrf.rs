@@ -22,7 +22,10 @@ async fn spawn_fixture_server(response: &'static str) -> String {
         let (mut socket, _) = listener.accept().await.expect("accept");
         let mut buf = [0u8; 4096];
         let _ = socket.read(&mut buf).await;
-        socket.write_all(response.as_bytes()).await.expect("write response");
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
         socket.shutdown().await.ok();
     });
 
@@ -41,8 +44,12 @@ async fn loopback_fixture_is_itself_blocked_by_the_guard() {
     let body = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nhello";
     let base_url = spawn_fixture_server(body).await;
 
-    let result = follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
-    assert!(result.is_err(), "loopback must be blocked even with no redirect involved");
+    let result =
+        follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
+    assert!(
+        result.is_err(),
+        "loopback must be blocked even with no redirect involved"
+    );
 }
 
 #[tokio::test]
@@ -52,8 +59,12 @@ async fn redirect_to_metadata_ip_is_blocked_not_followed() {
     let body = "HTTP/1.1 302 Found\r\nlocation: http://169.254.169.254/latest/meta-data/\r\nconnection: close\r\n\r\n";
     let base_url = spawn_fixture_server(body).await;
 
-    let result = follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
-    assert!(result.is_err(), "redirect to cloud metadata IP must be blocked, not followed");
+    let result =
+        follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
+    assert!(
+        result.is_err(),
+        "redirect to cloud metadata IP must be blocked, not followed"
+    );
 }
 
 #[tokio::test]
@@ -61,15 +72,24 @@ async fn redirect_to_ipv6_loopback_is_blocked_not_followed() {
     let body = "HTTP/1.1 302 Found\r\nlocation: http://[::1]/secret\r\nconnection: close\r\n\r\n";
     let base_url = spawn_fixture_server(body).await;
 
-    let result = follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
-    assert!(result.is_err(), "redirect to IPv6 loopback must be blocked, not followed");
+    let result =
+        follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
+    assert!(
+        result.is_err(),
+        "redirect to IPv6 loopback must be blocked, not followed"
+    );
 }
 
 #[tokio::test]
 async fn redirect_to_private_range_is_blocked_not_followed() {
-    let body = "HTTP/1.1 302 Found\r\nlocation: http://10.0.0.5/internal\r\nconnection: close\r\n\r\n";
+    let body =
+        "HTTP/1.1 302 Found\r\nlocation: http://10.0.0.5/internal\r\nconnection: close\r\n\r\n";
     let base_url = spawn_fixture_server(body).await;
 
-    let result = follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
-    assert!(result.is_err(), "redirect to a private-range IP must be blocked, not followed");
+    let result =
+        follow_redirects_with_guard(&base_url, Duration::from_secs(5), |c, u| c.get(u)).await;
+    assert!(
+        result.is_err(),
+        "redirect to a private-range IP must be blocked, not followed"
+    );
 }

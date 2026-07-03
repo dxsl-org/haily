@@ -50,12 +50,12 @@ pub async fn create_session(
 }
 
 pub async fn get_session(db: &DbHandle, id: &str) -> Result<Option<Session>> {
-    Ok(sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE id = ? AND deleted_at IS NULL",
+    Ok(
+        sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ? AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?,
     )
-    .bind(id)
-    .fetch_optional(db.pool())
-    .await?)
 }
 
 pub async fn touch_session(db: &DbHandle, id: &str) -> Result<()> {
@@ -93,11 +93,7 @@ pub async fn insert_message(
 }
 
 /// Returns messages in chronological order (oldest first) for LLM context window.
-pub async fn recent_messages(
-    db: &DbHandle,
-    session_id: &str,
-    limit: i64,
-) -> Result<Vec<Message>> {
+pub async fn recent_messages(db: &DbHandle, session_id: &str, limit: i64) -> Result<Vec<Message>> {
     Ok(sqlx::query_as::<_, Message>(
         "SELECT * FROM (
              SELECT * FROM messages WHERE session_id = ?

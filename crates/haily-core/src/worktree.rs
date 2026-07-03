@@ -116,7 +116,10 @@ impl EphemeralWorktree {
                 continue;
             }
             let abs_path = self.path.join(rel_path);
-            if haily_tools::security::is_symlink(&abs_path).await.unwrap_or(true) {
+            if haily_tools::security::is_symlink(&abs_path)
+                .await
+                .unwrap_or(true)
+            {
                 tracing::warn!(path = %abs_path.display(), "skipping symlinked untracked file in diff");
                 continue;
             }
@@ -189,10 +192,7 @@ impl EphemeralWorktree {
     /// cleanup error is logged as a warning.
     ///
     /// Returns `(result_of_f, diff_string)`.
-    pub async fn with_ephemeral_worktree<F, Fut, T>(
-        repo_root: &Path,
-        f: F,
-    ) -> Result<(T, String)>
+    pub async fn with_ephemeral_worktree<F, Fut, T>(repo_root: &Path, f: F) -> Result<(T, String)>
     where
         F: FnOnce(PathBuf) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T>> + Send,

@@ -43,7 +43,12 @@ impl MockAdapter {
 
     pub async fn send(&self, message: &str) -> Uuid {
         let session_id = Uuid::new_v4();
-        let tx = self.req_tx.lock().expect("lock").clone().expect("adapter not started");
+        let tx = self
+            .req_tx
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("adapter not started");
         tx.send(Request {
             session_id,
             adapter_id: "mock".to_string(),
@@ -74,7 +79,10 @@ impl Adapter for MockAdapter {
     }
 
     async fn deliver(&self, session_id: Uuid, chunk: ResponseChunk) -> Result<()> {
-        self.delivered.lock().expect("lock").push((session_id, chunk));
+        self.delivered
+            .lock()
+            .expect("lock")
+            .push((session_id, chunk));
         Ok(())
     }
 
@@ -104,7 +112,9 @@ pub async fn spawn_slow_llm_server(delay: std::time::Duration) -> String {
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let delay = delay;
             tokio::spawn(async move {
                 // Drain the request headers/body; a fixed buffer is enough for the
@@ -136,20 +146,29 @@ pub async fn spawn_slow_llm_server(delay: std::time::Duration) -> String {
 /// entirely BEFORE the response starts), this lets a test fire cancellation
 /// mid-stream, after some tokens have already arrived but before `[DONE]`. Returns
 /// the bound base URL.
-pub async fn spawn_streaming_llm_server(token_count: u32, inter_token_delay: std::time::Duration) -> String {
+pub async fn spawn_streaming_llm_server(
+    token_count: u32,
+    inter_token_delay: std::time::Duration,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
                 let _ = stream.read(&mut buf).await;
 
                 let status_and_headers =
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-                if stream.write_all(status_and_headers.as_bytes()).await.is_err() {
+                if stream
+                    .write_all(status_and_headers.as_bytes())
+                    .await
+                    .is_err()
+                {
                     return;
                 }
 

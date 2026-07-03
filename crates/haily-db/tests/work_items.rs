@@ -45,7 +45,9 @@ async fn full_lifecycle_queued_to_done() {
     let (db, _dir) = setup().await;
     let sid = make_session(&db).await;
 
-    let item = work_items::create(&db, &sid, "lifecycle task").await.unwrap();
+    let item = work_items::create(&db, &sid, "lifecycle task")
+        .await
+        .unwrap();
     assert_eq!(item.status, "queued");
 
     work_items::start(&db, &item.id).await.unwrap();
@@ -74,7 +76,9 @@ async fn fail_records_error_message() {
 
     let item = work_items::create(&db, &sid, "will fail").await.unwrap();
     work_items::start(&db, &item.id).await.unwrap();
-    work_items::fail(&db, &item.id, "network timeout").await.unwrap();
+    work_items::fail(&db, &item.id, "network timeout")
+        .await
+        .unwrap();
 
     let failed = work_items::get(&db, &item.id).await.unwrap().unwrap();
     assert_eq!(failed.status, "failed");
@@ -102,10 +106,19 @@ async fn list_active_excludes_terminal_statuses() {
     let active = work_items::list_active(&db).await.unwrap();
     let ids: Vec<&str> = active.iter().map(|i| i.id.as_str()).collect();
 
-    assert!(ids.contains(&running.id.as_str()), "running should be active");
+    assert!(
+        ids.contains(&running.id.as_str()),
+        "running should be active"
+    );
     assert!(ids.contains(&queued.id.as_str()), "queued should be active");
-    assert!(!ids.contains(&done_item.id.as_str()), "done should not be active");
-    assert!(!ids.contains(&failed_item.id.as_str()), "failed should not be active");
+    assert!(
+        !ids.contains(&done_item.id.as_str()),
+        "done should not be active"
+    );
+    assert!(
+        !ids.contains(&failed_item.id.as_str()),
+        "failed should not be active"
+    );
 }
 
 #[tokio::test]
@@ -117,7 +130,9 @@ async fn list_interrupted_shows_only_interrupted() {
     work_items::start(&db, &a.id).await.unwrap();
     work_items::mark_interrupted(&db, &a.id).await.unwrap();
 
-    let b = work_items::create(&db, &sid, "task b — still running").await.unwrap();
+    let b = work_items::create(&db, &sid, "task b — still running")
+        .await
+        .unwrap();
     work_items::start(&db, &b.id).await.unwrap();
 
     let interrupted = work_items::list_interrupted(&db).await.unwrap();

@@ -23,7 +23,9 @@ fn detects_negative_thumbs_down() {
 #[test]
 fn detects_negative_too_long() {
     let sig = detect_feedback("ngắn thôi, dài quá");
-    assert!(matches!(sig, Some(FeedbackSignal::Negative { topic: Some(ref t) }) if t == "response_length"));
+    assert!(
+        matches!(sig, Some(FeedbackSignal::Negative { topic: Some(ref t) }) if t == "response_length")
+    );
 }
 
 #[test]

@@ -58,44 +58,45 @@ pub async fn pending(db: &DbHandle, now_rfc3339: &str) -> Result<Vec<Reminder>> 
 
 pub async fn mark_fired(db: &DbHandle, id: &str, fired_at: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "UPDATE reminders SET fired_at = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(fired_at)
-    .bind(&now)
-    .bind(id)
-    .execute(db.pool())
-    .await?;
+    sqlx::query("UPDATE reminders SET fired_at = ?, updated_at = ? WHERE id = ?")
+        .bind(fired_at)
+        .bind(&now)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
     Ok(())
 }
 
 pub async fn list_all(db: &DbHandle) -> Result<Vec<Reminder>> {
     Ok(sqlx::query_as::<_, Reminder>(
-        "SELECT * FROM reminders WHERE deleted_at IS NULL ORDER BY fire_at ASC"
+        "SELECT * FROM reminders WHERE deleted_at IS NULL ORDER BY fire_at ASC",
     )
-    .fetch_all(db.pool()).await?)
+    .fetch_all(db.pool())
+    .await?)
 }
 
 pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let rows = sqlx::query(
-        "UPDATE reminders SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        "UPDATE reminders SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(&now).bind(&now).bind(id)
-    .execute(db.pool()).await?.rows_affected();
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
     Ok(rows > 0)
 }
 
 pub async fn set_outcome(db: &DbHandle, id: &str, outcome: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        "UPDATE reminders SET outcome = ?, outcome_at = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(outcome)
-    .bind(&now)
-    .bind(&now)
-    .bind(id)
-    .execute(db.pool())
-    .await?;
+    sqlx::query("UPDATE reminders SET outcome = ?, outcome_at = ?, updated_at = ? WHERE id = ?")
+        .bind(outcome)
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .execute(db.pool())
+        .await?;
     Ok(())
 }

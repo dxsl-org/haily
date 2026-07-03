@@ -4,10 +4,11 @@ use haily_db::{
     queries::{sessions, skills as db_skills, work_items},
     DbHandle,
 };
-use haily_types::{Request, ResponseChunk};
 use haily_kms::{skills::TaskOutcome, KmsHandle};
 use haily_llm::{CompletionRequest, LlmClient, LlmRouter, Message, Role, StreamChunk};
 use haily_tools::{ToolContext, ToolRegistry};
+use haily_types::{Request, ResponseChunk};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -26,8 +27,14 @@ fn estimate_tokens(s: &str) -> i64 {
 /// mislabel a legitimately completed turn as a failure, dragging down EMA confidence
 /// for skills that had nothing to do with the (nonexistent) failure.
 const INABILITY_PHRASES: &[&str] = &[
-    "không thể", "không làm được", "xin lỗi, tôi không",
-    "i cannot", "i can't", "i'm unable to", "i am unable to", "unable to complete",
+    "không thể",
+    "không làm được",
+    "xin lỗi, tôi không",
+    "i cannot",
+    "i can't",
+    "i'm unable to",
+    "i am unable to",
+    "unable to complete",
 ];
 
 /// Whether `response` (the turn's final, already tag-stripped text) reads as the
@@ -195,7 +202,9 @@ async fn stream_llm_response(
             None => {
                 // Channel closed without a Done/Error — treat as an abnormal end
                 // rather than silently returning a truncated success.
-                return Err(anyhow::anyhow!("LLM stream ended without a completion signal"));
+                return Err(anyhow::anyhow!(
+                    "LLM stream ended without a completion signal"
+                ));
             }
         }
     }
@@ -223,11 +232,18 @@ fn build_memory_block(facts: &[String], budget_tokens: usize) -> Option<String> 
     if facts.is_empty() {
         return None;
     }
-    let mut kept = facts.iter().take(SUB_TURN_MAX_FACTS).cloned().collect::<Vec<_>>();
+    let mut kept = facts
+        .iter()
+        .take(SUB_TURN_MAX_FACTS)
+        .cloned()
+        .collect::<Vec<_>>();
     loop {
         let block = format!(
             "## Relevant Memory\n{}",
-            kept.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
+            kept.iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         if budget::estimate(&block) <= budget_tokens || kept.len() <= 1 {
             return Some(block);
@@ -273,6 +289,11 @@ pub struct SubTurnRequest {
     /// relays ONLY approval requests to the parent's real `approval_tx`; sub-agent
     /// `Text`/`ToolResult` are still discarded (never surfaced to the user).
     pub approval_tx: mpsc::Sender<ResponseChunk>,
+    /// Phase 3 kill switch (C8): the SAME `Arc<AtomicBool>` the L0 turn holds, threaded
+    /// down so a sub-turn write at depth>0 observes `safety.disable_writes` too. Passed
+    /// (not read from a global) for the same reason the broker is — one runtime source of
+    /// truth, live-toggleable, shared by every depth.
+    pub kill: Arc<AtomicBool>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -301,6 +322,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         approval_gate,
         cancel,
         approval_tx,
+        kill,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -334,7 +356,11 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
 
     let delegate_overhead_ms = turn_start.elapsed().as_millis() as i64;
     tracing::Span::current().record("delegate_overhead_ms", delegate_overhead_ms);
-    tracing::debug!(delegate_overhead_ms, task_len = task.len(), "sub-turn pre-LLM overhead");
+    tracing::debug!(
+        delegate_overhead_ms,
+        task_len = task.len(),
+        "sub-turn pre-LLM overhead"
+    );
 
     let messages = vec![
         haily_llm::Message::system(full_prompt),
@@ -380,7 +406,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         let response = llm.complete_tiered(model_tier, llm_req).await?;
 
         if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
-            msgs.push(haily_llm::Message { role: haily_llm::Role::Assistant, content: response.clone() });
+            msgs.push(haily_llm::Message {
+                role: haily_llm::Role::Assistant,
+                content: response.clone(),
+            });
 
             // Guard BEFORE dispatch: a tripped guard (duplicate call / ceiling) ends
             // the sub-turn instead of feeding an error back — which a looping local
@@ -390,9 +419,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 break tool_call::strip_tool_markup(&response);
             }
 
-            let (result, tool_ok) = tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx)
-                .await
-                .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
+            let (result, tool_ok) =
+                tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &kill)
+                    .await
+                    .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
@@ -408,7 +438,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 serde_json::Value::String(safe_result),
                 tool_ok
             );
-            msgs.push(haily_llm::Message { role: haily_llm::Role::User, content: result_msg });
+            msgs.push(haily_llm::Message {
+                role: haily_llm::Role::User,
+                content: result_msg,
+            });
             // Assistant tool-call + tool-result just pushed both join the pinned
             // tail — the NEXT iteration's `refit` must not trim them.
             pinned_tail_len += 2;
@@ -449,6 +482,9 @@ pub struct TurnRuntime {
     pub kms: Arc<KmsHandle>,
     pub llm: Arc<LlmRouter>,
     pub tools: Arc<ToolRegistry>,
+    /// Phase 3 kill switch (C8): `safety.disable_writes`, shared from the Orchestrator so
+    /// the L0 turn and every sub-turn it spawns observe the same live-toggleable flag.
+    pub kill: Arc<AtomicBool>,
 }
 
 /// Full agent turn. Called once per incoming Request.
@@ -464,7 +500,13 @@ pub async fn run_turn(
     broker: &Arc<ApprovalBroker>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let TurnRuntime { db, kms, llm, tools } = runtime;
+    let TurnRuntime {
+        db,
+        kms,
+        llm,
+        tools,
+        kill,
+    } = runtime;
     let session_id = req.session_id.to_string();
     let turn_start = std::time::Instant::now();
 
@@ -551,7 +593,10 @@ pub async fn run_turn(
             };
 
             if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
-                messages.push(Message { role: Role::Assistant, content: response.clone() });
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.clone(),
+                });
 
                 // Guard BEFORE dispatch: a tripped guard ends the turn with the
                 // model's own text (or a fallback) rather than feeding the error
@@ -576,7 +621,7 @@ pub async fn run_turn(
                 }
 
                 let (result, tool_ok) =
-                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx)
+                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &kill)
                         .await
                         .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
@@ -594,7 +639,10 @@ pub async fn run_turn(
                     serde_json::Value::String(safe_result),
                     tool_ok
                 );
-                messages.push(Message { role: Role::User, content: result_msg });
+                messages.push(Message {
+                    role: Role::User,
+                    content: result_msg,
+                });
                 // Assistant tool-call + tool-result message just pushed both join the
                 // pinned tail — the NEXT loop iteration's `refit` must not trim them.
                 pinned_tail_len += 2;
@@ -750,14 +798,24 @@ mod streaming_tests {
     async fn run_stream(pieces: &[&str]) -> (String, String) {
         let (llm_tx, mut llm_rx) = mpsc::channel(64);
         for p in pieces {
-            llm_tx.send(StreamChunk::Token(p.to_string())).await.unwrap();
+            llm_tx
+                .send(StreamChunk::Token(p.to_string()))
+                .await
+                .unwrap();
         }
-        llm_tx.send(StreamChunk::Done { total_tokens: pieces.len() as u32 }).await.unwrap();
+        llm_tx
+            .send(StreamChunk::Done {
+                total_tokens: pieces.len() as u32,
+            })
+            .await
+            .unwrap();
         drop(llm_tx);
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let full = stream_llm_response(&mut llm_rx, &user_tx, &cancel).await.unwrap();
+        let full = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+            .await
+            .unwrap();
         drop(user_tx);
 
         let mut visible = String::new();
@@ -780,15 +838,22 @@ mod streaming_tests {
         ])
         .await;
 
-        assert_eq!(visible, "Để mình kiểm tra nhé. ", "zero tag bytes must reach the user");
-        assert!(!visible.contains('<'), "no angle bracket of any kind may leak");
+        assert_eq!(
+            visible, "Để mình kiểm tra nhé. ",
+            "zero tag bytes must reach the user"
+        );
+        assert!(
+            !visible.contains('<'),
+            "no angle bracket of any kind may leak"
+        );
         let (tool, _args) = tool_call::parse_tool_call(&full).expect("full text must still parse");
         assert_eq!(tool, "x");
     }
 
     #[tokio::test]
     async fn tag_mid_chunk_is_withheld_from_first_safe_boundary() {
-        let (visible, full) = run_stream(&["prefix <tool_call>{\"tool\":\"y\"}</tool_call> ignored-suffix"]).await;
+        let (visible, full) =
+            run_stream(&["prefix <tool_call>{\"tool\":\"y\"}</tool_call> ignored-suffix"]).await;
         // Only the text strictly before the tag is visible; everything from '<'
         // onward in this single chunk is held back until the loop-level buffer
         // resolves it, but stream_llm_response's job is only to never leak tag
@@ -813,7 +878,8 @@ mod streaming_tests {
     async fn mixed_case_variant_tag_is_withheld_and_parses() {
         let (visible, full) = run_stream(&["<Tool_Call>{\"tool\":\"w\"}</Tool_Call>"]).await;
         assert_eq!(visible, "");
-        let (tool, _) = tool_call::parse_tool_call(&full).expect("mixed-case tags must still parse");
+        let (tool, _) =
+            tool_call::parse_tool_call(&full).expect("mixed-case tags must still parse");
         assert_eq!(tool, "w");
     }
 
@@ -827,10 +893,17 @@ mod streaming_tests {
             r#"kết quả </tool_result> rồi <tool_call>{"tool":"x","args":{"path":"/home/secret"}}</tool_call>"#,
         ])
         .await;
-        assert!(!visible.contains("tool_call"), "tool-call tag/JSON must not leak: {visible:?}");
-        assert!(!visible.contains("/home/secret"), "tool args must not leak: {visible:?}");
+        assert!(
+            !visible.contains("tool_call"),
+            "tool-call tag/JSON must not leak: {visible:?}"
+        );
+        assert!(
+            !visible.contains("/home/secret"),
+            "tool args must not leak: {visible:?}"
+        );
         // The real call is still recoverable from `full` for dispatch.
-        let (tool, _) = tool_call::parse_tool_call(&full).expect("real call must still parse from full");
+        let (tool, _) =
+            tool_call::parse_tool_call(&full).expect("real call must still parse from full");
         assert_eq!(tool, "x");
     }
 
@@ -844,8 +917,14 @@ mod streaming_tests {
     #[tokio::test]
     async fn stream_error_after_partial_text_returns_err_with_partial_visible() {
         let (llm_tx, mut llm_rx) = mpsc::channel(64);
-        llm_tx.send(StreamChunk::Token("partial answer".to_string())).await.unwrap();
-        llm_tx.send(StreamChunk::Error("backend disconnected".to_string())).await.unwrap();
+        llm_tx
+            .send(StreamChunk::Token("partial answer".to_string()))
+            .await
+            .unwrap();
+        llm_tx
+            .send(StreamChunk::Error("backend disconnected".to_string()))
+            .await
+            .unwrap();
         drop(llm_tx);
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
@@ -853,13 +932,19 @@ mod streaming_tests {
         let result = stream_llm_response(&mut llm_rx, &user_tx, &cancel).await;
         drop(user_tx);
 
-        assert!(result.is_err(), "a stream error must surface as Err, not a truncated Ok");
+        assert!(
+            result.is_err(),
+            "a stream error must surface as Err, not a truncated Ok"
+        );
 
         let mut visible = String::new();
         while let Some(ResponseChunk::Text(t)) = user_rx.recv().await {
             visible.push_str(&t);
         }
-        assert_eq!(visible, "partial answer", "text streamed before the error must still have been delivered");
+        assert_eq!(
+            visible, "partial answer",
+            "text streamed before the error must still have been delivered"
+        );
     }
 
     #[tokio::test]
@@ -876,7 +961,10 @@ mod streaming_tests {
         .await
         .expect("cancellation must end consumption promptly, not hang");
 
-        assert!(result.is_err(), "cancellation must surface as an Err so the turn fails cleanly");
+        assert!(
+            result.is_err(),
+            "cancellation must surface as an Err so the turn fails cleanly"
+        );
     }
 }
 
@@ -919,16 +1007,27 @@ mod sub_turn_tests {
         let block = build_memory_block(&facts, 10_000).expect("block");
         assert!(block.contains("fact-0"), "top-ranked fact must survive");
         assert!(block.contains("fact-4"), "5th fact must survive");
-        assert!(!block.contains("fact-5"), "6th+ facts must be dropped by the top-5 cap");
+        assert!(
+            !block.contains("fact-5"),
+            "6th+ facts must be dropped by the top-5 cap"
+        );
     }
 
     #[test]
     fn build_memory_block_drops_lowest_ranked_facts_under_a_tight_budget() {
-        let facts: Vec<String> = (0..5).map(|i| format!("fact-{i}-{}", "x".repeat(200))).collect();
+        let facts: Vec<String> = (0..5)
+            .map(|i| format!("fact-{i}-{}", "x".repeat(200)))
+            .collect();
         // Budget too small for all 5 but large enough for at least one.
         let block = build_memory_block(&facts, 80).expect("block");
-        assert!(block.contains("fact-0-"), "highest-ranked fact must survive a tight budget");
-        assert!(!block.contains("fact-4-"), "lowest-ranked fact must be dropped first");
+        assert!(
+            block.contains("fact-0-"),
+            "highest-ranked fact must survive a tight budget"
+        );
+        assert!(
+            !block.contains("fact-4-"),
+            "lowest-ranked fact must be dropped first"
+        );
     }
 
     #[test]
@@ -955,22 +1054,25 @@ mod sub_turn_tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
                     let request_text = String::from_utf8_lossy(&buf[..n]);
                     let body_start = request_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-                    let system_content = serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
-                        .ok()
-                        .and_then(|v| {
-                            v["messages"].as_array().and_then(|msgs| {
-                                msgs.iter()
-                                    .find(|m| m["role"] == "system")
-                                    .and_then(|m| m["content"].as_str().map(str::to_string))
+                    let system_content =
+                        serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
+                            .ok()
+                            .and_then(|v| {
+                                v["messages"].as_array().and_then(|msgs| {
+                                    msgs.iter()
+                                        .find(|m| m["role"] == "system")
+                                        .and_then(|m| m["content"].as_str().map(str::to_string))
+                                })
                             })
-                        })
-                        .unwrap_or_else(|| "no-system-message-found".to_string());
+                            .unwrap_or_else(|| "no-system-message-found".to_string());
 
                     let payload = serde_json::json!({
                         "choices": [{ "message": { "content": system_content } }]
@@ -1002,11 +1104,20 @@ mod sub_turn_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         (db, kms, dir)
     }
 
-    fn base_req(task: String, db: Arc<DbHandle>, kms: Arc<KmsHandle>, llm: Arc<LlmRouter>) -> SubTurnRequest {
+    fn base_req(
+        task: String,
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        llm: Arc<LlmRouter>,
+    ) -> SubTurnRequest {
         let (approval_tx, _rx) = mpsc::channel(8);
         SubTurnRequest {
             task,
@@ -1022,6 +1133,7 @@ mod sub_turn_tests {
             approval_gate: Arc::new(ApprovalBroker::new()),
             cancel: CancellationToken::new(),
             approval_tx,
+            kill: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1030,9 +1142,16 @@ mod sub_turn_tests {
         let (db, kms, _dir) = test_kms().await;
         // FTS5's default tokenizer treats `-` as a query operator — plain
         // alphanumeric words keep the MATCH query well-formed for this test.
-        kms.remember("test domain", "vietnam trip", "scheduled for", "december", "test", None)
-            .await
-            .expect("seed fact");
+        kms.remember(
+            "test domain",
+            "vietnam trip",
+            "scheduled for",
+            "december",
+            "test",
+            None,
+        )
+        .await
+        .expect("seed fact");
 
         let base_url = spawn_prompt_echo_server().await;
         let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
@@ -1041,7 +1160,8 @@ mod sub_turn_tests {
         // syntax is an implicit AND across every token in the query, so the padding
         // must reuse words already in the fact rather than introduce unrelated
         // filler — otherwise the padding itself would make the query not match.
-        let task = "vietnam trip december ".repeat(TRIVIAL_TASK_CHAR_THRESHOLD / "vietnam trip december ".len() + 1);
+        let task = "vietnam trip december "
+            .repeat(TRIVIAL_TASK_CHAR_THRESHOLD / "vietnam trip december ".len() + 1);
         assert!(task.chars().count() >= TRIVIAL_TASK_CHAR_THRESHOLD);
         let req = base_req(task, db, kms, llm);
         let response = run_sub_turn(req).await.expect("run_sub_turn");
@@ -1059,9 +1179,16 @@ mod sub_turn_tests {
     #[tokio::test]
     async fn trivial_task_skips_kms_search_and_omits_memory_section() {
         let (db, kms, _dir) = test_kms().await;
-        kms.remember("test domain", "vietnam trip", "scheduled for", "december", "test", None)
-            .await
-            .expect("seed fact");
+        kms.remember(
+            "test domain",
+            "vietnam trip",
+            "scheduled for",
+            "december",
+            "test",
+            None,
+        )
+        .await
+        .expect("seed fact");
 
         let base_url = spawn_prompt_echo_server().await;
         let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
@@ -1103,9 +1230,8 @@ mod sub_turn_tests {
 
         // Padding reuses words already in the fact so FTS5's implicit-AND MATCH
         // still surfaces it (see `sub_agent_prompt_contains_memory_facts_when_hits_exist`).
-        let task = "injected fact contains payload ".repeat(
-            TRIVIAL_TASK_CHAR_THRESHOLD / "injected fact contains payload ".len() + 1,
-        );
+        let task = "injected fact contains payload "
+            .repeat(TRIVIAL_TASK_CHAR_THRESHOLD / "injected fact contains payload ".len() + 1);
         assert!(task.chars().count() >= TRIVIAL_TASK_CHAR_THRESHOLD);
         let req = base_req(task, db, kms, llm);
         let response = run_sub_turn(req).await.expect("run_sub_turn");
@@ -1116,7 +1242,10 @@ mod sub_turn_tests {
         );
         // The informational content (minus the tag tokens) must still be present —
         // neutralization strips the tag, not the fact.
-        assert!(response.contains("payload"), "non-tag fact content must survive neutralization");
+        assert!(
+            response.contains("payload"),
+            "non-tag fact content must survive neutralization"
+        );
     }
 }
 
@@ -1144,10 +1273,18 @@ mod outcome_tests {
 
     #[async_trait]
     impl Tool for AlwaysFailsTool {
-        fn name(&self) -> &str { "always_fails" }
-        fn description(&self) -> &str { "test tool that always errors" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
+        fn name(&self) -> &str {
+            "always_fails"
+        }
+        fn description(&self) -> &str {
+            "test tool that always errors"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Read
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Err(anyhow::anyhow!("boom"))
         }
@@ -1157,10 +1294,18 @@ mod outcome_tests {
 
     #[async_trait]
     impl Tool for AlwaysSucceedsTool {
-        fn name(&self) -> &str { "always_succeeds" }
-        fn description(&self) -> &str { "test tool that always succeeds" }
-        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
+        fn name(&self) -> &str {
+            "always_succeeds"
+        }
+        fn description(&self) -> &str {
+            "test tool that always succeeds"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Read
+        }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("done".to_string())
         }
@@ -1177,7 +1322,9 @@ mod outcome_tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let call_count = Arc::clone(&call_count);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
@@ -1222,7 +1369,11 @@ mod outcome_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
 
         let session_id = uuid::Uuid::new_v4();
         sessions::create_session(&db, &session_id.to_string(), "test-adapter", None)
@@ -1233,7 +1384,9 @@ mod outcome_tests {
     }
 
     async fn latest_trace_outcome(db: &DbHandle, session_id: uuid::Uuid) -> String {
-        let traces = db_skills::recent_traces(db, 10).await.expect("recent_traces");
+        let traces = db_skills::recent_traces(db, 10)
+            .await
+            .expect("recent_traces");
         traces
             .into_iter()
             .find(|t| t.session_id == session_id.to_string())
@@ -1265,6 +1418,7 @@ mod outcome_tests {
             approval_gate: Arc::new(ApprovalBroker::new()),
             cancel: CancellationToken::new(),
             approval_tx,
+            kill: Arc::new(AtomicBool::new(false)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1295,6 +1449,7 @@ mod outcome_tests {
             approval_gate: Arc::new(ApprovalBroker::new()),
             cancel: CancellationToken::new(),
             approval_tx,
+            kill: Arc::new(AtomicBool::new(false)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1313,15 +1468,21 @@ mod outcome_tests {
             let call_count = Arc::new(AtomicUsize::new(0));
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
                     let call_count = Arc::clone(&call_count);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65536];
                         let _ = stream.read(&mut buf).await;
                         let n = call_count.fetch_add(1, Ordering::SeqCst);
                         let content = match n {
-                            0 => r#"<tool_call>{"tool":"always_fails","args":{}}</tool_call>"#.to_string(),
-                            1..=3 => r#"<tool_call>{"tool":"always_succeeds","args":{}}</tool_call>"#.to_string(),
+                            0 => r#"<tool_call>{"tool":"always_fails","args":{}}</tool_call>"#
+                                .to_string(),
+                            1..=3 => {
+                                r#"<tool_call>{"tool":"always_succeeds","args":{}}</tool_call>"#
+                                    .to_string()
+                            }
                             _ => "Final answer.".to_string(),
                         };
                         let payload = serde_json::json!({
@@ -1360,6 +1521,7 @@ mod outcome_tests {
             approval_gate: Arc::new(ApprovalBroker::new()),
             cancel: CancellationToken::new(),
             approval_tx,
+            kill: Arc::new(AtomicBool::new(false)),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 

@@ -18,11 +18,28 @@ pub use haily_kms::feedback::{apply_feedback_signal, FeedbackSignal};
 const SHORT_MESSAGE_WORD_LIMIT: usize = 6;
 
 const POS_PATTERNS: &[&str] = &[
-    "👍", "tốt", "đúng rồi", "chính xác", "perfect", "great", "cảm ơn", "thank", "good",
+    "👍",
+    "tốt",
+    "đúng rồi",
+    "chính xác",
+    "perfect",
+    "great",
+    "cảm ơn",
+    "thank",
+    "good",
 ];
 const NEG_PATTERNS: &[&str] = &[
-    "👎", "sai", "không phải", "đừng làm vậy", "không đúng", "dài quá", "ngắn thôi", "quá dài",
-    "wrong", "bad", "stop",
+    "👎",
+    "sai",
+    "không phải",
+    "đừng làm vậy",
+    "không đúng",
+    "dài quá",
+    "ngắn thôi",
+    "quá dài",
+    "wrong",
+    "bad",
+    "stop",
 ];
 
 /// Word count of a trimmed message — used for the short-message anchor exemption.
@@ -70,7 +87,9 @@ fn try_parse_correction(msg: &str) -> Option<FeedbackSignal> {
     // any long message merely containing the word "not") in favor of requiring a
     // leading "no, it's ... but ..." shape.
     if trimmed.starts_with("no, it's") || trimmed.starts_with("no it's") {
-        let after = trimmed.trim_start_matches("no, it's").trim_start_matches("no it's");
+        let after = trimmed
+            .trim_start_matches("no, it's")
+            .trim_start_matches("no it's");
         if let Some(sep_pos) = after.find(" but ") {
             let old = after[..sep_pos].trim().to_string();
             let new = after[sep_pos + " but ".len()..].trim().to_string();
@@ -109,7 +128,9 @@ pub fn detect_feedback(msg: &str) -> Option<FeedbackSignal> {
 
     for pat in NEG_PATTERNS {
         if lower.contains(*pat) && is_anchored(trimmed, pat, short) {
-            return Some(FeedbackSignal::Negative { topic: infer_negative_topic(msg) });
+            return Some(FeedbackSignal::Negative {
+                topic: infer_negative_topic(msg),
+            });
         }
     }
     for pat in POS_PATTERNS {
@@ -130,17 +151,26 @@ mod precision_tests {
 
     #[test]
     fn tp_tot_lam_is_positive() {
-        assert!(matches!(detect_feedback("tốt lắm"), Some(FeedbackSignal::Positive)));
+        assert!(matches!(
+            detect_feedback("tốt lắm"),
+            Some(FeedbackSignal::Positive)
+        ));
     }
 
     #[test]
     fn tp_thumbs_up_is_positive() {
-        assert!(matches!(detect_feedback("👍"), Some(FeedbackSignal::Positive)));
+        assert!(matches!(
+            detect_feedback("👍"),
+            Some(FeedbackSignal::Positive)
+        ));
     }
 
     #[test]
     fn tp_sai_roi_is_negative() {
-        assert!(matches!(detect_feedback("sai rồi"), Some(FeedbackSignal::Negative { .. })));
+        assert!(matches!(
+            detect_feedback("sai rồi"),
+            Some(FeedbackSignal::Negative { .. })
+        ));
     }
 
     #[test]
@@ -212,7 +242,8 @@ mod precision_tests {
 
     #[test]
     fn fp_long_message_mentioning_style_without_complaint_does_not_fire() {
-        let msg = "phong cách viết code ở đây khá là thú vị và mình học được nhiều thứ mới từ dự án này";
+        let msg =
+            "phong cách viết code ở đây khá là thú vị và mình học được nhiều thứ mới từ dự án này";
         assert!(detect_feedback(msg).is_none());
     }
 
@@ -228,6 +259,9 @@ mod precision_tests {
     #[test]
     fn pattern_at_message_start_fires_even_when_not_short() {
         let msg = "sai rồi, mình đã nói là chủ nhật tuần sau chứ không phải tuần này đâu bạn ơi";
-        assert!(matches!(detect_feedback(msg), Some(FeedbackSignal::Negative { .. })));
+        assert!(matches!(
+            detect_feedback(msg),
+            Some(FeedbackSignal::Negative { .. })
+        ));
     }
 }

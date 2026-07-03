@@ -14,10 +14,11 @@ pub use approval::ApprovalBroker;
 
 use anyhow::Result;
 use haily_db::DbHandle;
-use haily_types::{ApprovalResolver, Request, ResponseChunk};
 use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;
+use haily_types::{ApprovalResolver, Request, ResponseChunk};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +35,12 @@ pub struct Orchestrator {
     /// broker instance for the whole orchestrator lifetime is correct (not
     /// per-turn); see `approval.rs` for the session-bound resolution contract.
     approval_broker: Arc<ApprovalBroker>,
+    /// Phase 3 kill switch (C8): `safety.disable_writes`. The runtime source of truth for
+    /// blocking NEW forward writes; the persisted preference row is only next-boot state.
+    /// Cloned into every `TurnRuntime`/`SubTurnRequest` (via the DelegateTools) so the gate
+    /// is observed at any depth, and exposed via `kill_handle()` so the app layer can flip
+    /// it live from `set_preference`/CLI without an orchestrator round-trip.
+    kill: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
@@ -81,6 +88,17 @@ impl Orchestrator {
             "work_item_resume", // resume a task
             "feedback_react",   // apply in-line user feedback
         ];
+        // Phase 3 kill switch (C8): seed from the persisted `safety.disable_writes`
+        // preference so a restart preserves a thrown switch. This Arc is the runtime
+        // source of truth from here on; the app layer flips it live via `kill_handle()`.
+        let disable_writes = haily_db::queries::meta::get_preference(&db, "safety.disable_writes")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let kill = Arc::new(AtomicBool::new(disable_writes));
+
         let base_v1 = ToolRegistry::build_v1();
         let mut tools = base_v1.sub_registry(L0_QUICK_TOOLS);
 
@@ -108,6 +126,7 @@ impl Orchestrator {
                     sub_registry: l2_reg,
                     max_depth: 2, // L1 (depth=1) can spawn; L2 (depth=2) blocked by depth guard
                     model_tier: spec.model_tier,
+                    kill: Arc::clone(&kill),
                 }));
             }
 
@@ -122,17 +141,43 @@ impl Orchestrator {
                 sub_registry: Arc::new(l1_reg),
                 max_depth: 1, // L0 (depth=0) can spawn L1; L1 depth guard handles the rest
                 model_tier: domain.model_tier,
+                kill: Arc::clone(&kill),
             }));
         }
 
         let tools = Arc::new(tools);
-        tracing::info!(llm = llm_provider, tools = tools.len(), "Orchestrator ready");
+        tracing::info!(
+            llm = llm_provider,
+            tools = tools.len(),
+            "Orchestrator ready"
+        );
 
         // Reset work items stuck in `running` from a previous crash to `interrupted`.
         match haily_db::queries::work_items::reset_stale_running(&db).await {
             Ok(n) if n > 0 => tracing::info!(count = n, "work items reset to interrupted"),
             Err(e) => tracing::warn!("failed to reset stale work items: {e:#}"),
             _ => {}
+        }
+
+        // Phase 3 reconciliation sweep (C6/C7): classify orphan `pending` journal rows
+        // left by a crash/kill mid-write via a read-back GET — NEVER a blind create-retry
+        // (M4). Placed right next to `reset_stale_running` (same crash-recovery boundary).
+        // The connector executor is wired in phase 4; until then the fail-closed
+        // placeholder marks unclassifiable rows `unverified` (the safe C7 direction — it
+        // never blocks a later undo). A row past its grace window and still `pending` is
+        // an orphan; a fresh in-flight write is skipped.
+        let reconcile_executor = haily_tools::connector::UnconfiguredExecutor;
+        let reconciled = haily_tools::journal_undo::reconcile::reconcile_incomplete(
+            &db,
+            &reconcile_executor,
+            haily_tools::journal_undo::reconcile::RECONCILE_GRACE_SECS,
+        )
+        .await;
+        if reconciled > 0 {
+            tracing::info!(
+                count = reconciled,
+                "reconciled orphan action-journal rows at startup"
+            );
         }
 
         Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm), shutdown, tasks);
@@ -143,6 +188,7 @@ impl Orchestrator {
             llm,
             tools,
             approval_broker: Arc::new(ApprovalBroker::with_auto_approve(auto_approve)),
+            kill,
         })
     }
 
@@ -176,12 +222,17 @@ impl Orchestrator {
             kms: Arc::clone(&self.kms),
             llm,
             tools: Arc::clone(&self.tools),
+            kill: Arc::clone(&self.kill),
         };
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
     }
 
     pub fn llm_provider(&self) -> String {
-        self.llm.read().unwrap_or_else(|e| e.into_inner()).provider_name().to_string()
+        self.llm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .provider_name()
+            .to_string()
     }
 
     /// Adapter-facing handle for resolving pending tool approvals (GUI/CLI/Telegram
@@ -189,6 +240,15 @@ impl Orchestrator {
     /// on, upcast to the layering-safe trait object defined in `haily-types`.
     pub fn approval_resolver(&self) -> Arc<dyn ApprovalResolver> {
         Arc::clone(&self.approval_broker) as Arc<dyn ApprovalResolver>
+    }
+
+    /// The `safety.disable_writes` kill switch (C8), for the app layer to flip live from
+    /// `set_preference`/CLI without an orchestrator round-trip — mirrors
+    /// `approval_resolver()`'s "clone the handle once at bootstrap" pattern. The caller
+    /// must ALSO persist the `safety.disable_writes` preference row for next-boot state;
+    /// this Arc is the runtime source of truth, the row is only persistence.
+    pub fn kill_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.kill)
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).
@@ -266,8 +326,14 @@ mod shutdown_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
-        let llm = Arc::new(RwLock::new(Arc::new(LlmRouter::init(LlmConfig::default()).await)));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
+        let llm = Arc::new(RwLock::new(Arc::new(
+            LlmRouter::init(LlmConfig::default()).await,
+        )));
 
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
@@ -304,7 +370,11 @@ mod shutdown_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(haily_db::DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         let original = Arc::new(LlmRouter::init(LlmConfig::default()).await);
         let llm = Arc::new(RwLock::new(Arc::clone(&original)));
 
@@ -337,7 +407,10 @@ mod shutdown_tests {
             Arc::ptr_eq(&observed, &reloaded),
             "workers' shared lock must observe a reload performed after spawn"
         );
-        assert!(!Arc::ptr_eq(&observed, &original), "stale pre-reload router must no longer be observable");
+        assert!(
+            !Arc::ptr_eq(&observed, &original),
+            "stale pre-reload router must no longer be observable"
+        );
 
         shutdown.cancel();
         tasks.close();
@@ -361,7 +434,11 @@ mod wiring_tests {
         let base = ToolRegistry::build_v1();
         for d in DOMAINS {
             for t in d.allowed_tools {
-                assert!(base.get(t).is_some(), "domain {} references unknown tool {t}", d.tool_name);
+                assert!(
+                    base.get(t).is_some(),
+                    "domain {} references unknown tool {t}",
+                    d.tool_name
+                );
             }
         }
     }
@@ -371,7 +448,11 @@ mod wiring_tests {
         let base = ToolRegistry::build_v1();
         for s in SPECIALISTS {
             for t in s.allowed_tools {
-                assert!(base.get(t).is_some(), "specialist {} references unknown tool {t}", s.tool_name);
+                assert!(
+                    base.get(t).is_some(),
+                    "specialist {} references unknown tool {t}",
+                    s.tool_name
+                );
             }
         }
     }
@@ -393,7 +474,11 @@ mod wiring_tests {
         // Duplicate names would collide in a sub-registry's HashMap, silently
         // shadowing one specialist with another.
         let mut seen = std::collections::HashSet::new();
-        for name in DOMAINS.iter().map(|d| d.tool_name).chain(SPECIALISTS.iter().map(|s| s.tool_name)) {
+        for name in DOMAINS
+            .iter()
+            .map(|d| d.tool_name)
+            .chain(SPECIALISTS.iter().map(|s| s.tool_name))
+        {
             assert!(seen.insert(name), "duplicate delegate tool name: {name}");
         }
     }
@@ -407,10 +492,18 @@ mod wiring_tests {
     #[test]
     fn every_domain_and_specialist_tier_defaults_to_none() {
         for d in DOMAINS {
-            assert!(d.model_tier.is_none(), "domain {} has a non-default model_tier", d.tool_name);
+            assert!(
+                d.model_tier.is_none(),
+                "domain {} has a non-default model_tier",
+                d.tool_name
+            );
         }
         for s in SPECIALISTS {
-            assert!(s.model_tier.is_none(), "specialist {} has a non-default model_tier", s.tool_name);
+            assert!(
+                s.model_tier.is_none(),
+                "specialist {} has a non-default model_tier",
+                s.tool_name
+            );
         }
     }
 }

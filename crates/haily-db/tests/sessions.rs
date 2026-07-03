@@ -14,11 +14,19 @@ async fn create_session_persists_under_caller_id() {
     let (db, _dir) = setup().await;
     let caller_id = uuid::Uuid::new_v4().to_string();
 
-    let created = sessions::create_session(&db, &caller_id, "cli", None).await.unwrap();
-    assert_eq!(created.id, caller_id, "session row must use the caller's id, not a fresh one");
+    let created = sessions::create_session(&db, &caller_id, "cli", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        created.id, caller_id,
+        "session row must use the caller's id, not a fresh one"
+    );
 
     let fetched = sessions::get_session(&db, &caller_id).await.unwrap();
-    assert!(fetched.is_some(), "second lookup by the same id must find the row (no new row)");
+    assert!(
+        fetched.is_some(),
+        "second lookup by the same id must find the row (no new row)"
+    );
     assert_eq!(fetched.unwrap().id, caller_id);
 }
 
@@ -31,7 +39,9 @@ async fn work_item_insert_succeeds_once_session_exists_under_same_id() {
     let (db, _dir) = setup().await;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    sessions::create_session(&db, &session_id, "cli", None).await.unwrap();
+    sessions::create_session(&db, &session_id, "cli", None)
+        .await
+        .unwrap();
 
     let wi = haily_db::queries::work_items::create(&db, &session_id, "tool-calling turn")
         .await
@@ -47,7 +57,10 @@ async fn work_item_insert_fails_fk_when_session_row_absent() {
     let orphan_session_id = uuid::Uuid::new_v4().to_string();
 
     let result = haily_db::queries::work_items::create(&db, &orphan_session_id, "orphan").await;
-    assert!(result.is_err(), "FK must reject a work_item under a nonexistent session");
+    assert!(
+        result.is_err(),
+        "FK must reject a work_item under a nonexistent session"
+    );
 }
 
 /// Replicates `run_turn`'s get-or-create idiom (agent.rs) directly against the DB:
@@ -60,8 +73,14 @@ async fn repeated_turns_under_same_session_id_leave_exactly_one_row() {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     for _ in 0..3 {
-        if sessions::get_session(&db, &session_id).await.unwrap().is_none() {
-            sessions::create_session(&db, &session_id, "cli", None).await.unwrap();
+        if sessions::get_session(&db, &session_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            sessions::create_session(&db, &session_id, "cli", None)
+                .await
+                .unwrap();
         } else {
             sessions::touch_session(&db, &session_id).await.unwrap();
         }
@@ -72,5 +91,8 @@ async fn repeated_turns_under_same_session_id_leave_exactly_one_row() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(count.0, 1, "three turns under the same session_id must leave exactly one row");
+    assert_eq!(
+        count.0, 1,
+        "three turns under the same session_id must leave exactly one row"
+    );
 }

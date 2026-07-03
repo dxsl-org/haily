@@ -11,7 +11,7 @@ use crate::{dispatch, watchers};
 use anyhow::Result;
 use haily_core::Orchestrator;
 use haily_db::DbHandle;
-use haily_io::{AdapterManager, Adapter};
+use haily_io::{Adapter, AdapterManager};
 use haily_kms::KmsHandle;
 use haily_tools::ToolRegistry;
 use std::{path::Path, sync::Arc, time::Duration};
@@ -31,7 +31,10 @@ pub struct BootstrapOptions {
 
 impl Default for BootstrapOptions {
     fn default() -> Self {
-        Self { enable_daemon: true, enable_watcher: true }
+        Self {
+            enable_daemon: true,
+            enable_watcher: true,
+        }
     }
 }
 
@@ -101,8 +104,10 @@ impl AppHandle {
         // approval broker) exist, so the resolver is injected here — after `init`,
         // before `start_all` begins accepting requests — rather than at construction.
         let resolver = orchestrator.approval_resolver();
+        let kill = orchestrator.kill_handle();
         for adapter in &adapters {
             adapter.set_approval_resolver(Arc::clone(&resolver));
+            adapter.set_kill_switch(Arc::clone(&kill));
         }
 
         let mut builder = AdapterManager::builder();
@@ -138,13 +143,26 @@ impl AppHandle {
             );
         }
 
+        // Phase 3: periodically purge action-journal rows past their retention window so
+        // recorded PII (request_params/pre_state/post_state) is bounded. Registered on the
+        // root tracker + selecting on shutdown, same contract as the watcher/daemon.
+        watchers::spawn_journal_purge(Arc::clone(&db), shutdown.child_token(), tasks.clone());
+
         info!(
             watcher = opts.enable_watcher,
             daemon = opts.enable_daemon,
             "startup complete — dispatch loop running"
         );
 
-        Ok(Self { db, kms, orchestrator, adapters: am, shutdown, tasks, turns })
+        Ok(Self {
+            db,
+            kms,
+            orchestrator,
+            adapters: am,
+            shutdown,
+            tasks,
+            turns,
+        })
     }
 
     /// Cancel the in-flight turn for `session_id`, if any. Delegates to the shared

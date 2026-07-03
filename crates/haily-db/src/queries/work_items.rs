@@ -181,12 +181,12 @@ pub async fn list_interrupted(db: &DbHandle) -> Result<Vec<WorkItem>> {
 /// # Errors
 /// Returns an error if the query fails.
 pub async fn get(db: &DbHandle, id: &str) -> Result<Option<WorkItem>> {
-    Ok(sqlx::query_as::<_, WorkItem>(
-        "SELECT * FROM work_items WHERE id = ?",
+    Ok(
+        sqlx::query_as::<_, WorkItem>("SELECT * FROM work_items WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?,
     )
-    .bind(id)
-    .fetch_optional(db.pool())
-    .await?)
 }
 
 /// On startup: reset any items stuck in 'running' state to 'interrupted'.

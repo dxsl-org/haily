@@ -27,7 +27,9 @@ pub struct NoteSaveTool;
 
 #[async_trait]
 impl Tool for NoteSaveTool {
-    fn name(&self) -> &str { "note_save" }
+    fn name(&self) -> &str {
+        "note_save"
+    }
     fn description(&self) -> &str {
         "Lưu note mới. Tự động extract [[wikilinks]] từ nội dung."
     }
@@ -42,12 +44,18 @@ impl Tool for NoteSaveTool {
             "required": ["title", "content"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let title   = args["title"].as_str().ok_or_else(|| anyhow::anyhow!("title required"))?;
-        let content = args["content"].as_str().ok_or_else(|| anyhow::anyhow!("content required"))?;
-        let tags    = args["tags"].as_str();
+        let title = args["title"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("title required"))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("content required"))?;
+        let tags = args["tags"].as_str();
         let wikilinks = extract_wikilinks(content);
 
         let note = notes::insert(&ctx.db, title, content, tags, None, None).await?;
@@ -67,7 +75,9 @@ pub struct NoteSearchTool;
 
 #[async_trait]
 impl Tool for NoteSearchTool {
-    fn name(&self) -> &str { "note_search" }
+    fn name(&self) -> &str {
+        "note_search"
+    }
     fn description(&self) -> &str {
         "Tìm kiếm notes theo từ khóa. Hỗ trợ tìm full-text trong tiêu đề và nội dung."
     }
@@ -81,10 +91,14 @@ impl Tool for NoteSearchTool {
             "required": ["query"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::Read
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query required"))?;
+        let query = args["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("query required"))?;
         let limit = args["limit"].as_i64().unwrap_or(10);
 
         let results = notes::search_fts(&ctx.db, query, limit).await?;
@@ -92,13 +106,18 @@ impl Tool for NoteSearchTool {
             return Ok(format!("Không tìm thấy note nào cho: {query}"));
         }
 
-        let items: Vec<Value> = results.iter().map(|n| json!({
-            "id": n.id,
-            "title": n.title,
-            "tags": n.tags,
-            "snippet": n.content.chars().take(200).collect::<String>(),
-            "created_at": n.created_at
-        })).collect();
+        let items: Vec<Value> = results
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": n.id,
+                    "title": n.title,
+                    "tags": n.tags,
+                    "snippet": n.content.chars().take(200).collect::<String>(),
+                    "created_at": n.created_at
+                })
+            })
+            .collect();
         Ok(serde_json::to_string_pretty(&items)?)
     }
 }
@@ -110,8 +129,12 @@ pub struct NoteUpdateTool;
 
 #[async_trait]
 impl Tool for NoteUpdateTool {
-    fn name(&self) -> &str { "note_update" }
-    fn description(&self) -> &str { "Cập nhật nội dung của một note theo ID." }
+    fn name(&self) -> &str {
+        "note_update"
+    }
+    fn description(&self) -> &str {
+        "Cập nhật nội dung của một note theo ID."
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -123,12 +146,20 @@ impl Tool for NoteUpdateTool {
             "required": ["id", "title", "content"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let id      = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
-        let title   = args["title"].as_str().ok_or_else(|| anyhow::anyhow!("title required"))?;
-        let content = args["content"].as_str().ok_or_else(|| anyhow::anyhow!("content required"))?;
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("id required"))?;
+        let title = args["title"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("title required"))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("content required"))?;
 
         notes::update_content(&ctx.db, id, title, content).await?;
         Ok(format!("Đã cập nhật note id={id}."))
@@ -142,8 +173,12 @@ pub struct NoteDeleteTool;
 
 #[async_trait]
 impl Tool for NoteDeleteTool {
-    fn name(&self) -> &str { "note_delete" }
-    fn description(&self) -> &str { "Xóa note theo ID." }
+    fn name(&self) -> &str {
+        "note_delete"
+    }
+    fn description(&self) -> &str {
+        "Xóa note theo ID."
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -153,10 +188,14 @@ impl Tool for NoteDeleteTool {
             "required": ["id"]
         })
     }
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::IrreversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("id required"))?;
         if notes::soft_delete(&ctx.db, id).await? {
             Ok(format!("Đã xóa note id={id}."))
         } else {

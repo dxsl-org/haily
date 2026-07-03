@@ -12,6 +12,7 @@ use haily_kms::KmsHandle;
 use haily_llm::{LlmRouter, Tier};
 use haily_tools::{RiskTier, Tool, ToolContext, ToolRegistry};
 use haily_types::ResponseChunk;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -56,6 +57,10 @@ pub struct DelegateTool {
     /// Model tier this domain/specialist prefers (Phase 7 tier foundation). `None`
     /// for every config today — passed through to `run_sub_turn`'s completion calls.
     pub model_tier: Option<Tier>,
+    /// Phase 3 kill switch (C8): the SAME `Arc<AtomicBool>` the Orchestrator holds,
+    /// threaded into every `SubTurnRequest` so a sub-turn write observes
+    /// `safety.disable_writes` too. Cloned into the request in `execute`.
+    pub kill: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -146,7 +151,11 @@ impl Tool for DelegateTool {
         let child = ctx.cancel.child_token();
         let (pause_tx, mut pause_rx) = tokio::sync::mpsc::channel::<()>(8);
 
-        let forwarder = tokio::spawn(approval_forwarder(sub_rx, ctx.approval_tx.clone(), pause_tx));
+        let forwarder = tokio::spawn(approval_forwarder(
+            sub_rx,
+            ctx.approval_tx.clone(),
+            pause_tx,
+        ));
 
         let sub_turn = crate::agent::run_sub_turn(crate::agent::SubTurnRequest {
             task: full_task,
@@ -162,6 +171,7 @@ impl Tool for DelegateTool {
             approval_gate: Arc::clone(&ctx.approval_gate),
             cancel: child.clone(),
             approval_tx: sub_tx,
+            kill: Arc::clone(&self.kill),
         });
 
         let result = run_with_pausable_timeout(
@@ -182,7 +192,11 @@ impl Tool for DelegateTool {
                 // unblocks any sub-turn await and closes `sub_tx`, letting the forwarder
                 // drain to completion below.
                 child.cancel();
-                tracing::warn!(domain = self.domain_name, timeout_secs = SUB_TURN_TIMEOUT_SECS, "sub-agent timed out");
+                tracing::warn!(
+                    domain = self.domain_name,
+                    timeout_secs = SUB_TURN_TIMEOUT_SECS,
+                    "sub-agent timed out"
+                );
                 Ok("Agent mất quá nhiều thời gian — tôi sẽ cố gắng trả lời trực tiếp.".into())
             }
         };
@@ -265,7 +279,8 @@ mod tests {
 
     #[test]
     fn sanitize_strips_all_tool_markup() {
-        let raw = "làm việc <tool_call>{\"tool\":\"x\"}</tool_call> và <tool_result>y</tool_result>";
+        let raw =
+            "làm việc <tool_call>{\"tool\":\"x\"}</tool_call> và <tool_result>y</tool_result>";
         let out = sanitize_delegate_input(raw);
         assert!(!out.contains("<tool_call>"));
         assert!(!out.contains("</tool_call>"));
@@ -321,16 +336,19 @@ mod reload_propagation_tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 16384];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
                     let request_text = String::from_utf8_lossy(&buf[..n]);
                     let body_start = request_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-                    let model = serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
-                        .ok()
-                        .and_then(|v| v["model"].as_str().map(str::to_string))
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let model =
+                        serde_json::from_str::<serde_json::Value>(&request_text[body_start..])
+                            .ok()
+                            .and_then(|v| v["model"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| "unknown".to_string());
 
                     let payload = serde_json::json!({
                         "choices": [{ "message": { "content": model } }]
@@ -363,7 +381,11 @@ mod reload_propagation_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
         let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
 
         let base_url = spawn_model_echo_server().await;
         let llm = Arc::new(RwLock::new(Arc::new(
@@ -381,6 +403,7 @@ mod reload_propagation_tests {
             sub_registry: Arc::new(ToolRegistry::new()),
             max_depth: 1,
             model_tier: None,
+            kill: Arc::new(AtomicBool::new(false)),
         };
 
         let (approval_tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -395,19 +418,29 @@ mod reload_propagation_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
         };
         let args = serde_json::json!({ "task": "short task before reload" });
-        let before = delegate.execute(args, &ctx).await.expect("execute before reload");
-        assert!(before.contains("model-before-reload"), "expected pre-reload model in response, got: {before}");
+        let before = delegate
+            .execute(args, &ctx)
+            .await
+            .expect("execute before reload");
+        assert!(
+            before.contains("model-before-reload"),
+            "expected pre-reload model in response, got: {before}"
+        );
 
         // Simulate `Orchestrator::reload_llm` — swap the Arc under the SAME lock the
         // DelegateTool holds, exactly as `reload_llm` does on `Orchestrator::llm`.
-        let new_router = Arc::new(LlmRouter::init(cloud_config(base_url, "model-after-reload")).await);
+        let new_router =
+            Arc::new(LlmRouter::init(cloud_config(base_url, "model-after-reload")).await);
         {
             let mut guard = llm.write().unwrap_or_else(|e| e.into_inner());
             *guard = new_router;
         }
 
         let args = serde_json::json!({ "task": "short task after reload" });
-        let after = delegate.execute(args, &ctx).await.expect("execute after reload");
+        let after = delegate
+            .execute(args, &ctx)
+            .await
+            .expect("execute after reload");
         assert!(
             after.contains("model-after-reload"),
             "expected the sub-turn to use the RELOADED model, got: {after} — DelegateTool is still reading a frozen router"
@@ -438,8 +471,17 @@ mod seam_tests {
         let forwarder = tokio::spawn(approval_forwarder(sub_rx, parent_tx, pause_tx));
 
         // Interleave sub-agent narration with a single real approval request.
-        sub_tx.send(ResponseChunk::Text("thinking...".into())).await.unwrap();
-        sub_tx.send(ResponseChunk::ToolResult { name: "note_save".into(), ok: true }).await.unwrap();
+        sub_tx
+            .send(ResponseChunk::Text("thinking...".into()))
+            .await
+            .unwrap();
+        sub_tx
+            .send(ResponseChunk::ToolResult {
+                name: "note_save".into(),
+                ok: true,
+            })
+            .await
+            .unwrap();
         let approval_id = Uuid::new_v4();
         sub_tx
             .send(ResponseChunk::ToolApprovalRequest {
@@ -456,9 +498,16 @@ mod seam_tests {
         forwarder.await.unwrap();
 
         // Exactly ONE chunk reached the parent — the approval request — and nothing else.
-        let relayed = parent_rx.recv().await.expect("the approval request must be relayed");
+        let relayed = parent_rx
+            .recv()
+            .await
+            .expect("the approval request must be relayed");
         match relayed {
-            ResponseChunk::ToolApprovalRequest { approval_id: got, origin, .. } => {
+            ResponseChunk::ToolApprovalRequest {
+                approval_id: got,
+                origin,
+                ..
+            } => {
                 assert_eq!(got, approval_id);
                 assert_eq!(origin.as_deref(), Some("L1:developer"));
             }
@@ -504,13 +553,22 @@ mod seam_tests {
 
         // An L2 timeout cancels only the L2 child.
         l2.cancel();
-        assert!(l2.is_cancelled(), "the child being timed out must be cancelled");
+        assert!(
+            l2.is_cancelled(),
+            "the child being timed out must be cancelled"
+        );
         assert!(!l1.is_cancelled(), "the intermediate parent must stay live");
-        assert!(!parent.is_cancelled(), "the L0 parent token must stay live after a sub-turn timeout");
+        assert!(
+            !parent.is_cancelled(),
+            "the L0 parent token must stay live after a sub-turn timeout"
+        );
 
         // Conversely, cancelling the parent DOES propagate down (shutdown drains all).
         parent.cancel();
-        assert!(l1.is_cancelled(), "parent cancel must propagate to the child");
+        assert!(
+            l1.is_cancelled(),
+            "parent cancel must propagate to the child"
+        );
     }
 
     /// M3: the sub-turn clock is PAUSED across a human-wait. With a short 100ms budget
@@ -554,6 +612,9 @@ mod seam_tests {
             "done"
         };
         let out = run_with_pausable_timeout(Duration::from_millis(100), work, &mut pause_rx).await;
-        assert_eq!(out, None, "a compute-bound sub-turn with no human-wait must still time out");
+        assert_eq!(
+            out, None,
+            "a compute-bound sub-turn with no human-wait must still time out"
+        );
     }
 }

@@ -25,7 +25,10 @@ pub struct TokenBudget {
 
 impl TokenBudget {
     pub fn new(context_window: u32) -> Self {
-        Self { context_window, output_reserve_frac: 0.25 }
+        Self {
+            context_window,
+            output_reserve_frac: 0.25,
+        }
     }
 
     /// Tokens available for prompt content (system + history + current turn).
@@ -57,7 +60,10 @@ impl TokenBudget {
         let budget = self.prompt_budget();
 
         let pinned_cost = estimate(&system.content)
-            + current_turn.iter().map(|m| estimate(&m.content)).sum::<usize>();
+            + current_turn
+                .iter()
+                .map(|m| estimate(&m.content))
+                .sum::<usize>();
 
         // Pinned content alone already meets or exceeds budget: no room for any prior
         // history. Correctness over aesthetics — never drop pinned content to compensate.
@@ -112,7 +118,10 @@ mod tests {
     use haily_llm::Role;
 
     fn msg(role: Role, content: impl Into<String>) -> Message {
-        Message { role, content: content.into() }
+        Message {
+            role,
+            content: content.into(),
+        }
     }
 
     fn user_history(n: usize, body_chars: usize) -> Vec<Message> {
@@ -135,7 +144,8 @@ mod tests {
         // diacritics are multi-byte UTF-8 but single `char`s, so this just checks the
         // heuristic produces a reasonable (non-zero, proportionate) lower bound — the
         // real safety net is the debug-log comparison against llama.rs's exact count.
-        let sample = "Khi cần dùng tool, output ĐÚNG format này. Please use the tool_call format exactly.";
+        let sample =
+            "Khi cần dùng tool, output ĐÚNG format này. Please use the tool_call format exactly.";
         let est = estimate(sample);
         let chars = sample.chars().count();
         // chars/3 must never be smaller than chars/4 (a laxer, more permissive divisor)
@@ -170,7 +180,10 @@ mod tests {
 
         // Never exceeds the prompt budget.
         let total: usize = fitted.iter().map(|m| estimate(&m.content)).sum();
-        assert!(total <= 150, "fitted set must respect prompt budget, got {total}");
+        assert!(
+            total <= 150,
+            "fitted set must respect prompt budget, got {total}"
+        );
 
         // System is present.
         assert_eq!(fitted.first().unwrap().content, "s");
@@ -180,10 +193,11 @@ mod tests {
         assert!(fitted.len() < 1 + history.len() + current.len());
         // The newest surviving prior-history message must be the most recent one
         // present, i.e. dropped messages are strictly from the oldest end.
-        let history_kept: Vec<&Message> =
-            fitted[1..fitted.len() - current.len()].iter().collect();
+        let history_kept: Vec<&Message> = fitted[1..fitted.len() - current.len()].iter().collect();
         if let Some(newest_kept) = history_kept.last() {
-            assert!(newest_kept.content.starts_with("turn-99") || history_kept.len() < history.len());
+            assert!(
+                newest_kept.content.starts_with("turn-99") || history_kept.len() < history.len()
+            );
         }
         // Every kept history message must be a suffix (newest contiguous run) of the
         // original history — i.e. index order is preserved and it's the tail end.
@@ -216,7 +230,10 @@ mod tests {
         let current = vec![
             msg(Role::User, "do the thing"),
             msg(Role::Assistant, "<tool_call>{}</tool_call>"),
-            msg(Role::User, format!("<tool_result>{giant_result}</tool_result>")),
+            msg(
+                Role::User,
+                format!("<tool_result>{giant_result}</tool_result>"),
+            ),
         ];
 
         let fitted = budget.fit_messages(&system, &history, &current);
@@ -240,8 +257,14 @@ mod tests {
         // Simulate 4 tool calls: user msg + 4x (assistant call + tool result).
         let mut current = vec![msg(Role::User, "multi-step task")];
         for i in 0..4 {
-            current.push(msg(Role::Assistant, format!("<tool_call>{{\"tool\":\"t{i}\"}}</tool_call>")));
-            current.push(msg(Role::User, format!("<tool_result>{{\"result\":\"call-{i}-data\"}}</tool_result>")));
+            current.push(msg(
+                Role::Assistant,
+                format!("<tool_call>{{\"tool\":\"t{i}\"}}</tool_call>"),
+            ));
+            current.push(msg(
+                Role::User,
+                format!("<tool_result>{{\"result\":\"call-{i}-data\"}}</tool_result>"),
+            ));
         }
 
         let fitted = budget.fit_messages(&system, &history, &current);
@@ -249,8 +272,14 @@ mod tests {
         // Every current-turn message, including the FIRST tool call's result, survives.
         let tail = &fitted[fitted.len() - current.len()..];
         assert_eq!(tail, current.as_slice());
-        assert!(tail.iter().any(|m| m.content.contains("call-0-data")), "earliest same-turn tool result must survive");
-        assert!(tail.iter().any(|m| m.content.contains("call-3-data")), "latest same-turn tool result must survive");
+        assert!(
+            tail.iter().any(|m| m.content.contains("call-0-data")),
+            "earliest same-turn tool result must survive"
+        );
+        assert!(
+            tail.iter().any(|m| m.content.contains("call-3-data")),
+            "latest same-turn tool result must survive"
+        );
     }
 
     #[test]
@@ -306,12 +335,18 @@ mod tests {
         let budget = TokenBudget::new(200); // prompt_budget = 150 tokens
         let mut messages = vec![msg(Role::System, "s")];
         messages.extend(user_history(50, 20)); // large prior history to force trimming
-        // Pinned tail: user message + 4 tool-call/result pairs (9 messages).
+                                               // Pinned tail: user message + 4 tool-call/result pairs (9 messages).
         let pinned_tail = {
             let mut t = vec![msg(Role::User, "multi-step task")];
             for i in 0..4 {
-                t.push(msg(Role::Assistant, format!("<tool_call>{{\"tool\":\"t{i}\"}}</tool_call>")));
-                t.push(msg(Role::User, format!("<tool_result>call-{i}-data</tool_result>")));
+                t.push(msg(
+                    Role::Assistant,
+                    format!("<tool_call>{{\"tool\":\"t{i}\"}}</tool_call>"),
+                ));
+                t.push(msg(
+                    Role::User,
+                    format!("<tool_result>call-{i}-data</tool_result>"),
+                ));
             }
             t
         };
@@ -355,7 +390,10 @@ mod tests {
         // full message list (mirroring the loop, which re-fits from the source of
         // truth each time, not from the previously-trimmed output).
         pinned_tail.push(msg(Role::Assistant, "<tool_call>{}</tool_call>"));
-        pinned_tail.push(msg(Role::User, format!("<tool_result>{}</tool_result>", "z".repeat(2000))));
+        pinned_tail.push(msg(
+            Role::User,
+            format!("<tool_result>{}</tool_result>", "z".repeat(2000)),
+        ));
         let mut messages_v2 = vec![msg(Role::System, "s")];
         messages_v2.extend(user_history(30, 15));
         messages_v2.extend(pinned_tail.clone());

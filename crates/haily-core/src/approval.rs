@@ -7,8 +7,8 @@
 //! `haily-io` never needs to depend on `haily-core` (the trait itself lives in
 //! `haily-types`).
 use async_trait::async_trait;
-use haily_types::{ApprovalGate, ApprovalResolver};
 use dashmap::DashMap;
+use haily_types::{ApprovalGate, ApprovalResolver};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -40,14 +40,20 @@ pub struct ApprovalBroker {
 
 impl ApprovalBroker {
     pub fn new() -> Self {
-        Self { pending: DashMap::new(), auto_approve: HashSet::new() }
+        Self {
+            pending: DashMap::new(),
+            auto_approve: HashSet::new(),
+        }
     }
 
     /// Construct with a pre-validated auto-approve allowlist. Callers MUST validate
     /// `names` against the tool registry first (destructive/exfil classes can never
     /// be listed) — this constructor trusts its input and does not re-check.
     pub fn with_auto_approve(names: HashSet<String>) -> Self {
-        Self { pending: DashMap::new(), auto_approve: names }
+        Self {
+            pending: DashMap::new(),
+            auto_approve: names,
+        }
     }
 
     /// Whether `tool_name` is on the pre-validated auto-approve allowlist. Every
@@ -75,7 +81,12 @@ impl ApprovalBroker {
     /// `pendingApproval` slot (a second would silently overwrite the first). Rather
     /// than register a hidden pending nobody can resolve, we reject fail-loud (log +
     /// return `false` = deny) and DO NOT touch the existing pending entry.
-    pub async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool {
+    pub async fn request(
+        &self,
+        approval_id: Uuid,
+        session_id: Uuid,
+        cancel: &CancellationToken,
+    ) -> bool {
         if self.pending.iter().any(|e| e.value().0 == session_id) {
             warn!(
                 %approval_id,
@@ -111,7 +122,12 @@ impl Default for ApprovalBroker {
 /// `ToolContext::approval_gate` can be real from day one (KISS, phase-1 spec step 5).
 #[async_trait]
 impl ApprovalGate for ApprovalBroker {
-    async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool {
+    async fn request(
+        &self,
+        approval_id: Uuid,
+        session_id: Uuid,
+        cancel: &CancellationToken,
+    ) -> bool {
         self.request(approval_id, session_id, cancel).await
     }
 
@@ -126,7 +142,11 @@ impl ApprovalResolver for ApprovalBroker {
         // mismatched caller can't observe (or race) the real pending state, and a
         // second resolve() for the same id after the first succeeds is a clean no-op
         // (idempotent — entry is already gone).
-        let removed = self.pending.remove_if(&approval_id, |_, (bound_session, _)| *bound_session == session_id);
+        let removed = self
+            .pending
+            .remove_if(&approval_id, |_, (bound_session, _)| {
+                *bound_session == session_id
+            });
         match removed {
             Some((_, (_, tx))) => {
                 // Ignore send failure: the requester side may have already exited via
@@ -217,8 +237,14 @@ mod tests {
         cancel.cancel(); // pre-cancelled — request() must see it immediately, not hang
 
         let decision = broker.request(approval_id, session_id, &cancel).await;
-        assert!(!decision, "cancellation must deny immediately, proving the deny-by-default select arm works");
-        assert!(broker.pending.is_empty(), "pending entry must be cleaned up on exit");
+        assert!(
+            !decision,
+            "cancellation must deny immediately, proving the deny-by-default select arm works"
+        );
+        assert!(
+            broker.pending.is_empty(),
+            "pending entry must be cleaned up on exit"
+        );
     }
 
     #[tokio::test]
@@ -270,7 +296,10 @@ mod tests {
 
         // The approval must still be resolvable by the real session afterward.
         let resolved = broker_ref.resolve(approval_id, real_session, true);
-        assert!(resolved, "the genuine session must still be able to resolve after a forged attempt");
+        assert!(
+            resolved,
+            "the genuine session must still be able to resolve after a forged attempt"
+        );
 
         let decision = tokio::time::timeout(Duration::from_secs(2), request_fut)
             .await
@@ -302,14 +331,20 @@ mod tests {
 
         // Second concurrent request for the SAME session: denied without registering.
         let second = broker_ref.request(second_id, session_id, &cancel).await;
-        assert!(!second, "a 2nd concurrent pending for the same session must be denied");
+        assert!(
+            !second,
+            "a 2nd concurrent pending for the same session must be denied"
+        );
         assert!(
             broker_ref.pending.get(&second_id).is_none(),
             "the rejected 2nd request must NOT have registered a pending entry"
         );
 
         // The FIRST pending is untouched and still resolvable by the real session.
-        assert!(broker_ref.resolve(first_id, session_id, true), "the original pending must be intact");
+        assert!(
+            broker_ref.resolve(first_id, session_id, true),
+            "the original pending must be intact"
+        );
         let first = tokio::time::timeout(Duration::from_secs(2), first_fut)
             .await
             .expect("first request should resolve once approved");
@@ -337,7 +372,12 @@ mod tests {
         // not panic or double-send on the (already-consumed) oneshot sender.
         assert!(!broker_ref.resolve(approval_id, session_id, false));
 
-        let decision = tokio::time::timeout(Duration::from_secs(2), request_fut).await.expect("first resolve should have unblocked request()");
-        assert!(decision, "the first (approve) resolve must be the one that wins");
+        let decision = tokio::time::timeout(Duration::from_secs(2), request_fut)
+            .await
+            .expect("first resolve should have unblocked request()");
+        assert!(
+            decision,
+            "the first (approve) resolve must be the one that wins"
+        );
     }
 }

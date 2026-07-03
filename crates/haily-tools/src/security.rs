@@ -24,10 +24,10 @@ pub const TRUNCATED_MARKER: &str = "\n[truncated]\n";
 
 // Known cloud metadata endpoints to block regardless of IP classification.
 const BLOCKED_HOSTS: &[&str] = &[
-    "169.254.169.254",       // AWS/GCP/Azure IMDS
+    "169.254.169.254", // AWS/GCP/Azure IMDS
     "metadata.google.internal",
-    "100.100.100.200",       // Alibaba Cloud metadata
-    "fd00:ec2::254",         // AWS IPv6 IMDS
+    "100.100.100.200", // Alibaba Cloud metadata
+    "fd00:ec2::254",   // AWS IPv6 IMDS
 ];
 
 /// Maximum redirect hops a caller may manually follow after an `ssrf_guard` re-check
@@ -75,7 +75,9 @@ pub async fn ssrf_guard(raw_url: &str) -> Result<VettedAddr> {
     // Try parsing the host as a bare IP first (fast path — no DNS).
     if let Ok(ip) = host.parse::<IpAddr>() {
         check_ip(ip, host)?;
-        return Ok(VettedAddr { addr: SocketAddr::new(ip, port) });
+        return Ok(VettedAddr {
+            addr: SocketAddr::new(ip, port),
+        });
     }
 
     // DNS resolution: check every resolved address, but only pin the first — that is
@@ -95,7 +97,9 @@ pub async fn ssrf_guard(raw_url: &str) -> Result<VettedAddr> {
         check_ip(*ip, host)?;
     }
 
-    Ok(VettedAddr { addr: SocketAddr::new(addrs[0], port) })
+    Ok(VettedAddr {
+        addr: SocketAddr::new(addrs[0], port),
+    })
 }
 
 /// V4 ranges that must never be reachable from a tool: loopback, RFC1918 private,
@@ -156,7 +160,11 @@ fn check_ip(ip: IpAddr, host: &str) -> Result<()> {
 /// would reach the metadata endpoint before the caller gets a chance to inspect
 /// anything. [`follow_redirects_with_guard`] re-implements following manually, one
 /// hop at a time, re-running `ssrf_guard` on every `Location` header.
-fn build_pinned_client(host: &str, vetted: VettedAddr, timeout: Duration) -> Result<reqwest::Client> {
+fn build_pinned_client(
+    host: &str,
+    vetted: VettedAddr,
+    timeout: Duration,
+) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(timeout)
         .user_agent("Haily/1.0")
@@ -365,7 +373,11 @@ pub fn shell_injection_guard(input: &str) -> Result<()> {
 /// for the preview) so both enforce identical rules.
 pub fn validate_rel_path(rel_path: &str) -> Result<()> {
     let rel = Path::new(rel_path);
-    if rel.is_absolute() || rel.components().any(|c| c == std::path::Component::ParentDir) {
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
         bail!("path traversal detected in worktree output: {rel_path}");
     }
     Ok(())
@@ -444,7 +456,11 @@ mod tests {
     async fn ssrf_guard_blocks_ipv4_mapped_metadata() {
         // ::ffff:169.254.169.254 — an IPv4-mapped V6 literal that the OS routes to the
         // V4 metadata endpoint. Must be decoded and blocked, not vetted as a safe V6.
-        assert!(ssrf_guard("http://[::ffff:169.254.169.254]/latest/meta-data/").await.is_err());
+        assert!(
+            ssrf_guard("http://[::ffff:169.254.169.254]/latest/meta-data/")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -490,7 +506,10 @@ mod tests {
         // as a syntactically valid public-range literal (no network call is made
         // for the IP-literal fast path).
         let vetted = ssrf_guard("http://93.184.216.34:8080/").await.unwrap();
-        assert_eq!(vetted.addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 8080));
+        assert_eq!(
+            vetted.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 8080)
+        );
     }
 
     #[test]

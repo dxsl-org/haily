@@ -7,6 +7,7 @@ use haily_app::{AppHandle, BootstrapOptions, TurnRegistry};
 use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, ApprovalResolver, GuiRequestSender, GuiResponseReceiver, Request};
 use haily_kms::KmsHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 use tauri::{AppHandle as TauriAppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::Mutex;
@@ -29,6 +30,11 @@ struct AppState {
     /// every turn's token into. Cloned out of `app` once at setup, mirroring
     /// `approval_resolver`, so `cancel_turn` doesn't need to lock `app` either.
     turns: Arc<TurnRegistry>,
+    /// `safety.disable_writes` kill switch (phase 3, C8) — the SAME `Arc<AtomicBool>` the
+    /// orchestrator gates on. Cloned out of `app` at setup (mirrors `approval_resolver`/
+    /// `turns`) because `set_preference` has NO orchestrator access (it is behind the
+    /// shutdown `Mutex`). Flipping this Bool changes dispatch behavior live, no restart.
+    kill: Arc<AtomicBool>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -96,8 +102,17 @@ fn list_local_models() -> Vec<serde_json::Value> {
     models::list_local_models()
 }
 
+/// Persist a preference AND, for `safety.disable_writes`, flip the runtime kill switch so
+/// the change takes effect immediately (no restart). The Bool is the runtime source of
+/// truth; the persisted row is only next-boot state — both are updated here because
+/// `set_preference` has no orchestrator access (the kill Arc was cloned into `AppState`
+/// at bootstrap for exactly this reason).
 #[tauri::command]
 async fn set_preference(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    if key == "safety.disable_writes" {
+        let on = value == "true" || value == "1";
+        state.kill.store(on, Ordering::Release);
+    }
     meta::upsert_preference(&state.db, &key, &value, "gui").await.map_err(|e| e.to_string())
 }
 
@@ -139,12 +154,14 @@ pub fn run() {
             let kms = Arc::clone(&app_handle.kms);
             let approval_resolver = app_handle.orchestrator.approval_resolver();
             let turns = app_handle.turn_registry();
+            let kill = app_handle.orchestrator.kill_handle();
             app.manage(AppState {
                 gui_req_tx,
                 db,
                 kms,
                 approval_resolver,
                 turns,
+                kill,
                 app: Mutex::new(Some(app_handle)),
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);

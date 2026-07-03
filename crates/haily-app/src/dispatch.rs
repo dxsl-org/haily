@@ -28,7 +28,14 @@ pub async fn spawn_dispatch_loop(
     info!("dispatch loop running");
 
     let dispatch_tasks = tasks.clone();
-    tasks.spawn(dispatch_loop(am, orc, req_rx, shutdown, dispatch_tasks, turns));
+    tasks.spawn(dispatch_loop(
+        am,
+        orc,
+        req_rx,
+        shutdown,
+        dispatch_tasks,
+        turns,
+    ));
     Ok(())
 }
 
@@ -105,7 +112,10 @@ async fn dispatch_loop(
                 // let buffering adapters (Telegram) tell "discard what's buffered"
                 // apart from "append this too", or the user sees a single fused
                 // "partial-answer⚠️error" message. See `haily_types::ResponseChunk::Error`.
-                resp_tx_err.send(ResponseChunk::Error(format!("⚠️ {e:#}"))).await.ok();
+                resp_tx_err
+                    .send(ResponseChunk::Error(format!("⚠️ {e:#}")))
+                    .await
+                    .ok();
                 resp_tx_err.send(ResponseChunk::Complete).await.ok();
             }
 

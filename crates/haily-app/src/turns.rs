@@ -20,7 +20,9 @@ pub struct TurnRegistry {
 
 impl TurnRegistry {
     pub fn new() -> Self {
-        Self { tokens: DashMap::new() }
+        Self {
+            tokens: DashMap::new(),
+        }
     }
 
     /// Register `token` as the cancellable handle for `session_id`'s in-flight turn.
@@ -74,15 +76,28 @@ mod tests {
         let token = CancellationToken::new();
         registry.register(session_id, token.clone());
 
-        assert!(registry.cancel(session_id), "should find and cancel the registered turn");
-        assert!(token.is_cancelled(), "the original token handle must observe the cancellation");
-        assert_eq!(registry.registered_count(), 0, "cancel must remove the entry, not just fire it");
+        assert!(
+            registry.cancel(session_id),
+            "should find and cancel the registered turn"
+        );
+        assert!(
+            token.is_cancelled(),
+            "the original token handle must observe the cancellation"
+        );
+        assert_eq!(
+            registry.registered_count(),
+            0,
+            "cancel must remove the entry, not just fire it"
+        );
     }
 
     #[test]
     fn cancel_on_unknown_session_returns_false() {
         let registry = TurnRegistry::new();
-        assert!(!registry.cancel(Uuid::new_v4()), "no turn registered — must return false, not panic");
+        assert!(
+            !registry.cancel(Uuid::new_v4()),
+            "no turn registered — must return false, not panic"
+        );
     }
 
     #[test]
@@ -94,7 +109,14 @@ mod tests {
 
         registry.remove(session_id);
 
-        assert!(!token.is_cancelled(), "remove is for normal completion — must not cancel");
-        assert_eq!(registry.registered_count(), 0, "remove must drop the entry so the map doesn't leak");
+        assert!(
+            !token.is_cancelled(),
+            "remove is for normal completion — must not cancel"
+        );
+        assert_eq!(
+            registry.registered_count(),
+            0,
+            "remove must drop the entry so the map doesn't leak"
+        );
     }
 }

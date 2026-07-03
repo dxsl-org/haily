@@ -1,6 +1,9 @@
-use crate::{Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus};
+use crate::{
+    Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus,
+};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -33,6 +36,11 @@ pub struct CliAdapter {
     /// `start()` runs) but is handled by falling back to "not awaiting" rather than
     /// panicking.
     resolver: Arc<Mutex<Option<Arc<dyn ApprovalResolver>>>>,
+    /// `safety.disable_writes` kill switch (phase 3, C8), injected at bootstrap via
+    /// `set_kill_switch` — the SAME `Arc<AtomicBool>` the orchestrator gates on. `None`
+    /// until injected; the `/writes` command reports "not wired" rather than panicking.
+    /// Lets the terminal user throw/clear the switch live with `/writes off` / `/writes on`.
+    kill: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl CliAdapter {
@@ -42,6 +50,7 @@ impl CliAdapter {
             eof: CancellationToken::new(),
             awaiting: Arc::new(Mutex::new(None)),
             resolver: Arc::new(Mutex::new(None)),
+            kill: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -68,6 +77,7 @@ impl Adapter for CliAdapter {
         let eof = self.eof.clone();
         let awaiting = Arc::clone(&self.awaiting);
         let resolver = Arc::clone(&self.resolver);
+        let kill = Arc::clone(&self.kill);
 
         tokio::spawn(async move {
             let stdin = tokio::io::stdin();
@@ -120,6 +130,16 @@ impl Adapter for CliAdapter {
                     continue;
                 }
 
+                // `/writes on|off` throws or clears the kill switch (C8) live. Handled
+                // before chat dispatch so it never reaches the orchestrator as a message.
+                if let Some(arg) = message.strip_prefix("/writes") {
+                    let arg = arg.trim();
+                    let reply = handle_writes_command(&kill, arg);
+                    let _ = stdout.write_all(reply.as_bytes()).await;
+                    stdout.flush().await.ok();
+                    continue;
+                }
+
                 // If a tool approval is pending, the next non-empty line is the y/n
                 // answer to it — NOT a new chat message. Consumed (taken) here so a
                 // stray extra line afterward falls through to normal chat handling.
@@ -133,8 +153,13 @@ impl Adapter for CliAdapter {
                 if let Some(pending) = pending {
                     let approved = matches!(message.to_ascii_lowercase().as_str(), "y" | "yes");
                     let resolved = match resolver.lock() {
-                        Ok(guard) => guard.as_ref().map(|r| r.resolve(pending.approval_id, pending.session_id, approved)),
-                        Err(poisoned) => poisoned.into_inner().as_ref().map(|r| r.resolve(pending.approval_id, pending.session_id, approved)),
+                        Ok(guard) => guard
+                            .as_ref()
+                            .map(|r| r.resolve(pending.approval_id, pending.session_id, approved)),
+                        Err(poisoned) => poisoned
+                            .into_inner()
+                            .as_ref()
+                            .map(|r| r.resolve(pending.approval_id, pending.session_id, approved)),
                     };
                     match resolved {
                         Some(true) => {
@@ -145,7 +170,9 @@ impl Adapter for CliAdapter {
                             tracing::warn!("approval resolve() rejected (already resolved or session mismatch)");
                         }
                         None => {
-                            tracing::warn!("y/n received but no approval resolver is wired yet — ignoring");
+                            tracing::warn!(
+                                "y/n received but no approval resolver is wired yet — ignoring"
+                            );
                         }
                     }
                     stdout.flush().await.ok();
@@ -192,18 +219,36 @@ impl Adapter for CliAdapter {
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
             }
-            ResponseChunk::ToolApprovalRequest { tool, args, approval_id, origin } => {
+            ResponseChunk::ToolApprovalRequest {
+                tool,
+                args,
+                approval_id,
+                origin,
+            } => {
                 // Set BEFORE printing the prompt: the reader task could otherwise
                 // observe the prompt (via stdout ordering) before `awaiting` is set,
                 // but since both this write and the reader's next read_line happen
                 // after this store, ordering here — not after — is what makes the
                 // next line unambiguously route as a y/n answer.
                 match self.awaiting.lock() {
-                    Ok(mut guard) => *guard = Some(AwaitingApproval { approval_id, session_id }),
-                    Err(poisoned) => *poisoned.into_inner() = Some(AwaitingApproval { approval_id, session_id }),
+                    Ok(mut guard) => {
+                        *guard = Some(AwaitingApproval {
+                            approval_id,
+                            session_id,
+                        })
+                    }
+                    Err(poisoned) => {
+                        *poisoned.into_inner() = Some(AwaitingApproval {
+                            approval_id,
+                            session_id,
+                        })
+                    }
                 }
                 // `origin` (e.g. "L1:developer") is display-only — who is asking.
-                let who = origin.as_deref().map(|o| format!(" [{o}]")).unwrap_or_default();
+                let who = origin
+                    .as_deref()
+                    .map(|o| format!(" [{o}]"))
+                    .unwrap_or_default();
                 let prompt = format!(
                     "\n[Tool approval needed]{who}\nTool: {tool}\nArgs: {args}\nApprove? (y/n): "
                 );
@@ -234,7 +279,11 @@ impl Adapter for CliAdapter {
                 return Ok(());
             }
             Notification::MorningBrief(brief) => format!("\n[Morning Brief]\n{brief}\n"),
-            Notification::Alert { title, body, urgent } => {
+            Notification::Alert {
+                title,
+                body,
+                urgent,
+            } => {
                 let prefix = if urgent { "🔴" } else { "📢" };
                 format!("\n{prefix} {title}\n{body}\n")
             }
@@ -254,8 +303,47 @@ impl Adapter for CliAdapter {
         }
     }
 
+    fn set_kill_switch(&self, kill: Arc<AtomicBool>) {
+        match self.kill.lock() {
+            Ok(mut guard) => *guard = Some(kill),
+            Err(poisoned) => *poisoned.into_inner() = Some(kill),
+        }
+    }
+
     fn id(&self) -> &str {
         "cli"
+    }
+}
+
+/// Parse and apply a `/writes` REPL command. `arg` is the text after `/writes`.
+/// Returns the line to echo to the user. Pure aside from the atomic store so it is unit-
+/// testable. `on` = writes enabled (switch OFF); `off` = writes disabled (switch ON).
+fn handle_writes_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>, arg: &str) -> String {
+    let handle = match kill.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let Some(handle) = handle else {
+        return "[writes] kill switch not wired yet\n".to_string();
+    };
+    match arg {
+        "off" => {
+            handle.store(true, Ordering::Release);
+            "[writes] DISABLED — new writes are blocked (in-flight writes are not stopped)\n"
+                .to_string()
+        }
+        "on" => {
+            handle.store(false, Ordering::Release);
+            "[writes] ENABLED — new writes allowed\n".to_string()
+        }
+        "" | "status" => {
+            let disabled = handle.load(Ordering::Acquire);
+            format!(
+                "[writes] currently {}\n",
+                if disabled { "DISABLED" } else { "ENABLED" }
+            )
+        }
+        _ => "[writes] usage: /writes on | off | status\n".to_string(),
     }
 }
 
@@ -267,17 +355,21 @@ fn render_status_panel(items: &[WorkItemStatus]) -> String {
     let mut out = String::new();
     for item in items {
         let icon = match item.status.as_str() {
-            "running"                => "⚙",
-            "queued"                 => "⏳",
+            "running" => "⚙",
+            "queued" => "⏳",
             "paused" | "interrupted" => "⏸",
-            _                        => "•",
+            _ => "•",
         };
         let title: String = if item.title.chars().count() > 42 {
             item.title.chars().take(41).collect::<String>() + "…"
         } else {
             item.title.clone()
         };
-        let phase = item.phase.as_deref().map(|p| format!(" [{p}]")).unwrap_or_default();
+        let phase = item
+            .phase
+            .as_deref()
+            .map(|p| format!(" [{p}]"))
+            .unwrap_or_default();
         out.push_str(&format!("  {icon} \"{title}\"{phase} {}%\n", item.progress));
     }
     out.push_str("  ─────────────────────────────────\n");
@@ -326,7 +418,9 @@ mod tests {
         .expect("deliver should not error");
 
         let pending = cli.awaiting.lock().unwrap();
-        let pending = pending.as_ref().expect("awaiting state must be set after a ToolApprovalRequest chunk");
+        let pending = pending
+            .as_ref()
+            .expect("awaiting state must be set after a ToolApprovalRequest chunk");
         assert_eq!(pending.approval_id, approval_id);
         assert_eq!(pending.session_id, session_id);
     }
@@ -338,25 +432,44 @@ mod tests {
     #[tokio::test]
     async fn pending_approval_routes_yes_to_resolver_as_approved() {
         let cli = CliAdapter::new();
-        let resolver = Arc::new(RecordingResolver { called: AtomicBool::new(false), last_approved: Mutex::new(None) });
+        let resolver = Arc::new(RecordingResolver {
+            called: AtomicBool::new(false),
+            last_approved: Mutex::new(None),
+        });
         cli.set_approval_resolver(resolver.clone());
 
         let approval_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         cli.deliver(
             session_id,
-            ResponseChunk::ToolApprovalRequest { tool: "task_delete".to_string(), args: "{}".to_string(), approval_id, origin: None },
+            ResponseChunk::ToolApprovalRequest {
+                tool: "task_delete".to_string(),
+                args: "{}".to_string(),
+                approval_id,
+                origin: None,
+            },
         )
         .await
         .unwrap();
 
         // Mirror the reader task's own routing logic against the shared state.
-        let pending = cli.awaiting.lock().unwrap().take().expect("must still be pending");
+        let pending = cli
+            .awaiting
+            .lock()
+            .unwrap()
+            .take()
+            .expect("must still be pending");
         let approved = matches!("y", "y" | "yes");
         resolver.resolve(pending.approval_id, pending.session_id, approved);
 
-        assert!(resolver.called.load(Ordering::SeqCst), "resolver must be invoked for a y/n answer, not skipped");
+        assert!(
+            resolver.called.load(Ordering::SeqCst),
+            "resolver must be invoked for a y/n answer, not skipped"
+        );
         assert_eq!(*resolver.last_approved.lock().unwrap(), Some(true));
-        assert!(cli.awaiting.lock().unwrap().is_none(), "awaiting state must be cleared (taken) after being consumed");
+        assert!(
+            cli.awaiting.lock().unwrap().is_none(),
+            "awaiting state must be cleared (taken) after being consumed"
+        );
     }
 }

@@ -63,7 +63,11 @@ pub async fn active(db: &DbHandle) -> Result<Vec<Task>> {
 
 pub async fn update_status(db: &DbHandle, id: &str, status: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let completed_at = if status == "done" { Some(now.clone()) } else { None };
+    let completed_at = if status == "done" {
+        Some(now.clone())
+    } else {
+        None
+    };
     sqlx::query(
         "UPDATE tasks
          SET status = ?, completed_at = ?, updated_at = ?
@@ -81,10 +85,14 @@ pub async fn update_status(db: &DbHandle, id: &str, status: &str) -> Result<()> 
 pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let rows = sqlx::query(
-        "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(&now).bind(&now).bind(id)
-    .execute(db.pool()).await?.rows_affected();
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
     Ok(rows > 0)
 }
 

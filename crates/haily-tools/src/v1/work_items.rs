@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 
 fn status_emoji(status: &str) -> &'static str {
     match status {
-        "running"     => "🔄",
+        "running" => "🔄",
         "interrupted" => "⏸",
-        "queued"      => "⏳",
-        "done"        => "✅",
-        "failed"      => "❌",
-        _             => "❓",
+        "queued" => "⏳",
+        "done" => "✅",
+        "failed" => "❌",
+        _ => "❓",
     }
 }
 
@@ -22,7 +22,9 @@ pub struct WorkItemListTool;
 
 #[async_trait]
 impl Tool for WorkItemListTool {
-    fn name(&self) -> &str { "work_item_list" }
+    fn name(&self) -> &str {
+        "work_item_list"
+    }
 
     fn description(&self) -> &str {
         "Liệt kê các công việc đang chạy hoặc bị dừng dang dở. \
@@ -43,7 +45,9 @@ impl Tool for WorkItemListTool {
         })
     }
 
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::Read
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let filter = args["filter"].as_str().unwrap_or("active");
@@ -94,7 +98,9 @@ pub struct WorkItemResumeTool;
 
 #[async_trait]
 impl Tool for WorkItemResumeTool {
-    fn name(&self) -> &str { "work_item_resume" }
+    fn name(&self) -> &str {
+        "work_item_resume"
+    }
 
     fn description(&self) -> &str {
         "Xem chi tiết và checkpoint của một công việc bị dừng. \
@@ -114,10 +120,14 @@ impl Tool for WorkItemResumeTool {
         })
     }
 
-    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("id required"))?;
 
         let Some(item) = work_items::get(&ctx.db, id).await? else {
             return Ok(format!("Không tìm thấy work item với id: {id}"));
@@ -140,11 +150,11 @@ impl Tool for WorkItemResumeTool {
              Checkpoint: {checkpoint}\n\
              \n\
              💡 Nhắn lại yêu cầu gốc để tiếp tục từ đầu, hoặc mô tả bạn muốn tiếp tục từ đâu.",
-            title    = item.title,
-            status   = item.status,
-            phase    = phase,
+            title = item.title,
+            status = item.status,
+            phase = phase,
             progress = item.progress,
-            started  = started,
+            started = started,
             checkpoint = checkpoint,
         ))
     }

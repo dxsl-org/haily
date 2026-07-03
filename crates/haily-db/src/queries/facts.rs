@@ -165,10 +165,14 @@ pub async fn list_top(db: &DbHandle, limit: i64) -> Result<Vec<Fact>> {
 pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let rows = sqlx::query(
-        "UPDATE kms_facts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        "UPDATE kms_facts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(&now).bind(&now).bind(id)
-    .execute(db.pool()).await?.rows_affected();
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
     Ok(rows > 0)
 }
 

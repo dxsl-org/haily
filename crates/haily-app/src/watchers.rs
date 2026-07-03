@@ -1,7 +1,7 @@
 //! Work-item watcher and proactive daemon startup — spawned identically for every
 //! mode (this phase's fix for F6: GUI previously lacked the watcher, CLI lacked the
 //! daemon; both are now unconditional, gated only by `BootstrapOptions`).
-use haily_db::{queries::work_items, DbHandle};
+use haily_db::{queries::journal, queries::work_items, DbHandle};
 use haily_io::{AdapterManager, Notification, WorkItemStatus};
 use haily_proactive::ProactiveDaemon;
 use std::sync::Arc;
@@ -51,7 +51,9 @@ pub fn spawn_work_item_watcher(
                     phase: i.phase,
                 })
                 .collect();
-            am.notify_all(Notification::WorkItemsChanged(summaries)).await.ok();
+            am.notify_all(Notification::WorkItemsChanged(summaries))
+                .await
+                .ok();
         }
     });
 }
@@ -64,4 +66,30 @@ pub fn spawn_proactive_daemon(
     tasks: TaskTracker,
 ) {
     ProactiveDaemon::new(db, am).start(shutdown, &tasks);
+}
+
+/// Interval in seconds between action-journal retention purges. Hourly is fine — the
+/// retention window is measured in days, so a coarser cadence still bounds PII promptly.
+const JOURNAL_PURGE_INTERVAL_SECS: u64 = 3600;
+
+/// Periodically purge action-journal rows past their `retention_expires_at` (phase 3,
+/// C-security). Bounds recorded PII. Selects on shutdown and is tracked, so a purge in
+/// progress finishes (or the sleep is interrupted) rather than being abandoned silently.
+pub fn spawn_journal_purge(db: Arc<DbHandle>, shutdown: CancellationToken, tasks: TaskTracker) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("journal purge task shutting down");
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(JOURNAL_PURGE_INTERVAL_SECS)) => {}
+            }
+            match journal::purge_expired(&db).await {
+                Ok(n) if n > 0 => info!(count = n, "purged expired action-journal rows"),
+                Err(e) => tracing::warn!("journal purge failed: {e:#}"),
+                _ => {}
+            }
+        }
+    });
 }
