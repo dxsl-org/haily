@@ -3,7 +3,7 @@ use crate::approval::ApprovalBroker;
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
 use haily_types::ResponseChunk;
-use haily_tools::{ToolClass, ToolContext, ToolRegistry};
+use haily_tools::{RiskTier, ToolContext, ToolRegistry};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -130,11 +130,12 @@ fn find_matching_close(text: &str, open: &TagMatch) -> Option<TagMatch> {
 /// can terminate the turn — feeding a guard error back here would let a looping
 /// model spin. Dispatch therefore no longer owns the guard.
 ///
-/// `broker`/`cancel` gate `ToolClass::RequireApproval` tools: `ctx.session_id` is the
+/// `broker`/`cancel` gate `RiskTier::IrreversibleWrite` tools: `ctx.session_id` is the
 /// turn's session, `cancel` is the turn's cancellation token (fired on shutdown so a
 /// pending approval never blocks the drain). Sub-agents (`ctx.depth > 0`) are hard-
-/// blocked from this class entirely, before the broker is ever consulted — a
-/// sub-agent runs headless with a sink channel and no user to ask.
+/// blocked from this tier entirely, before the broker is ever consulted — a
+/// sub-agent runs headless with a sink channel and no user to ask. (This hard block
+/// is removed in phase 2 once the sub-agent approval seam opens — see plan.md.)
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
@@ -148,18 +149,18 @@ pub async fn dispatch(
         .get(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{tool_name}'"))?;
 
-    match tool.approval_class() {
-        ToolClass::Blocked => {
+    match tool.risk_tier(&args) {
+        RiskTier::Blocked => {
             bail!("tool '{tool_name}' is blocked");
         }
-        ToolClass::RequireApproval => {
+        RiskTier::IrreversibleWrite => {
             // Sub-agents (depth > 0) run in a headless context with a sink channel.
             // Approval requests would be silently dropped, so block them entirely.
             if ctx.depth > 0 {
                 bail!("tool '{tool_name}' requires user approval and cannot run inside a sub-agent");
             }
             // Pre-validated allowlist (destructive/exfil tools can never be listed —
-            // enforced at startup, not here) lets specific low-risk RequireApproval
+            // enforced at startup, not here) lets specific low-risk IrreversibleWrite
             // tools skip the interactive prompt. Every bypass is logged at warn: it
             // is a deliberate, auditable trust decision, not silent.
             if broker.is_auto_approved(tool_name) {
@@ -182,7 +183,7 @@ pub async fn dispatch(
                 }
             }
         }
-        ToolClass::AutoApprove => {}
+        RiskTier::Read | RiskTier::ReversibleWrite => {}
     }
 
     info!(tool = tool_name, "executing tool");
@@ -341,7 +342,7 @@ mod tests {
         fn name(&self) -> &str { "literal_error_prefix" }
         fn description(&self) -> &str { "returns legit text starting with 'Error:'" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("Error: this is the literal log line the user asked to fetch".to_string())
         }
@@ -354,7 +355,7 @@ mod tests {
         fn name(&self) -> &str { "failing_tool" }
         fn description(&self) -> &str { "always errors" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Err(anyhow::anyhow!("boom"))
         }
@@ -365,7 +366,16 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let db = std::sync::Arc::new(haily_db::DbHandle::init(&db_path).await.unwrap());
         let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone(), dir.path()).await.unwrap());
-        let ctx = ToolContext { db, kms, session_id: Uuid::new_v4(), depth: 0 };
+        let (approval_tx, _rx) = mpsc::channel(8);
+        let ctx = ToolContext {
+            db,
+            kms,
+            session_id: Uuid::new_v4(),
+            depth: 0,
+            approval_gate: std::sync::Arc::new(ApprovalBroker::new()),
+            approval_tx,
+            cancel: CancellationToken::new(),
+        };
         (ctx, dir)
     }
 
@@ -414,7 +424,7 @@ mod tests {
         fn name(&self) -> &str { "delete_thing" }
         fn description(&self) -> &str { "a destructive tool that must be approved" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::IrreversibleWrite }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("deleted".to_string())
         }

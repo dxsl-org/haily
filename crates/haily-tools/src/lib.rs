@@ -5,7 +5,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
+use haily_types::ApprovalGate;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub struct ToolContext {
@@ -15,12 +17,41 @@ pub struct ToolContext {
     /// Agent nesting depth: 0 = L0 orchestrator, 1 = L1 domain agent, 2 = L2 specialist.
     /// Delegate tools check this to enforce max depth and prevent infinite recursion.
     pub depth: u8,
+    /// Seam handle for raising a tool approval from wherever this `ToolContext` is
+    /// used (L0 today; sub-turns in phase 2) without `haily-tools` depending on
+    /// `haily-core` — the trait lives in the leaf `haily-types` crate.
+    pub approval_gate: Arc<dyn ApprovalGate>,
+    /// Channel to send `ResponseChunk::ToolApprovalRequest` (and other tool-visible
+    /// chunks) upstream. Phase 1 wires this at each `ToolContext` construction site;
+    /// dispatch itself still takes its own `tx` param this phase (seam not yet open).
+    pub approval_tx: tokio::sync::mpsc::Sender<haily_types::ResponseChunk>,
+    /// This turn's cancellation token — fired on shutdown so a pending approval
+    /// raised through the seam never blocks the drain.
+    pub cancel: CancellationToken,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ToolClass {
-    AutoApprove,
-    RequireApproval,
+/// Blast-radius classification for a tool call, evaluated per-call against `args` so
+/// a single tool CAN return different tiers for different arguments (e.g. a future
+/// "delete draft" vs "delete sent" distinction) — v1 tools are constant-tier (YAGNI:
+/// no arg-branching added yet), which is what makes the `auto_approve` empty-probe
+/// validation sound (see `no_v1_tool_tier_varies_by_args`).
+///
+/// Fail-closed contract: a tool that cannot parse `args` well enough to determine its
+/// true tier MUST return `IrreversibleWrite`, never a cheaper tier — an unparseable
+/// call is exactly the case where blast radius is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskTier {
+    /// Pure read, no side effect.
+    Read,
+    /// Local write with no external side effect and no undo path yet (no v1 journal —
+    /// the journal wraps connectors only). Executes without an approval prompt.
+    ReversibleWrite,
+    /// Requires human approval before executing: external egress, or a local
+    /// operation gated for safety even though it may be physically reversible
+    /// (soft-deletes are `IrreversibleWrite` for GATING, not reversibility — never
+    /// re-tier them to `ReversibleWrite` until a journal/undo path covers them).
+    IrreversibleWrite,
+    /// Never executes.
     Blocked,
 }
 
@@ -29,7 +60,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
-    fn approval_class(&self) -> ToolClass;
+    /// Classify this call's blast radius. See `RiskTier`'s fail-closed contract for
+    /// the malformed-args case.
+    fn risk_tier(&self, args: &serde_json::Value) -> RiskTier;
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String>;
 }
 
@@ -132,7 +165,7 @@ mod tests {
         fn name(&self) -> &str { self.0 }
         fn description(&self) -> &str { "mock" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("ok".into())
         }
@@ -184,5 +217,37 @@ mod tests {
         ] {
             assert!(base.get(name).is_some(), "missing quick tool: {name}");
         }
+    }
+
+    /// A tool that parses `args["limit"]` and demonstrates the `RiskTier` fail-closed
+    /// contract: a well-formed numeric limit is a plain read, but an unparseable
+    /// value means the tool cannot determine its true blast radius, so it MUST
+    /// report `IrreversibleWrite` rather than silently falling back to `Read`.
+    struct LimitParsingTool;
+
+    #[async_trait]
+    impl Tool for LimitParsingTool {
+        fn name(&self) -> &str { "limit_parsing_test_tool" }
+        fn description(&self) -> &str { "test tool for the fail-closed contract" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn risk_tier(&self, args: &serde_json::Value) -> RiskTier {
+            match args.get("limit") {
+                None => RiskTier::Read, // absent is a valid default, not malformed
+                Some(v) if v.is_u64() => RiskTier::Read,
+                // Present but not a valid unsigned integer: blast radius unknown.
+                Some(_) => RiskTier::IrreversibleWrite,
+            }
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("ok".into())
+        }
+    }
+
+    #[test]
+    fn risk_tier_fail_closed_on_malformed_args() {
+        let tool = LimitParsingTool;
+        assert_eq!(tool.risk_tier(&serde_json::json!({"limit": "not-a-number"})), RiskTier::IrreversibleWrite);
+        assert_eq!(tool.risk_tier(&serde_json::json!({"limit": 10})), RiskTier::Read);
+        assert_eq!(tool.risk_tier(&serde_json::json!({})), RiskTier::Read);
     }
 }

@@ -6,7 +6,8 @@
 //! and is exposed to adapters (GUI/CLI/Telegram) as `Arc<dyn ApprovalResolver>` so
 //! `haily-io` never needs to depend on `haily-core` (the trait itself lives in
 //! `haily-types`).
-use haily_types::ApprovalResolver;
+use async_trait::async_trait;
+use haily_types::{ApprovalGate, ApprovalResolver};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -87,6 +88,15 @@ impl Default for ApprovalBroker {
     }
 }
 
+/// Delegates to the inherent `request` above — lands here (not phase 2) so
+/// `ToolContext::approval_gate` can be real from day one (KISS, phase-1 spec step 5).
+#[async_trait]
+impl ApprovalGate for ApprovalBroker {
+    async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool {
+        self.request(approval_id, session_id, cancel).await
+    }
+}
+
 impl ApprovalResolver for ApprovalBroker {
     fn resolve(&self, approval_id: Uuid, session_id: Uuid, approved: bool) -> bool {
         // `remove_if` takes the entry out only when the session matches, so a
@@ -116,6 +126,15 @@ impl ApprovalResolver for ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase-1 success criteria: `ApprovalGate` must be object-safe and
+    /// `ApprovalBroker` must implement it, so `ToolContext::approval_gate` can hold
+    /// it as `Arc<dyn ApprovalGate>` — this is a compile-time proof, not a runtime
+    /// assertion (a signature/object-safety regression fails the build, not this test).
+    #[test]
+    fn approval_broker_is_object_safe_as_approval_gate() {
+        let _: std::sync::Arc<dyn ApprovalGate> = std::sync::Arc::new(ApprovalBroker::new());
+    }
 
     #[tokio::test]
     async fn approve_resolves_true() {

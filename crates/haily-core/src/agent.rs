@@ -323,13 +323,6 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         haily_llm::Message::user(task.clone()),
     ];
 
-    let tool_ctx = ToolContext {
-        db: db.clone(),
-        kms,
-        session_id,
-        depth,
-    };
-
     // Reuse the same tool loop logic as run_turn, without WorkItem tracking.
     let mut msgs = messages;
     let mut guard = tool_call::LoopGuard::new();
@@ -337,11 +330,22 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let (tx, _rx) = tokio::sync::mpsc::channel(32); // sink — sub-agents don't stream to user
 
     // Sub-turns run at depth > 0, which `dispatch` hard-blocks from
-    // `ToolClass::RequireApproval` before either of these is ever touched — a
+    // `RiskTier::IrreversibleWrite` before either of these is ever touched — a
     // throwaway broker/token (not threaded from the parent turn) is intentional,
-    // not a shortcut: a sub-agent must never reach the approval path at all.
+    // not a shortcut: a sub-agent must never reach the approval path at all. Phase 2
+    // rewires `tool_ctx.approval_gate`/`cancel` to the real parent-turn seam handles.
     let sub_turn_broker = ApprovalBroker::new();
     let sub_turn_cancel = CancellationToken::new();
+
+    let tool_ctx = ToolContext {
+        db: db.clone(),
+        kms,
+        session_id,
+        depth,
+        approval_gate: Arc::new(ApprovalBroker::new()),
+        approval_tx: tx.clone(),
+        cancel: sub_turn_cancel.clone(),
+    };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
     // `[system, task]`), but the tool loop still accumulates `<tool_result>`
@@ -439,7 +443,7 @@ pub struct TurnRuntime {
 
 /// Full agent turn. Called once per incoming Request.
 ///
-/// `broker` gates `ToolClass::RequireApproval` tool calls at depth 0; `cancel` is the
+/// `broker` gates `RiskTier::IrreversibleWrite` tool calls at depth 0; `cancel` is the
 /// turn's cancellation token — firing it (shutdown) denies any pending approval
 /// immediately instead of holding up the drain for up to the 120s approval timeout.
 #[instrument(skip_all, fields(session = %req.session_id))]
@@ -447,7 +451,7 @@ pub async fn run_turn(
     req: &Request,
     runtime: TurnRuntime,
     tx: mpsc::Sender<ResponseChunk>,
-    broker: &ApprovalBroker,
+    broker: &Arc<ApprovalBroker>,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let TurnRuntime { db, kms, llm, tools } = runtime;
@@ -482,6 +486,12 @@ pub async fn run_turn(
         kms: kms.clone(),
         session_id: req.session_id,
         depth: 0,
+        // Real L0 broker-as-gate/tx/cancel — `ApprovalBroker` also implements
+        // `ApprovalGate` (approval.rs), so this is the SAME broker `dispatch` below
+        // consults, not a parallel authorization path.
+        approval_gate: Arc::clone(broker) as Arc<dyn haily_types::ApprovalGate>,
+        approval_tx: tx.clone(),
+        cancel: cancel.clone(),
     };
 
     let mut guard = tool_call::LoopGuard::new();
@@ -1109,7 +1119,7 @@ mod outcome_tests {
     use haily_db::DbHandle;
     use haily_kms::KmsHandle;
     use haily_llm::LlmConfig;
-    use haily_tools::{Tool, ToolClass, ToolRegistry};
+    use haily_tools::{RiskTier, Tool, ToolRegistry};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1121,7 +1131,7 @@ mod outcome_tests {
         fn name(&self) -> &str { "always_fails" }
         fn description(&self) -> &str { "test tool that always errors" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Err(anyhow::anyhow!("boom"))
         }
@@ -1134,7 +1144,7 @@ mod outcome_tests {
         fn name(&self) -> &str { "always_succeeds" }
         fn description(&self) -> &str { "test tool that always succeeds" }
         fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-        fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::Read }
         async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
             Ok("done".to_string())
         }

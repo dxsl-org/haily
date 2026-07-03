@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::{LlmRouter, Tier};
-use haily_tools::{Tool, ToolClass, ToolContext, ToolRegistry};
+use haily_tools::{RiskTier, Tool, ToolContext, ToolRegistry};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -84,8 +84,8 @@ impl Tool for DelegateTool {
         })
     }
 
-    fn approval_class(&self) -> ToolClass {
-        ToolClass::AutoApprove
+    fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
@@ -283,7 +283,16 @@ mod reload_propagation_tests {
             model_tier: None,
         };
 
-        let ctx = ToolContext { db: Arc::clone(&db), kms: Arc::clone(&kms), session_id: Uuid::new_v4(), depth: 0 };
+        let (approval_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ctx = ToolContext {
+            db: Arc::clone(&db),
+            kms: Arc::clone(&kms),
+            session_id: Uuid::new_v4(),
+            depth: 0,
+            approval_gate: Arc::new(crate::approval::ApprovalBroker::new()),
+            approval_tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
         let args = serde_json::json!({ "task": "short task before reload" });
         let before = delegate.execute(args, &ctx).await.expect("execute before reload");
         assert!(before.contains("model-before-reload"), "expected pre-reload model in response, got: {before}");

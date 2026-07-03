@@ -1,4 +1,4 @@
-use crate::{Tool, ToolClass, ToolContext};
+use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::queries::notes;
@@ -42,7 +42,7 @@ impl Tool for NoteSaveTool {
             "required": ["title", "content"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let title   = args["title"].as_str().ok_or_else(|| anyhow::anyhow!("title required"))?;
@@ -81,7 +81,7 @@ impl Tool for NoteSearchTool {
             "required": ["query"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query required"))?;
@@ -123,7 +123,7 @@ impl Tool for NoteUpdateTool {
             "required": ["id", "title", "content"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id      = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
@@ -153,7 +153,7 @@ impl Tool for NoteDeleteTool {
             "required": ["id"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;

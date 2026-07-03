@@ -5,9 +5,11 @@ edition.workspace = true
 description = "Tool implementations — all tools the agent can call in V1"
 
 [dependencies]
-haily-db  = { workspace = true }
-haily-kms = { workspace = true }
+haily-db    = { workspace = true }
+haily-kms   = { workspace = true }
+haily-types = { workspace = true }
 tokio      = { workspace = true }
+tokio-util = { workspace = true }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }

@@ -5,7 +5,9 @@
 //! same message shapes without `haily-core` importing the adapter layer — see CLAUDE.md's
 //! "haily-core must never import from haily-io" invariant.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,23 @@ pub trait ApprovalResolver: Send + Sync {
     /// unknown, already resolved, or bound to a different session (forged/foreign-chat
     /// attempt — callers should log and otherwise ignore a `false` result).
     fn resolve(&self, approval_id: Uuid, session_id: Uuid, approved: bool) -> bool;
+}
+
+/// Request-side half of the tool-approval flow, mirroring the `ApprovalResolver` /
+/// `haily-core::ApprovalBroker` split: this trait lives in the leaf crate so
+/// `haily-tools` (and any sub-agent code built on it) can raise an approval without
+/// depending on `haily-core` — see CLAUDE.md's layering invariant.
+/// `haily-core::ApprovalBroker` is the sole implementer.
+///
+/// `approval_id` is shown to the user (not a secret); `session_id` is the sole auth
+/// boundary — implementations MUST verify the pending approval was registered under
+/// this exact `session_id` before honoring a decision (mirrors `ApprovalResolver`).
+#[async_trait]
+pub trait ApprovalGate: Send + Sync {
+    /// Register a pending approval and wait for a decision. Returns `true` only if
+    /// approved before `cancel` fires or the implementation's own timeout elapses —
+    /// callers must treat cancellation and timeout identically to an explicit deny.
+    async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool;
 }
 
 #[cfg(test)]

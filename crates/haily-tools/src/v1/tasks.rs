@@ -1,4 +1,4 @@
-use crate::{Tool, ToolClass, ToolContext};
+use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::queries::tasks;
@@ -27,7 +27,7 @@ impl Tool for TaskCreateTool {
             "required": ["title"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let title    = args["title"].as_str().ok_or_else(|| anyhow::anyhow!("title required"))?;
@@ -54,7 +54,7 @@ impl Tool for TaskListTool {
     fn parameters_schema(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, _args: Value, ctx: &ToolContext) -> Result<String> {
         let active = tasks::active(&ctx.db).await?;
@@ -92,7 +92,7 @@ impl Tool for TaskCompleteTool {
             "required": ["id"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;
@@ -119,7 +119,7 @@ impl Tool for TaskDeleteTool {
             "required": ["id"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;

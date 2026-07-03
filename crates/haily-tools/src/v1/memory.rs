@@ -1,4 +1,4 @@
-use crate::{Tool, ToolClass, ToolContext};
+use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::queries::facts;
@@ -28,7 +28,7 @@ impl Tool for MemoryRememberTool {
             "required": ["subject", "predicate", "object"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let subject   = args["subject"].as_str().ok_or_else(|| anyhow::anyhow!("subject required"))?;
@@ -63,7 +63,7 @@ impl Tool for MemorySearchTool {
             "required": ["query"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query required"))?;
@@ -104,7 +104,7 @@ impl Tool for MemoryListTool {
             }
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let limit = args["limit"].as_i64().unwrap_or(20);
@@ -166,7 +166,7 @@ impl Tool for FeedbackReactTool {
             "required": ["reaction"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::ReversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let reaction = args["reaction"].as_str().unwrap_or("positive");
@@ -208,7 +208,7 @@ impl Tool for MemoryForgetTool {
             "required": ["id"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("id required"))?;

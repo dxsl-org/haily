@@ -8,6 +8,8 @@ description = "Shared message/DTO types (Request, ResponseChunk, Notification) â
 serde = { workspace = true }
 uuid  = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
 serde_json = { workspace = true }

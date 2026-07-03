@@ -1,4 +1,4 @@
-use crate::{Tool, ToolClass, ToolContext};
+use crate::{RiskTier, Tool, ToolContext};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ impl Tool for WorktreeApplyTool {
         })
     }
 
-    fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let worktree_path = args["worktree_path"]

@@ -1,5 +1,5 @@
 use crate::security;
-use crate::{Tool, ToolClass, ToolContext};
+use crate::{RiskTier, Tool, ToolContext};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -36,7 +36,7 @@ impl Tool for WebSearchTool {
             "required": ["query"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let query = args["query"].as_str().ok_or_else(|| anyhow::anyhow!("query is required"))?;
@@ -122,7 +122,7 @@ impl Tool for UrlFetchTool {
             "required": ["url"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::AutoApprove }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::Read }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let url = args["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required"))?;
@@ -176,7 +176,7 @@ impl Tool for HttpRequestTool {
             "required": ["method", "url"]
         })
     }
-    fn approval_class(&self) -> ToolClass { ToolClass::RequireApproval }
+    fn risk_tier(&self, _args: &Value) -> RiskTier { RiskTier::IrreversibleWrite }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let method_str = args["method"].as_str().unwrap_or("GET").to_uppercase();
@@ -270,6 +270,6 @@ mod tests {
         // downgraded to auto-approve, the header allowlist decision above would
         // need to be revisited (this test is the tripwire for that).
         let tool = HttpRequestTool;
-        assert_eq!(tool.approval_class(), ToolClass::RequireApproval);
+        assert_eq!(tool.risk_tier(&json!({})), RiskTier::IrreversibleWrite);
     }
 }

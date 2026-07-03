@@ -232,7 +232,7 @@ pub async fn follow_redirects_with_guard(
 ///   proxy the caller doesn't control here.
 ///
 /// `Authorization`/`Cookie` are deliberately NOT on this list — `http_request` is
-/// permanently in the `RequireApproval` class (see `HttpRequestTool::approval_class`
+/// permanently `RiskTier::IrreversibleWrite` (see `HttpRequestTool::risk_tier`
 /// and its accompanying test), so a human has already reviewed the exact headers
 /// being sent before every call.
 const DENIED_HEADERS: &[&str] = &["host", "content-length", "transfer-encoding", "connection"];
