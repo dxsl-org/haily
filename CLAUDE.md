@@ -58,19 +58,31 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | File | Purpose |
 |------|---------|
 | `crates/haily-core/src/lib.rs` | Orchestrator export, module coordination |
-| `crates/haily-core/src/agent.rs` | Agent loop, tool dispatch, streaming, multi-turn state |
+| `crates/haily-core/src/agent.rs` | Agent loop, tool dispatch, streaming, multi-turn state, kill-switch re-check |
 | `crates/haily-core/src/approval.rs` | Session-bound tool approval broker (real implementation) |
 | `crates/haily-core/src/budget.rs` | Token-budgeted context assembly (replaces 15-turn window) |
 | `crates/haily-core/src/feedback_parser.rs` | Vietnamese + English feedback signal detection |
 | `crates/haily-core/src/tag_matcher.rs` | Canonical tag hold-back for streaming (llama + cloud SSE) |
 | `crates/haily-core/src/delegate.rs` | Sub-agent spawning, tier selection, shared memory |
+| `crates/haily-core/src/tool_call.rs` | Tool dispatch, risk tier gating, kill-switch exemption logic |
 | `crates/haily-kms/src/skills.rs` | Skill synthesis (Jaccard clustering), EMA confidence, exponential decay |
 | `crates/haily-kms/src/feedback.rs` | FeedbackSignal enum (Positive, Negative, Correction) |
 | `crates/haily-kms/src/hnsw.rs` | HNSW index w/ tombstones, dump/load persistence, atomic swap |
 | `crates/haily-llm/src/router.rs` | LLM routing: llama.cpp primary → cloud fallback |
 | `crates/haily-llm/src/sse.rs` | SSE parser for cloud streaming (OpenAI, Anthropic) |
 | `crates/haily-llm/src/breaker.rs` | Circuit breaker (real file; not circuit_breaker.rs) |
+| `crates/haily-db/src/queries/journal.rs` | Action journal insert, readback, undo queries (Safe Operator Harness) |
+| `crates/haily-db/src/queries/connectors.rs` | Connector manifest CRUD (Safe Operator Harness phase 4) |
 | `crates/haily-db/src/queries/` | All SQL — one file per domain |
+| `crates/haily-tools/src/lib.rs` | RiskTier enum, Tool trait, ApprovalGate trait (via haily-types re-export) |
+| `crates/haily-tools/src/connector/manifest.rs` | Manifest schema (version, ops, risk_tier, compensability) |
+| `crates/haily-tools/src/connector/http_connector_tool.rs` | Generic HTTP tool interpreting a manifest op (outbox, read-back diff) |
+| `crates/haily-tools/src/connector/odoo_executor.rs` | Odoo-specific executor (execute_kw, fault classification, C4 cred-by-ref) |
+| `crates/haily-tools/src/connector/executor.rs` | ConnectorExecutor trait, UnconfiguredExecutor placeholder |
+| `crates/haily-tools/src/journal_undo/mod.rs` | JournalUndoTool (IrreversibleWrite, kill-switch-exempt) |
+| `crates/haily-tools/src/journal_undo/reconcile.rs` | Reconciliation state machine (attempt_undo, refusal logic) |
+| `crates/haily-tools/src/security.rs` | ssrf_guard_with_allowance (IP/CIDR pin, metadata block) |
+| `crates/haily-types/src/lib.rs` | RiskTier, ApprovalGate trait (leaf crate, avoids layering inversion) |
 | `crates/haily-io/src/lib.rs` | Adapter trait definition, manager |
 | `crates/haily-app/src/bootstrap.rs` | Shared bootstrap (LlmConfig, db, orchestrator) |
 | `crates/haily-app/src/dispatch.rs` | Mode dispatch (GUI/CLI/headless) + adapter wiring |
@@ -94,7 +106,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 **Comments:** Document *why* and contract, not *what*. Public API requires doc comments with params/returns/errors.
 
-**Adding tools:** New file in `crates/haily-tools/src/v2/` + register in `registry.rs`.
+**Adding tools:** Tools and connectors live in `crates/haily-tools/src/`. V1 tools in `v1/` are registered in `ToolRegistry::build_v1()`. Connector tools (generic HTTP + Odoo-specific) live in `crates/haily-tools/src/connector/` and are registered via `register_connectors()`. Journal undo tool in `crates/haily-tools/src/journal_undo/` is registered in `build_v1()`.
 
 **Adding I/O adapters:** New module in `crates/haily-io/src/` + wire up at app layer only.
 
@@ -113,18 +125,19 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 ## Current Phase Status
 
-**Phase 1–12: Complete (2026-07-02 remediation cycle)**
-- Architecture Remediation Plan: all 10 phases shipped to main
+**Phase 1–13: Complete (2026-07-03)**
+- Architecture Remediation Plan (Phase Rem): all 10 phases shipped to main (2026-07-02)
+- Safe Operator Harness (Phase 13): RiskTier, ApprovalGate seam, action journal + undo + kill switch, connector manifests, Odoo CRM (2026-07-03)
 - Red Team findings (32 total): all accepted, applied, verified
 - Regression gates: `cargo clippy -- -D warnings && cargo test` passing
 
-**Next phases:** Phase 13 (Voice/Multimodal), Phase 14 (Multi-Device Sync) — deferred pending UX validation.
+**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation.
 
 ## Docs
 
 Full documentation is in `.docs/`:
-- `architecture.md` — 13 technical decisions (Decisions 9–12 added 2026-07-02)
-- `code-standards.md` — Rust coding conventions, CancellationToken + TaskTracker patterns
+- `architecture.md` — 18 technical decisions (Decisions 14–18 added 2026-07-03: RiskTier, ApprovalGate, journal, connectors, Odoo)
+- `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait)
 - `project-structure.md` — 10-crate layout (haily-types, haily-app added), dependency graph, layering test
-- `project-roadmap.md` — Phase status (1–12 complete as of 2026-07-02)
-- `code-standards.md` — also documents real patterns (graceful shutdown, HNSW persistence)
+- `project-roadmap.md` — Phase status (1–13 complete; Phase 14–15 planned)
+- `project-changelog.md` — Significant changes, features, fixes by phase (Safe Operator Harness added 2026-07-03)
