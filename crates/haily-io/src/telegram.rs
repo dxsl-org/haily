@@ -267,10 +267,16 @@ impl Adapter for TelegramAdapter {
                     }
                 }
             }
-            ResponseChunk::ToolApprovalRequest { tool, args, approval_id } => {
+            ResponseChunk::ToolApprovalRequest { tool, args, approval_id, origin } => {
                 if let Some(chat_id) = self.session_to_chat.get(&session_id) {
+                    // `origin` (e.g. "L1:developer") is display-only — who is asking.
+                    let who = origin
+                        .as_deref()
+                        .map(|o| format!(" <i>({})</i>", escape_html(o)))
+                        .unwrap_or_default();
                     let msg = format!(
-                        "⚙️ <b>Tool approval needed</b>\n<code>{}</code>\n{}",
+                        "⚙️ <b>Tool approval needed</b>{}\n<code>{}</code>\n{}",
+                        who,
                         escape_html(&tool),
                         escape_html(&args)
                     );

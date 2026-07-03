@@ -192,7 +192,7 @@ impl Adapter for CliAdapter {
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
             }
-            ResponseChunk::ToolApprovalRequest { tool, args, approval_id } => {
+            ResponseChunk::ToolApprovalRequest { tool, args, approval_id, origin } => {
                 // Set BEFORE printing the prompt: the reader task could otherwise
                 // observe the prompt (via stdout ordering) before `awaiting` is set,
                 // but since both this write and the reader's next read_line happen
@@ -202,8 +202,10 @@ impl Adapter for CliAdapter {
                     Ok(mut guard) => *guard = Some(AwaitingApproval { approval_id, session_id }),
                     Err(poisoned) => *poisoned.into_inner() = Some(AwaitingApproval { approval_id, session_id }),
                 }
+                // `origin` (e.g. "L1:developer") is display-only — who is asking.
+                let who = origin.as_deref().map(|o| format!(" [{o}]")).unwrap_or_default();
                 let prompt = format!(
-                    "\n[Tool approval needed]\nTool: {tool}\nArgs: {args}\nApprove? (y/n): "
+                    "\n[Tool approval needed]{who}\nTool: {tool}\nArgs: {args}\nApprove? (y/n): "
                 );
                 stdout.write_all(prompt.as_bytes()).await?;
                 stdout.flush().await?;
@@ -317,6 +319,7 @@ mod tests {
                 tool: "worktree_apply".to_string(),
                 args: "{}".to_string(),
                 approval_id,
+                origin: None,
             },
         )
         .await
@@ -342,7 +345,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         cli.deliver(
             session_id,
-            ResponseChunk::ToolApprovalRequest { tool: "task_delete".to_string(), args: "{}".to_string(), approval_id },
+            ResponseChunk::ToolApprovalRequest { tool: "task_delete".to_string(), args: "{}".to_string(), approval_id, origin: None },
         )
         .await
         .unwrap();

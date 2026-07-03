@@ -258,6 +258,21 @@ pub struct SubTurnRequest {
     /// falls back to the default model in that case, so this is a no-op wire-through
     /// until a config actually opts into a tier.
     pub model_tier: Option<haily_llm::Tier>,
+    /// Phase 2 seam: the SAME session approval gate the parent turn uses (the real
+    /// `ApprovalBroker`, threaded down as `Arc<dyn ApprovalGate>`), so a destructive
+    /// tool a sub-agent attempts routes to the ONE user via the ONE broker — not a
+    /// throwaway that can never be resolved.
+    pub approval_gate: Arc<dyn haily_types::ApprovalGate>,
+    /// Sub-turn's child cancellation token (a `child_token()` of the parent turn's).
+    /// Cancelling the parent cancels this; cancelling this does NOT cancel the parent
+    /// (the asymmetry `child_token()` guarantees), so a sub-turn timeout can never
+    /// abort the L0 turn that spawned it.
+    pub cancel: CancellationToken,
+    /// Upstream sink for `ResponseChunk::ToolApprovalRequest`. `DelegateTool::execute`
+    /// wires a sub-turn-local `(sub_tx, sub_rx)` here and spawns a forwarder that
+    /// relays ONLY approval requests to the parent's real `approval_tx`; sub-agent
+    /// `Text`/`ToolResult` are still discarded (never surfaced to the user).
+    pub approval_tx: mpsc::Sender<ResponseChunk>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -283,6 +298,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         tools,
         session_id,
         model_tier,
+        approval_gate,
+        cancel,
+        approval_tx,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -327,24 +345,24 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let mut msgs = messages;
     let mut guard = tool_call::LoopGuard::new();
     let mut tool_call_log: Vec<serde_json::Value> = Vec::new();
-    let (tx, _rx) = tokio::sync::mpsc::channel(32); // sink — sub-agents don't stream to user
 
-    // Sub-turns run at depth > 0, which `dispatch` hard-blocks from
-    // `RiskTier::IrreversibleWrite` before either of these is ever touched — a
-    // throwaway broker/token (not threaded from the parent turn) is intentional,
-    // not a shortcut: a sub-agent must never reach the approval path at all. Phase 2
-    // rewires `tool_ctx.approval_gate`/`cancel` to the real parent-turn seam handles.
-    let sub_turn_broker = ApprovalBroker::new();
-    let sub_turn_cancel = CancellationToken::new();
-
+    // Phase 2 seam: the sub-turn no longer mints a throwaway broker/token/sink. It
+    // dispatches through the parent-threaded `approval_gate`/`cancel` and sends its
+    // approval requests up `approval_tx` — the sub-turn-local channel whose receiver
+    // `DelegateTool::execute` drains with a forwarder that relays ONLY
+    // `ToolApprovalRequest` to the real user (sub-agent `Text`/`ToolResult` stay
+    // discarded). A destructive tool a sub-agent attempts thus reaches the ONE user
+    // via the ONE session broker — the depth hard-block that previously stood in for
+    // this is gone (tool_call.rs), and the gate tests prove no bypass remains.
     let tool_ctx = ToolContext {
         db: db.clone(),
         kms,
         session_id,
         depth,
-        approval_gate: Arc::new(ApprovalBroker::new()),
-        approval_tx: tx.clone(),
-        cancel: sub_turn_cancel.clone(),
+        domain: Some(domain_name),
+        approval_gate: Arc::clone(&approval_gate),
+        approval_tx: approval_tx.clone(),
+        cancel: cancel.clone(),
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -372,17 +390,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 break tool_call::strip_tool_markup(&response);
             }
 
-            let (result, tool_ok) = tool_call::dispatch(
-                &tool_name,
-                args.clone(),
-                &tools,
-                &tool_ctx,
-                &tx,
-                &sub_turn_broker,
-                &sub_turn_cancel,
-            )
-            .await
-            .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
+            let (result, tool_ok) = tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx)
+                .await
+                .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
@@ -486,6 +496,8 @@ pub async fn run_turn(
         kms: kms.clone(),
         session_id: req.session_id,
         depth: 0,
+        // L0 has no single domain — `origin` renders as bare `"L0"`.
+        domain: None,
         // Real L0 broker-as-gate/tx/cancel — `ApprovalBroker` also implements
         // `ApprovalGate` (approval.rs), so this is the SAME broker `dispatch` below
         // consults, not a parallel authorization path.
@@ -564,7 +576,7 @@ pub async fn run_turn(
                 }
 
                 let (result, tool_ok) =
-                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &tx, broker, cancel)
+                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx)
                         .await
                         .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
@@ -995,6 +1007,7 @@ mod sub_turn_tests {
     }
 
     fn base_req(task: String, db: Arc<DbHandle>, kms: Arc<KmsHandle>, llm: Arc<LlmRouter>) -> SubTurnRequest {
+        let (approval_tx, _rx) = mpsc::channel(8);
         SubTurnRequest {
             task,
             system_prompt: "You are a test sub-agent.",
@@ -1006,6 +1019,9 @@ mod sub_turn_tests {
             tools: Arc::new(ToolRegistry::new()),
             session_id: uuid::Uuid::new_v4(),
             model_tier: None,
+            approval_gate: Arc::new(ApprovalBroker::new()),
+            cancel: CancellationToken::new(),
+            approval_tx,
         }
     }
 
@@ -1234,6 +1250,7 @@ mod outcome_tests {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(AlwaysSucceedsTool));
 
+        let (approval_tx, _rx) = mpsc::channel(8);
         let req = SubTurnRequest {
             task: "do the thing".to_string(),
             system_prompt: "test",
@@ -1245,6 +1262,9 @@ mod outcome_tests {
             tools: Arc::new(tools),
             session_id,
             model_tier: None,
+            approval_gate: Arc::new(ApprovalBroker::new()),
+            cancel: CancellationToken::new(),
+            approval_tx,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1260,6 +1280,7 @@ mod outcome_tests {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(AlwaysFailsTool));
 
+        let (approval_tx, _rx) = mpsc::channel(8);
         let req = SubTurnRequest {
             task: "do the thing".to_string(),
             system_prompt: "test",
@@ -1271,6 +1292,9 @@ mod outcome_tests {
             tools: Arc::new(tools),
             session_id,
             model_tier: None,
+            approval_gate: Arc::new(ApprovalBroker::new()),
+            cancel: CancellationToken::new(),
+            approval_tx,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1321,6 +1345,7 @@ mod outcome_tests {
         tools.register(Arc::new(AlwaysFailsTool));
         tools.register(Arc::new(AlwaysSucceedsTool));
 
+        let (approval_tx, _rx) = mpsc::channel(8);
         let req = SubTurnRequest {
             task: "do the thing".to_string(),
             system_prompt: "test",
@@ -1332,6 +1357,9 @@ mod outcome_tests {
             tools: Arc::new(tools),
             session_id,
             model_tier: None,
+            approval_gate: Arc::new(ApprovalBroker::new()),
+            cancel: CancellationToken::new(),
+            approval_tx,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 

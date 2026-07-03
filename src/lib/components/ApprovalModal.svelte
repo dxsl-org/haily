@@ -27,6 +27,9 @@
   <div class="modal" role="alertdialog" aria-modal="true" aria-label="Yêu cầu phê duyệt công cụ">
     <h2>⚙️ Yêu cầu phê duyệt</h2>
     <p class="tool-name"><code>{pending.tool}</code></p>
+    {#if pending.origin}
+      <p class="origin">Yêu cầu bởi: <code>{pending.origin}</code></p>
+    {/if}
     <pre class="args">{pending.args}</pre>
     <div class="actions">
       <button class="deny" onclick={() => decide(false)} disabled={resolving}>❌ Không</button>
@@ -67,6 +70,16 @@
     color: #c084fc;
     font-size: 13px;
     margin-bottom: 8px;
+  }
+
+  .origin {
+    color: #8a86ac;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+
+  .origin code {
+    color: #a8a4c8;
   }
 
   .args {

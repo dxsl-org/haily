@@ -55,6 +55,7 @@
           approvalId: chunk.data.approval_id,
           tool: chunk.data.tool,
           args: chunk.data.args,
+          origin: chunk.data.origin,
         };
         return;
       }

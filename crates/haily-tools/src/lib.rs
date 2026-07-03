@@ -17,16 +17,26 @@ pub struct ToolContext {
     /// Agent nesting depth: 0 = L0 orchestrator, 1 = L1 domain agent, 2 = L2 specialist.
     /// Delegate tools check this to enforce max depth and prevent infinite recursion.
     pub depth: u8,
+    /// Static domain label of the (sub-)agent this context runs in, e.g.
+    /// `Some("developer")` for an L1 developer sub-turn. `None` at L0 (the root
+    /// orchestrator has no single domain). Used SERVER-SIDE only to build the
+    /// display-only `origin` on an approval request (`L{depth}:{domain}`) — never an
+    /// auth input, and never sourced from LLM/task text.
+    pub domain: Option<&'static str>,
     /// Seam handle for raising a tool approval from wherever this `ToolContext` is
-    /// used (L0 today; sub-turns in phase 2) without `haily-tools` depending on
-    /// `haily-core` — the trait lives in the leaf `haily-types` crate.
+    /// used (L0 or a sub-turn) without `haily-tools` depending on `haily-core` — the
+    /// trait lives in the leaf `haily-types` crate. At L0 this is the real
+    /// `ApprovalBroker`; at a sub-turn it is the SAME broker threaded down, so an
+    /// approval reaches the one user via the one session broker at any depth.
     pub approval_gate: Arc<dyn ApprovalGate>,
-    /// Channel to send `ResponseChunk::ToolApprovalRequest` (and other tool-visible
-    /// chunks) upstream. Phase 1 wires this at each `ToolContext` construction site;
-    /// dispatch itself still takes its own `tx` param this phase (seam not yet open).
+    /// Channel `dispatch` sends `ResponseChunk::ToolApprovalRequest`/`ToolResult` up.
+    /// At L0 this is the turn's real response stream; at a sub-turn it is a local
+    /// channel whose receiver a forwarder drains, relaying ONLY approval requests to
+    /// the parent (sub-agent narration stays discarded).
     pub approval_tx: tokio::sync::mpsc::Sender<haily_types::ResponseChunk>,
-    /// This turn's cancellation token — fired on shutdown so a pending approval
-    /// raised through the seam never blocks the drain.
+    /// This (sub-)turn's cancellation token — fired on shutdown so a pending approval
+    /// raised through the seam never blocks the drain. At a sub-turn this is a
+    /// `child_token()` of the parent's, so a sub-turn timeout cancels only itself.
     pub cancel: CancellationToken,
 }
 

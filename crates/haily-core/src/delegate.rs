@@ -11,6 +11,7 @@ use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::{LlmRouter, Tier};
 use haily_tools::{RiskTier, Tool, ToolContext, ToolRegistry};
+use haily_types::ResponseChunk;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -128,33 +129,132 @@ impl Tool for DelegateTool {
         // router instead of one frozen at `DelegateTool` construction time.
         let llm = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
 
-        let result = tokio::time::timeout(
+        // Phase 2 seam wiring:
+        //  - `sub_tx`/`sub_rx`: the sub-turn's local response channel. The forwarder
+        //    below drains `sub_rx` and relays ONLY `ToolApprovalRequest` upstream to
+        //    the parent's real `ctx.approval_tx` — sub-agent `Text`/`ToolResult` are
+        //    discarded (never surfaced as narration to the user).
+        //  - `child`: a `child_token()` of the parent turn's cancel. Cancelling the
+        //    parent cancels this sub-turn; a sub-turn timeout cancels ONLY this child,
+        //    never the parent (the `child_token()` asymmetry).
+        //  - `pause_tx`/`pause_rx`: the M3 clock-pause pulse. Each time the forwarder
+        //    relays an approval request (a human-wait begins), it pulses; the timeout
+        //    loop below re-arms a fresh `SUB_TURN_TIMEOUT_SECS` window on each pulse, so
+        //    the wall-clock spent waiting for a human decision is excluded from the
+        //    sub-turn compute budget.
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let child = ctx.cancel.child_token();
+        let (pause_tx, mut pause_rx) = tokio::sync::mpsc::channel::<()>(8);
+
+        let forwarder = tokio::spawn(approval_forwarder(sub_rx, ctx.approval_tx.clone(), pause_tx));
+
+        let sub_turn = crate::agent::run_sub_turn(crate::agent::SubTurnRequest {
+            task: full_task,
+            system_prompt: self.system_prompt,
+            domain_name: self.domain_name,
+            depth: ctx.depth + 1,
+            db: Arc::clone(&self.db),
+            kms: Arc::clone(&self.kms),
+            llm,
+            tools: Arc::clone(&self.sub_registry),
+            session_id: ctx.session_id,
+            model_tier: self.model_tier,
+            approval_gate: Arc::clone(&ctx.approval_gate),
+            cancel: child.clone(),
+            approval_tx: sub_tx,
+        });
+
+        let result = run_with_pausable_timeout(
             Duration::from_secs(SUB_TURN_TIMEOUT_SECS),
-            crate::agent::run_sub_turn(crate::agent::SubTurnRequest {
-                task: full_task,
-                system_prompt: self.system_prompt,
-                domain_name: self.domain_name,
-                depth: ctx.depth + 1,
-                db: Arc::clone(&self.db),
-                kms: Arc::clone(&self.kms),
-                llm,
-                tools: Arc::clone(&self.sub_registry),
-                session_id: ctx.session_id,
-                model_tier: self.model_tier,
-            }),
+            sub_turn,
+            &mut pause_rx,
         )
         .await;
 
-        match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => {
+        let outcome = match result {
+            Some(Ok(response)) => Ok(response),
+            Some(Err(e)) => {
                 tracing::warn!(domain = self.domain_name, error = %e, "sub-agent failed");
                 Ok(format!("Không thể hoàn thành yêu cầu lúc này: {e:#}"))
             }
-            Err(_elapsed) => {
+            None => {
+                // Elapse: cancel ONLY the child token (never the parent turn), which
+                // unblocks any sub-turn await and closes `sub_tx`, letting the forwarder
+                // drain to completion below.
+                child.cancel();
                 tracing::warn!(domain = self.domain_name, timeout_secs = SUB_TURN_TIMEOUT_SECS, "sub-agent timed out");
                 Ok("Agent mất quá nhiều thời gian — tôi sẽ cố gắng trả lời trực tiếp.".into())
             }
+        };
+
+        // INVARIANT (mirrors dispatch.rs's delivery-forwarder rule): the forwarder MUST
+        // be joined on EVERY exit path — success, sub-turn error, and timeout-elapse —
+        // or a leaked task could relay a stale approval into a later turn. `sub_tx` is
+        // dropped when `run_sub_turn` returns (or `child.cancel()` above unblocks it),
+        // so `sub_rx.recv()` yields `None` and the forwarder terminates; this await
+        // just confirms it has.
+        let _ = forwarder.await;
+        outcome
+    }
+}
+
+/// Drain a sub-turn's response channel, relaying ONLY `ToolApprovalRequest` chunks
+/// upstream to the parent's real `parent_tx` — sub-agent `Text`/`ToolResult`/`Complete`
+/// narration is discarded (never surfaced to the user). Each relayed approval pulses
+/// `pause_tx` to signal the M3 clock-pause (a human-wait is starting).
+///
+/// Terminates when `sub_rx` closes (the sub-turn dropped its `sub_tx`) or the parent
+/// stream is gone. Must be joined by the caller on every exit path so a leaked task
+/// cannot relay a stale approval into a later turn.
+async fn approval_forwarder(
+    mut sub_rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
+    parent_tx: tokio::sync::mpsc::Sender<ResponseChunk>,
+    pause_tx: tokio::sync::mpsc::Sender<()>,
+) {
+    while let Some(chunk) = sub_rx.recv().await {
+        if matches!(chunk, ResponseChunk::ToolApprovalRequest { .. }) {
+            // Best-effort pulse: a full channel just means one is already queued.
+            let _ = pause_tx.try_send(());
+            // Relay to the real user. If the parent stream is gone, stop relaying but
+            // keep draining so the sub-turn is never wedged on a full channel.
+            if parent_tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+        // Non-approval chunks are discarded.
+    }
+}
+
+/// Run `fut` under a wall-clock `timeout` that PAUSES across a human-wait (M3).
+///
+/// Instead of a flat `tokio::time::timeout`, this races `fut` against a sleep that
+/// RE-ARMS to a fresh `timeout` window every time a pulse arrives on `pause_rx`. The
+/// forwarder pulses `pause_rx` whenever it relays a nested `ToolApprovalRequest`, so
+/// the time a sub-turn spends blocked in `broker.request` (waiting for the user) is
+/// excluded from its compute budget: a 90s nested approval on a 60s-elapsed sub-turn
+/// does NOT trip a 120s limit.
+///
+/// Returns `Some(fut_output)` on completion, or `None` on a genuine compute timeout
+/// (the deadline elapsed with no pending approval). `biased` select prefers the
+/// future's completion and the pause pulse over the sleep, so a just-resolved approval
+/// cannot lose a race to a simultaneously-firing stale deadline.
+async fn run_with_pausable_timeout<F>(
+    timeout: Duration,
+    fut: F,
+    pause_rx: &mut tokio::sync::mpsc::Receiver<()>,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(fut);
+    loop {
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+        tokio::select! {
+            biased;
+            res = &mut fut => break Some(res),
+            Some(()) = pause_rx.recv() => continue, // human-wait began — arm a fresh window
+            _ = &mut sleep => break None,            // genuine compute timeout
         }
     }
 }
@@ -289,6 +389,7 @@ mod reload_propagation_tests {
             kms: Arc::clone(&kms),
             session_id: Uuid::new_v4(),
             depth: 0,
+            domain: None,
             approval_gate: Arc::new(crate::approval::ApprovalBroker::new()),
             approval_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -311,5 +412,148 @@ mod reload_propagation_tests {
             after.contains("model-after-reload"),
             "expected the sub-turn to use the RELOADED model, got: {after} — DelegateTool is still reading a frozen router"
         );
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    //! Phase 2 — the sub-agent approval seam: the forwarder (relay-only + join), the
+    //! `child_token()` asymmetry, and the M3 pausable-timeout clock. These exercise
+    //! the SAME `approval_forwarder`/`run_with_pausable_timeout` functions
+    //! `DelegateTool::execute` calls (not copies), so a regression there fails here.
+    use super::*;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    /// The forwarder relays ONLY `ToolApprovalRequest` upstream; sub-agent
+    /// `Text`/`ToolResult`/`Complete` narration is discarded and never reaches the
+    /// parent tx (guards the narration-leak hazard).
+    #[tokio::test]
+    async fn forwarder_relays_only_approval_requests() {
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let (parent_tx, mut parent_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let (pause_tx, _pause_rx) = tokio::sync::mpsc::channel::<()>(8);
+
+        let forwarder = tokio::spawn(approval_forwarder(sub_rx, parent_tx, pause_tx));
+
+        // Interleave sub-agent narration with a single real approval request.
+        sub_tx.send(ResponseChunk::Text("thinking...".into())).await.unwrap();
+        sub_tx.send(ResponseChunk::ToolResult { name: "note_save".into(), ok: true }).await.unwrap();
+        let approval_id = Uuid::new_v4();
+        sub_tx
+            .send(ResponseChunk::ToolApprovalRequest {
+                tool: "delete_thing".into(),
+                args: "{}".into(),
+                approval_id,
+                origin: Some("L1:developer".into()),
+            })
+            .await
+            .unwrap();
+        sub_tx.send(ResponseChunk::Complete).await.unwrap();
+        drop(sub_tx); // close the channel so the forwarder terminates
+
+        forwarder.await.unwrap();
+
+        // Exactly ONE chunk reached the parent — the approval request — and nothing else.
+        let relayed = parent_rx.recv().await.expect("the approval request must be relayed");
+        match relayed {
+            ResponseChunk::ToolApprovalRequest { approval_id: got, origin, .. } => {
+                assert_eq!(got, approval_id);
+                assert_eq!(origin.as_deref(), Some("L1:developer"));
+            }
+            other => panic!("expected the approval request, got {other:?}"),
+        }
+        assert!(
+            parent_rx.recv().await.is_none(),
+            "no sub-agent Text/ToolResult/Complete narration may leak to the parent"
+        );
+    }
+
+    /// The forwarder task terminates (is joinable) once the sub-turn drops its `sub_tx`
+    /// — i.e. it does not leak on the timeout path where `child.cancel()` unblocks the
+    /// sub-turn and drops the sender (guards the round-2 forwarder-race hazard).
+    #[tokio::test]
+    async fn forwarder_joined_on_timeout_path() {
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let (parent_tx, _parent_rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let (pause_tx, _pause_rx) = tokio::sync::mpsc::channel::<()>(8);
+
+        let forwarder = tokio::spawn(approval_forwarder(sub_rx, parent_tx, pause_tx));
+
+        // Simulate the timeout-elapse path: the sub-turn is dropped (its `sub_tx` goes
+        // away) without the channel ever being explicitly closed by a graceful return.
+        drop(sub_tx);
+
+        // The forwarder must terminate promptly, proving the join in `execute` cannot
+        // hang and the task is not leaked.
+        tokio::time::timeout(Duration::from_secs(2), forwarder)
+            .await
+            .expect("forwarder must terminate when sub_tx is dropped, not leak")
+            .expect("forwarder task panicked");
+    }
+
+    /// A child-token cancellation (a sub-turn timeout) cancels ONLY the child; the
+    /// parent (L0) token stays live — a sub-turn timeout must never abort the whole
+    /// turn (the `child_token()` asymmetry).
+    #[tokio::test]
+    async fn child_token_timeout_does_not_cancel_parent() {
+        let parent = CancellationToken::new();
+        let l1 = parent.child_token();
+        let l2 = l1.child_token();
+
+        // An L2 timeout cancels only the L2 child.
+        l2.cancel();
+        assert!(l2.is_cancelled(), "the child being timed out must be cancelled");
+        assert!(!l1.is_cancelled(), "the intermediate parent must stay live");
+        assert!(!parent.is_cancelled(), "the L0 parent token must stay live after a sub-turn timeout");
+
+        // Conversely, cancelling the parent DOES propagate down (shutdown drains all).
+        parent.cancel();
+        assert!(l1.is_cancelled(), "parent cancel must propagate to the child");
+    }
+
+    /// M3: the sub-turn clock is PAUSED across a human-wait. With a short 100ms budget
+    /// and a "compute" future that would take ~400ms, a flat timeout would fire; but
+    /// pausing (a pulse every 30ms while the wait is in progress) re-arms the window so
+    /// the future completes. Tests the APPROVAL_TIMEOUT < T < SUB_TURN window shape at
+    /// small scale (real 120s coincidence is untestable in a unit test).
+    #[tokio::test]
+    async fn sub_turn_clock_paused_across_broker_wait() {
+        let (pause_tx, mut pause_rx) = tokio::sync::mpsc::channel::<()>(8);
+
+        // A future modelling a sub-turn that is BLOCKED in a nested approval for 400ms
+        // (four 100ms budgets long) while the human decides; it pulses `pause_tx` every
+        // 30ms to signal the ongoing human-wait, then completes.
+        let pulser = pause_tx.clone();
+        let work = async move {
+            for _ in 0..13 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let _ = pulser.try_send(());
+            }
+            "done"
+        };
+
+        // Budget shorter than the work — WITHOUT the pause this would elapse to None.
+        let out = run_with_pausable_timeout(Duration::from_millis(100), work, &mut pause_rx).await;
+        assert_eq!(
+            out,
+            Some("done"),
+            "a paused (approval-pending) sub-turn must NOT trip its compute timeout"
+        );
+    }
+
+    /// Control for the M3 test: with NO pulses, the same short budget DOES elapse to a
+    /// genuine timeout — proving the pause is what saved the test above, not a loose
+    /// budget.
+    #[tokio::test]
+    async fn unpaused_clock_still_times_out() {
+        let (_pause_tx, mut pause_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            "done"
+        };
+        let out = run_with_pausable_timeout(Duration::from_millis(100), work, &mut pause_rx).await;
+        assert_eq!(out, None, "a compute-bound sub-turn with no human-wait must still time out");
     }
 }

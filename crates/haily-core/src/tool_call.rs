@@ -1,11 +1,8 @@
 /// Tool call parsing, loop-guard, and dispatch.
-use crate::approval::ApprovalBroker;
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
 use haily_types::ResponseChunk;
 use haily_tools::{RiskTier, ToolContext, ToolRegistry};
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -130,20 +127,21 @@ fn find_matching_close(text: &str, open: &TagMatch) -> Option<TagMatch> {
 /// can terminate the turn — feeding a guard error back here would let a looping
 /// model spin. Dispatch therefore no longer owns the guard.
 ///
-/// `broker`/`cancel` gate `RiskTier::IrreversibleWrite` tools: `ctx.session_id` is the
-/// turn's session, `cancel` is the turn's cancellation token (fired on shutdown so a
-/// pending approval never blocks the drain). Sub-agents (`ctx.depth > 0`) are hard-
-/// blocked from this tier entirely, before the broker is ever consulted — a
-/// sub-agent runs headless with a sink channel and no user to ask. (This hard block
-/// is removed in phase 2 once the sub-agent approval seam opens — see plan.md.)
+/// `RiskTier::IrreversibleWrite` tools are gated through the seam handles carried on
+/// `ctx` (phase 2): `ctx.approval_gate` (the SAME session `ApprovalBroker` at every
+/// depth), `ctx.approval_tx` (upstream sink — at a sub-turn this is the forwarder
+/// that relays the request to the real user), `ctx.cancel` (fired on shutdown so a
+/// pending approval never blocks the drain), and `ctx.session_id` (the sole auth
+/// boundary). An IrreversibleWrite at ANY depth routes to the ONE user via the ONE
+/// broker — the previous depth>0 hard-block is gone; the gate-bypass tests
+/// (`no_irreversible_write_executes_without_broker_resolution`,
+/// `irreversible_write_at_depth_routes_through_session_broker`) prove the replacement
+/// is equivalent-or-stronger.
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
     registry: &ToolRegistry,
     ctx: &ToolContext,
-    tx: &mpsc::Sender<ResponseChunk>,
-    broker: &ApprovalBroker,
-    cancel: &CancellationToken,
 ) -> Result<(String, bool)> {
     let tool = registry
         .get(tool_name)
@@ -154,31 +152,31 @@ pub async fn dispatch(
             bail!("tool '{tool_name}' is blocked");
         }
         RiskTier::IrreversibleWrite => {
-            // Sub-agents (depth > 0) run in a headless context with a sink channel.
-            // Approval requests would be silently dropped, so block them entirely.
-            if ctx.depth > 0 {
-                bail!("tool '{tool_name}' requires user approval and cannot run inside a sub-agent");
-            }
             // Pre-validated allowlist (destructive/exfil tools can never be listed —
             // enforced at startup, not here) lets specific low-risk IrreversibleWrite
             // tools skip the interactive prompt. Every bypass is logged at warn: it
             // is a deliberate, auditable trust decision, not silent.
-            if broker.is_auto_approved(tool_name) {
+            if ctx.approval_gate.is_auto_approved(tool_name) {
                 warn!(tool = tool_name, "tool call auto-approved via config allowlist");
             } else {
                 let approval_id = Uuid::new_v4();
-                let _ = tx
+                let _ = ctx
+                    .approval_tx
                     .send(ResponseChunk::ToolApprovalRequest {
                         tool: tool_name.to_string(),
                         args: args.to_string(),
                         approval_id,
+                        // Server-derived "who is asking" — from `ctx.depth` + the static
+                        // domain name, NEVER from LLM/task text, so a compromised
+                        // sub-agent cannot forge `L0`. Display-only (see `ResponseChunk`).
+                        origin: Some(approval_origin(ctx.depth, ctx.domain)),
                     })
                     .await;
 
-                let approved = broker.request(approval_id, ctx.session_id, cancel).await;
+                let approved = ctx.approval_gate.request(approval_id, ctx.session_id, &ctx.cancel).await;
                 if !approved {
                     info!(tool = tool_name, %approval_id, "tool call denied (declined, timed out, or cancelled)");
-                    let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
+                    let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
                     return Ok(("Người dùng đã từ chối yêu cầu này.".to_string(), false));
                 }
             }
@@ -189,12 +187,12 @@ pub async fn dispatch(
     info!(tool = tool_name, "executing tool");
     let (result, ok) = match tool.execute(args, ctx).await {
         Ok(output) => {
-            let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: true }).await;
+            let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: true }).await;
             (output, true)
         }
         Err(e) => {
             warn!(tool = tool_name, error = %e, "tool failed");
-            let _ = tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
+            let _ = ctx.approval_tx.send(ResponseChunk::ToolResult { name: tool_name.to_string(), ok: false }).await;
             (format!("Tool error: {e:#}"), false)
         }
     };
@@ -202,9 +200,27 @@ pub async fn dispatch(
     Ok((result, ok))
 }
 
+/// Build the display-only `origin` label for a `ToolApprovalRequest`, derived SERVER-
+/// SIDE from the nesting depth and the static domain of the (sub-)agent. Depth 0 =
+/// `"L0"` (the root orchestrator asking on the user's behalf); depth>0 =
+/// `"L{depth}:{domain}"` (a sub-agent, e.g. `"L1:developer"`), or bare `"L{depth}"`
+/// if no domain is set. This label is for the approval UI's "who is asking" line only
+/// — it is NEVER an authorization input, and is never sourced from LLM output or task
+/// text, so a compromised sub-agent cannot forge `L0`/`System`.
+fn approval_origin(depth: u8, domain: Option<&str>) -> String {
+    match (depth, domain) {
+        (0, _) => "L0".to_string(),
+        (d, Some(name)) => format!("L{d}:{name}"),
+        (d, None) => format!("L{d}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalBroker;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn strip_tool_tags_removes_tags_but_keeps_content() {
@@ -361,34 +377,42 @@ mod tests {
         }
     }
 
-    async fn test_tool_ctx() -> (ToolContext, tempfile::TempDir) {
+    /// Build a `ToolContext` whose seam handles (`approval_gate`, `approval_tx`,
+    /// `cancel`) are the SAME `broker`/`rx`/`cancel` the test controls — so a test can
+    /// drive an approval decision (via the returned broker+rx) exactly the way an
+    /// adapter's resolver would, at any `depth`. This is the phase-2 shape: dispatch
+    /// gates through `ctx`, so the test must inject through `ctx` too.
+    async fn test_ctx(
+        depth: u8,
+        broker: std::sync::Arc<ApprovalBroker>,
+        cancel: CancellationToken,
+    ) -> (ToolContext, mpsc::Receiver<ResponseChunk>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = std::sync::Arc::new(haily_db::DbHandle::init(&db_path).await.unwrap());
         let kms = std::sync::Arc::new(haily_kms::KmsHandle::init((*db).clone(), dir.path()).await.unwrap());
-        let (approval_tx, _rx) = mpsc::channel(8);
+        let (approval_tx, rx) = mpsc::channel(8);
         let ctx = ToolContext {
             db,
             kms,
             session_id: Uuid::new_v4(),
-            depth: 0,
-            approval_gate: std::sync::Arc::new(ApprovalBroker::new()),
+            depth,
+            domain: if depth == 0 { None } else { Some("developer") },
+            approval_gate: broker as std::sync::Arc<dyn haily_types::ApprovalGate>,
             approval_tx,
-            cancel: CancellationToken::new(),
+            cancel,
         };
-        (ctx, dir)
+        (ctx, rx, dir)
     }
 
     #[tokio::test]
     async fn dispatch_marks_legit_text_starting_with_error_prefix_as_ok() {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(LiteralErrorPrefixTool));
-        let (ctx, _dir) = test_tool_ctx().await;
-        let (tx, _rx) = mpsc::channel(8);
-        let broker = ApprovalBroker::new();
-        let cancel = CancellationToken::new();
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
 
-        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+        let (text, ok) = dispatch("literal_error_prefix", serde_json::json!({}), &registry, &ctx)
             .await
             .unwrap();
 
@@ -400,12 +424,10 @@ mod tests {
     async fn dispatch_marks_actual_tool_failure_as_not_ok() {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(FailingTool));
-        let (ctx, _dir) = test_tool_ctx().await;
-        let (tx, _rx) = mpsc::channel(8);
-        let broker = ApprovalBroker::new();
-        let cancel = CancellationToken::new();
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
 
-        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+        let (text, ok) = dispatch("failing_tool", serde_json::json!({}), &registry, &ctx)
             .await
             .unwrap();
 
@@ -430,14 +452,28 @@ mod tests {
         }
     }
 
+    /// A tool that records into a shared flag whether `execute` was ever reached — the
+    /// gate tests assert the destructive body NEVER runs without a resolved approval.
+    struct ExecObserverTool(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl Tool for ExecObserverTool {
+        fn name(&self) -> &str { "delete_thing" }
+        fn description(&self) -> &str { "records whether execute was reached" }
+        fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier { RiskTier::IrreversibleWrite }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("deleted".to_string())
+        }
+    }
+
     #[tokio::test]
     async fn deny_blocks_execution_and_returns_decline_text() {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(RequireApprovalTool));
-        let (ctx, _dir) = test_tool_ctx().await;
-        let (tx, mut rx) = mpsc::channel(8);
         let broker = std::sync::Arc::new(ApprovalBroker::new());
-        let cancel = CancellationToken::new();
+        let (ctx, mut rx, _dir) = test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         // Drain the ToolApprovalRequest chunk and deny it via the broker, mirroring
         // what an adapter's resolver would do.
@@ -453,7 +489,7 @@ mod tests {
             }
         });
 
-        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
             .await
             .unwrap();
 
@@ -466,10 +502,8 @@ mod tests {
     async fn approve_executes_tool_exactly_once() {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(RequireApprovalTool));
-        let (ctx, _dir) = test_tool_ctx().await;
-        let (tx, mut rx) = mpsc::channel(8);
         let broker = std::sync::Arc::new(ApprovalBroker::new());
-        let cancel = CancellationToken::new();
+        let (ctx, mut rx, _dir) = test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         let broker_clone = std::sync::Arc::clone(&broker);
         let session_id = ctx.session_id;
@@ -483,7 +517,7 @@ mod tests {
             }
         });
 
-        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel)
+        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
             .await
             .unwrap();
 
@@ -496,15 +530,15 @@ mod tests {
     async fn cancellation_during_pending_approval_denies_without_executing() {
         let mut registry = ToolRegistry::new();
         registry.register(std::sync::Arc::new(RequireApprovalTool));
-        let (ctx, _dir) = test_tool_ctx().await;
-        let (tx, _rx) = mpsc::channel(8); // never drained/resolved — only cancellation can end this
-        let broker = ApprovalBroker::new();
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
         cancel.cancel(); // simulates shutdown firing before/while the approval is pending
+        // never drained/resolved — only cancellation can end this
+        let (ctx, _rx, _dir) = test_ctx(0, broker, cancel).await;
 
         let (text, ok) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel),
+            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
         )
         .await
         .expect("cancellation must deny promptly, not hang toward the 120s timeout")
@@ -514,17 +548,124 @@ mod tests {
         assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
     }
 
-    #[tokio::test]
-    async fn depth_greater_than_zero_still_hard_blocks_before_the_broker() {
-        let mut registry = ToolRegistry::new();
-        registry.register(std::sync::Arc::new(RequireApprovalTool));
-        let (mut ctx, _dir) = test_tool_ctx().await;
-        ctx.depth = 1;
-        let (tx, _rx) = mpsc::channel(8);
-        let broker = ApprovalBroker::new();
-        let cancel = CancellationToken::new();
+    // -----------------------------------------------------------------------
+    // Phase 2 — sub-agent approval seam (the depth hard-block is GONE; an
+    // IrreversibleWrite at depth>0 must route through the SAME session broker).
+    // These gate tests are the mandatory replacement for the removed hard-block
+    // (memory 2026-06-21 sub-agent-gate-bypass CRITICAL).
+    // -----------------------------------------------------------------------
 
-        let result = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx, &tx, &broker, &cancel).await;
-        assert!(result.is_err(), "sub-agent depth>0 must bail before ever consulting the broker");
+    /// GATE TEST: a depth=1 IrreversibleWrite emits an approval request and awaits the
+    /// SAME broker; a deny → ok=false and the tool never executes. Replaces the
+    /// depth-block with route-through-shared-broker.
+    #[tokio::test]
+    async fn irreversible_write_at_depth_routes_through_session_broker() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(1, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
+
+        let broker_clone = std::sync::Arc::clone(&broker);
+        let session_id = ctx.session_id;
+        let saw_origin = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saw_origin_c = std::sync::Arc::clone(&saw_origin);
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, origin, .. } = chunk {
+                    *saw_origin_c.lock().unwrap() = origin;
+                    use haily_types::ApprovalResolver;
+                    broker_clone.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch("delete_thing", serde_json::json!({}), &registry, &ctx)
+            .await
+            .unwrap();
+
+        responder.await.unwrap();
+        assert!(!ok, "a sub-agent's denied IrreversibleWrite must report ok=false");
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst), "the tool body must NOT have executed on deny");
+        // origin is server-derived from depth+domain, never forgeable upward.
+        assert_eq!(saw_origin.lock().unwrap().as_deref(), Some("L1:developer"));
+    }
+
+    /// GATE TEST (memory 2026-06-21): the destructive `execute` is unreachable at
+    /// depth>0 until the broker resolves TRUE — proven even when the request goes
+    /// nowhere (rx dropped = a sink tx) and the broker is never resolved: the
+    /// APPROVAL_TIMEOUT/cancel path must deny, never execute.
+    #[tokio::test]
+    async fn no_irreversible_write_executes_without_broker_resolution() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        // Pre-cancel to stand in for "no user ever answers" without waiting out 120s —
+        // the request is emitted into a tx whose receiver we immediately drop (sink).
+        cancel.cancel();
+        let (ctx, rx, _dir) = test_ctx(1, broker, cancel).await;
+        drop(rx); // sink: the approval request has nowhere to go and is never resolved
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
+        )
+        .await
+        .expect("must deny promptly via cancel, not hang toward the 120s timeout")
+        .unwrap();
+
+        assert!(!ok);
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "execute must be UNREACHABLE at depth>0 before the broker resolves true — even with a sink tx"
+        );
+    }
+
+    /// GATE TEST: a nested resolve() with the WRONG session_id is rejected and does
+    /// not unblock the pending approval — the `session_id` auth boundary holds at
+    /// depth>0 exactly as it does at L0.
+    #[tokio::test]
+    async fn forged_session_id_still_rejected_at_depth() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(ExecObserverTool(std::sync::Arc::clone(&executed))));
+        let broker = std::sync::Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (ctx, mut rx, _dir) = test_ctx(1, std::sync::Arc::clone(&broker), cancel.clone()).await;
+
+        let broker_clone = std::sync::Arc::clone(&broker);
+        let cancel_c = cancel.clone();
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    // A foreign session tries to approve — must be rejected.
+                    let forged = broker_clone.resolve(approval_id, Uuid::new_v4(), true);
+                    assert!(!forged, "a forged session_id must NOT resolve the pending approval");
+                    // The forged attempt left the pending intact; end the wait via cancel
+                    // (deny), proving the tool never ran off a foreign approval.
+                    cancel_c.cancel();
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch("delete_thing", serde_json::json!({}), &registry, &ctx),
+        )
+        .await
+        .expect("must resolve via the cancel deny, not hang")
+        .unwrap();
+
+        responder.await.unwrap();
+        assert!(!ok, "a forged approval must not let the tool run");
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst), "forged approval must not reach execute");
     }
 }

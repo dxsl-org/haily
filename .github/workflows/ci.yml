@@ -69,6 +69,12 @@ jobs:
       # loader must stay compilable with the llama feature off.
       - name: Clippy (haily-app, no default features)
         run: cargo clippy -p haily-app --no-default-features --all-targets -- -D warnings
+      # The `telegram` adapter is feature-gated, so a workspace build with default
+      # features never compiles it — a `ResponseChunk` field change (e.g. the M8
+      # `origin` field) could break the telegram destructure silently. Build with the
+      # feature on so that path stays green.
+      - name: Build (telegram feature)
+        run: cargo build -p haily-cli --features telegram
       - name: Test
         run: cargo test --workspace
 

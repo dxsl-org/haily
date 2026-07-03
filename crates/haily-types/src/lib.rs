@@ -26,6 +26,14 @@ pub enum ResponseChunk {
         tool: String,
         args: String,
         approval_id: Uuid,
+        /// Server-derived "who is asking" label (e.g. `"L0"`, `"L1:developer"`),
+        /// display-only. NEVER an auth input — `session_id` is the sole approval
+        /// boundary; `origin` is derived from `ctx.depth` + a static domain name in
+        /// `tool_call::dispatch`, never from LLM/task text. `#[serde(default)]` keeps
+        /// this ADDITIVE: a pre-`origin` payload (no field) still deserializes to
+        /// `None`, so the wire envelope is not a breaking change (M8).
+        #[serde(default)]
+        origin: Option<String>,
     },
     ToolResult {
         name: String,
@@ -101,6 +109,16 @@ pub trait ApprovalGate: Send + Sync {
     /// approved before `cancel` fires or the implementation's own timeout elapses —
     /// callers must treat cancellation and timeout identically to an explicit deny.
     async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool;
+
+    /// Whether `tool_name` is on the pre-validated auto-approve allowlist and may skip
+    /// the interactive prompt. Exposed on the gate (not just the concrete broker) so
+    /// `dispatch` can consult it through the SAME `Arc<dyn ApprovalGate>` seam handle
+    /// it uses for `request` — at any depth. Every bypass is logged at warn by the
+    /// caller; the allowlist can never contain a destructive/exfil tool (validated at
+    /// bootstrap). Default `false`: a gate with no allowlist auto-approves nothing.
+    fn is_auto_approved(&self, _tool_name: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +131,7 @@ mod tests {
             tool: "exec".to_string(),
             args: "{}".to_string(),
             approval_id: Uuid::nil(),
+            origin: None,
         };
         let json = serde_json::to_string(&chunk).expect("serialize");
         // Frontend (src/lib/tauri.ts) depends on this exact envelope shape.
@@ -125,10 +144,54 @@ mod tests {
                 tool,
                 args,
                 approval_id,
+                origin,
             } => {
                 assert_eq!(tool, "exec");
                 assert_eq!(args, "{}");
                 assert_eq!(approval_id, Uuid::nil());
+                assert_eq!(origin, None);
+            }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    /// M8: `origin` is `Option<String>` + `#[serde(default)]`, so it is ADDITIVE —
+    /// a payload minted before the field existed (no `origin` key at all) must still
+    /// deserialize, defaulting to `None`. This is the guarantee that a persisted or
+    /// in-flight old chunk does not break after upgrade.
+    #[test]
+    fn origin_absent_payload_deserializes() {
+        // Exactly the pre-`origin` wire shape — note NO `origin` key in `data`.
+        let legacy = r#"{"type":"ToolApprovalRequest","data":{"tool":"exec","args":"{}","approval_id":"00000000-0000-0000-0000-000000000000"}}"#;
+        let chunk: ResponseChunk =
+            serde_json::from_str(legacy).expect("legacy payload without origin must deserialize");
+        match chunk {
+            ResponseChunk::ToolApprovalRequest { origin, tool, .. } => {
+                assert_eq!(tool, "exec");
+                assert_eq!(origin, None, "absent origin must default to None, not error");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// M8: a payload WITH `origin` round-trips faithfully — proves the field is a
+    /// real, serialized part of the envelope (not silently dropped) for consumers
+    /// that render the "who is asking" line.
+    #[test]
+    fn origin_roundtrips() {
+        let chunk = ResponseChunk::ToolApprovalRequest {
+            tool: "odoo_create".to_string(),
+            args: "{}".to_string(),
+            approval_id: Uuid::nil(),
+            origin: Some("L1:developer".to_string()),
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"origin\":\"L1:developer\""));
+
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::ToolApprovalRequest { origin, .. } => {
+                assert_eq!(origin, Some("L1:developer".to_string()));
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }

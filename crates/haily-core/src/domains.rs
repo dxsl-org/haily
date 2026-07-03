@@ -6,6 +6,16 @@
 ///
 /// L2 specialists are not listed here — they are registered by their parent L1 agent
 /// as additional delegate tools in the sub-registry (Phase 12 Phase B+).
+///
+// PHASE 4 (C2 deferred): connector op-names (e.g. "odoo_create", "odoo_write",
+// "odoo_search_read") must be added to the delegable domains' `allowed_tools` here so
+// sub-agents can SEE connector tools once phase 4 registers them into `base_v1`. They
+// are NOT reserved now on purpose: the `all_domain_whitelists_resolve` test (lib.rs)
+// asserts every `allowed_tools` name resolves to a REGISTERED tool via
+// `base.get(t).is_some()`, and connector tools do not exist until phase 4/5 —
+// reserving phantom names today would break that guard. Add them in the SAME phase-4
+// change that registers `HttpConnectorTool`, so the whitelist and the registry stay
+// consistent (add to at least "delegate_to_business" for CRM-in-a-box).
 pub struct DomainConfig {
     /// Tool name exposed to the L0 LLM, e.g. "delegate_to_developer".
     pub tool_name: &'static str,

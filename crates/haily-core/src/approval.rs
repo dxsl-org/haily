@@ -67,7 +67,26 @@ impl ApprovalBroker {
     /// The pending entry is always removed on exit (decision, cancel, or timeout) so
     /// a late `resolve()` call for the same id after this returns is a harmless no-op
     /// (id no longer found → `resolve()` returns `false`).
+    ///
+    /// INVARIANT (M10): at most ONE pending approval per `session_id`. Tool dispatch
+    /// is sequential within a turn (the L0 loop and each sub-turn issue one tool call
+    /// at a time), so a second live `request` for the same session can only arise from
+    /// a bug or a concurrency violation — and the frontend holds a single
+    /// `pendingApproval` slot (a second would silently overwrite the first). Rather
+    /// than register a hidden pending nobody can resolve, we reject fail-loud (log +
+    /// return `false` = deny) and DO NOT touch the existing pending entry.
     pub async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool {
+        if self.pending.iter().any(|e| e.value().0 == session_id) {
+            warn!(
+                %approval_id,
+                %session_id,
+                "approval request rejected — a pending approval already exists for this session \
+                 (M10: sequential dispatch ⇒ ≤1 pending approval/session); denying fail-loud without \
+                 overwriting the in-flight request"
+            );
+            return false;
+        }
+
         let (tx, rx) = oneshot::channel();
         self.pending.insert(approval_id, (session_id, tx));
 
@@ -94,6 +113,10 @@ impl Default for ApprovalBroker {
 impl ApprovalGate for ApprovalBroker {
     async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool {
         self.request(approval_id, session_id, cancel).await
+    }
+
+    fn is_auto_approved(&self, tool_name: &str) -> bool {
+        self.is_auto_approved(tool_name)
     }
 }
 
@@ -253,6 +276,44 @@ mod tests {
             .await
             .expect("request() should resolve once the real session approves");
         assert!(decision);
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_pending_rejected_for_session() {
+        // M10: with one approval already in flight for a session, a SECOND concurrent
+        // `request` for the same session must be denied fail-loud without disturbing
+        // the first — the frontend holds a single pending slot, so a silent second
+        // pending would either overwrite the first or become unresolvable.
+        let broker = ApprovalBroker::new();
+        let session_id = Uuid::new_v4();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+
+        let broker_ref = &broker;
+        let first_fut = broker_ref.request(first_id, session_id, &cancel);
+        tokio::pin!(first_fut);
+
+        // Drive the first request far enough to register its pending entry.
+        tokio::select! {
+            _ = &mut first_fut => panic!("first request must not resolve yet"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        // Second concurrent request for the SAME session: denied without registering.
+        let second = broker_ref.request(second_id, session_id, &cancel).await;
+        assert!(!second, "a 2nd concurrent pending for the same session must be denied");
+        assert!(
+            broker_ref.pending.get(&second_id).is_none(),
+            "the rejected 2nd request must NOT have registered a pending entry"
+        );
+
+        // The FIRST pending is untouched and still resolvable by the real session.
+        assert!(broker_ref.resolve(first_id, session_id, true), "the original pending must be intact");
+        let first = tokio::time::timeout(Duration::from_secs(2), first_fut)
+            .await
+            .expect("first request should resolve once approved");
+        assert!(first, "the first (untouched) approval resolves normally");
     }
 
     #[tokio::test]

@@ -23,7 +23,10 @@ export interface ErrorChunk {
 
 export interface ToolApprovalRequestChunk {
   type: 'ToolApprovalRequest';
-  data: { tool: string; args: string; approval_id: string };
+  // `origin` is a server-derived, display-only "who is asking" label (e.g. "L0",
+  // "L1:developer"). Optional to match `#[serde(default)]` on the Rust side — an
+  // older payload without it is still valid. NEVER an auth input.
+  data: { tool: string; args: string; approval_id: string; origin?: string | null };
 }
 
 export interface ToolResultChunk {
@@ -49,6 +52,8 @@ export interface PendingApproval {
   approvalId: string;
   tool: string;
   args: string;
+  /** Server-derived "who is asking" label (e.g. "L0", "L1:developer"), display-only. */
+  origin?: string | null;
 }
 
 /** Send a message and return the session UUID. */
