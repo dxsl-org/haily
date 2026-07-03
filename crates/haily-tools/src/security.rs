@@ -151,6 +151,218 @@ fn check_ip(ip: IpAddr, host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Addresses that are NEVER allowable, even when a manifest lists them in its pinned
+/// allowance (C3) — the cloud-metadata / link-local surface an SSRF is trying to reach.
+/// A private RFC1918 host (e.g. an on-prem ERP at 10.x) CAN be allowed via a pinned CIDR,
+/// but IMDS/link-local can NOT: allowing it would defeat the entire guard. Distinct from
+/// [`ipv4_blocked`], which also blocks ordinary private ranges the allowance may re-permit.
+fn is_never_allowable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            // Link-local 169.254.0.0/16 (covers 169.254.169.254 IMDS)
+            v4.is_link_local()
+                // Loopback (metadata is never on loopback, but never-allow it anyway)
+                || v4.is_loopback()
+                // Alibaba Cloud metadata 100.100.100.0/24 (superset of .200)
+                || v4.octets().starts_with(&[100, 100, 100])
+        }
+        IpAddr::V6(v6) => {
+            // Canonicalize an embedded V4 (mapped/compat/NAT64) and re-check as V4 —
+            // ::ffff:169.254.169.254 must be treated as the metadata IP (memory 2026-06-21).
+            let o = v6.octets();
+            let embedded = if o[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+            } else {
+                v6.to_ipv4()
+            };
+            if let Some(v4) = embedded {
+                return is_never_allowable(IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                // Link-local fe80::/10
+                || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+                // AWS IPv6 IMDS fd00:ec2::254 (and its /64 metadata prefix)
+                || o[..8] == [0xfd, 0x00, 0x0e, 0xc2, 0, 0, 0, 0]
+        }
+    }
+}
+
+/// Match `ip` against a CIDR string like `"10.0.0.0/8"` or `"93.184.216.34/32"`, or a bare
+/// IP literal (treated as a /32 or /128). Returns `false` on any parse error — an
+/// unparseable allowance entry can NEVER widen the allowance (fail-closed).
+fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
+    let (net_str, prefix) = match cidr.split_once('/') {
+        Some((n, p)) => match p.parse::<u8>() {
+            Ok(p) => (n, Some(p)),
+            Err(_) => return false,
+        },
+        None => (cidr, None),
+    };
+    let net: IpAddr = match net_str.trim().parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            let prefix = prefix.unwrap_or(32);
+            if prefix > 32 {
+                return false;
+            }
+            let mask = v4_mask(prefix);
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            let prefix = prefix.unwrap_or(128);
+            if prefix > 128 {
+                return false;
+            }
+            let mask = v6_mask(prefix);
+            (u128::from(net) & mask) == (u128::from(ip) & mask)
+        }
+        // Never match across families — an allowance is family-specific.
+        _ => false,
+    }
+}
+
+fn v4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix as u32)
+    }
+}
+
+fn v6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix as u32)
+    }
+}
+
+/// `true` when `ip` is permitted under a per-manifest allowance: it matches at least one
+/// pinned CIDR AND is not on the never-allowable metadata/link-local surface. A public IP
+/// is permitted by the default guard regardless (it doesn't need to be on the allowance).
+fn allowance_permits(ip: IpAddr, allowed_ip_cidrs: &[String]) -> bool {
+    if is_never_allowable(ip) {
+        return false;
+    }
+    allowed_ip_cidrs.iter().any(|c| cidr_contains(c, ip))
+}
+
+/// SSRF guard for a manifest-approved connector URL, honoring a per-manifest IP/CIDR
+/// allowance (C3). A resolved address is permitted when EITHER the default [`ssrf_guard`]
+/// would already permit it (a public IP) OR it matches a pinned CIDR AND is not on the
+/// never-allowable metadata/link-local surface. The allowance is the single controlled
+/// weakening — scoped to a human-approved base_url's PINNED IP/CIDR (not the hostname,
+/// which is DNS-rebindable to IMDS), re-resolved + compared here at call time.
+///
+/// Callers MUST connect to the returned `addr` (`.resolve(host, addr)`) rather than
+/// re-resolving — a second lookup could DNS-rebind to a different address than the one
+/// vetted here. [`follow_redirects_with_guard_allowance`] re-runs THIS guard (same
+/// allowance) on every redirect hop so a `302 → 169.254.169.254` is denied even though
+/// the manifest host itself was allowed.
+///
+/// # Errors
+/// Returns an error for a non-http(s) scheme, a missing host, a DNS failure, a
+/// metadata/link-local target (never allowable), or a private address not on the pin.
+pub async fn ssrf_guard_with_allowance(
+    raw_url: &str,
+    allowed_ip_cidrs: &[String],
+) -> Result<VettedAddr> {
+    let url = Url::parse(raw_url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        bail!("disallowed URL scheme '{scheme}' — only http/https are permitted");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+
+    // Metadata endpoints blocked by hostname regardless of any allowance.
+    for blocked in BLOCKED_HOSTS {
+        if host.eq_ignore_ascii_case(blocked) {
+            bail!("SSRF: blocked metadata endpoint '{host}'");
+        }
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+
+    // Resolve to concrete addresses (IP literal fast path, else DNS).
+    let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map_err(|e| anyhow::anyhow!("DNS lookup failed for '{host}': {e}"))?
+            .map(|s| s.ip())
+            .collect()
+    };
+    if addrs.is_empty() {
+        bail!("SSRF: host '{host}' resolved to no addresses");
+    }
+
+    // Every resolved address must pass EITHER the default guard (public) OR the allowance
+    // (a pinned private CIDR that is not metadata/link-local). A single failing address
+    // fails the whole check — an attacker cannot slip a bad IP into a multi-A record.
+    for ip in &addrs {
+        if check_ip(*ip, host).is_err() && !allowance_permits(*ip, allowed_ip_cidrs) {
+            bail!(
+                "SSRF: '{ip}' (host '{host}') is neither public nor on the manifest's pinned \
+                 allowance (or is a never-allowable metadata/link-local address)"
+            );
+        }
+    }
+
+    Ok(VettedAddr {
+        addr: SocketAddr::new(addrs[0], port),
+    })
+}
+
+/// Validate a manifest's `base_url` at APPROVAL/INSERT time: it must NOT resolve into a
+/// never-allowable metadata/link-local range, EVEN IF that address is listed in the
+/// allowance. A human approving a base_url that (now or via a poisoned allowance) points
+/// at IMDS must be rejected outright — the allowance can re-permit an on-prem private
+/// host, never the metadata surface.
+///
+/// # Errors
+/// Returns an error if the URL is malformed, has a bad scheme/host, fails to resolve, or
+/// resolves to a never-allowable address.
+pub async fn validate_manifest_base_url(base_url: &str) -> Result<()> {
+    let url = Url::parse(base_url).map_err(|e| anyhow::anyhow!("invalid base_url: {e}"))?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        bail!("connector base_url must be http/https, got '{scheme}'");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("base_url has no host"))?;
+    for blocked in BLOCKED_HOSTS {
+        if host.eq_ignore_ascii_case(blocked) {
+            bail!("connector base_url points at blocked metadata endpoint '{host}'");
+        }
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map_err(|e| anyhow::anyhow!("base_url DNS lookup failed for '{host}': {e}"))?
+            .map(|s| s.ip())
+            .collect()
+    };
+    for ip in &addrs {
+        if is_never_allowable(*ip) {
+            bail!(
+                "connector base_url '{base_url}' resolves to never-allowable \
+                 metadata/link-local address '{ip}' — rejected at approval"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build a per-request `reqwest::Client` pinned to `vetted.addr` for `host`, with
 /// automatic redirect-following disabled.
 ///
@@ -223,6 +435,60 @@ pub async fn follow_redirects_with_guard(
             .to_string();
 
         tracing::warn!(hop, target = %current_url, "following redirect (re-vetting on next hop)");
+    }
+
+    unreachable!("loop always returns or bails by the last iteration")
+}
+
+/// Redirect-following variant of [`follow_redirects_with_guard`] that re-runs
+/// [`ssrf_guard_with_allowance`] with the SAME per-manifest allowance on EVERY hop. This
+/// is what stops a manifest host (allowed to reach an on-prem private IP) from being
+/// bounced via `302 → http://169.254.169.254/` to the metadata endpoint: the metadata IP
+/// is never-allowable, so the re-guard on the redirect target denies it even though the
+/// original host was permitted. The allowance is passed by reference so the same slice
+/// governs the initial request and every hop identically.
+///
+/// # Errors
+/// Returns an error if any hop fails the allowance guard, the redirect chain exceeds
+/// [`MAX_REDIRECT_HOPS`], or a transport error occurs.
+pub async fn follow_redirects_with_guard_allowance(
+    initial_url: &str,
+    allowed_ip_cidrs: &[String],
+    timeout: Duration,
+    build_request: impl Fn(&reqwest::Client, &str) -> RequestBuilder,
+) -> Result<Response> {
+    let mut current_url = initial_url.to_string();
+
+    for hop in 0..=MAX_REDIRECT_HOPS {
+        let vetted = ssrf_guard_with_allowance(&current_url, allowed_ip_cidrs).await?;
+        let parsed = Url::parse(&current_url).map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host"))?
+            .to_string();
+
+        let client = build_pinned_client(&host, vetted, timeout)?;
+        let resp = build_request(&client, &current_url).send().await?;
+
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        if hop == MAX_REDIRECT_HOPS {
+            bail!("too many redirects (>{MAX_REDIRECT_HOPS}) for {initial_url}");
+        }
+
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("redirect response missing Location header"))?;
+
+        current_url = parsed
+            .join(location)
+            .map_err(|e| anyhow::anyhow!("invalid redirect Location '{location}': {e}"))?
+            .to_string();
+
+        tracing::warn!(hop, target = %current_url, "connector redirect (re-vetting allowance)");
     }
 
     unreachable!("loop always returns or bails by the last iteration")
@@ -516,6 +782,128 @@ mod tests {
     fn check_ip_blocks_alibaba_metadata_range() {
         let ip = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200));
         assert!(check_ip(ip, "100.100.100.200").is_err());
+    }
+
+    // ---- ssrf_guard_with_allowance (C3) -----------------------------------------
+
+    #[tokio::test]
+    async fn allowance_permits_pinned_private_cidr() {
+        // A private RFC1918 host is blocked by the default guard but PERMITTED when it
+        // matches a pinned CIDR (an on-prem ERP the human approved).
+        let allow = vec!["10.0.0.0/8".to_string()];
+        let vetted = ssrf_guard_with_allowance("http://10.20.30.40:8069/", &allow)
+            .await
+            .expect("pinned private CIDR must be permitted");
+        assert_eq!(
+            vetted.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 8069)
+        );
+    }
+
+    #[tokio::test]
+    async fn allowance_blocks_same_ip_when_not_pinned() {
+        // The SAME private IP resolving from a host NOT on the allowance stays blocked —
+        // the allowance is scoped to the pinned CIDR, not to the IP universally.
+        let allow = vec!["192.168.1.0/24".to_string()]; // different subnet
+        let res = ssrf_guard_with_allowance("http://10.20.30.40:8069/", &allow).await;
+        assert!(
+            res.is_err(),
+            "a private IP off the pinned allowance must stay blocked"
+        );
+        // And with an EMPTY allowance the private IP is blocked exactly like the default.
+        let res2 = ssrf_guard_with_allowance("http://10.20.30.40/", &[]).await;
+        assert!(res2.is_err());
+    }
+
+    #[tokio::test]
+    async fn allowance_permits_public_ip_unaffected() {
+        // A public IP is permitted with or without any allowance — the default guard
+        // already lets it through; the allowance path must not change that.
+        let vetted = ssrf_guard_with_allowance("http://93.184.216.34/", &[])
+            .await
+            .expect("public IP unaffected by allowance");
+        assert_eq!(
+            vetted.addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80)
+        );
+    }
+
+    #[tokio::test]
+    async fn allowance_never_permits_metadata_even_if_listed() {
+        // 169.254.169.254 is on the never-allowable surface — listing it in the allowance
+        // must NOT permit it. This is the core C3 invariant: the allowance re-permits
+        // private hosts, NEVER the metadata/link-local surface.
+        let allow = vec!["169.254.0.0/16".to_string()];
+        let res =
+            ssrf_guard_with_allowance("http://169.254.169.254/latest/meta-data/", &allow).await;
+        assert!(res.is_err(), "metadata IP is never allowable even if listed");
+
+        // The IPv4-mapped V6 form must also be denied (canonicalization preserved).
+        let res2 =
+            ssrf_guard_with_allowance("http://[::ffff:169.254.169.254]/", &allow).await;
+        assert!(res2.is_err(), "mapped metadata V6 never allowable");
+
+        // Alibaba metadata /24 too.
+        let allow_ali = vec!["100.100.100.0/24".to_string()];
+        assert!(
+            ssrf_guard_with_allowance("http://100.100.100.200/", &allow_ali)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_base_url_rejects_metadata_at_approval() {
+        // A base_url resolving to 169.254.169.254 is REJECTED at approval time, even if a
+        // (poisoned) allowance would list it.
+        assert!(
+            validate_manifest_base_url("http://169.254.169.254/")
+                .await
+                .is_err()
+        );
+        // A public base_url passes approval.
+        assert!(
+            validate_manifest_base_url("https://93.184.216.34/")
+                .await
+                .is_ok()
+        );
+        // A private base_url passes approval (the allowance decides call-time access; the
+        // approval check only rejects the never-allowable metadata surface).
+        assert!(validate_manifest_base_url("http://10.20.30.40/").await.is_ok());
+        // Non-http scheme rejected.
+        assert!(validate_manifest_base_url("file:///etc/passwd").await.is_err());
+    }
+
+    #[test]
+    fn cidr_contains_matches_and_rejects() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40));
+        assert!(cidr_contains("10.0.0.0/8", ip));
+        assert!(cidr_contains("10.20.30.40/32", ip));
+        assert!(!cidr_contains("10.20.31.0/24", ip));
+        assert!(!cidr_contains("192.168.0.0/16", ip));
+        // Bare IP literal is treated as an exact match.
+        assert!(cidr_contains("10.20.30.40", ip));
+        // Malformed entries can never widen the allowance (fail-closed).
+        assert!(!cidr_contains("not-a-cidr", ip));
+        assert!(!cidr_contains("10.0.0.0/99", ip));
+        // Cross-family never matches.
+        let v6 = IpAddr::V6("::1".parse().unwrap());
+        assert!(!cidr_contains("10.0.0.0/8", v6));
+    }
+
+    #[test]
+    fn is_never_allowable_covers_metadata_surface() {
+        assert!(is_never_allowable("169.254.169.254".parse().unwrap()));
+        assert!(is_never_allowable("169.254.1.1".parse().unwrap())); // link-local /16
+        assert!(is_never_allowable("100.100.100.200".parse().unwrap())); // alibaba
+        assert!(is_never_allowable("127.0.0.1".parse().unwrap())); // loopback
+        assert!(is_never_allowable("fe80::1".parse().unwrap())); // v6 link-local
+        assert!(is_never_allowable("::ffff:169.254.169.254".parse().unwrap()));
+        // An ordinary private host is NOT never-allowable — the allowance may permit it.
+        assert!(!is_never_allowable("10.20.30.40".parse().unwrap()));
+        assert!(!is_never_allowable("192.168.1.1".parse().unwrap()));
+        // A public IP is not never-allowable.
+        assert!(!is_never_allowable("8.8.8.8".parse().unwrap()));
     }
 
     #[test]

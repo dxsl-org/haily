@@ -1,12 +1,16 @@
 //! Connector seam — the external-side abstraction the action journal drives.
 //!
-//! Phase 3 provides only the `ConnectorExecutor` trait + a test mock (moved forward from
-//! phase 4 so `journal_undo` compiles, C-resequence). Phase 4 adds the generic HTTP impl
-//! module here; phase 5 the Odoo impl. NO HTTP lives here yet.
+//! Phase 3 provided the `ConnectorExecutor` trait + a test mock; phase 4 adds the generic,
+//! manifest-interpreting `HttpConnectorTool` + `HttpExecutor` (raw HTTP through the SSRF
+//! allowance guard) + the `Manifest`/`OpSpec` schema. Phase 5 adds the Odoo specialization.
 pub mod executor;
+pub mod http_connector_tool;
+pub mod manifest;
 pub mod redact;
 
 pub use executor::{ConnectorExecutor, ExecOutcome};
+pub use http_connector_tool::{HttpConnectorTool, HttpExecutor};
+pub use manifest::{Manifest, OpSpec};
 
 use anyhow::Result;
 use async_trait::async_trait;

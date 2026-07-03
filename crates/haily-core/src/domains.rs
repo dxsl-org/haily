@@ -7,15 +7,13 @@
 /// L2 specialists are not listed here — they are registered by their parent L1 agent
 /// as additional delegate tools in the sub-registry (Phase 12 Phase B+).
 ///
-// PHASE 4 (C2 deferred): connector op-names (e.g. "odoo_create", "odoo_write",
-// "odoo_search_read") must be added to the delegable domains' `allowed_tools` here so
-// sub-agents can SEE connector tools once phase 4 registers them into `base_v1`. They
-// are NOT reserved now on purpose: the `all_domain_whitelists_resolve` test (lib.rs)
-// asserts every `allowed_tools` name resolves to a REGISTERED tool via
-// `base.get(t).is_some()`, and connector tools do not exist until phase 4/5 —
-// reserving phantom names today would break that guard. Add them in the SAME phase-4
-// change that registers `HttpConnectorTool`, so the whitelist and the registry stay
-// consistent (add to at least "delegate_to_business" for CRM-in-a-box).
+// PHASE 4 (C2): connector op-names are whitelisted for the delegable "business" domain
+// below (`CONNECTOR_OP_WHITELIST`) so a sub-agent can SEE connector tools once the
+// orchestrator registers them into `base_v1` (see `Orchestrator::init`). `sub_registry`
+// silently skips a whitelisted name that is not currently registered, so listing a
+// connector op here is inert when no manifest declares it and live when one does — no
+// phantom-name failure. The `all_domain_whitelists_resolve` test (lib.rs) registers a
+// representative manifest declaring these exact op-names before asserting resolution.
 pub struct DomainConfig {
     /// Tool name exposed to the L0 LLM, e.g. "delegate_to_developer".
     pub tool_name: &'static str,
@@ -31,6 +29,22 @@ pub struct DomainConfig {
     /// until a task-outcome quality signal exists.
     pub model_tier: Option<haily_llm::Tier>,
 }
+
+/// Connector op-names the "business" (CRM-in-a-box) domain is allowed to call once a
+/// human-approved manifest registers them into `base_v1` (C2). These are the CONVENTIONAL
+/// op-names a first-party Odoo manifest declares (phase 5); listing them in the business
+/// domain's `allowed_tools` is inert until a manifest actually declares them
+/// (`sub_registry` skips unknown names) and live the moment one does.
+///
+/// Test-only: the canonical list the C2 whitelist-resolution tests build a representative
+/// manifest from. The runtime whitelist lives inline in `delegate_to_business`'s
+/// `allowed_tools`; this const keeps the two in sync under test.
+#[cfg(test)]
+pub const CONNECTOR_OP_WHITELIST: &[&str] = &[
+    "odoo_contact_create",
+    "odoo_contact_write",
+    "odoo_contact_search_read",
+];
 
 pub const DOMAINS: &[DomainConfig] = &[
     DomainConfig {
@@ -113,6 +127,9 @@ Chuyên nghiệp, súc tích, đúng deadline. Ưu tiên action items rõ ràng.
             "note_save", "note_search", "note_update",
             "task_create", "task_list", "task_complete",
             "memory_remember", "memory_search",
+            // Connector ops (C2) — inert until a manifest declares them, live once one
+            // does. Kept in sync with `CONNECTOR_OP_WHITELIST`.
+            "odoo_contact_create", "odoo_contact_write", "odoo_contact_search_read",
         ],
         model_tier: None,
     },

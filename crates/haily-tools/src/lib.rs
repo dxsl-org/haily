@@ -138,6 +138,47 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Register one `HttpConnectorTool` per op of each parsed, human-approved manifest
+    /// (Safe Operator Harness phase 4, R3). MUST be called on the `base_v1` registry
+    /// BEFORE any `sub_registry()` snapshot / `Arc`-wrap (C2): `register` needs unique
+    /// ownership (`&mut self`), and once `base_v1` is snapshotted into per-domain
+    /// sub-registries and frozen behind an `Arc`, no connector tool could be added and the
+    /// domain whitelists would resolve their connector op-names to `None`.
+    ///
+    /// `kill` is the SAME `Arc<AtomicBool>` the orchestrator flips live — cloned into each
+    /// tool AND its `HttpExecutor` so the M5 re-check observes a mid-write kill at any
+    /// depth. `cred_ref_for` yields the credential preference-key name per connector so the
+    /// journal records WHICH credential a write used (the secret itself is redacted, C4).
+    /// `timeout` bounds every external connector call.
+    pub fn register_connectors(
+        &mut self,
+        manifests: Vec<connector::Manifest>,
+        kill: Arc<std::sync::atomic::AtomicBool>,
+        timeout: std::time::Duration,
+        cred_ref_for: impl Fn(&str) -> String,
+    ) {
+        for manifest in manifests {
+            let manifest = Arc::new(manifest);
+            let cred_ref = cred_ref_for(&manifest.connector_name);
+            // One executor shared across all ops of a manifest (same base_url + allowance).
+            let shared_executor: Arc<dyn crate::connector::ConnectorExecutor> =
+                Arc::new(connector::HttpExecutor::new(
+                    Arc::clone(&manifest),
+                    Arc::clone(&kill),
+                    timeout,
+                ));
+            for op in &manifest.ops {
+                self.register(Arc::new(connector::HttpConnectorTool {
+                    manifest: Arc::clone(&manifest),
+                    op: Arc::new(op.clone()),
+                    executor: Arc::clone(&shared_executor),
+                    kill: Arc::clone(&kill),
+                    cred_ref: cred_ref.clone(),
+                }));
+            }
+        }
+    }
+
     /// Build a sub-registry containing only the named tools.
     /// Used by delegate tools to enforce per-domain tool whitelists.
     /// Unknown names are silently skipped.
@@ -295,5 +336,34 @@ mod tests {
             RiskTier::Read
         );
         assert_eq!(tool.risk_tier(&serde_json::json!({})), RiskTier::Read);
+    }
+
+    #[test]
+    fn register_connectors_before_sub_registry_makes_ops_resolvable() {
+        // C2 ordering at the tools layer: registering connector ops into base_v1 BEFORE
+        // taking a sub_registry snapshot lets the snapshot resolve the op-names. This is
+        // the same ordering the orchestrator's `connector_op_visible_to_delegable_subagent`
+        // test asserts end-to-end.
+        let manifest = connector::manifest::parse(
+            r#"{"connector_name":"odoo","version":"1","base_url":"https://erp.example.com",
+                "allowed_ip_cidrs":[],
+                "ops":[{"name":"odoo_contact_create","risk_tier":"IrreversibleWrite",
+                        "compensability":"compensatable","compensation":{"op":"unlink"}}]}"#,
+        )
+        .unwrap();
+        let mut base = ToolRegistry::build_v1();
+        base.register_connectors(
+            vec![manifest],
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_secs(30),
+            |c| format!("{c}.api_key"),
+        );
+        // Now visible in base AND in a whitelist-scoped sub_registry that names the op.
+        assert!(base.get("odoo_contact_create").is_some());
+        let sub = base.sub_registry(&["odoo_contact_create", "web_search"]);
+        assert!(
+            sub.get("odoo_contact_create").is_some(),
+            "connector op must resolve in a sub_registry snapshot taken AFTER registration"
+        );
     }
 }

@@ -1,4 +1,5 @@
 pub mod calendar;
+pub mod connectors;
 pub mod episodic;
 pub mod facts;
 pub mod graph;

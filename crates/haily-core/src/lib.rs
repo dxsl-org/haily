@@ -88,6 +88,10 @@ impl Orchestrator {
             "work_item_resume", // resume a task
             "feedback_react",   // apply in-line user feedback
         ];
+        // Timeout bounding every external connector call (phase 4). Conservative — an
+        // interactive connector op should complete well within this; a hang is treated as
+        // a transport error the C7 read-back path recovers from.
+        const CONNECTOR_TIMEOUT_SECS: u64 = 30;
         // Phase 3 kill switch (C8): seed from the persisted `safety.disable_writes`
         // preference so a restart preserves a thrown switch. This Arc is the runtime
         // source of truth from here on; the app layer flips it live via `kill_handle()`.
@@ -99,7 +103,69 @@ impl Orchestrator {
             .unwrap_or(false);
         let kill = Arc::new(AtomicBool::new(disable_writes));
 
-        let base_v1 = ToolRegistry::build_v1();
+        let mut base_v1 = ToolRegistry::build_v1();
+
+        // Phase 4 (C2): register human-approved connector ops into `base_v1` BEFORE any
+        // `sub_registry` snapshot below — `register` needs `&mut self`, and once `base_v1`
+        // is snapshotted + Arc-wrapped no op could be added and the domain whitelists would
+        // resolve their connector op-names to `None`. Each op becomes one HttpConnectorTool
+        // bound to the shared kill switch (M5) + the phase-3 journal (via ToolContext.db).
+        // An unparseable manifest, or one whose base_url resolves into a blocked
+        // metadata/link-local range, is SKIPPED (logged) rather than registered — a
+        // connector tool that would fail-closed on every call is worse than absent.
+        let mut parsed_manifests = Vec::new();
+        match haily_db::queries::connectors::list_active(&db).await {
+            Ok(rows) => {
+                for row in rows {
+                    // Integrity gate: recompute the content hash and skip a row whose stored
+                    // hash no longer matches its bytes (out-of-band tamper the append-only
+                    // trigger can't catch — raw sqlite write / file-level edit / doctored-DB
+                    // restore). A tampered, human-unapproved schema must never register.
+                    if !row.verify_integrity() {
+                        tracing::warn!(
+                            connector = %row.connector_name,
+                            version = %row.version,
+                            "skipping connector — content_hash mismatch (manifest altered out-of-band); re-approval required"
+                        );
+                        continue;
+                    }
+                    match haily_tools::connector::manifest::parse(&row.manifest_json) {
+                        Ok(m) => {
+                            if let Err(e) =
+                                haily_tools::security::validate_manifest_base_url(&m.base_url).await
+                            {
+                                tracing::warn!(
+                                    connector = %row.connector_name,
+                                    version = %row.version,
+                                    "skipping connector — base_url failed approval-time SSRF validation: {e:#}"
+                                );
+                                continue;
+                            }
+                            parsed_manifests.push(m);
+                        }
+                        Err(e) => tracing::warn!(
+                            connector = %row.connector_name,
+                            version = %row.version,
+                            "skipping unparseable connector manifest: {e:#}"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to load connector manifests: {e:#}"),
+        }
+        if !parsed_manifests.is_empty() {
+            let op_count: usize = parsed_manifests.iter().map(|m| m.ops.len()).sum();
+            base_v1.register_connectors(
+                parsed_manifests,
+                Arc::clone(&kill),
+                std::time::Duration::from_secs(CONNECTOR_TIMEOUT_SECS),
+                // Credential preference key convention: "<connector>.api_key". The secret
+                // is redacted (C4); only this reference name is journaled.
+                |connector_name| format!("{connector_name}.api_key"),
+            );
+            tracing::info!(ops = op_count, "registered connector ops into base_v1");
+        }
+
         let mut tools = base_v1.sub_registry(L0_QUICK_TOOLS);
 
         // Build one DelegateTool per domain (L0 → L1).
@@ -162,10 +228,16 @@ impl Orchestrator {
         // Phase 3 reconciliation sweep (C6/C7): classify orphan `pending` journal rows
         // left by a crash/kill mid-write via a read-back GET — NEVER a blind create-retry
         // (M4). Placed right next to `reset_stale_running` (same crash-recovery boundary).
-        // The connector executor is wired in phase 4; until then the fail-closed
-        // placeholder marks unclassifiable rows `unverified` (the safe C7 direction — it
-        // never blocks a later undo). A row past its grace window and still `pending` is
-        // an orphan; a fresh in-flight write is skipped.
+        // A row past its grace window and still `pending` is an orphan; a fresh in-flight
+        // write is skipped.
+        //
+        // PHASE 4 decision — reconciliation stays on `UnconfiguredExecutor`: the sweep runs
+        // ONCE over ALL incomplete rows regardless of connector, but each row's read-back
+        // must go to ITS OWN manifest's base_url + pinned allowance (routing by
+        // `row.tool_name` → op → manifest). That per-row executor selection is real routing
+        // logic, deferred to phase 5 with the Odoo executor (noted in the plan). Until then
+        // the fail-closed placeholder marks unclassifiable rows `unverified` — the safe C7
+        // direction, which never blocks a later undo.
         let reconcile_executor = haily_tools::connector::UnconfiguredExecutor;
         let reconciled = haily_tools::journal_undo::reconcile::reconcile_incomplete(
             &db,
@@ -426,12 +498,45 @@ mod wiring_tests {
     //! silently drops unknown tool names, so a typo in any `allowed_tools` entry
     //! would strip a capability with zero runtime signal — these tests turn that
     //! into a compile-then-test failure instead.
-    use crate::{domains::DOMAINS, specialists::SPECIALISTS};
+    use crate::domains::{CONNECTOR_OP_WHITELIST, DOMAINS};
+    use crate::specialists::SPECIALISTS;
     use haily_tools::ToolRegistry;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Build a base_v1 with a representative connector manifest registered, declaring the
+    /// exact op-names the whitelist references (C2). Mirrors `Orchestrator::init`'s
+    /// register-before-snapshot ordering so the whitelist-resolution tests exercise a base
+    /// that actually contains the connector ops.
+    fn base_v1_with_connectors() -> ToolRegistry {
+        let ops: String = CONNECTOR_OP_WHITELIST
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{"name":"{n}","risk_tier":"IrreversibleWrite","compensability":"compensatable","compensation":{{"op":"unlink"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"connector_name":"odoo","version":"1","base_url":"https://erp.example.com","allowed_ip_cidrs":[],"ops":[{ops}]}}"#
+        );
+        let manifest = haily_tools::connector::manifest::parse(&json).unwrap();
+        let mut base = ToolRegistry::build_v1();
+        base.register_connectors(
+            vec![manifest],
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(30),
+            |c| format!("{c}.api_key"),
+        );
+        base
+    }
 
     #[test]
     fn all_domain_whitelists_resolve() {
-        let base = ToolRegistry::build_v1();
+        // Register connectors first (C2) so a whitelisted connector op-name resolves —
+        // exactly the ordering `Orchestrator::init` uses.
+        let base = base_v1_with_connectors();
         for d in DOMAINS {
             for t in d.allowed_tools {
                 assert!(
@@ -441,6 +546,23 @@ mod wiring_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn connector_op_visible_to_delegable_subagent() {
+        // C2 ordering fix, end-to-end: a connector op registered into base_v1 BEFORE the
+        // per-domain sub_registry snapshot must resolve in a delegable domain's snapshot —
+        // else `sub_registry.get(op) → None` and a sub-agent can never reach it.
+        let base = base_v1_with_connectors();
+        let business = DOMAINS
+            .iter()
+            .find(|d| d.tool_name == "delegate_to_business")
+            .expect("business domain exists");
+        let sub = base.sub_registry(business.allowed_tools);
+        assert!(
+            sub.get("odoo_contact_create").is_some(),
+            "connector op must resolve in the business domain's sub_registry (C2)"
+        );
     }
 
     #[test]
