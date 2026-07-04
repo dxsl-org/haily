@@ -23,6 +23,7 @@
 //! every manifest `compensation` template carries its own `model` (+`method`), and the
 //! executor resolves model/method from the PLAN for a compensation op (from the manifest for a
 //! primary op) — fail-closed when neither yields a model.
+use crate::connector::credential::CredentialGetter;
 use crate::connector::executor::{ConnectorExecutor, ExecOutcome};
 use crate::connector::manifest::Manifest;
 use crate::connector::odoo_fault::{self, FaultClass};
@@ -85,6 +86,14 @@ pub struct OdooExecutor {
     /// production wiring (`Orchestrator::init`) constructs `HttpExecutor` with no loopback
     /// allowance at all; ONLY the golden test builds an `OdooExecutor` with this set true.
     allow_loopback: bool,
+    /// Harness Completion phase 4: an optional OS-keyring-backed credential source, tried
+    /// BEFORE the `kms_preferences` DB read. `None` preserves the pre-phase-4 behavior
+    /// (DB-only) — every existing construction site (including the golden tests) keeps
+    /// compiling unchanged. Layering: this is a trait object defined in THIS crate
+    /// ([`CredentialGetter`]); the concrete OS-keyring implementation lives in `haily-app`
+    /// (which depends on `haily-tools`, never the reverse) and is injected here at
+    /// construction — the same pattern as the already-injected `db` handle.
+    credential_getter: Option<Arc<dyn CredentialGetter>>,
 }
 
 /// Parameters for constructing an [`OdooExecutor`]. Grouped so the constructor stays within
@@ -102,11 +111,18 @@ pub struct OdooExecutorConfig {
     /// TEST ONLY — never true in production. See [`OdooExecutor::allow_loopback`]. Defaults to
     /// `false` via [`OdooExecutorConfig::production`]; only the golden test sets it true.
     pub allow_loopback: bool,
+    /// See [`OdooExecutor::credential_getter`]. Defaults to `None` via
+    /// [`OdooExecutorConfig::production`] (DB-only, pre-phase-4 behavior); production wiring
+    /// that wants the OS keyring must set this explicitly via
+    /// [`OdooExecutorConfig::with_credential_getter`].
+    pub credential_getter: Option<Arc<dyn CredentialGetter>>,
 }
 
 impl OdooExecutorConfig {
-    /// Build a production config with the loopback SSRF carve-out DISABLED. Use this at every
-    /// non-test construction site so the TEST-ONLY `allow_loopback` cannot be set by accident.
+    /// Build a production config with the loopback SSRF carve-out DISABLED and no keyring
+    /// credential source (DB-only — the pre-phase-4 behavior). Use this at every non-test
+    /// construction site so the TEST-ONLY `allow_loopback` cannot be set by accident; call
+    /// [`Self::with_credential_getter`] afterward to opt into the keyring.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn production(
@@ -131,7 +147,15 @@ impl OdooExecutorConfig {
             kill,
             timeout,
             allow_loopback: false,
+            credential_getter: None,
         }
+    }
+
+    /// Opt into an OS-keyring-backed credential source, tried before the DB fallback.
+    #[must_use]
+    pub fn with_credential_getter(mut self, getter: Arc<dyn CredentialGetter>) -> Self {
+        self.credential_getter = Some(getter);
+        self
     }
 }
 
@@ -151,6 +175,7 @@ impl OdooExecutor {
             kill: cfg.kill,
             timeout: cfg.timeout,
             allow_loopback: cfg.allow_loopback,
+            credential_getter: cfg.credential_getter,
         }
     }
 
@@ -194,10 +219,26 @@ impl OdooExecutor {
         Ok((model, method))
     }
 
-    /// Read the actual API key from `kms_preferences` by reference (C4). The returned key is
-    /// used only to build the request body and is dropped immediately after — it is NEVER
-    /// stored on `self`, logged, or journaled.
+    /// Read the actual API key by reference (C4). When a [`CredentialGetter`] is injected it
+    /// is the SOLE authority: it already encapsulates keyring lookup AND the policy-gated DB
+    /// read-fallback (M5b). An `Ok(None)` from it therefore means "not available under the
+    /// configured policy" — we must NOT do our own raw DB read on top, or a deployment that
+    /// deliberately disabled read-fallback (`allow_read_fallback = false`) would have the
+    /// plaintext secret read anyway, silently defeating the policy (a fail-open). Only when NO
+    /// getter is injected (pre-phase-4 / not-yet-wired path) do we read `kms_preferences`
+    /// directly. The returned key is used only to build the request body and is dropped
+    /// immediately after — it is NEVER stored on `self`, logged, or journaled.
     async fn read_key(&self) -> Result<String> {
+        if let Some(getter) = &self.credential_getter {
+            return getter
+                .get_secret(&self.cred_ref)
+                .await
+                .with_context(|| format!("credential getter failed for '{}'", self.cred_ref))?
+                .filter(|k| !k.is_empty())
+                .with_context(|| {
+                    format!("Odoo credential '{}' not available under policy", self.cred_ref)
+                });
+        }
         meta::get_preference(&self.db, &self.cred_ref)
             .await?
             .filter(|k| !k.is_empty())
@@ -631,6 +672,7 @@ mod tests {
             kill: Arc::new(AtomicBool::new(false)),
             timeout: Duration::from_secs(15),
             allow_loopback: false,
+            credential_getter: None,
         });
         (exec, dir)
     }
@@ -668,5 +710,66 @@ mod tests {
         assert_eq!(extract_id(&json!([{"id": 5, "name": "x"}])), Some("5".into())); // read
         assert_eq!(extract_id(&json!([])), None);
         assert_eq!(extract_id(&Value::Null), None);
+    }
+
+    /// Harness Completion phase 4: an injected [`CredentialGetter`] must be tried BEFORE
+    /// the `kms_preferences` DB read — proves the layering-safe seam actually takes
+    /// priority rather than just compiling.
+    #[tokio::test]
+    async fn read_key_prefers_injected_credential_getter_over_db() {
+        use crate::connector::credential::mock::MockCredentialGetter;
+        use std::collections::HashMap;
+
+        let (mut exec, _dir) = test_executor().await;
+        // DB holds one value; the getter holds a DIFFERENT value under the same ref.
+        meta::upsert_preference(&exec.db, &exec.cred_ref, "db-value", "test")
+            .await
+            .unwrap();
+        exec.credential_getter = Some(Arc::new(MockCredentialGetter(HashMap::from([(
+            exec.cred_ref.clone(),
+            "getter-value".to_string(),
+        )]))));
+
+        assert_eq!(exec.read_key().await.unwrap(), "getter-value");
+    }
+
+    /// A getter present but returning `Ok(None)` is AUTHORITATIVE: the getter's own
+    /// `CredentialStore` already performed (or policy-denied) the DB read-fallback internally
+    /// (M5b), so `OdooExecutor` must NOT do its own raw DB read on top — doing so would read
+    /// the plaintext secret even when the deployment set `allow_read_fallback = false`,
+    /// silently defeating the fail-closed read policy. It must error instead, even when a DB
+    /// row is present.
+    #[tokio::test]
+    async fn read_key_with_getter_does_not_bypass_policy_to_raw_db() {
+        use crate::connector::credential::mock::MockCredentialGetter;
+        use std::collections::HashMap;
+
+        let (mut exec, _dir) = test_executor().await;
+        // A plaintext row EXISTS in the DB — but the getter is the sole authority and
+        // returned nothing, so read_key must NOT reach past it to this row.
+        meta::upsert_preference(&exec.db, &exec.cred_ref, "db-plaintext-must-not-leak", "test")
+            .await
+            .unwrap();
+        exec.credential_getter = Some(Arc::new(MockCredentialGetter(HashMap::new())));
+
+        let err = exec
+            .read_key()
+            .await
+            .expect_err("getter Ok(None) is authoritative — must not fall through to raw DB");
+        assert!(
+            !format!("{err:#}").contains("db-plaintext-must-not-leak"),
+            "the plaintext secret must never appear in the error"
+        );
+    }
+
+    /// No getter injected at all (`None`) preserves the exact pre-phase-4 behavior: read
+    /// straight from `kms_preferences`.
+    #[tokio::test]
+    async fn read_key_with_no_getter_reads_db_directly() {
+        let (exec, _dir) = test_executor().await;
+        meta::upsert_preference(&exec.db, &exec.cred_ref, "legacy-db-only", "test")
+            .await
+            .unwrap();
+        assert_eq!(exec.read_key().await.unwrap(), "legacy-db-only");
     }
 }

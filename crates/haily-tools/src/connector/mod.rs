@@ -3,6 +3,7 @@
 //! Phase 3 provided the `ConnectorExecutor` trait + a test mock; phase 4 adds the generic,
 //! manifest-interpreting `HttpConnectorTool` + `HttpExecutor` (raw HTTP through the SSRF
 //! allowance guard) + the `Manifest`/`OpSpec` schema. Phase 5 adds the Odoo specialization.
+pub mod credential;
 pub mod executor;
 pub mod http_connector_tool;
 pub mod manifest;
@@ -11,9 +12,13 @@ pub mod odoo_fault;
 pub mod readback_diff;
 pub mod redact;
 
+pub use credential::CredentialGetter;
 pub use executor::{ConnectorExecutor, ExecOutcome};
 pub use http_connector_tool::{HttpConnectorTool, HttpExecutor};
-pub use manifest::{Manifest, OpSpec};
+pub use manifest::{
+    approved_version_pref_key, check_version, manifest_diff, Manifest, ManifestDiff, OpDiff,
+    OpSpec, VersionCheck,
+};
 pub use odoo_executor::{OdooExecutor, OdooExecutorConfig};
 
 use anyhow::Result;

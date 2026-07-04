@@ -94,6 +94,7 @@ fn odoo_executor(db: Arc<DbHandle>, manifest: Arc<Manifest>) -> Arc<OdooExecutor
         kill: Arc::new(AtomicBool::new(false)),
         timeout: Duration::from_secs(15),
         allow_loopback: true, // TEST ONLY — reach the local sandbox; never true in production.
+        credential_getter: None, // DB-only for the golden suite; keyring is exercised in haily-app's own tests.
     }))
 }
 

@@ -83,7 +83,15 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
          Rebuild with `--features telegram` to enable the Telegram adapter."
     );
 
-    let handle = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default()).await?;
+    // M5a: Session-0/no-D-Bus headless daemons cannot reliably reach the OS keyring
+    // (DPAPI needs the interactive session; Linux secret-service needs a D-Bus session
+    // bus) — never attempt it here, go straight to the DB-read path with a persisted
+    // fallback warning instead of hanging or erroring on every credential read.
+    let opts = BootstrapOptions {
+        attempt_keyring: false,
+        ..BootstrapOptions::default()
+    };
+    let handle = AppHandle::bootstrap(&data_dir, adapters, opts).await?;
 
     eprintln!(
         "Haily — Headless  |  LLM: {}  |  data: {}",
