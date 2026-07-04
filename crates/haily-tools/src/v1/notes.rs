@@ -1,3 +1,4 @@
+use super::set_last_journal_id;
 use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
@@ -69,7 +70,7 @@ impl Tool for NoteSaveTool {
         // the forward INSERT must reference the SAME id inside one transaction (C2).
         let id = uuid::Uuid::new_v4().to_string();
         let request_params = redact::redact_to_string(args.clone(), "local");
-        local_journaled_write(
+        let outcome = local_journaled_write(
             &ctx.db,
             LocalMutation::NoteSave {
                 id: &id,
@@ -86,6 +87,7 @@ impl Tool for NoteSaveTool {
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
         Ok(format!("Đã lưu note: \"{title}\" (id: {id})"))
     }
 }
@@ -195,6 +197,7 @@ impl Tool for NoteUpdateTool {
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
         Ok(if outcome.is_some() {
             format!("Đã cập nhật note id={id}.")
         } else {
@@ -247,6 +250,7 @@ impl Tool for NoteDeleteTool {
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
         Ok(if outcome.is_some() {
             format!("Đã xóa note id={id}.")
         } else {

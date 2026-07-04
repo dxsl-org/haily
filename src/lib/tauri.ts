@@ -26,12 +26,30 @@ export interface ToolApprovalRequestChunk {
   // `origin` is a server-derived, display-only "who is asking" label (e.g. "L0",
   // "L1:developer"). Optional to match `#[serde(default)]` on the Rust side — an
   // older payload without it is still valid. NEVER an auth input.
-  data: { tool: string; args: string; approval_id: string; origin?: string | null };
+  // `reversible` (R4, phase 3): true when this prompt exists ONLY because the
+  // per-turn destructive-op cap escalated a normally-`ReversibleWrite` delete —
+  // the action IS journaled/undoable. false (or absent, pre-phase-3) means the
+  // tool is genuinely `IrreversibleWrite`/`Blocked` on its own merits. Drives
+  // whether the modal shows a "can't be undone" claim or a milder confirmation.
+  data: {
+    tool: string;
+    args: string;
+    approval_id: string;
+    origin?: string | null;
+    reversible?: boolean;
+  };
 }
 
 export interface ToolResultChunk {
   type: 'ToolResult';
-  data: { name: string; ok: boolean };
+  // `reversible`/`journal_id` are additive fields mirroring Rust's `#[serde(default)]`
+  // on `ResponseChunk::ToolResult` (R4, phase 3) — an older backend build's payload
+  // without them still matches this shape once destructured with `??` fallbacks by
+  // the consumer, so treat both as "may be absent", not required. `journal_id` is
+  // non-null only when `reversible` is true AND the write's `post_state_version` had
+  // already landed at emit time (M4 ordering guard) — see `tool_call.rs`. Snake_case
+  // on purpose: this mirrors the wire's Rust field names exactly, no camelCase rename.
+  data: { name: string; ok: boolean; reversible?: boolean; journal_id?: string | null };
 }
 
 export interface CompleteChunk {
@@ -54,6 +72,9 @@ export interface PendingApproval {
   args: string;
   /** Server-derived "who is asking" label (e.g. "L0", "L1:developer"), display-only. */
   origin?: string | null;
+  /** True when this prompt is a cap-escalated but genuinely reversible action —
+   * see `ToolApprovalRequestChunk.data.reversible`. Absent/false = truly final. */
+  reversible?: boolean;
 }
 
 /** Send a message and return the session UUID. */

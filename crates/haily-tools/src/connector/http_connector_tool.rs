@@ -552,6 +552,7 @@ mod tests {
             approval_tx: tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         };
         (c, dir)
     }

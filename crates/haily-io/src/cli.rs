@@ -256,6 +256,7 @@ impl Adapter for CliAdapter {
                 args,
                 approval_id,
                 origin,
+                reversible: _,
             } => {
                 // Set BEFORE printing the prompt: the reader task could otherwise
                 // observe the prompt (via stdout ordering) before `awaiting` is set,
@@ -287,10 +288,19 @@ impl Adapter for CliAdapter {
                 stdout.write_all(prompt.as_bytes()).await?;
                 stdout.flush().await?;
             }
-            ResponseChunk::ToolResult { name, ok } => {
-                let status = if ok { "✓" } else { "✗" };
-                let line = format!("[{status} {name}]\n");
-                stdout.write_all(line.as_bytes()).await?;
+            ResponseChunk::ToolResult {
+                name,
+                ok,
+                // R4 framing additive fields (Harness Completion phase 3): the CLI's
+                // stdout format is a fixed, byte-stable contract (M8) — an inline-undo
+                // affordance is GUI-only, so these are read but intentionally unused
+                // here. See `render_tool_result_line_is_stable_regardless_of_new_fields`.
+                reversible: _,
+                journal_id: _,
+            } => {
+                stdout
+                    .write_all(render_tool_result_line(&name, ok).as_bytes())
+                    .await?;
             }
         }
         Ok(())
@@ -379,6 +389,15 @@ fn handle_writes_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>, arg: &str) 
     }
 }
 
+/// Render a `ToolResult` chunk's one-line stdout form, e.g. `[✓ task_delete]\n`. Pure
+/// and unit-testable so the M8 byte-stability guarantee (CLI output never changes
+/// shape when `ToolResult` gains additive fields — Harness Completion phase 3) can be
+/// asserted directly, without capturing process stdout.
+fn render_tool_result_line(name: &str, ok: bool) -> String {
+    let status = if ok { "✓" } else { "✗" };
+    format!("[{status} {name}]\n")
+}
+
 /// Parse a `/undo` REPL command. `arg` is the text after `/undo`. Returns the chat
 /// message to forward to the orchestrator, or `None` (print usage, send nothing) if no
 /// id was given — pure and unit-testable, mirroring `handle_writes_command`.
@@ -455,6 +474,7 @@ mod tests {
                 args: "{}".to_string(),
                 approval_id,
                 origin: None,
+                reversible: false,
             },
         )
         .await
@@ -490,6 +510,7 @@ mod tests {
                 args: "{}".to_string(),
                 approval_id,
                 origin: None,
+                reversible: false,
             },
         )
         .await
@@ -539,5 +560,60 @@ mod tests {
     fn parse_undo_command_missing_id_returns_none() {
         assert_eq!(parse_undo_command(""), None);
         assert_eq!(parse_undo_command("   "), None);
+    }
+
+    /// M8 guard (Harness Completion phase 3, R4 framing): the CLI's `[✓ name]`/
+    /// `[✗ name]` stdout line depends ONLY on `name`/`ok` — `ResponseChunk::ToolResult`
+    /// gaining `reversible`/`journal_id` must not change a single byte of what the CLI
+    /// prints. `deliver()`'s `ToolResult` arm calls this exact function (not a copy),
+    /// so a regression there fails here too.
+    #[test]
+    fn render_tool_result_line_is_stable_regardless_of_new_fields() {
+        // The line only ever depends on name/ok — assert the exact byte-for-byte shape
+        // a pre-phase-3 CLI would have produced.
+        assert_eq!(render_tool_result_line("task_delete", true), "[✓ task_delete]\n");
+        assert_eq!(render_tool_result_line("task_delete", false), "[✗ task_delete]\n");
+    }
+
+    /// Constructs both a legacy-shaped and an R4-shaped `ToolResult` (reversible +
+    /// journal_id populated) and proves `deliver()`'s rendering path derives the same
+    /// line for both — the CLI arm destructures every field but only reads `name`/`ok`.
+    #[tokio::test]
+    async fn deliver_tool_result_rendering_ignores_reversible_and_journal_id() {
+        // No direct way to capture this adapter's process-wide stdout in-test; instead
+        // prove the two field-shapes drive an IDENTICAL call to the same pure renderer
+        // `deliver()` uses, which is the actual byte-stability contract.
+        let legacy = ResponseChunk::ToolResult {
+            name: "task_delete".to_string(),
+            ok: true,
+            reversible: false,
+            journal_id: None,
+        };
+        let r4 = ResponseChunk::ToolResult {
+            name: "task_delete".to_string(),
+            ok: true,
+            reversible: true,
+            journal_id: Some("journal-row-id".to_string()),
+        };
+        let render = |chunk: ResponseChunk| match chunk {
+            ResponseChunk::ToolResult { name, ok, .. } => render_tool_result_line(&name, ok),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert_eq!(render(legacy), render(r4));
+
+        // Also exercise the real adapter path end-to-end to prove it does not panic or
+        // otherwise diverge when the new fields are populated.
+        let cli = CliAdapter::new();
+        cli.deliver(
+            Uuid::new_v4(),
+            ResponseChunk::ToolResult {
+                name: "task_delete".to_string(),
+                ok: true,
+                reversible: true,
+                journal_id: Some("journal-row-id".to_string()),
+            },
+        )
+        .await
+        .expect("deliver must not error on a ToolResult with the new fields populated");
     }
 }

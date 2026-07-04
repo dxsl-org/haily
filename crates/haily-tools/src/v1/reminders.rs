@@ -1,3 +1,4 @@
+use super::set_last_journal_id;
 use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
@@ -52,7 +53,7 @@ impl Tool for ReminderAddTool {
         // and the forward INSERT must reference the SAME id inside one transaction (C2).
         let id = uuid::Uuid::new_v4().to_string();
         let request_params = redact::redact_to_string(args.clone(), "local");
-        local_journaled_write(
+        let outcome = local_journaled_write(
             &ctx.db,
             LocalMutation::ReminderAdd {
                 id: &id,
@@ -69,6 +70,7 @@ impl Tool for ReminderAddTool {
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
         Ok(format!("Đã đặt nhắc nhở: \"{title}\" vào {fire_at} (id: {id})"))
     }
 }
@@ -161,6 +163,7 @@ impl Tool for ReminderDeleteTool {
             crate::LOCAL_RETENTION_DAYS,
         )
         .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
         Ok(if outcome.is_some() {
             format!("Đã hủy nhắc nhở id={id}.")
         } else {

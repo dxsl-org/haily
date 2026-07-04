@@ -401,6 +401,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         approval_tx: approval_tx.clone(),
         cancel: cancel.clone(),
         turn_deletes: Arc::clone(&turn_deletes),
+        // Fresh per-dispatch-call cell for this sub-turn's own tool loop — never
+        // shared with the parent's `ToolContext` (M4: no cross-turn bleed).
+        last_journal_id: Arc::new(std::sync::Mutex::new(None)),
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -566,6 +569,9 @@ pub async fn run_turn(
         approval_tx: tx.clone(),
         cancel: cancel.clone(),
         turn_deletes: Arc::clone(&turn_deletes),
+        // Reset at the top of THIS turn's context; `tool_call::dispatch` additionally
+        // resets it before every individual tool call within the turn (M4 no-bleed).
+        last_journal_id: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let mut guard = tool_call::LoopGuard::new();

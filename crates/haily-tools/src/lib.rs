@@ -69,6 +69,20 @@ pub struct ToolContext {
     /// actually executes — never by a tool itself, and never resettable from LLM/task
     /// text, so a compromised sub-agent cannot reset or bypass the cap.
     pub turn_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    /// M4 out-param side-channel (Harness Completion phase 3, R4 framing): threads a
+    /// journal row id out of a local tool's `execute()` without widening the
+    /// `Tool::execute` trait's `Result<String>` return across ~20 implementations.
+    /// Set by `local_journaled_write`'s local-tool callers (`v1::{tasks,notes,
+    /// reminders}`) AFTER `set_post_state_version` has landed inside the SAME
+    /// transaction `local_journaled_write` already commits — so a `Some` value here
+    /// always implies the C10 undo-guard's baseline version is recorded (see that
+    /// function's doc comment). `dispatch` resets this to `None` at the TOP of every
+    /// call (never carried over from a prior tool) and reads it AFTER `execute()`
+    /// returns, populating `ResponseChunk::ToolResult{reversible, journal_id}`. This
+    /// is PER-DISPATCH-CALL state, not a process-global: dispatch is sequential
+    /// within one turn, so reset-then-read around a single `execute()` call can never
+    /// observe another call's value (see `tool_call.rs`'s no-cross-tool-bleed test).
+    pub last_journal_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so

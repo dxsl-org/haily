@@ -311,9 +311,16 @@ impl Adapter for TelegramAdapter {
                     tracing::warn!(%session_id, tool = %tool, "telegram: approval request for a session with no bound chat — user cannot respond, will timeout-deny");
                 }
             }
-            ResponseChunk::ToolResult { name, ok } => {
-                // Silent — tool results are embedded in the next text response
-                let _ = (name, ok);
+            ResponseChunk::ToolResult {
+                name,
+                ok,
+                // R4 framing additive fields (Harness Completion phase 3) — Telegram
+                // has no inline-undo affordance (GUI-only); tool results stay embedded
+                // in the next text response, so these are intentionally unused here.
+                reversible,
+                journal_id,
+            } => {
+                let _ = (name, ok, reversible, journal_id);
             }
         }
         Ok(())

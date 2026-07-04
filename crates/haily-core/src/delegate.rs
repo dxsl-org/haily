@@ -431,6 +431,7 @@ mod reload_propagation_tests {
             approval_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         };
         let args = serde_json::json!({ "task": "short task before reload" });
         let before = delegate
@@ -494,6 +495,8 @@ mod seam_tests {
             .send(ResponseChunk::ToolResult {
                 name: "note_save".into(),
                 ok: true,
+                reversible: false,
+                journal_id: None,
             })
             .await
             .unwrap();
@@ -504,6 +507,7 @@ mod seam_tests {
                 args: "{}".into(),
                 approval_id,
                 origin: Some("L1:developer".into()),
+                reversible: false,
             })
             .await
             .unwrap();
