@@ -15,7 +15,11 @@ const MAX_TOOL_CALLS: u32 = 10;
 /// (Harness Completion phase 2). A CLOSED list keyed on tool NAME, not `risk_tier()` —
 /// the tier must stay constant per tool (the `no_v1_tool_tier_varies_by_args` probe's
 /// soundness depends on it), so the cap is dispatch-layer policy, applied here by name.
-const RETIERED_DELETE_TOOLS: &[&str] = &["task_delete", "note_delete", "reminder_delete"];
+///
+/// `pub(crate)` (Harness Completion phase 5, H1 fix): `agent::approval_stats` replays
+/// this SAME escalation rule to derive `approval_requested`/`approval_denied` telemetry
+/// without a broker-observation channel — see its doc comment.
+pub(crate) const RETIERED_DELETE_TOOLS: &[&str] = &["task_delete", "note_delete", "reminder_delete"];
 
 /// Guards against runaway loops: identical consecutive calls and call-count ceiling.
 pub struct LoopGuard {

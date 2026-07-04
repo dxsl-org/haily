@@ -1,4 +1,5 @@
 mod cross_domain;
+mod daily_rollup;
 mod dnd;
 mod morning_brief;
 mod reminders;
@@ -32,9 +33,10 @@ where
     });
 }
 
-/// Proactive background engine — fires morning briefs, reminders, and cross-domain alerts.
+/// Proactive background engine — fires morning briefs, reminders, cross-domain
+/// alerts, and (Harness Completion phase 5) daily telemetry rollup + retention.
 ///
-/// `start()` spawns three independent tokio tasks and returns immediately. Each loop
+/// `start()` spawns four independent tokio tasks and returns immediately. Each loop
 /// runs until `shutdown` is cancelled.
 pub struct ProactiveDaemon {
     db: Arc<DbHandle>,
@@ -64,7 +66,12 @@ impl ProactiveDaemon {
         );
         spawn_logged(
             "cross_domain",
-            cross_domain::alert_loop(db, am, shutdown.child_token()),
+            cross_domain::alert_loop(db.clone(), am, shutdown.child_token()),
+            tasks,
+        );
+        spawn_logged(
+            "daily_rollup",
+            daily_rollup::loop_forever(db, shutdown.child_token()),
             tasks,
         );
     }
@@ -98,7 +105,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    /// Proves the shutdown wiring end-to-end: cancelling `shutdown` makes all three
+    /// Proves the shutdown wiring end-to-end: cancelling `shutdown` makes all four
     /// loops (which otherwise sleep for up to 24h) exit promptly, and `TaskTracker`
     /// observes them as finished.
     #[tokio::test]

@@ -222,7 +222,10 @@ impl Tool for FeedbackReactTool {
             _ => FeedbackSignal::Positive,
         };
 
-        feedback::apply_feedback_signal(&signal, &ctx.db).await?;
+        // Explicit tool call (`feedback_react`) — the highest-confidence provenance
+        // (m2): the user deliberately invoked this tool, not a phrase-matched guess.
+        feedback::apply_feedback_signal(&signal, &ctx.db, &ctx.session_id.to_string(), true)
+            .await?;
         Ok(format!("Đã ghi lại phản hồi: {reaction}"))
     }
 }

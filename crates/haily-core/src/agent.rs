@@ -50,6 +50,445 @@ fn count_failed_calls(tool_call_log: &[serde_json::Value]) -> usize {
     tool_call_log.iter().filter(|e| e["ok"] == false).count()
 }
 
+/// String form of a routing `Tier` for persistence in `kms_task_traces.model_tier` —
+/// `Tier` itself has no `Display`/`as_str` (it is an internal routing enum, not a
+/// user-facing or serialized type elsewhere), so this is a local, additive mapping
+/// rather than widening `haily-llm`'s public surface for one telemetry column.
+fn tier_str(tier: Option<haily_llm::Tier>) -> Option<&'static str> {
+    match tier {
+        Some(haily_llm::Tier::Fast) => Some("fast"),
+        Some(haily_llm::Tier::Medium) => Some("medium"),
+        Some(haily_llm::Tier::Thinking) => Some("thinking"),
+        None => None,
+    }
+}
+
+/// Derive `(approval_requested, approval_denied)` for the whole turn by REPLAYING
+/// `tool_call::dispatch`'s exact gating rules against the dispatched-call log, rather
+/// than a bare `tool.risk_tier()` re-derivation (Harness Completion phase 5, H1 fix —
+/// the prior version diverged from broker reality in two undocumented, opposite
+/// directions; both are fixed here instead of merely documented, per the review):
+///
+/// 1. **M2 cap escalation** (`tool_call.rs`'s `RETIERED_DELETE_TOOLS` +
+///    `MAX_AUTO_DELETES_PER_TURN`): a re-tiered delete (`task_delete`/`note_delete`/
+///    `reminder_delete`) is `ReversibleWrite` on `tool.risk_tier()` — the OLD code
+///    checked only that raw tier and so NEVER counted a cap-escalated delete as
+///    "requested," even though `dispatch` genuinely raised an interactive prompt for
+///    it (a false NEGATIVE, undercounting real approval requests). Fixed by replaying
+///    the SAME escalation predicate `dispatch` evaluates: track a running delete
+///    counter and escalate to `IrreversibleWrite` once it reaches the cap, exactly as
+///    `tool_call::dispatch` does.
+/// 2. **Auto-approve allowlist** (`ApprovalGate::is_auto_approved`): a genuinely
+///    `IrreversibleWrite` tool on the allowlist never raises an interactive prompt —
+///    the OLD code counted it as "requested" regardless (a false POSITIVE, overcounting
+///    prompts that were never shown). Fixed by consulting the SAME `approval_gate`
+///    `dispatch` consults before counting a call as requested.
+///
+/// Residual imprecision (documented, not silently trusted): the running delete
+/// counter is reconstructed by walking THIS call's own `tool_call_log`, seeded from
+/// `final_turn_deletes` minus this log's own successful-retiered-delete count — exact
+/// for a single call site's log in isolation, but if a DELEGATED sub-turn's deletes
+/// interleave with the parent L0 turn's deletes against the SAME shared
+/// `ctx.turn_deletes` counter (cross-delegation cumulative cap, Harness Completion
+/// phase 2), the seed can only be inferred, not observed per-call, for whichever side
+/// runs second. This narrows (does not eliminate) the earlier blanket approximation:
+/// within one call site's own log — the overwhelmingly common case, and the only case
+/// for a non-delegating turn — this is now exact.
+fn approval_stats(
+    tool_call_log: &[serde_json::Value],
+    tools: &ToolRegistry,
+    approval_gate: &Arc<dyn haily_types::ApprovalGate>,
+    final_turn_deletes: usize,
+) -> (bool, bool) {
+    let is_successful_retiered_delete = |entry: &serde_json::Value| {
+        entry["tool"]
+            .as_str()
+            .map(|n| tool_call::RETIERED_DELETE_TOOLS.contains(&n))
+            .unwrap_or(false)
+            && entry["ok"] == true
+    };
+    let successful_retiered_in_log = tool_call_log.iter().filter(|e| is_successful_retiered_delete(e)).count();
+    // Reconstruct the counter's value BEFORE this log's own calls ran. Saturating: a
+    // delegated sub-turn's log can never itself exceed the shared final count.
+    let mut running_deletes = final_turn_deletes.saturating_sub(successful_retiered_in_log);
+
+    let mut requested = false;
+    let mut denied = false;
+    for entry in tool_call_log {
+        let Some(name) = entry["tool"].as_str() else {
+            continue;
+        };
+        let Some(tool) = tools.get(name) else {
+            continue;
+        };
+        let args: serde_json::Value = entry["args"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let tier = tool.risk_tier(&args);
+        let is_retiered = tool_call::RETIERED_DELETE_TOOLS.contains(&name);
+        let effective_tier = if is_retiered
+            && tier == haily_tools::RiskTier::ReversibleWrite
+            && running_deletes >= haily_tools::MAX_AUTO_DELETES_PER_TURN
+        {
+            haily_tools::RiskTier::IrreversibleWrite
+        } else {
+            tier
+        };
+
+        if effective_tier == haily_tools::RiskTier::IrreversibleWrite && !approval_gate.is_auto_approved(name) {
+            requested = true;
+            if entry["ok"] == false {
+                denied = true;
+            }
+        }
+
+        if is_retiered && entry["ok"] == true {
+            running_deletes += 1;
+        }
+    }
+    (requested, denied)
+}
+
+/// Whether `tool_call_log` contains a `feedback_react` call this SAME turn whose
+/// `reaction` is `negative` or `correction` — the m2-review (M2) same-turn
+/// corroborator for `repeat_request`: an explicit user reaction within this turn's
+/// own tool-call log (not a cross-turn join, which stays `feedback.rs`'s
+/// attribution-gated `downgrade_prior_trace` path) is at least as strong evidence as
+/// the `Partial`-outcome corroborator.
+fn has_explicit_negative_feedback_this_turn(tool_call_log: &[serde_json::Value]) -> bool {
+    tool_call_log.iter().any(|entry| {
+        entry["tool"].as_str() == Some("feedback_react")
+            && entry["args"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v["reaction"].as_str().map(str::to_string))
+                .is_some_and(|r| r == "negative" || r == "correction")
+    })
+}
+
+/// The handful of fields `run_turn` and `run_sub_turn` cannot share verbatim when
+/// calling `record_outcome_and_update_skill` — everything else about the label/
+/// telemetry/EMA wiring (outcome computation, undo/repeat lookups, `derive_label`,
+/// `TraceMetrics` assembly, `insert_trace`, the anti-reinforcement `unknown` guard)
+/// is byte-for-byte identical between the two call sites, so it lives in that one
+/// shared helper instead of two near-duplicate blocks.
+struct OutcomeMetricsInput<'a> {
+    model_tier: Option<&'a str>,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    delegate_overhead_ms: Option<i64>,
+    /// Distinguishes the two call sites' `tracing::warn!` messages on a failed
+    /// `update_skill_confidence` — kept as a caller-supplied literal rather than
+    /// inferred, so the log text stays exactly what each site logged before this
+    /// helper existed.
+    confidence_update_failure_msg: &'static str,
+    /// M3 review fix: whether THIS call site is allowed to drive
+    /// `update_skill_confidence` at all. A delegated sub-turn (`run_sub_turn`) always
+    /// STILL inserts its own trace (telemetry — `delegate_overhead_ms`, tool counts,
+    /// etc. — keeps its per-sub-turn granularity, which is genuinely useful data),
+    /// but `false` here skips the EMA nudge, because the PARENT L0 turn's own
+    /// `record_outcome_and_update_skill` call ALSO runs (once, always, at the end of
+    /// `run_turn`) and would otherwise double-apply the EMA for one user-visible
+    /// action routed through a delegate — silently doubling the effective learning
+    /// rate for every delegated task versus a non-delegated one. Only `run_turn`
+    /// (L0, depth 0) sets this `true`; `run_sub_turn` (any depth ≥ 1) sets it `false`.
+    owns_learning: bool,
+    /// H1 review fix: the SAME seam handles `tool_call::dispatch` consults, threaded
+    /// through so `approval_stats` can replay dispatch's exact gating (auto-approve
+    /// allowlist + M2 per-turn delete-cap escalation) instead of re-deriving a bare
+    /// `RiskTier`. See `approval_stats`'s doc comment for the two divergences this
+    /// closes.
+    approval_gate: &'a Arc<dyn haily_types::ApprovalGate>,
+    /// Final (end-of-call) value of the turn's shared destructive-delete counter —
+    /// `approval_stats` reconstructs each call's PRE-dispatch counter value by
+    /// replaying this log against it. See `approval_stats`'s doc comment for the
+    /// residual cross-delegation imprecision this cannot fully resolve.
+    final_turn_deletes: usize,
+}
+
+/// Shared tail of `run_turn`/`run_sub_turn`: compute the turn's outcome label from
+/// undo/repeat/tool-error signals, persist the trace with its telemetry, and —
+/// only when a real signal fired AND this call site owns learning — nudge a matching
+/// skill's EMA confidence.
+///
+/// SAFETY (anti-reinforcement invariant): `label.is_unknown()` must short-circuit
+/// BOTH the label persisted (`None`, not `Some("unknown")`) and the EMA update
+/// (skipped entirely, never defaulted to a neutral reward) — see the doc comments
+/// on `TraceMetrics::label_source` and the `outcome_signal_tests` module below.
+#[allow(clippy::too_many_arguments)]
+async fn record_outcome_and_update_skill(
+    db: &DbHandle,
+    session_id: &str,
+    task_description: &str,
+    tool_call_log: &[serde_json::Value],
+    tools: &ToolRegistry,
+    final_response: &str,
+    elapsed_ms: i64,
+    input: OutcomeMetricsInput<'_>,
+) {
+    let tool_calls_json = serde_json::to_string(tool_call_log).unwrap_or_default();
+    let failed_calls = count_failed_calls(tool_call_log);
+    let outcome = TaskOutcome::compute(
+        signals_inability(final_response),
+        failed_calls,
+        tool_call_log.len(),
+    );
+
+    let trace_created_at = chrono::Utc::now().to_rfc3339();
+    let undo_within_5min = db_skills::undo_within_n_min(
+        db,
+        session_id,
+        &trace_created_at,
+        haily_kms::skills::UNDO_WINDOW_MINUTES,
+    )
+    .await
+    .unwrap_or(false);
+    // Repeat-request detection (researcher-03 §1): checked BEFORE this turn's own
+    // trace is inserted, so "previous" genuinely means the prior turn, not this one
+    // compared against itself.
+    let is_repeat = match db_skills::most_recent_trace(db, session_id).await {
+        Ok(Some(prev)) => haily_kms::skills::is_repeat_request(&prev.task_description, task_description),
+        _ => false,
+    };
+    // M2 review fix: an uncorroborated repeat (a clean turn, no other negative
+    // indicator) must not read as a failure signal — see `derive_label`'s doc
+    // comment. `Partial` (some-but-not-most tool calls failed) or an explicit
+    // negative/correction `feedback_react` call THIS turn both corroborate; a
+    // `Failure` outcome already wins its own branch in `derive_label` before
+    // `is_repeat_request` is even considered, so it is deliberately NOT included
+    // here (would never be reachable).
+    let has_corroborating_negative_signal =
+        outcome == TaskOutcome::Partial || has_explicit_negative_feedback_this_turn(tool_call_log);
+    let label = haily_kms::skills::derive_label(outcome, undo_within_5min, is_repeat, has_corroborating_negative_signal);
+    let (approval_requested, approval_denied) =
+        approval_stats(tool_call_log, tools, input.approval_gate, input.final_turn_deletes);
+
+    let metrics = db_skills::TraceMetrics {
+        model_tier: input.model_tier,
+        prompt_tokens: input.prompt_tokens,
+        completion_tokens: input.completion_tokens,
+        tool_call_count: Some(tool_call_log.len() as i64),
+        approval_requested: Some(approval_requested),
+        approval_denied: Some(approval_denied),
+        undo_within_5min: Some(undo_within_5min),
+        // `label_source IS NULL` is the DB-level contract for "no signal fired"
+        // (see `TaskTrace::label_source`'s doc comment) — an `unknown` label must
+        // persist as NULL, not the literal string "unknown", so a rollup/query never
+        // has to special-case a magic string alongside NULL.
+        label_source: if label.is_unknown() {
+            None
+        } else {
+            Some(label.source.as_str())
+        },
+        label_confidence: if label.is_unknown() {
+            None
+        } else {
+            Some(label.confidence)
+        },
+        delegate_overhead_ms: input.delegate_overhead_ms,
+    };
+
+    let _ = db_skills::insert_trace(
+        db,
+        session_id,
+        task_description,
+        &tool_calls_json,
+        outcome.as_str(),
+        Some(elapsed_ms),
+        metrics,
+    )
+    .await;
+
+    // SAFETY (anti-reinforcement invariant): `unknown` NEVER drives the EMA — skip
+    // the call entirely rather than defaulting to a neutral reward (memory
+    // 2026-06-21 project-memory-anti-reinforcement-plan; researcher-03 §2.2). Only
+    // reachable when a real signal fired, this turn's task matched an active skill
+    // closely enough (`find_matching_skill`) — most turns correspond to no
+    // synthesized skill yet, and that must not be forced into a false match — AND
+    // (M3 review fix) this call site owns learning: a delegated sub-turn's trace is
+    // still inserted above (telemetry value stands) but never drives the EMA itself,
+    // since the parent L0 turn's OWN `record_outcome_and_update_skill` call already
+    // does so once for the whole user-visible action.
+    if !label.is_unknown() && input.owns_learning {
+        if let Ok(active) = db_skills::active_skills(db).await {
+            if let Some(skill) = haily_kms::skills::find_matching_skill(task_description, &active) {
+                let reward = outcome.ema_reward() * label.confidence;
+                if let Err(e) = haily_kms::skills::update_skill_confidence(db, &skill.id, reward).await {
+                    tracing::warn!(skill_id = %skill.id, error = %e, "{}", input.confidence_update_failure_msg);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_stats_tests {
+    //! Harness Completion phase 5, H1 review fix — `approval_stats` must replay
+    //! `tool_call::dispatch`'s exact gating (M2 cap escalation + auto-approve
+    //! allowlist) rather than a bare `RiskTier` re-derivation. These tests prove the
+    //! two divergences the review identified are now closed, using synthetic
+    //! `tool_call_log` entries (no real dispatch needed — `approval_stats` is a pure
+    //! function of the log + registry + gate + counter).
+    use super::*;
+    use async_trait::async_trait;
+    use haily_tools::{RiskTier, Tool, ToolRegistry};
+
+    /// Stand-in for a re-tiered delete tool (`task_delete` — in
+    /// `RETIERED_DELETE_TOOLS`), constant `ReversibleWrite` on `risk_tier()` exactly
+    /// like the real `TaskDeleteTool`.
+    struct RetieredDeleteToolFixture;
+
+    #[async_trait]
+    impl Tool for RetieredDeleteToolFixture {
+        fn name(&self) -> &str {
+            "task_delete"
+        }
+        fn description(&self) -> &str {
+            "fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::ReversibleWrite
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("deleted".to_string())
+        }
+    }
+
+    /// A tool that is genuinely `IrreversibleWrite` on its own merits (not a
+    /// cap-escalated `ReversibleWrite`) — e.g. stands in for `memory_forget`.
+    struct GenuineIrreversibleToolFixture;
+
+    #[async_trait]
+    impl Tool for GenuineIrreversibleToolFixture {
+        fn name(&self) -> &str {
+            "memory_forget"
+        }
+        fn description(&self) -> &str {
+            "fixture"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::IrreversibleWrite
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("forgotten".to_string())
+        }
+    }
+
+    fn log_entry(tool: &str, ok: bool) -> serde_json::Value {
+        serde_json::json!({ "tool": tool, "args": "{}", "ok": ok })
+    }
+
+    /// H1 case 1 (the OLD false-negative): a cap-escalated `task_delete` call — the
+    /// tool's own `risk_tier()` is `ReversibleWrite`, but `final_turn_deletes` is
+    /// already at the cap when this call ran, so `dispatch` genuinely raised an
+    /// interactive approval prompt for it. The fix must count this as
+    /// `approval_requested = true`, which the OLD bare-`risk_tier()` check could
+    /// never do (it only ever saw `ReversibleWrite`, never the escalation).
+    #[tokio::test]
+    async fn cap_escalated_retiered_delete_is_counted_as_requested() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RetieredDeleteToolFixture));
+        let gate: Arc<dyn haily_types::ApprovalGate> = Arc::new(ApprovalBroker::new());
+
+        // The counter was ALREADY at the cap before this (the only) call in the log
+        // ran, so dispatch would have escalated it to IrreversibleWrite and raised a
+        // prompt; since it succeeded (ok:true), the counter's FINAL value is one
+        // past the cap (mirrors `tool_call.rs`'s own
+        // `cap_escalation_approved_still_executes_and_increments_counter` behavior:
+        // an approved escalated delete still executes and still increments).
+        let log = vec![log_entry("task_delete", true)];
+        let (requested, denied) =
+            approval_stats(&log, &tools, &gate, haily_tools::MAX_AUTO_DELETES_PER_TURN + 1);
+
+        assert!(
+            requested,
+            "a cap-escalated re-tiered delete must be counted as approval_requested \
+             (H1 fix — the old bare-RiskTier check always missed this)"
+        );
+        assert!(!denied, "this call succeeded (ok:true), so it must not be counted as denied");
+    }
+
+    /// Mirror of the above: a cap-escalated delete that was DENIED must count as
+    /// both requested AND denied.
+    #[tokio::test]
+    async fn cap_escalated_retiered_delete_denied_is_counted_as_denied() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RetieredDeleteToolFixture));
+        let gate: Arc<dyn haily_types::ApprovalGate> = Arc::new(ApprovalBroker::new());
+
+        let log = vec![log_entry("task_delete", false)];
+        let (requested, denied) =
+            approval_stats(&log, &tools, &gate, haily_tools::MAX_AUTO_DELETES_PER_TURN);
+
+        assert!(requested);
+        assert!(denied, "a denied (ok:false) escalated delete must be counted as denied");
+    }
+
+    /// A re-tiered delete UNDER the cap must NOT be counted as requested — it
+    /// auto-runs with no interactive prompt, exactly like the real dispatch path.
+    #[tokio::test]
+    async fn under_cap_retiered_delete_is_not_counted_as_requested() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(RetieredDeleteToolFixture));
+        let gate: Arc<dyn haily_types::ApprovalGate> = Arc::new(ApprovalBroker::new());
+
+        // final_turn_deletes = 0, well under the cap.
+        let log = vec![log_entry("task_delete", true)];
+        let (requested, _denied) = approval_stats(&log, &tools, &gate, 0);
+
+        assert!(
+            !requested,
+            "a re-tiered delete under the cap auto-runs with no prompt — must not count as requested"
+        );
+    }
+
+    /// H1 case 2 (the OLD false-positive): a genuinely `IrreversibleWrite` tool on
+    /// the auto-approve allowlist never raises an interactive prompt in real
+    /// dispatch — the fix must NOT count it as requested. The old bare-`RiskTier`
+    /// check counted every `IrreversibleWrite` call as requested regardless of the
+    /// allowlist, overcounting prompts that were never shown.
+    #[tokio::test]
+    async fn allowlisted_irreversible_write_is_not_counted_as_requested() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(GenuineIrreversibleToolFixture));
+        let gate: Arc<dyn haily_types::ApprovalGate> = Arc::new(ApprovalBroker::with_auto_approve(
+            ["memory_forget".to_string()].into_iter().collect(),
+        ));
+
+        let log = vec![log_entry("memory_forget", true)];
+        let (requested, denied) = approval_stats(&log, &tools, &gate, 0);
+
+        assert!(
+            !requested,
+            "an allowlisted IrreversibleWrite tool never raises a prompt in real \
+             dispatch — must not be counted as requested (H1 fix)"
+        );
+        assert!(!denied);
+    }
+
+    /// A genuinely `IrreversibleWrite` tool NOT on the allowlist DOES raise a real
+    /// prompt — must be counted as requested (the baseline case both the old and new
+    /// implementations should agree on).
+    #[tokio::test]
+    async fn non_allowlisted_irreversible_write_is_counted_as_requested() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(GenuineIrreversibleToolFixture));
+        let gate: Arc<dyn haily_types::ApprovalGate> = Arc::new(ApprovalBroker::new());
+
+        let log = vec![log_entry("memory_forget", true)];
+        let (requested, _denied) = approval_stats(&log, &tools, &gate, 0);
+
+        assert!(requested, "a non-allowlisted IrreversibleWrite call must count as requested");
+    }
+}
+
 /// Splits `buffer` into `(emit, hold)` at the hold-back boundary: `hold` is the
 /// longest trailing suffix that could still extend into a recognized tool tag
 /// (`<tool_call>`/`<tool_result>`, whitespace/case tolerant — see `tag_matcher`) if
@@ -91,11 +530,24 @@ fn split_safe(buffer: &str) -> (&str, &str) {
 /// producer (llama's blocking decode loop / the cloud SSE task) to notice on its own
 /// — dropping `rx` here is itself the second half of the cancellation signal those
 /// producers watch for (see `llama.rs`/`cloud.rs` doc comments).
+/// Returns `(full_text, total_tokens)`. NOTE (Harness Completion phase 5, H2 review
+/// fix): despite the field's name, `total_tokens` is NOT a trustworthy token count
+/// for telemetry purposes and must never be persisted as `kms_task_traces.
+/// completion_tokens` — see that call site's comment. The llama.cpp backend
+/// increments it once per actually-decoded token (genuinely accurate there), but the
+/// cloud SSE backend (`haily_llm::cloud`) increments it once per `Delta` EVENT, and a
+/// provider may batch several tokens' worth of text into one SSE delta — undercounting
+/// the real count. `run_turn` has no backend-agnostic way to know which producer served
+/// a given call (`LlmRouter` can fail over between them mid-lifetime), so a single
+/// "total_tokens" number here cannot be trusted as accurate across both. Kept as a
+/// `u32` return (not removed) only because callers still find the raw per-call count
+/// useful for internal flow/logging purposes distinct from the persisted-metric
+/// honesty bar `TraceMetrics::completion_tokens` must clear.
 async fn stream_llm_response(
     rx: &mut mpsc::Receiver<StreamChunk>,
     tx: &mpsc::Sender<ResponseChunk>,
     cancel: &CancellationToken,
-) -> Result<String> {
+) -> Result<(String, u32)> {
     let mut full = String::new();
     // Buffer of bytes not yet flushed to `tx`. While `Scanning`, holds only the
     // tail that might still become a tag; while `InTag`, holds the entire withheld
@@ -183,7 +635,7 @@ async fn stream_llm_response(
                     }
                 }
             }
-            Some(StreamChunk::Done { .. }) => {
+            Some(StreamChunk::Done { total_tokens }) => {
                 // Any residual `pending` text at clean end-of-stream was never
                 // confirmed to close out a tag (a real closed tag would already have
                 // been drained above) — either an incomplete tag prefix (e.g. a lone
@@ -194,7 +646,7 @@ async fn stream_llm_response(
                 // stay invisible to the user (the security invariant this function
                 // exists for), and a plain incomplete prefix will be re-rendered by
                 // `strip_tool_markup` at the loop's end instead.
-                return Ok(full);
+                return Ok((full, total_tokens));
             }
             Some(StreamChunk::Error(msg)) => {
                 return Err(anyhow::anyhow!("{msg}"));
@@ -468,21 +920,36 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // Record sub-agent activity for skill synthesis — uses the parent session_id
     // so the skill system learns from delegated work too.
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
-    let tool_calls_json = serde_json::to_string(&tool_call_log).unwrap_or_default();
-    let failed_calls = count_failed_calls(&tool_call_log);
-    let outcome = TaskOutcome::compute(
-        signals_inability(&final_response),
-        failed_calls,
-        tool_call_log.len(),
-    );
     let sub_task = format!("[{domain_name}] {task}");
-    let _ = db_skills::insert_trace(
+
+    // Harness Completion phase 5: same label-provenance + telemetry wiring as
+    // `run_turn`'s L0 path, scoped to the parent `session_id` (traces from a
+    // delegated sub-turn are attributed to the SAME session, per the existing
+    // "learns from delegated work too" convention above).
+    let session_id_str = session_id.to_string();
+    record_outcome_and_update_skill(
         &db,
-        &session_id.to_string(),
+        &session_id_str,
         &sub_task,
-        &tool_calls_json,
-        outcome.as_str(),
-        Some(elapsed_ms),
+        &tool_call_log,
+        &tools,
+        &final_response,
+        elapsed_ms,
+        OutcomeMetricsInput {
+            model_tier: tier_str(model_tier),
+            // sub-turn uses complete_tiered (non-streaming); no per-call token count
+            // surfaced here.
+            prompt_tokens: None,
+            completion_tokens: None,
+            delegate_overhead_ms: Some(delegate_overhead_ms),
+            confidence_update_failure_msg: "failed to update skill confidence from sub-turn outcome label",
+            // M3 review fix: a delegated sub-turn NEVER owns learning — the parent L0
+            // turn's own end-of-turn call is the sole EMA driver for one user-visible
+            // delegated action. See `OutcomeMetricsInput::owns_learning`'s doc comment.
+            owns_learning: false,
+            approval_gate: &approval_gate,
+            final_turn_deletes: turn_deletes.load(std::sync::atomic::Ordering::Relaxed),
+        },
     )
     .await;
 
@@ -534,9 +1001,20 @@ pub async fn run_turn(
         sessions::touch_session(&db, &session_id).await?;
     }
 
-    // Detect and persist feedback signal before inserting user message
+    // Detect and persist feedback signal before inserting user message.
+    //
+    // SECURITY (m2): `req.message` — the `Request::message` field — is the ONLY text
+    // this function ever passes to `detect_feedback`. It is the genuine incoming user
+    // message, never a tool result or fetched/pasted document body: those flow into
+    // the LLM's own `messages` history as `<tool_result>` blocks below, and are never
+    // re-read as `req.message` by this or any later turn. A phrase like "no, that's
+    // wrong" embedded in a pasted document or a tool's output therefore cannot reach
+    // `detect_feedback` through this call site — it would have to appear in the text
+    // the user themselves typed/sent this turn. `is_explicit = false`: this is a
+    // pattern-matched guess, capped below an explicit `feedback_react` tool call's
+    // confidence (see `apply_feedback_signal`'s doc comment).
     if let Some(signal) = feedback_parser::detect_feedback(&req.message) {
-        let _ = feedback_parser::apply_feedback_signal(&signal, &db).await;
+        let _ = feedback_parser::apply_feedback_signal(&signal, &db, &session_id, false).await;
     }
 
     sessions::insert_message(&db, &session_id, "user", &req.message, None).await?;
@@ -613,7 +1091,11 @@ pub async fn run_turn(
                 Ok(rx) => rx,
                 Err(e) => break 'turn Err(e),
             };
-            let response = match stream_llm_response(&mut stream, &tx, cancel).await {
+            // `_total_tokens` is deliberately discarded (H2 review fix): not a
+            // trustworthy cross-backend measurement — see `stream_llm_response`'s doc
+            // comment. `TraceMetrics::completion_tokens` is persisted as `None`
+            // below rather than fabricated from this count.
+            let (response, _total_tokens) = match stream_llm_response(&mut stream, &tx, cancel).await {
                 Ok(r) => r,
                 Err(e) => break 'turn Err(e),
             };
@@ -733,21 +1215,46 @@ pub async fn run_turn(
     // failed; Success otherwise. Replaces the old binary "failure if ANY call
     // errored," which made a 9-out-of-10-success turn indistinguishable from a
     // total failure in the EMA reward this trace eventually drives.
+    //
+    // Harness Completion phase 5: label provenance + telemetry, then (only when a
+    // real signal fired) drive the previously-dead EMA — see
+    // `record_outcome_and_update_skill`'s doc comment for the shared undo/repeat/
+    // label/insert-trace/EMA sequence this also runs for `run_sub_turn`. m4's exact
+    // undo predicate needs a `created_at` to compare against — using "now" internally
+    // (rather than whatever `insert_trace` mints moments later) is a negligible skew
+    // against a 5-minute window and avoids a second DB round-trip just to read the
+    // row back before checking undo.
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
-    let tool_calls_json = serde_json::to_string(&tool_call_log).unwrap_or_default();
-    let failed_calls = count_failed_calls(&tool_call_log);
-    let outcome = TaskOutcome::compute(
-        signals_inability(&final_response),
-        failed_calls,
-        tool_call_log.len(),
-    );
-    let _ = db_skills::insert_trace(
+    // H2 review fix: neither `prompt_tokens` nor `completion_tokens` has a
+    // trustworthy source today. `estimate_tokens` (chars/4) is a heuristic guess, not
+    // a measurement; `completion_tokens_total` is a real per-token count on the
+    // llama.cpp backend but an SSE-delta/frame count (NOT tokens) on the cloud
+    // backend, and `run_turn` has no backend-agnostic way to tell which one served
+    // any given call. Persisting either as a number would look like a real
+    // measurement it is not — `TraceMetrics` fields are `Option<i64>` precisely so a
+    // genuinely-unknown metric can be `None` instead of a fabricated value (CLAUDE.md
+    // "real code only"). Revisit if/when a backend surfaces a real `usage` field
+    // (see `haily_llm::sse`'s parsers — neither currently exposes one).
+    record_outcome_and_update_skill(
         &db,
         &session_id,
         &req.message,
-        &tool_calls_json,
-        outcome.as_str(),
-        Some(elapsed_ms),
+        &tool_call_log,
+        &tools,
+        &final_response,
+        elapsed_ms,
+        OutcomeMetricsInput {
+            model_tier: None, // L0 turns don't select a Tier today — see `SubTurnRequest::model_tier` doc.
+            prompt_tokens: None,
+            completion_tokens: None,
+            delegate_overhead_ms: None, // L0 turns have no delegate-spawn overhead of their own.
+            confidence_update_failure_msg: "failed to update skill confidence from outcome label",
+            // M3 review fix: the L0 turn is the SOLE owner of learning — see
+            // `OutcomeMetricsInput::owns_learning`'s doc comment.
+            owns_learning: true,
+            approval_gate: &tool_ctx.approval_gate,
+            final_turn_deletes: turn_deletes.load(std::sync::atomic::Ordering::Relaxed),
+        },
     )
     .await;
 
@@ -839,7 +1346,7 @@ mod streaming_tests {
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let full = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+        let (full, _total_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
             .await
             .unwrap();
         drop(user_tx);
@@ -1993,6 +2500,722 @@ mod turn_integration_tests {
         assert!(
             remaining_active.iter().any(|t| t.id == ids[5]),
             "the 6th (denied, over-cap) task must survive undeleted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outcome_signal_tests {
+    //! Harness Completion phase 5 — end-to-end through the REAL `run_turn` entrypoint
+    //! (mirrors `turn_integration_tests`'s SSE mock-server technique): the outcome
+    //! signal that used to be dead code now drives `update_skill_confidence`, gated
+    //! by the anti-reinforcement `unknown`-never-moves-confidence invariant, and
+    //! `req.message` is the ONLY text `detect_feedback` ever sees (the m2 attribution
+    //! boundary this suite proves by construction of the call graph, not by
+    //! inspecting internals).
+    use super::*;
+    use haily_db::DbHandle;
+    use haily_kms::KmsHandle;
+    use haily_llm::LlmConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn cloud_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    async fn test_db_kms() -> (Arc<DbHandle>, Arc<KmsHandle>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
+        (db, kms, dir)
+    }
+
+    /// Single-shot SSE responder — every call gets the SAME plain-text final answer,
+    /// no tool calls. Sufficient for tests that only care about the outcome/label
+    /// wiring after the loop ends, not about tool dispatch.
+    async fn spawn_plain_answer_sse_server(answer: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": answer } }]
+                    })
+                    .to_string();
+                    let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    async fn run_plain_turn(
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        session_id: uuid::Uuid,
+        message: &str,
+        answer: &'static str,
+    ) {
+        let base_url = spawn_plain_answer_sse_server(answer).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(ToolRegistry::new()),
+            kill: Arc::new(AtomicBool::new(false)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let req = Request {
+            session_id,
+            adapter_id: "test-adapter".to_string(),
+            message: message.to_string(),
+            user_ref: None,
+        };
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+        drain.await.expect("drain task");
+    }
+
+    async fn latest_trace(db: &DbHandle, session_id: uuid::Uuid) -> db_skills::TaskTrace {
+        db_skills::most_recent_trace(db, &session_id.to_string())
+            .await
+            .expect("most_recent_trace")
+            .expect("a trace must have been recorded")
+    }
+
+    /// Scripted SSE responder that emits `contents[n]` (repeating the last entry past
+    /// the end) as this call's delta — mirrors `turn_integration_tests`'
+    /// `spawn_scripted_sse_server`, duplicated here (not shared) per this file's own
+    /// per-module-helper convention (see that module's docs).
+    async fn spawn_scripted_sse_server(contents: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contents = std::sync::Arc::new(contents);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let call_count = std::sync::Arc::clone(&call_count);
+                let contents = std::sync::Arc::clone(&contents);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let idx = n.min(contents.len().saturating_sub(1));
+                    let content = contents.get(idx).cloned().unwrap_or_else(|| "Final answer.".to_string());
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": content } }]
+                    })
+                    .to_string();
+                    let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn tool_call_content(tool: &str, args: serde_json::Value) -> String {
+        format!(r#"<tool_call>{{"tool":"{tool}","args":{args}}}</tool_call>"#)
+    }
+
+    /// Plain-JSON (non-streaming) scripted responder — the dialect `complete_tiered`
+    /// speaks, needed for a delegated sub-turn's completions (M3 test). See
+    /// `turn_integration_tests::spawn_scripted_json_server`'s doc comment for why
+    /// this must NOT be the SSE responder.
+    async fn spawn_scripted_json_server(contents: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contents = std::sync::Arc::new(contents);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let call_count = std::sync::Arc::clone(&call_count);
+                let contents = std::sync::Arc::clone(&contents);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let idx = n.min(contents.len().saturating_sub(1));
+                    let content = contents.get(idx).cloned().unwrap_or_else(|| "Final answer.".to_string());
+                    let payload = serde_json::json!({
+                        "choices": [{ "message": { "content": content } }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// Drives one turn against a SCRIPTED (multi-response) SSE server with the REAL
+    /// `feedback_react` tool registered — used for the M2 corroboration test, where
+    /// turn 2 must issue an explicit `feedback_react` call in the SAME turn as the
+    /// repeat-request text, unlike `run_plain_turn`'s empty registry.
+    async fn run_scripted_turn_with_feedback_tool(
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        session_id: uuid::Uuid,
+        message: &str,
+        scripted_responses: Vec<String>,
+    ) {
+        let base_url = spawn_scripted_sse_server(scripted_responses).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(haily_tools::v1::memory::FeedbackReactTool));
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(registry),
+            kill: Arc::new(AtomicBool::new(false)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let req = Request {
+            session_id,
+            adapter_id: "test-adapter".to_string(),
+            message: message.to_string(),
+            user_ref: None,
+        };
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+        drain.await.expect("drain task");
+    }
+
+    /// A plain-text, no-tool-call turn (no undo, no repeat-request, Success outcome)
+    /// has no corroborating signal at all — the label must be `unknown`, and the turn's
+    /// trace must carry NO label_source/label_confidence.
+    #[tokio::test]
+    async fn a_plain_successful_turn_with_no_signal_is_labeled_unknown() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        run_plain_turn(db.clone(), kms, session_id, "what's the weather like", "It's sunny today.")
+            .await;
+
+        let trace = latest_trace(&db, session_id).await;
+        assert_eq!(trace.outcome, "success");
+        assert!(
+            trace.label_source.is_none(),
+            "a no-signal turn must not be force-labeled: {:?}",
+            trace.label_source
+        );
+        assert!(trace.label_confidence.is_none());
+    }
+
+    /// SAFETY (anti-reinforcement invariant): running an `unknown`-labeled turn must
+    /// NOT move a matching skill's confidence at all — even when an active skill
+    /// exists whose description closely matches the turn's task. This is the
+    /// end-to-end proof that `run_turn` actually SKIPS `update_skill_confidence` for
+    /// `unknown` rather than defaulting to a neutral reward.
+    #[tokio::test]
+    async fn unknown_labeled_turn_does_not_move_a_matching_skills_confidence() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        let skill = db_skills::insert_skill(
+            &db,
+            "weather-lookup",
+            "check the weather forecast for a city",
+            "pattern",
+            "[]",
+        )
+        .await
+        .expect("seed skill");
+        let confidence_before = skill.confidence;
+
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "check the weather forecast for hanoi today",
+            "It's sunny today.",
+        )
+        .await;
+
+        let after = db_skills::get_skill(&db, &skill.id)
+            .await
+            .expect("get_skill")
+            .expect("skill must still exist");
+        assert_eq!(
+            after.confidence, confidence_before,
+            "an unknown-labeled turn must leave skill confidence UNCHANGED, not nudge it toward a neutral value"
+        );
+    }
+
+    /// A genuine repeat-request (same session, near-duplicate task text on the very
+    /// next turn) CORROBORATED by an explicit negative `feedback_react` call within
+    /// that same turn (M2 review fix — an uncorroborated repeat alone must NOT label
+    /// as a failure signal; see `uncorroborated_repeat_request_leaves_confidence_unchanged`
+    /// below for that negative case) drives a `RepeatRequest` label, which — since it
+    /// is NOT unknown — DOES move a matching skill's confidence via the EMA. This
+    /// proves the "success turn moves confidence" success criterion: the previously-
+    /// dead `update_skill_confidence` path is now reachable end-to-end.
+    #[tokio::test]
+    async fn corroborated_repeat_request_label_moves_a_matching_skills_confidence_via_ema() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        // Description and both turns' messages deliberately reuse the SAME core word
+        // set so every pairwise Jaccard comparison this test relies on (skill-match
+        // AND turn-to-turn repeat-request) clears `CLUSTER_SIMILARITY_THRESHOLD`
+        // (0.40) with margin, rather than depending on a borderline overlap ratio.
+        let skill = db_skills::insert_skill(
+            &db,
+            "flight-booking",
+            "book a flight ticket to hanoi for the user",
+            "pattern",
+            "[]",
+        )
+        .await
+        .expect("seed skill");
+        // Seed confidence BELOW the eventual EMA reward (outcome.ema_reward()=1.0 *
+        // label.confidence=REPEAT_REQUEST_CONFIDENCE=0.5 → reward=0.5) so the
+        // production EMA_ALPHA=0.10 update provably moves it upward: seeding AT or
+        // ABOVE 0.5 would make `alpha*0.5 + (1-alpha)*confidence` a no-op-or-decrease,
+        // hiding a real wiring bug behind a coincidental equality.
+        db_skills::update_skill_confidence(&db, &skill.id, 0.2, 1.0)
+            .await
+            .expect("seed low confidence");
+        let mid = db_skills::get_skill(&db, &skill.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .confidence;
+        assert!((mid - 0.2).abs() < 1e-9, "sanity: confidence seeded at 0.2");
+
+        // Turn 1: establishes the prior trace's task_description.
+        run_plain_turn(
+            db.clone(),
+            kms.clone(),
+            session_id,
+            "book a flight ticket to hanoi",
+            "Sure, let me help with that.",
+        )
+        .await;
+        // Turn 2: near-duplicate of turn 1's task (triggers is_repeat_request) AND an
+        // explicit negative feedback_react call in the SAME turn (the M2
+        // corroborating signal) — the model issues the tool call first, then a final
+        // answer once the tool result comes back.
+        run_scripted_turn_with_feedback_tool(
+            db.clone(),
+            kms,
+            session_id,
+            "book a flight ticket to hanoi please",
+            vec![
+                tool_call_content(
+                    "feedback_react",
+                    serde_json::json!({"reaction": "negative", "about": "accuracy"}),
+                ),
+                "Xin lỗi, để mình thử lại.".to_string(),
+            ],
+        )
+        .await;
+
+        let trace = latest_trace(&db, session_id).await;
+        assert_eq!(trace.label_source.as_deref(), Some("repeat_request"));
+
+        let after = db_skills::get_skill(&db, &skill.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.confidence > mid,
+            "a Success outcome with a non-unknown label must move confidence upward via EMA, got {} (was {mid})",
+            after.confidence
+        );
+    }
+
+    /// M2 review fix, negative case: a repeat-request with NO corroborating negative
+    /// signal (a clean, all-succeeded turn, no explicit feedback) must NOT move a
+    /// matching skill's confidence at all — the same anti-reinforcement invariant as
+    /// `unknown_labeled_turn_does_not_move_a_matching_skills_confidence`, but reached
+    /// via an uncorroborated `repeat_request` rather than a first-time no-signal turn.
+    /// This is the direct end-to-end proof that benign habitual repetition (e.g. a
+    /// daily "tóm tắt hôm nay" habit) no longer erodes skill confidence.
+    #[tokio::test]
+    async fn uncorroborated_repeat_request_leaves_confidence_unchanged() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        let skill = db_skills::insert_skill(
+            &db,
+            "flight-booking",
+            "book a flight ticket to hanoi for the user",
+            "pattern",
+            "[]",
+        )
+        .await
+        .expect("seed skill");
+        let confidence_before = skill.confidence;
+
+        // Turn 1: establishes the prior trace's task_description.
+        run_plain_turn(
+            db.clone(),
+            kms.clone(),
+            session_id,
+            "book a flight ticket to hanoi",
+            "Sure, let me help with that.",
+        )
+        .await;
+        // Turn 2: near-duplicate of turn 1 (would trigger is_repeat_request) but NO
+        // tool call, NO feedback signal, NO failure — a completely clean, benign
+        // repeat with zero corroborating negative indicator.
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "book a flight ticket to hanoi please",
+            "Sure, let me help with that.",
+        )
+        .await;
+
+        let trace = latest_trace(&db, session_id).await;
+        assert!(
+            trace.label_source.is_none(),
+            "an uncorroborated repeat must be labeled unknown (NULL), not repeat_request: {:?}",
+            trace.label_source
+        );
+
+        let after = db_skills::get_skill(&db, &skill.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.confidence, confidence_before,
+            "a benign, uncorroborated repeat must leave skill confidence UNCHANGED"
+        );
+    }
+
+    /// m2 attribution: `req.message` — a genuine incoming user message — carrying a
+    /// negative-feedback phrase downgrades the PRIOR turn's trace to failure.
+    #[tokio::test]
+    async fn genuine_user_message_negative_feedback_downgrades_the_prior_trace() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        // Turn 1: an ordinary request, Success outcome.
+        run_plain_turn(
+            db.clone(),
+            kms.clone(),
+            session_id,
+            "what's the capital of vietnam",
+            "Hanoi is the capital of Vietnam.",
+        )
+        .await;
+        let turn1_trace_id = latest_trace(&db, session_id).await.id;
+
+        // Turn 2: the user's own typed message says the previous answer was wrong.
+        // `detect_feedback` runs on `req.message` — this call site — and NOTHING else.
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "sai rồi, không phải vậy",
+            "Xin lỗi, để mình kiểm tra lại.",
+        )
+        .await;
+
+        let turn1_after = db_skills::recent_traces(&db, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == turn1_trace_id)
+            .expect("turn 1's trace must still exist");
+        assert_eq!(
+            turn1_after.outcome, "failure",
+            "a genuine user negative-feedback message must downgrade the PRIOR turn's trace"
+        );
+        assert_eq!(turn1_after.label_source.as_deref(), Some("phrase_feedback"));
+    }
+
+    /// m2 SECURITY boundary: a negative-feedback phrase embedded in a TOOL RESULT
+    /// (simulated here directly, since `run_turn` has no tool that echoes attacker
+    /// text back as `req.message`) must NOT be able to downgrade a trace — because
+    /// `detect_feedback` is only ever invoked on `req.message`, never on tool output.
+    /// This test proves the negative: feeding the same phrase through the ONLY OTHER
+    /// text channel a turn produces (the assistant's own final response, which is
+    /// never re-parsed as feedback either) has no downgrade effect, corroborating
+    /// that the call graph — not a runtime filter — is what makes tool/pasted content
+    /// unreachable as a feedback source.
+    #[tokio::test]
+    async fn a_negative_phrase_in_the_assistant_response_never_downgrades_anything() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        // The ASSISTANT's response (not the user's message) contains a negative
+        // phrase — this text flows through `sessions::insert_message`/streaming, but
+        // is NEVER passed to `detect_feedback` (only `req.message` is, at the top of
+        // `run_turn`, before this response is even generated).
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "how do I center a div",
+            "sai rồi, không phải vậy — let me try again with flexbox instead.",
+        )
+        .await;
+
+        let trace = latest_trace(&db, session_id).await;
+        assert_eq!(
+            trace.outcome, "success",
+            "a negative phrase appearing in the ASSISTANT's own output (never in \
+             req.message) must not downgrade the turn's own trace"
+        );
+    }
+
+    /// Metrics persistence: a turn's trace carries `tool_call_count`. H2 review fix:
+    /// `prompt_tokens`/`completion_tokens` must be honest `None` rather than a
+    /// fabricated-looking number — neither has a trustworthy cross-backend source
+    /// today (see `stream_llm_response`'s doc comment for why the cloud SSE path's
+    /// per-delta count is a frame count, not a token count, and `estimate_tokens` is
+    /// a heuristic guess, not a measurement).
+    #[tokio::test]
+    async fn turn_trace_persists_tool_call_count_and_leaves_unmeasured_token_fields_null() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        run_plain_turn(db.clone(), kms, session_id, "hi", "hello there").await;
+
+        let trace = latest_trace(&db, session_id).await;
+        assert_eq!(trace.tool_call_count, Some(0));
+        assert!(
+            trace.completion_tokens.is_none(),
+            "completion_tokens must be honest NULL, not a fabricated frame-count number, got {:?}",
+            trace.completion_tokens
+        );
+        assert!(
+            trace.prompt_tokens.is_none(),
+            "prompt_tokens must be honest NULL, not an estimate_tokens heuristic, got {:?}",
+            trace.prompt_tokens
+        );
+    }
+
+    /// M3 review fix: a delegated turn's sub-turn STILL inserts its own trace
+    /// (telemetry stands) but must NOT itself drive the EMA — only the parent L0
+    /// turn's own end-of-turn `record_outcome_and_update_skill` call owns learning.
+    /// Without the `owns_learning` gate, this scenario would move the matching
+    /// skill's confidence TWICE for one user-visible delegated action (undocumented
+    /// 2x learning rate) — proven here by giving BOTH levels a genuine, independently
+    /// non-unknown label (L0: `undo_within_5min`; sub-turn: an explicit negative
+    /// `feedback_react` call) so a double-EMA bug would be unambiguously visible as
+    /// "moved further than one application of the EMA formula could produce."
+    #[tokio::test]
+    async fn delegated_turn_trace_exists_but_skill_confidence_moves_exactly_once() {
+        use crate::delegate::DelegateTool;
+        use haily_db::queries::{journal, sessions};
+        use std::sync::RwLock;
+
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        // Both the L0 message and the sub-turn's task text share the SAME core word
+        // set as the skill's description, so `find_matching_skill` matches at BOTH
+        // call sites — the precondition for a double-count bug to be observable.
+        let skill = db_skills::insert_skill(
+            &db,
+            "trip-planning",
+            "plan a trip to hanoi for the user",
+            "pattern",
+            "[]",
+        )
+        .await
+        .expect("seed skill");
+        db_skills::update_skill_confidence(&db, &skill.id, 0.2, 1.0)
+            .await
+            .expect("seed low confidence");
+        let before = db_skills::get_skill(&db, &skill.id).await.unwrap().unwrap().confidence;
+        assert!((before - 0.2).abs() < 1e-9, "sanity: confidence seeded at 0.2");
+
+        // L0's own real signal: a same-session action_journal row already undone
+        // within the 5-minute window — independent of anything the sub-turn does,
+        // so L0's OWN label is guaranteed UndoWithinN (never unknown).
+        sessions::create_session(&db, &session_id.to_string(), "test-adapter", None)
+            .await
+            .expect("seed session");
+        let row = journal::insert(
+            &db,
+            journal::NewAction {
+                session_id: &session_id.to_string(),
+                tool_name: "odoo_create",
+                tool_tier: "IrreversibleWrite",
+                compensability: "compensatable",
+                idempotency_key: "m3-test-op-1",
+                correlation_ref: "corr-m3-1",
+                request_params: r#"{"model":"res.partner"}"#,
+                pre_state: None,
+                pre_state_version: None,
+                compensation_plan: Some(r#"{"op":"unlink","id":1}"#),
+                turn_id: None,
+                retention_days: 30,
+            },
+        )
+        .await
+        .expect("seed journal row");
+        journal::advance_undo_status(&db, &row.id, "undone")
+            .await
+            .expect("mark undone");
+
+        // Sub-turn script: an explicit negative feedback_react call (guaranteed
+        // non-unknown label regardless of repeat/undo signals at THIS level), then a
+        // final answer.
+        let sub_url = spawn_scripted_json_server(vec![
+            tool_call_content(
+                "feedback_react",
+                serde_json::json!({"reaction": "negative", "about": "accuracy"}),
+            ),
+            "Đã ghi nhận, mình sẽ điều chỉnh.".to_string(),
+        ])
+        .await;
+        let sub_llm = Arc::new(LlmRouter::init(cloud_config(sub_url)).await);
+
+        let mut sub_registry = ToolRegistry::new();
+        sub_registry.register(Arc::new(haily_tools::v1::memory::FeedbackReactTool));
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let delegate = DelegateTool {
+            tool_name: "delegate_to_helper",
+            description: "delegates trip planning to a helper sub-agent",
+            system_prompt: "You are a helper sub-agent.",
+            domain_name: "helper",
+            db: db.clone(),
+            kms: kms.clone(),
+            llm: Arc::new(RwLock::new(sub_llm)),
+            sub_registry: Arc::new(sub_registry),
+            max_depth: 2,
+            model_tier: None,
+            kill: Arc::clone(&kill),
+        };
+
+        let mut l0_registry = ToolRegistry::new();
+        l0_registry.register(Arc::new(delegate));
+
+        // L0 script: delegate once, then a final answer once the delegate's result
+        // comes back.
+        let l0_url = spawn_scripted_sse_server(vec![
+            tool_call_content(
+                "delegate_to_helper",
+                serde_json::json!({"task": "plan a trip to hanoi for the user"}),
+            ),
+            "Đã lên kế hoạch chuyến đi Hà Nội cho bạn.".to_string(),
+        ])
+        .await;
+        let l0_llm = Arc::new(LlmRouter::init(cloud_config(l0_url)).await);
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm: l0_llm,
+            tools: Arc::new(l0_registry),
+            kill,
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let req = Request {
+            session_id,
+            adapter_id: "test-adapter".to_string(),
+            message: "plan a trip to hanoi for the user".to_string(),
+            user_ref: None,
+        };
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+        drain.await.expect("drain task");
+
+        // Both traces must exist: the sub-turn's own (telemetry value stands) AND
+        // the L0 turn's own.
+        let all_traces = db_skills::recent_traces(&db, 10).await.expect("recent_traces");
+        let session_traces: Vec<_> = all_traces
+            .into_iter()
+            .filter(|t| t.session_id == session_id.to_string())
+            .collect();
+        assert_eq!(
+            session_traces.len(),
+            2,
+            "both the sub-turn's own trace AND the L0 turn's trace must be inserted, got: {session_traces:?}"
+        );
+        assert!(
+            session_traces.iter().any(|t| t.label_source.as_deref() == Some("undo_within_n_min")),
+            "the L0 turn's own trace must carry the undo_within_5min label"
+        );
+        assert!(
+            session_traces.iter().any(|t| t.task_description.contains("[helper]")),
+            "the sub-turn's own trace must exist with its [domain] task_description prefix"
+        );
+
+        // The skill's confidence must have moved EXACTLY ONE EMA application's worth
+        // — not two. Compute the expected single-application value from the L0
+        // turn's own label (UndoWithinN, confidence=UNDO_LABEL_CONFIDENCE) and the
+        // Success outcome's ema_reward()=1.0, and assert the actual result matches
+        // that arithmetic (not a further-moved, double-applied value).
+        let expected_single_reward =
+            TaskOutcome::Success.ema_reward() * haily_kms::skills::UNDO_LABEL_CONFIDENCE;
+        let expected_after_one = 0.10 * expected_single_reward + 0.90 * before;
+
+        let after = db_skills::get_skill(&db, &skill.id).await.unwrap().unwrap();
+        assert!(
+            (after.confidence - expected_after_one).abs() < 1e-6,
+            "skill confidence must move by EXACTLY one EMA application \
+             (expected {expected_after_one}, got {}) — a double-count bug would move \
+             it further via a second application on top of the first",
+            after.confidence
         );
     }
 }
