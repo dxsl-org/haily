@@ -336,6 +336,7 @@ async fn daemon_option_registers_additional_background_tasks() {
         BootstrapOptions {
             enable_daemon: true,
             enable_watcher: true,
+            attempt_keyring: true,
         },
     )
     .await
@@ -352,6 +353,7 @@ async fn daemon_option_registers_additional_background_tasks() {
         BootstrapOptions {
             enable_daemon: false,
             enable_watcher: true,
+            attempt_keyring: true,
         },
     )
     .await

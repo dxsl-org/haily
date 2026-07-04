@@ -40,6 +40,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream"], default-features = false }
+# OS credential store (Phase 4: keyring, NOT v4/keyring-core — see haily-app/src/credential_store.rs).
+# No default features; the concrete backend feature is selected per-target in haily-app/Cargo.toml.
+keyring = { version = "=3.6.2", default-features = false }
 # Internal crates (path deps for workspace members that import each other)
 haily-types = { path = "crates/haily-types" }
 haily-db    = { path = "crates/haily-db" }

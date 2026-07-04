@@ -4,16 +4,29 @@
   import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
-  import { cancelTurn } from '$lib/tauri';
+  import { cancelTurn, sendMessage } from '$lib/tauri';
   import type { ChunkPayload, PendingApproval } from '$lib/tauri';
+  import { toolVerb } from '$lib/tool-verbs';
 
   type Role = 'user' | 'assistant' | 'system';
+
+  /** One reversible write completed this turn, buffered until `Complete` lands (M4 button
+   * gating — more writes may still land in the same turn while it streams). `journalId` is
+   * always non-null here: only `ToolResult` chunks with a non-null `journal_id` are buffered
+   * (see the chunk handler below). */
+  interface UndoableAction {
+    journalId: string;
+    verb: string;
+  }
 
   interface Message {
     id: string;
     role: Role;
     content: string;
     pending: boolean;
+    /** Reversible actions completed during this turn, revealed only once `pending` flips
+     * false (the turn's `Complete` chunk arrived) — see `UndoableAction`. */
+    undoable: UndoableAction[];
   }
 
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
@@ -32,6 +45,7 @@
       role: 'system',
       content: 'Xin chào! Tôi là Haily 💜 Hỏi tôi bất cứ điều gì.',
       pending: false,
+      undoable: [],
     },
   ]);
   let input = $state('');
@@ -63,6 +77,7 @@
           tool: chunk.data.tool,
           args: chunk.data.args,
           origin: chunk.data.origin,
+          reversible: chunk.data.reversible,
         };
         return;
       }
@@ -71,7 +86,7 @@
       let idx: number | undefined;
       if (session_id === NIL_UUID) {
         // Proactive notification — create a new system bubble
-        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true });
+        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true, undoable: [] });
         idx = messages.length - 1;
       } else {
         idx = sessionIndex.get(session_id);
@@ -86,6 +101,17 @@
         // the GUI doesn't buffer-then-flush like Telegram, but a bare append would
         // still visually run the error into whatever partial answer streamed first.
         messages[idx].content += `\n⚠️ ${chunk.data}`;
+      } else if (chunk.type === 'ToolResult') {
+        // Buffer only — the [Undo] affordance itself is gated to render after `Complete`
+        // (M4 button gating: more writes may still land later in the same turn, and
+        // offering undo mid-stream would be misleading about what "this turn" did).
+        // `journal_id` is non-null only when `reversible` is true AND the write's
+        // `post_state_version` had already landed at emit time (M4 ordering) — trust
+        // that invariant here rather than re-deriving it client-side.
+        const { name, reversible, journal_id } = chunk.data;
+        if (reversible && journal_id) {
+          messages[idx].undoable.push({ journalId: journal_id, verb: toolVerb(name, '{}') });
+        }
       } else if (chunk.type === 'Complete') {
         messages[idx].pending = false;
         sessionIndex.delete(session_id);
@@ -94,9 +120,6 @@
           stopping = false;
         }
       }
-      // ToolResult chunks are status-only (✓/✗ tool name) — the CLI/Telegram
-      // adapters surface them inline; the GUI has no dedicated status line for them
-      // yet and intentionally ignores them here rather than half-rendering.
 
       scrollToBottom();
     });
@@ -119,10 +142,10 @@
     sending = true;
     autoResize();
 
-    messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false });
+    messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false, undoable: [] });
 
     const assistantIdx = messages.length;
-    messages.push({ id: crypto.randomUUID(), role: 'assistant', content: '', pending: true });
+    messages.push({ id: crypto.randomUUID(), role: 'assistant', content: '', pending: true, undoable: [] });
     scrollToBottom();
 
     try {
@@ -155,6 +178,24 @@
       // failure; the console log gives a debugging trail without a modal.
       console.error('cancelTurn failed', e);
       stopping = false;
+    }
+  }
+
+  // Mirrors `SafetyTab.svelte`'s `requestUndo` phrasing exactly so both undo entry points
+  // (this inline button and the Safety tab's recent-actions list) produce identical
+  // downstream LLM behavior — same sentence in, same `journal_undo` tool call out. This is
+  // UI sugar over the normal chat flow, NOT a new write seam: `journal_undo` still prompts
+  // for approval (M4 lock, unchanged) and is session-scoped (M1), enforced server-side.
+  let undoing = $state<string | null>(null);
+  async function requestUndo(journalId: string) {
+    if (undoing) return;
+    undoing = journalId;
+    try {
+      await sendMessage(`Undo the action with journal id "${journalId}".`);
+    } catch (e) {
+      console.error('undo sendMessage failed', e);
+    } finally {
+      undoing = null;
     }
   }
 
@@ -201,6 +242,23 @@
           {#if msg.pending}
             <span class="cursor">▋</span>
           {/if}
+        {/if}
+        <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
+             gating — undo affordances for this turn's writes only appear once nothing
+             else from this turn can still land. -->
+        {#if !msg.pending && msg.undoable.length > 0}
+          <div class="undo-list">
+            {#each msg.undoable as action (action.journalId)}
+              <button
+                class="undo-inline"
+                onclick={() => requestUndo(action.journalId)}
+                disabled={undoing === action.journalId}
+                title={action.verb}
+              >
+                {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
+              </button>
+            {/each}
+          </div>
         {/if}
       </div>
     {/each}
@@ -307,6 +365,31 @@
     word-break: break-word;
     font-size: 14px;
   }
+
+  .undo-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  /* min-height 44px meets the WCAG 2.1 AA (2.5.5) minimum touch target size. */
+  .undo-inline {
+    padding: 8px 12px;
+    min-height: 44px;
+    border: 1px solid #3a2a5a;
+    border-radius: 999px;
+    background: #1e1638;
+    color: #c084fc;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: normal;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .undo-inline:hover:not(:disabled) { border-color: #7c3aed; background: #271a4a; }
+  .undo-inline:disabled { opacity: 0.5; cursor: default; }
 
   .bubble.user {
     background: #7c3aed;

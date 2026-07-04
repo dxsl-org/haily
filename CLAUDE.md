@@ -125,19 +125,20 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 ## Current Phase Status
 
-**Phase 1–13: Complete (2026-07-03)**
+**Phase 1–13.5: Complete (2026-07-04)**
 - Architecture Remediation Plan (Phase Rem): all 10 phases shipped to main (2026-07-02)
 - Safe Operator Harness (Phase 13): RiskTier, ApprovalGate seam, action journal + undo + kill switch, connector manifests, Odoo CRM (2026-07-03)
+- Harness Completion (Phases 13.1–13.5): Local journal/undo, per-turn cap, human-verb UI, keyring credentials (dormant), TaskOutcome→EMA wiring, label sources + confidence weighting, anti-reinforcement invariants, golden-task eval harness (23 cases, zero network, behavior-asserting) (2026-07-04)
 - Red Team findings (32 total): all accepted, applied, verified
 - Regression gates: `cargo clippy -- -D warnings && cargo test` passing
 
-**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation.
+**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation. Router A/B experiment unblocked by Phase 5's outcome data + eval harness.
 
 ## Docs
 
 Full documentation is in `.docs/`:
-- `architecture.md` — 18 technical decisions (Decisions 14–18 added 2026-07-03: RiskTier, ApprovalGate, journal, connectors, Odoo)
-- `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait)
+- `architecture.md` — 25 technical decisions (Decision 25 added 2026-07-04: outcome signal design & eval harness; Decisions 14–24 from earlier phases)
+- `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait, out-param side-channel, credential-getter seam)
 - `project-structure.md` — 10-crate layout (haily-types, haily-app added), dependency graph, layering test
-- `project-roadmap.md` — Phase status (1–13 complete; Phase 14–15 planned)
-- `project-changelog.md` — Significant changes, features, fixes by phase (Safe Operator Harness added 2026-07-03)
+- `project-roadmap.md` — Phase status (1–13.5 complete; 13.1–13.5 collapsed into single summary; Phase 14–15 planned; follow-up directions: generic declarative connectors + router A/B)
+- `project-changelog.md` — Significant changes, features, fixes by phase (Harness Completion Phase 5 added 2026-07-04)

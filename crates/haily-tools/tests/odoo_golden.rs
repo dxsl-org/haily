@@ -94,6 +94,7 @@ fn odoo_executor(db: Arc<DbHandle>, manifest: Arc<Manifest>) -> Arc<OdooExecutor
         kill: Arc::new(AtomicBool::new(false)),
         timeout: Duration::from_secs(15),
         allow_loopback: true, // TEST ONLY — reach the local sandbox; never true in production.
+        credential_getter: None, // DB-only for the golden suite; keyring is exercised in haily-app's own tests.
     }))
 }
 
@@ -124,11 +125,14 @@ async fn tool_ctx(db: Arc<DbHandle>) -> (ToolContext, tempfile::TempDir) {
         db,
         kms,
         session_id: uuid::Uuid::new_v4(),
+        turn_id: uuid::Uuid::new_v4(),
         depth: 0,
         domain: None,
         approval_gate: Arc::new(NoopGate),
         approval_tx: tx,
         cancel: tokio_util::sync::CancellationToken::new(),
+        turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        last_journal_id: Arc::new(std::sync::Mutex::new(None)),
     };
     (ctx, dir)
 }
@@ -339,7 +343,9 @@ async fn create_undo_roundtrip() {
 
     // Drive the REAL undo against the REAL row — the archive compensation must target the
     // created id and flip active=false.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "create-undo: {outcome:?}"
@@ -399,7 +405,9 @@ async fn update_undo_roundtrip() {
     );
 
     // Drive the REAL undo — function must be restored to "before", C10-guarded by write_date.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "update-undo: {outcome:?}"
@@ -445,7 +453,9 @@ async fn archive_undo_roundtrip() {
     .await;
 
     // Undo → active flips back to true.
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::Undone | UndoOutcome::AlreadyDone),
         "archive-undo: {outcome:?}"
@@ -527,7 +537,9 @@ async fn unlink_compensation_missing_error_is_done() {
     }
 
     // The unlink of an already-gone id must classify as AlreadyDone (MissingError = done).
-    let outcome = attempt_undo(&db, exec.as_ref(), &row).await.expect("undo");
+    let outcome = attempt_undo(&db, exec.as_ref(), &row, &row.session_id)
+        .await
+        .expect("undo");
     assert!(
         matches!(outcome, UndoOutcome::AlreadyDone),
         "MissingError on unlink must be treated as already-done: {outcome:?}"
@@ -567,6 +579,7 @@ async fn batch_partial_failure_three_counts() {
             pre_state: None,
             pre_state_version: None,
             compensation_plan: None,
+            turn_id: None,
             retention_days: 30,
         },
     )
@@ -574,7 +587,7 @@ async fn batch_partial_failure_three_counts() {
     .unwrap();
 
     let ids = vec![undoable.id.clone(), final_row.id.clone(), "no-such-id".to_string()];
-    let counts = batch_undo(&db, exec.as_ref(), &ids).await;
+    let counts = batch_undo(&db, exec.as_ref(), &ids, &ctx.session_id.to_string()).await;
     assert_eq!(counts.undone, 1, "one row undone");
     assert_eq!(counts.failed, 1, "final row refused = failed");
     assert_eq!(counts.not_attempted, 1, "unknown id not attempted");

@@ -12,10 +12,32 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Days a LOCAL tool's (tasks/notes/reminders) journal row is retained before purge — mirrors
+/// the connector path's `CONNECTOR_RETENTION_DAYS` (USER-VALIDATED parity; this phase does
+/// NOT change retention policy or re-tier any local tool, it only journals them).
+pub const LOCAL_RETENTION_DAYS: i64 = 30;
+
+/// Per-turn ceiling on auto-run (no-approval-prompt) deletes of a re-tiered `ReversibleWrite`
+/// soft-delete tool — USER-VALIDATED (2026-07-03 interview), declared as a const rather than
+/// hard-coded at the dispatch call site. Beyond this count, `haily-core::tool_call::dispatch`
+/// escalates the NEXT such delete to the approval gate for that one call, as a DISPATCH-layer
+/// policy — the tool's own `risk_tier()` return value is unchanged (see the `RiskTier` doc
+/// below on why this must never become an args-dependent tier).
+pub const MAX_AUTO_DELETES_PER_TURN: usize = 5;
+
 pub struct ToolContext {
     pub db: Arc<DbHandle>,
     pub kms: Arc<KmsHandle>,
     pub session_id: Uuid,
+    /// Server-derived correlation id shared by every tool call within ONE agent turn —
+    /// minted exactly once per turn in `agent::run_turn`/`run_sub_turn` (NEVER from LLM
+    /// output or tool args, so a compromised sub-agent cannot forge another turn's
+    /// group). A delegated sub-turn reuses its PARENT's `turn_id` rather than minting a
+    /// fresh one (see `delegate.rs`) — a delegation is part of the turn that requested
+    /// it, not a new logical unit of work, so its writes must undo together with the
+    /// parent's under one `undo_turn` call. Stamped onto every journal row (local and
+    /// connector) so `journal::list_by_turn` can collect the group.
+    pub turn_id: Uuid,
     /// Agent nesting depth: 0 = L0 orchestrator, 1 = L1 domain agent, 2 = L2 specialist.
     /// Delegate tools check this to enforce max depth and prevent infinite recursion.
     pub depth: u8,
@@ -40,6 +62,27 @@ pub struct ToolContext {
     /// raised through the seam never blocks the drain. At a sub-turn this is a
     /// `child_token()` of the parent's, so a sub-turn timeout cancels only itself.
     pub cancel: CancellationToken,
+    /// Count of successful re-tiered-delete executions so far THIS TURN (M2) — shared
+    /// with every sub-turn `delegate.rs` spawns (same `turn_id` group), so a delegated
+    /// sub-agent's deletes count toward the SAME cap as the parent's, not a fresh one.
+    /// Incremented ONLY by `haily-core::tool_call::dispatch` after a re-tiered delete
+    /// actually executes — never by a tool itself, and never resettable from LLM/task
+    /// text, so a compromised sub-agent cannot reset or bypass the cap.
+    pub turn_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    /// M4 out-param side-channel (Harness Completion phase 3, R4 framing): threads a
+    /// journal row id out of a local tool's `execute()` without widening the
+    /// `Tool::execute` trait's `Result<String>` return across ~20 implementations.
+    /// Set by `local_journaled_write`'s local-tool callers (`v1::{tasks,notes,
+    /// reminders}`) AFTER `set_post_state_version` has landed inside the SAME
+    /// transaction `local_journaled_write` already commits — so a `Some` value here
+    /// always implies the C10 undo-guard's baseline version is recorded (see that
+    /// function's doc comment). `dispatch` resets this to `None` at the TOP of every
+    /// call (never carried over from a prior tool) and reads it AFTER `execute()`
+    /// returns, populating `ResponseChunk::ToolResult{reversible, journal_id}`. This
+    /// is PER-DISPATCH-CALL state, not a process-global: dispatch is sequential
+    /// within one turn, so reset-then-read around a single `execute()` call can never
+    /// observe another call's value (see `tool_call.rs`'s no-cross-tool-bleed test).
+    pub last_journal_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so
@@ -55,13 +98,30 @@ pub struct ToolContext {
 pub enum RiskTier {
     /// Pure read, no side effect.
     Read,
-    /// Local write with no external side effect and no undo path yet (no v1 journal —
-    /// the journal wraps connectors only). Executes without an approval prompt.
+    /// A write that executes WITHOUT an approval prompt because it is journaled and
+    /// undoable. Covers every plain local create/update (calendar_add, note_save,
+    /// note_update, memory_remember, reminder_add, task_create, task_complete,
+    /// work_item_resume) AND, as of the Harness Completion phase (re-tier +
+    /// turn_id group undo), the THREE local soft-delete tools whose journal/undo
+    /// coverage now matches: `task_delete`, `note_delete`, `reminder_delete`. Their
+    /// safety net is no longer the approval prompt but: (1) the journal + undo path
+    /// (phase 1), (2) a per-turn destructive-op cap enforced in DISPATCH, not here
+    /// (`MAX_AUTO_DELETES_PER_TURN` — see its doc), and (3) the kill switch (C8),
+    /// which still blocks every `ReversibleWrite` exactly as it blocks
+    /// `IrreversibleWrite`. A tool must NEVER vary this return by args (see the
+    /// fail-closed contract above) — the cap's escalation happens in
+    /// `haily-core::tool_call::dispatch`, which treats an over-cap call as
+    /// `IrreversibleWrite` FOR THAT CALL ONLY, without this method's return value
+    /// ever changing.
     ReversibleWrite,
     /// Requires human approval before executing: external egress, or a local
-    /// operation gated for safety even though it may be physically reversible
-    /// (soft-deletes are `IrreversibleWrite` for GATING, not reversibility — never
-    /// re-tier them to `ReversibleWrite` until a journal/undo path covers them).
+    /// operation gated for safety even though it may be physically reversible.
+    /// The re-tier ban still applies to every soft-delete NOT listed above:
+    /// `memory_forget` (HNSW-index coupling — undoing a forget cannot simply
+    /// restore a row, the ANN index itself must be rebuilt/re-inserted, unresolved)
+    /// and `calendar_delete` (recurrence semantics — undoing one occurrence vs. a
+    /// whole series is unresolved). Do not re-tier either until a journal/undo path
+    /// that actually covers their specific semantics lands.
     IrreversibleWrite,
     /// Never executes.
     Blocked,

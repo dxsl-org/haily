@@ -4,6 +4,7 @@ pub mod episodic;
 pub mod facts;
 pub mod graph;
 pub mod journal;
+pub mod local_snapshot;
 pub mod meta;
 pub mod notes;
 pub mod reminders;

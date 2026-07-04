@@ -2,7 +2,7 @@
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
 use haily_tools::journal_undo::IS_COMPENSATION_TOOL;
-use haily_tools::{RiskTier, ToolContext, ToolRegistry};
+use haily_tools::{RiskTier, ToolContext, ToolRegistry, MAX_AUTO_DELETES_PER_TURN};
 use haily_types::ResponseChunk;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,6 +10,16 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const MAX_TOOL_CALLS: u32 = 10;
+
+/// The re-tiered `ReversibleWrite` soft-delete tools the M2 per-turn cap applies to
+/// (Harness Completion phase 2). A CLOSED list keyed on tool NAME, not `risk_tier()` —
+/// the tier must stay constant per tool (the `no_v1_tool_tier_varies_by_args` probe's
+/// soundness depends on it), so the cap is dispatch-layer policy, applied here by name.
+///
+/// `pub(crate)` (Harness Completion phase 5, H1 fix): `agent::approval_stats` replays
+/// this SAME escalation rule to derive `approval_requested`/`approval_denied` telemetry
+/// without a broker-observation channel — see its doc comment.
+pub(crate) const RETIERED_DELETE_TOOLS: &[&str] = &["task_delete", "note_delete", "reminder_delete"];
 
 /// Guards against runaway loops: identical consecutive calls and call-count ceiling.
 pub struct LoopGuard {
@@ -156,6 +166,18 @@ fn find_matching_close(text: &str, open: &TagMatch) -> Option<TagMatch> {
 /// depth>0 observes the same switch. The message is honest: it blocks NEW writes, not one
 /// already in flight. The real executor re-checks `kill` again just before its network
 /// call (M5 TOCTOU) — that re-check lives in the phase-4 HTTP executor.
+///
+/// M2 (Harness Completion phase 2): `task_delete`/`note_delete`/`reminder_delete` are
+/// re-tiered `ReversibleWrite` (auto-run, journaled, undoable) — see the `RiskTier` doc.
+/// This function computes a per-call `effective_tier` that escalates ONE of these tools
+/// to `IrreversibleWrite` once `ctx.turn_deletes` has already reached
+/// `MAX_AUTO_DELETES_PER_TURN` successful auto-runs this turn; `tool.risk_tier()` itself
+/// is never mutated, so the constant-tier invariant `no_v1_tool_tier_varies_by_args`
+/// checks holds. Every successful auto-run delete still gets its existing
+/// `ResponseChunk::ToolResult{ok:true}` send below — that IS the "notify the user" chunk
+/// for a write that ran without a prompt (CLI/Telegram render it as `[✓ name]`; no new
+/// chunk variant needed). The kill switch (C8) remains the safety net for a re-tiered
+/// delete both below and above the cap.
 pub async fn dispatch(
     tool_name: &str,
     args: serde_json::Value,
@@ -167,12 +189,51 @@ pub async fn dispatch(
         .get(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown tool '{tool_name}'"))?;
 
+    // M4 out-param reset: clear ANY value left by a PRIOR tool call before this one
+    // runs. Dispatch is sequential within a turn, so reset-here / read-after-execute
+    // brackets exactly one tool's `execute()` — a call that never sets the cell (every
+    // non-local tool, and any local Read) is thus guaranteed to observe `None` below,
+    // never a leftover id from a previous, unrelated call (see the no-cross-tool-bleed
+    // test in this module's test suite).
+    match ctx.last_journal_id.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+
     let tier = tool.risk_tier(&args);
+
+    // M2 per-turn destructive-op cap: a re-tiered delete tool is DISPATCH-LAYER escalated
+    // to `IrreversibleWrite` for THIS call once `ctx.turn_deletes` has already reached
+    // `MAX_AUTO_DELETES_PER_TURN` successful auto-runs this turn. `tool.risk_tier()` itself
+    // never changes (read, not mutated, here) — the escalation only affects the local
+    // `effective_tier` this call gates on, preserving the constant-tier invariant the
+    // `no_v1_tool_tier_varies_by_args` probe relies on. A relaxed load is sufficient: the
+    // counter only needs to be monotonically visible within one turn's sequential dispatch
+    // calls (and any concurrent sub-turn shares the SAME `Arc`, so a stale read only ever
+    // under-counts by calls truly racing at this instant, never resets/bypasses the cap).
+    let is_retiered_delete = RETIERED_DELETE_TOOLS.contains(&tool_name);
+    let effective_tier = if is_retiered_delete
+        && tier == RiskTier::ReversibleWrite
+        && ctx.turn_deletes.load(Ordering::Relaxed) >= MAX_AUTO_DELETES_PER_TURN
+    {
+        info!(
+            tool = tool_name,
+            cap = MAX_AUTO_DELETES_PER_TURN,
+            "per-turn destructive-op cap reached — escalating to approval"
+        );
+        RiskTier::IrreversibleWrite
+    } else {
+        tier
+    };
+
     // Kill-switch gate, layered onto the tier match below. Compensation is EXEMPT — else
     // the switch would block undo. `Acquire` pairs with the `Release` store in the
-    // toggle path so a live flip is observed without a restart.
+    // toggle path so a live flip is observed without a restart. Gates on `effective_tier`
+    // so an escalated-past-cap delete is held to the SAME kill-switch bar as any other
+    // write — and gates on `tier` for the un-escalated case, which is the ONLY remaining
+    // safety net for an auto-run re-tiered delete below the cap.
     let is_compensation = tool_name == IS_COMPENSATION_TOOL;
-    if tier != RiskTier::Read && !is_compensation && kill.load(Ordering::Acquire) {
+    if effective_tier != RiskTier::Read && !is_compensation && kill.load(Ordering::Acquire) {
         info!(
             tool = tool_name,
             "write blocked by kill switch (safety.disable_writes)"
@@ -182,6 +243,8 @@ pub async fn dispatch(
             .send(ResponseChunk::ToolResult {
                 name: tool_name.to_string(),
                 ok: false,
+                reversible: false,
+                journal_id: None,
             })
             .await;
         return Ok((
@@ -192,7 +255,7 @@ pub async fn dispatch(
         ));
     }
 
-    match tier {
+    match effective_tier {
         RiskTier::Blocked => {
             bail!("tool '{tool_name}' is blocked");
         }
@@ -208,6 +271,11 @@ pub async fn dispatch(
                 );
             } else {
                 let approval_id = Uuid::new_v4();
+                // The tool's OWN tier (pre-escalation) tells the UI whether this prompt
+                // exists only because M2's per-turn cap escalated a normally-reversible
+                // delete, vs. a tool that is genuinely IrreversibleWrite/Blocked on its
+                // own merits — see `ResponseChunk::ToolApprovalRequest::reversible` doc.
+                let is_cap_escalated_reversible = tier == RiskTier::ReversibleWrite;
                 let _ = ctx
                     .approval_tx
                     .send(ResponseChunk::ToolApprovalRequest {
@@ -218,6 +286,7 @@ pub async fn dispatch(
                         // domain name, NEVER from LLM/task text, so a compromised
                         // sub-agent cannot forge `L0`. Display-only (see `ResponseChunk`).
                         origin: Some(approval_origin(ctx.depth, ctx.domain)),
+                        reversible: is_cap_escalated_reversible,
                     })
                     .await;
 
@@ -232,6 +301,8 @@ pub async fn dispatch(
                         .send(ResponseChunk::ToolResult {
                             name: tool_name.to_string(),
                             ok: false,
+                            reversible: false,
+                            journal_id: None,
                         })
                         .await;
                     return Ok(("Người dùng đã từ chối yêu cầu này.".to_string(), false));
@@ -244,11 +315,36 @@ pub async fn dispatch(
     info!(tool = tool_name, "executing tool");
     let (result, ok) = match tool.execute(args, ctx).await {
         Ok(output) => {
+            // M2: count every SUCCESSFUL re-tiered-delete execution this turn, whether it
+            // ran auto (under the cap) or after an escalated approval — the cap must keep
+            // escalating monotonically for every delete beyond the Nth, not just the first.
+            // Incremented only here (post-success), never by a tool or from LLM/task text.
+            if is_retiered_delete {
+                ctx.turn_deletes.fetch_add(1, Ordering::Relaxed);
+            }
+            // M4: surface the journal id ONLY for a successful ReversibleWrite whose
+            // `execute()` set `ctx.last_journal_id` — i.e. only a local tool that went
+            // through `local_journaled_write` and committed with `post_state_version`
+            // recorded (see that function's doc comment for why a `Some` here already
+            // implies the version landed). Read/IrreversibleWrite always report
+            // `reversible:false, journal_id:None` even if somehow set (defensive —
+            // no such tool exists today, but the tier is the authority, not the cell).
+            let journal_id = if tier == RiskTier::ReversibleWrite {
+                match ctx.last_journal_id.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                }
+            } else {
+                None
+            };
+            let reversible = journal_id.is_some();
             let _ = ctx
                 .approval_tx
                 .send(ResponseChunk::ToolResult {
                     name: tool_name.to_string(),
                     ok: true,
+                    reversible,
+                    journal_id,
                 })
                 .await;
             (output, true)
@@ -260,6 +356,8 @@ pub async fn dispatch(
                 .send(ResponseChunk::ToolResult {
                     name: tool_name.to_string(),
                     ok: false,
+                    reversible: false,
+                    journal_id: None,
                 })
                 .await;
             (format!("Tool error: {e:#}"), false)
@@ -498,11 +596,14 @@ mod tests {
             db,
             kms,
             session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
             depth,
             domain: if depth == 0 { None } else { Some("developer") },
             approval_gate: broker as std::sync::Arc<dyn haily_types::ApprovalGate>,
             approval_tx,
             cancel,
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         };
         (ctx, rx, dir)
     }
@@ -610,12 +711,22 @@ mod tests {
             test_ctx(0, std::sync::Arc::clone(&broker), CancellationToken::new()).await;
 
         // Drain the ToolApprovalRequest chunk and deny it via the broker, mirroring
-        // what an adapter's resolver would do.
+        // what an adapter's resolver would do. Also capture `reversible`: a tool that
+        // is genuinely `IrreversibleWrite` on its own merits (not cap-escalated) must
+        // carry `false`, the mirror image of the cap-escalation case's `true`.
         let broker_clone = std::sync::Arc::clone(&broker);
         let session_id = ctx.session_id;
+        let saw_reversible = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saw_reversible_c = std::sync::Arc::clone(&saw_reversible);
         let responder = tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {
-                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    reversible,
+                    ..
+                } = chunk
+                {
+                    *saw_reversible_c.lock().unwrap() = Some(reversible);
                     use haily_types::ApprovalResolver;
                     broker_clone.resolve(approval_id, session_id, false);
                     break;
@@ -636,6 +747,11 @@ mod tests {
         responder.await.unwrap();
         assert!(!ok, "denied approval must report ok=false");
         assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert_eq!(
+            *saw_reversible.lock().unwrap(),
+            Some(false),
+            "a genuinely IrreversibleWrite tool (not cap-escalated) must carry reversible:false"
+        );
     }
 
     #[tokio::test]
@@ -1054,5 +1170,414 @@ mod tests {
             "the same dispatch must now block the write after a live flip"
         );
         assert!(t2.contains("safety.disable_writes"), "{t2}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Harness Completion phase 2 — M2 per-turn destructive-op cap. A re-tiered delete
+    // (task_delete/note_delete/reminder_delete) is `ReversibleWrite` and auto-runs, but
+    // dispatch escalates the (N+1)th such delete in one turn to the approval gate, and
+    // the kill switch remains a safety net at every count.
+    // -----------------------------------------------------------------------
+
+    /// Stand-in for a re-tiered delete tool (e.g. `task_delete`) — constant
+    /// `ReversibleWrite` tier, registered under a name in `RETIERED_DELETE_TOOLS` so
+    /// dispatch's M2 cap logic applies to it exactly as it would to the real tool.
+    struct RetieredDeleteTool;
+
+    #[async_trait]
+    impl Tool for RetieredDeleteTool {
+        fn name(&self) -> &str {
+            "task_delete"
+        }
+        fn description(&self) -> &str {
+            "stand-in for a re-tiered soft-delete"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::ReversibleWrite
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("deleted".to_string())
+        }
+    }
+
+    /// Build a `ToolContext` whose `turn_deletes` counter is pre-seeded to `n` — lets a
+    /// test start "already at the cap" without dispatching N real calls first.
+    async fn test_ctx_with_deletes(
+        broker: std::sync::Arc<ApprovalBroker>,
+        n: usize,
+    ) -> (
+        ToolContext,
+        mpsc::Receiver<ResponseChunk>,
+        tempfile::TempDir,
+    ) {
+        let (ctx, rx, dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        ctx.turn_deletes.store(n, Ordering::Relaxed);
+        (ctx, rx, dir)
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_a_retiered_delete_even_under_the_cap() {
+        // M2 proof: a re-tiered `ReversibleWrite` delete normally auto-runs with no
+        // approval prompt — the kill switch is its ONLY remaining safety net. Prove it
+        // blocks the write exactly like any other tier, with the counter nowhere near
+        // the cap (isolating the kill-switch behavior from the M2 escalation).
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx_with_deletes(broker, 0).await;
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (text, ok) = dispatch("task_delete", serde_json::json!({}), &registry, &ctx, &kill)
+            .await
+            .unwrap();
+
+        assert!(
+            !ok,
+            "a re-tiered delete must still be blocked by the kill switch"
+        );
+        assert!(text.contains("safety.disable_writes"), "{text}");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            0,
+            "a blocked delete must not increment the destructive counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_cap_retiered_delete_auto_runs_without_approval() {
+        // Baseline: below `MAX_AUTO_DELETES_PER_TURN`, a re-tiered delete executes with
+        // NO approval prompt (the whole point of the re-tier) and the counter advances.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx_with_deletes(broker, MAX_AUTO_DELETES_PER_TURN - 1).await;
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+
+        assert!(ok, "under the cap, the delete must auto-run: {text}");
+        assert_eq!(text, "deleted");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN,
+            "a successful auto-run delete must increment the counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_escalates_delete_past_limit_to_approval_while_risk_tier_stays_constant() {
+        // M2: once `turn_deletes` has already reached the cap, the NEXT re-tiered delete
+        // must route through the approval gate for THAT call — proving dispatch's
+        // escalation is a local `effective_tier`, never a mutation of `risk_tier()`.
+        let tool = Arc::new(RetieredDeleteTool);
+        assert_eq!(
+            tool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "sanity: the tool's own tier is ReversibleWrite before dispatch"
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::clone(&tool) as Arc<dyn Tool>);
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        // Drain the approval request the escalation must raise, and DENY it — proving the
+        // escalated call actually reached the gate rather than silently auto-running.
+        // Also capture `reversible` off the request: the R4 framing layer (phase 3) relies
+        // on this field to tell the GUI "cap-escalated but still undoable" apart from a
+        // genuinely final tool — a cap-escalated `ReversibleWrite` delete must carry `true`.
+        let session_id = ctx.session_id;
+        let saw_reversible = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saw_reversible_c = std::sync::Arc::clone(&saw_reversible);
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    reversible,
+                    ..
+                } = chunk
+                {
+                    *saw_reversible_c.lock().unwrap() = Some(reversible);
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch(
+                "task_delete",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
+        )
+        .await
+        .expect("must resolve via the approval deny, not hang")
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            !ok,
+            "past the cap, the delete must require (and here, be denied) approval"
+        );
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert_eq!(
+            *saw_reversible.lock().unwrap(),
+            Some(true),
+            "a cap-escalated ReversibleWrite delete must carry reversible:true — \
+             the GUI badge relies on this to avoid a false 'can't be undone' claim"
+        );
+
+        // The invariant `no_v1_tool_tier_varies_by_args` depends on: risk_tier() itself
+        // is UNCHANGED by the cap escalation.
+        assert_eq!(
+            tool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "risk_tier() must stay constant — the cap is dispatch-layer policy, not a tier mutation"
+        );
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN,
+            "a denied (never executed) escalated delete must NOT increment the counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_escalation_approved_still_executes_and_increments_counter() {
+        // Mirror of the deny case: an escalated delete that IS approved still executes
+        // (the cap gates on approval, it does not permanently block), and its success
+        // still counts toward the cap for the NEXT call this turn.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, true);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            ok,
+            "an approved escalated delete must still execute: {text}"
+        );
+        assert_eq!(text, "deleted");
+        assert_eq!(
+            ctx.turn_deletes.load(Ordering::Relaxed),
+            MAX_AUTO_DELETES_PER_TURN + 1,
+            "the cap must keep escalating monotonically for every delete beyond the cap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Harness Completion phase 3 — R4 framing, M4 out-param seam. A successful
+    // local `ReversibleWrite` (task_create/task_delete) sets `ctx.last_journal_id`
+    // via `local_journaled_write`; `dispatch` reads it after `execute()` returns and
+    // populates `ToolResult{reversible, journal_id}`. `journal_id` must imply the
+    // C10 undo-guard's baseline `post_state_version` has already landed, and the
+    // out-param cell must never bleed a value from one tool call into the next.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reversible_write_local_tool_populates_journal_id_with_version_landed() {
+        // Success Criterion: a ReversibleWrite with a recorded post_state_version
+        // yields a non-null journal_id.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(haily_tools::v1::tasks::TaskCreateTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let kill = kill_off();
+
+        let dispatch_fut = dispatch(
+            "task_create",
+            serde_json::json!({"title": "buy milk"}),
+            &registry,
+            &ctx,
+            &kill,
+        );
+        let (dispatch_result, chunk) = tokio::join!(dispatch_fut, async {
+            while let Some(chunk) = rx.recv().await {
+                if matches!(chunk, ResponseChunk::ToolResult { .. }) {
+                    return Some(chunk);
+                }
+            }
+            None
+        });
+        let (_text, ok) = dispatch_result.unwrap();
+        assert!(ok, "task_create must succeed");
+
+        let chunk = chunk.expect("dispatch must emit a ToolResult chunk");
+        let (reversible, journal_id) = match chunk {
+            ResponseChunk::ToolResult {
+                reversible,
+                journal_id,
+                ..
+            } => (reversible, journal_id),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(
+            reversible,
+            "a journaled local write must report reversible:true"
+        );
+        let journal_id = journal_id
+            .expect("a successful local ReversibleWrite must yield a non-null journal_id");
+
+        // The implication this out-param exists to guarantee: journal_id present ⇒
+        // post_state_version already landed (local_journaled_write commits both in
+        // the SAME transaction — see its doc comment), so the C10 guard is live the
+        // instant an [Undo] could be offered.
+        let row = haily_db::queries::journal::get_by_id(&ctx.db, &journal_id)
+            .await
+            .expect("query journal row")
+            .expect("journal row must exist for the returned id");
+        assert!(
+            row.post_state_version.is_some(),
+            "journal_id must only be surfaced once post_state_version has landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tool_never_reports_reversible_even_if_tier_misclassified() {
+        // Defensive path: a Read-tier tool always reports reversible:false/journal_id:
+        // None regardless of what (if anything) is sitting in the out-param cell —
+        // the TIER gates surfacing, not the cell's mere presence.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+
+        // Poison the cell as if a prior call had left something behind — dispatch's
+        // top-of-call reset (exercised by the bleed test below) is bypassed here on
+        // purpose to isolate the tier gate itself.
+        *ctx.last_journal_id.lock().unwrap() = Some("leftover-id".to_string());
+
+        let (_text, ok) = dispatch(
+            "read_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+
+        let chunk = rx.recv().await.expect("must emit a ToolResult chunk");
+        match chunk {
+            ResponseChunk::ToolResult {
+                reversible,
+                journal_id,
+                ..
+            } => {
+                assert!(!reversible, "a Read tool must never report reversible:true");
+                assert_eq!(
+                    journal_id, None,
+                    "a Read tool must never surface a journal_id"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn last_journal_id_does_not_bleed_across_tool_calls() {
+        // M4 risk note: dispatching tool A (sets the cell) then tool B (a plain Read
+        // that never touches it) must NOT leave B's ToolResult carrying A's journal_id
+        // — dispatch resets the cell at the TOP of every call, so B must observe None.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(haily_tools::v1::tasks::TaskCreateTool));
+        registry.register(Arc::new(ReadTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+
+        // Tool A: a real local ReversibleWrite that sets the cell.
+        let (_text_a, ok_a) = dispatch(
+            "task_create",
+            serde_json::json!({"title": "task A"}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+        assert!(ok_a);
+        let chunk_a = rx.recv().await.expect("tool A must emit a ToolResult");
+        let journal_id_a = match chunk_a {
+            ResponseChunk::ToolResult { journal_id, .. } => {
+                journal_id.expect("tool A must have set a journal_id")
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+
+        // Sanity: the cell still holds A's id right after A's dispatch returns (proves
+        // the bleed check below is meaningful, not vacuously true because nothing was
+        // ever set).
+        assert_eq!(
+            ctx.last_journal_id.lock().unwrap().as_deref(),
+            Some(journal_id_a.as_str())
+        );
+
+        // Tool B: a Read that never touches the out-param.
+        let (_text_b, ok_b) = dispatch(
+            "read_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+        )
+        .await
+        .unwrap();
+        assert!(ok_b);
+        let chunk_b = rx.recv().await.expect("tool B must emit a ToolResult");
+        match chunk_b {
+            ResponseChunk::ToolResult {
+                reversible,
+                journal_id,
+                ..
+            } => {
+                assert!(
+                    !reversible,
+                    "tool B (a Read) must not inherit tool A's reversible:true"
+                );
+                assert_eq!(
+                    journal_id, None,
+                    "tool B must not inherit tool A's leftover journal_id — the cell must be reset per dispatch call"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 }

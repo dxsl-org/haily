@@ -34,10 +34,38 @@ pub enum ResponseChunk {
         /// `None`, so the wire envelope is not a breaking change (M8).
         #[serde(default)]
         origin: Option<String>,
+        /// True when the underlying tool is normally `ReversibleWrite` and this
+        /// specific approval prompt exists ONLY because the per-turn destructive-op
+        /// cap escalated it for this call (Harness Completion phase 2's M2 policy) —
+        /// i.e. the action IS journaled/undoable, this is not a genuinely final write.
+        /// `false` for a tool that is actually `IrreversibleWrite`/`Blocked` on its own
+        /// merits (e.g. `memory_forget`, `calendar_delete`). Display-only — lets a UI
+        /// distinguish "can't be undone" from "cap reached, please confirm" without
+        /// re-deriving tier logic client-side. `#[serde(default)]` keeps this ADDITIVE.
+        #[serde(default)]
+        reversible: bool,
     },
     ToolResult {
         name: String,
         ok: bool,
+        /// Whether this call was a journaled, undoable `ReversibleWrite` local write
+        /// (Harness Completion phase 3, R4 framing) — `false` for `Read`/
+        /// `IrreversibleWrite` tools and for any `ReversibleWrite` that did not go
+        /// through the local journal out-param (`ToolContext::last_journal_id`).
+        /// `#[serde(default)]` keeps this ADDITIVE: a pre-this-change payload with no
+        /// `reversible` key still deserializes, defaulting to `false` (M8).
+        #[serde(default)]
+        reversible: bool,
+        /// The action-journal row id to pass to `journal_undo` for this call, set
+        /// ONLY once `dispatch` observed `ToolContext::last_journal_id` populated
+        /// AFTER `execute()` returned — which in turn only happens once
+        /// `local_journaled_write` has committed its transaction with
+        /// `post_state_version` recorded (see that function's doc comment). A
+        /// `journal_id` therefore always implies the C10 undo-guard's baseline
+        /// version has landed. `#[serde(default)]` keeps this ADDITIVE (M8): an old
+        /// payload with no `journal_id` key deserializes to `None`.
+        #[serde(default)]
+        journal_id: Option<String>,
     },
     /// Turn-ending failure (LLM error, cancelled mid-stream, etc.), distinct from
     /// `Text` specifically so adapters that BUFFER `Text` chunks until `Complete`
@@ -132,6 +160,7 @@ mod tests {
             args: "{}".to_string(),
             approval_id: Uuid::nil(),
             origin: None,
+            reversible: false,
         };
         let json = serde_json::to_string(&chunk).expect("serialize");
         // Frontend (src/lib/tauri.ts) depends on this exact envelope shape.
@@ -145,11 +174,13 @@ mod tests {
                 args,
                 approval_id,
                 origin,
+                reversible,
             } => {
                 assert_eq!(tool, "exec");
                 assert_eq!(args, "{}");
                 assert_eq!(approval_id, Uuid::nil());
                 assert_eq!(origin, None);
+                assert!(!reversible);
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
@@ -184,6 +215,7 @@ mod tests {
             args: "{}".to_string(),
             approval_id: Uuid::nil(),
             origin: Some("L1:developer".to_string()),
+            reversible: false,
         };
         let json = serde_json::to_string(&chunk).expect("serialize");
         assert!(json.contains("\"origin\":\"L1:developer\""));
@@ -192,6 +224,45 @@ mod tests {
         match round_tripped {
             ResponseChunk::ToolApprovalRequest { origin, .. } => {
                 assert_eq!(origin, Some("L1:developer".to_string()));
+            }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    /// M8: `reversible` is `bool` + `#[serde(default)]` — a pre-phase-3 payload with
+    /// no `reversible` key must still deserialize (defaulting to `false`, the safe
+    /// "treat as final" reading) rather than error.
+    #[test]
+    fn reversible_absent_payload_deserializes_to_false() {
+        let legacy = r#"{"type":"ToolApprovalRequest","data":{"tool":"exec","args":"{}","approval_id":"00000000-0000-0000-0000-000000000000"}}"#;
+        let chunk: ResponseChunk = serde_json::from_str(legacy)
+            .expect("legacy payload without reversible must deserialize");
+        match chunk {
+            ResponseChunk::ToolApprovalRequest { reversible, .. } => {
+                assert!(!reversible, "absent reversible must default to false");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// A `reversible: true` prompt (M2 cap-escalated delete) round-trips faithfully —
+    /// the UI badge distinction depends on this surviving serialization.
+    #[test]
+    fn reversible_true_roundtrips() {
+        let chunk = ResponseChunk::ToolApprovalRequest {
+            tool: "task_delete".to_string(),
+            args: "{}".to_string(),
+            approval_id: Uuid::nil(),
+            origin: Some("L0".to_string()),
+            reversible: true,
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"reversible\":true"));
+
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::ToolApprovalRequest { reversible, .. } => {
+                assert!(reversible);
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
@@ -210,6 +281,86 @@ mod tests {
         let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
         match round_tripped {
             ResponseChunk::Error(msg) => assert_eq!(msg, "boom"),
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    /// M8/M4 (Harness Completion phase 3): a `ToolResult` payload minted BEFORE
+    /// `reversible`/`journal_id` existed (neither key present) must still
+    /// deserialize, defaulting `reversible` to `false` and `journal_id` to `None` —
+    /// the guarantee that an old/in-flight chunk (or a Telegram/CLI adapter that
+    /// never learns about the new fields) does not break after upgrade.
+    #[test]
+    fn tool_result_legacy_payload_without_new_fields_deserializes() {
+        let legacy = r#"{"type":"ToolResult","data":{"name":"task_delete","ok":true}}"#;
+        let chunk: ResponseChunk =
+            serde_json::from_str(legacy).expect("legacy ToolResult payload must deserialize");
+        match chunk {
+            ResponseChunk::ToolResult {
+                name,
+                ok,
+                reversible,
+                journal_id,
+            } => {
+                assert_eq!(name, "task_delete");
+                assert!(ok);
+                assert!(!reversible, "absent reversible must default to false");
+                assert_eq!(journal_id, None, "absent journal_id must default to None");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// A `ToolResult` WITH the new fields round-trips faithfully — proves they are
+    /// real, serialized parts of the envelope for the GUI's inline-[Undo] affordance.
+    #[test]
+    fn tool_result_with_new_fields_roundtrips() {
+        let chunk = ResponseChunk::ToolResult {
+            name: "task_delete".to_string(),
+            ok: true,
+            reversible: true,
+            journal_id: Some("journal-row-id".to_string()),
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"reversible\":true"));
+        assert!(json.contains("\"journal_id\":\"journal-row-id\""));
+
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::ToolResult {
+                reversible,
+                journal_id,
+                ..
+            } => {
+                assert!(reversible);
+                assert_eq!(journal_id, Some("journal-row-id".to_string()));
+            }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    /// An irreversible/read call reports `reversible:false, journal_id:None` and
+    /// still round-trips distinctly from a reversible one — guards against the two
+    /// shapes being conflated by a lazy `Default` derive somewhere downstream.
+    #[test]
+    fn tool_result_irreversible_shape_has_no_journal_id() {
+        let chunk = ResponseChunk::ToolResult {
+            name: "web_search".to_string(),
+            ok: true,
+            reversible: false,
+            journal_id: None,
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::ToolResult {
+                reversible,
+                journal_id,
+                ..
+            } => {
+                assert!(!reversible);
+                assert_eq!(journal_id, None);
+            }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
     }

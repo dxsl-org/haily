@@ -20,6 +20,11 @@ tracing     = { workspace = true }
 serde_json  = { workspace = true }
 dashmap     = "6"
 uuid        = { workspace = true }
+keyring     = { workspace = true }
+# Only for `credential_store::scrub_residue`'s raw `VACUUM` — `DbHandle` (haily-db) does
+# not expose a generic raw-execute helper, and adding one is outside this crate's
+# file-ownership for this phase. `sqlite` (no other backend) matches haily-db's own features.
+sqlx        = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 
 [features]
 default = []
@@ -30,7 +35,24 @@ llama  = ["haily-llm/llama"]
 cuda   = ["haily-llm/cuda"]
 metal  = ["haily-llm/metal"]
 vulkan = ["haily-llm/vulkan"]
+# Exposes `CredentialStore::force_next_keyring_error` (mock-backend error injection) to
+# EXTERNAL test crates under `tests/`. Never enabled by a production build — only via the
+# self-referencing dev-dependency below, which cargo only activates for this crate's own
+# tests/benches/examples.
+test-support = []
+
+[target.'cfg(windows)'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { workspace = true, features = ["sync-secret-service", "linux-native"] }
 
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1"
+# Self-dependency so `tests/*.rs` integration tests (compiled as an external crate) can
+# see `CredentialStore::force_next_keyring_error` behind the `test-support` feature above.
+haily-app = { path = ".", features = ["test-support"] }

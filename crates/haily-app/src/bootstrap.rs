@@ -5,7 +5,8 @@
 //! without calling `shutdown()` leaves background tasks running until the process
 //! exits — always call `shutdown()` on the signal/exit-event path.
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
-use crate::config::load_llm_config;
+use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
+use crate::credential_store::{CredentialPolicy, CredentialStore};
 use crate::turns::TurnRegistry;
 use crate::{dispatch, watchers};
 use anyhow::Result;
@@ -21,12 +22,18 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Toggles for subsystems that historically differed between modes (F6 mode
-/// asymmetry). Both default to `true` — every mode gets the full feature set unless
-/// a caller has a specific reason to opt out (e.g. a future test harness).
+/// asymmetry). `enable_daemon`/`enable_watcher` default to `true` — every mode gets the
+/// full feature set unless a caller has a specific reason to opt out (e.g. a future test
+/// harness). `attempt_keyring` defaults to `true` (interactive desktop/CLI) and MUST be
+/// set `false` by the `--headless` launch path (M5a) — Windows Credential Manager (DPAPI,
+/// tied to the interactive session) and Linux secret-service (needs a D-Bus session bus)
+/// are both structurally unavailable in a true daemon/Session-0 context, so a headless
+/// boot that still tried the keyring could hang or error on every credential read.
 #[derive(Debug, Clone, Copy)]
 pub struct BootstrapOptions {
     pub enable_daemon: bool,
     pub enable_watcher: bool,
+    pub attempt_keyring: bool,
 }
 
 impl Default for BootstrapOptions {
@@ -34,6 +41,7 @@ impl Default for BootstrapOptions {
         Self {
             enable_daemon: true,
             enable_watcher: true,
+            attempt_keyring: true,
         }
     }
 }
@@ -51,6 +59,11 @@ pub struct AppHandle {
     pub kms: Arc<KmsHandle>,
     pub orchestrator: Arc<Orchestrator>,
     pub adapters: AdapterManager,
+    /// OS-keyring-backed credential store (Harness Completion phase 4). Exposed so a mode
+    /// layer (e.g. the Tauri command surface) can read/rotate a connector secret through
+    /// the same read/write-fallback policy the startup migration used — never by reaching
+    /// into `kms_preferences` directly for a credential.
+    pub credential_store: Arc<CredentialStore>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
@@ -79,6 +92,28 @@ impl AppHandle {
         let db = Arc::new(db);
         let kms = Arc::new(kms);
         let llm_cfg = load_llm_config(&kms).await;
+
+        // Harness Completion phase 4: move any plaintext connector secret already sitting
+        // in `kms_preferences` into the OS keyring. M5a: headless/Session-0 never attempts
+        // the keyring at all (DPAPI/secret-service are both unreliable there), so the
+        // migration step is skipped outright rather than attempted-and-failed on every
+        // boot. Idempotent either way — `migrate_from_db` is a no-op once the row already
+        // holds the keyring marker (or `attempt_keyring` is false, since a headless boot
+        // recording a fallback warning here would be noise: it never even tried).
+        let credential_policy = if opts.attempt_keyring {
+            CredentialPolicy::default()
+        } else {
+            CredentialPolicy::headless()
+        };
+        let credential_store = Arc::new(CredentialStore::new(Arc::clone(&db), credential_policy));
+        if opts.attempt_keyring {
+            if let Err(e) = credential_store.migrate_from_db(ODOO_API_KEY_PREF).await {
+                // Never fatal: the DB row is left untouched on a failed migration (no data
+                // loss — see `migrate_from_db`'s contract), so the connector simply keeps
+                // reading the plaintext value until the next successful boot's attempt.
+                warn!("credential migration for '{ODOO_API_KEY_PREF}' failed: {e:#}");
+            }
+        }
 
         // Validate the auto_approve allowlist against the same tool set the
         // orchestrator will build from. A destructive/exfil tool listed here is a
@@ -159,6 +194,7 @@ impl AppHandle {
             kms,
             orchestrator,
             adapters: am,
+            credential_store,
             shutdown,
             tasks,
             turns,

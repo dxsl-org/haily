@@ -72,6 +72,177 @@ impl TaskOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Label provenance (Harness Completion phase 5, researcher-03 §2)
+// ---------------------------------------------------------------------------
+
+/// Confidence weights per label source (researcher-03 §2.1): explicit signals and
+/// undo are high-precision (≥0.9), repeat-request and tool-error-ratio are weaker
+/// correlates. `UNDO_LABEL_CONFIDENCE` is DELIBERATELY near-zero rather than the
+/// literature's suggested ≥0.9 — m4's risk note: before local undos populate the
+/// journal broadly (which Phase 2 of this same plan enables, already merged on this
+/// branch), the signal fires rarely, and calibrating the eval baseline against a
+/// near-dead signal at full confidence would be worse than under-weighting it. This
+/// is a conscious tuning knob, documented so a future pass can raise it once
+/// `undo_within_5min` is observed firing at a healthy rate — not an oversight.
+pub const EXPLICIT_FEEDBACK_CONFIDENCE: f64 = 0.9;
+/// Phrase-detected (pattern-matched) correction/negative feedback — CAPPED BELOW
+/// `EXPLICIT_FEEDBACK_CONFIDENCE` (m2): a parsed phrase is weaker evidence than an
+/// explicit `feedback_react` tool call, since a phrase match can misfire on
+/// incidental phrasing even after the anchor/short-message precision rules in
+/// `feedback_parser`.
+pub const PHRASE_FEEDBACK_CONFIDENCE: f64 = 0.5;
+pub const TOOL_ERROR_RATIO_CONFIDENCE: f64 = 0.6;
+pub const REPEAT_REQUEST_CONFIDENCE: f64 = 0.5;
+/// m4: near-zero until Phase 2's local-undo journaling has matured the signal.
+pub const UNDO_LABEL_CONFIDENCE: f64 = 0.05;
+/// m4 exact predicate window: an `action_journal` row undone within this many
+/// minutes of the CURRENT action's `created_at` counts as `undo_within_5min`.
+pub const UNDO_WINDOW_MINUTES: i64 = 5;
+
+/// Where a turn's outcome label came from — the anti-reinforcement provenance tag
+/// (researcher-03 §2.1). `Unknown` is the safety-critical variant: a turn with no
+/// corroborating signal MUST NOT drive `update_skill_confidence` at all (see that
+/// function's caller in `haily-core::agent`, which skips the call entirely rather
+/// than defaulting to a neutral 0.5 reward).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelSource {
+    ExplicitFeedback,
+    PhraseFeedback,
+    ToolErrorRatio,
+    RepeatRequest,
+    UndoWithinN,
+    Unknown,
+}
+
+impl LabelSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LabelSource::ExplicitFeedback => "explicit_feedback",
+            LabelSource::PhraseFeedback => "phrase_feedback",
+            LabelSource::ToolErrorRatio => "tool_error_ratio",
+            LabelSource::RepeatRequest => "repeat_request",
+            LabelSource::UndoWithinN => "undo_within_n_min",
+            LabelSource::Unknown => "unknown",
+        }
+    }
+}
+
+/// A turn's outcome label: provenance + confidence weight. `is_unknown()` is the
+/// gate callers must check BEFORE reading `confidence` — there is no meaningful
+/// weight for "no signal," and a caller that read `confidence` unconditionally would
+/// risk `Unknown`'s placeholder `0.0` being mistaken for "confidently zero reward"
+/// rather than "skip this turn entirely."
+#[derive(Debug, Clone, Copy)]
+pub struct Label {
+    pub source: LabelSource,
+    pub confidence: f64,
+}
+
+impl Label {
+    pub fn unknown() -> Self {
+        Label {
+            source: LabelSource::Unknown,
+            confidence: 0.0,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.source == LabelSource::Unknown
+    }
+}
+
+/// Derive the label for a turn from the highest-precision signal available, in the
+/// priority order researcher-03 §1 ranks by precision: explicit feedback (highest) >
+/// undo-within-N > tool-error-ratio > repeat-request > unknown (default, moves
+/// nothing). Only ONE signal drives the label even when several could apply — this
+/// keeps the EMA input a single well-defined `reward * confidence` rather than an
+/// ad-hoc combination the anti-reinforcement guard would need to separately reason
+/// about (researcher-03 §2's corroboration-floor guard operates at the skill-archival
+/// layer, not here).
+///
+/// `explicit_feedback`/`phrase_feedback` are NOT computed here — they are joined by
+/// the caller (`haily-kms::feedback::apply_feedback_signal`) against the PRIOR
+/// turn's trace once a feedback signal fires on THIS turn's message (m2 attribution
+/// gate lives at that call site, not in this pure function).
+///
+/// # M2 review fix — benign repetition must not read as failure
+/// `repeat_request` alone is a WEAK, high-noise proxy: a user who habitually sends
+/// near-duplicate consecutive messages (e.g. a daily "tóm tắt hôm nay" habit) would
+/// otherwise have every one of those turns mislabeled as a failure signal, eroding an
+/// otherwise-healthy skill's confidence for behavior that has nothing to do with task
+/// quality. `has_corroborating_negative_signal` gates it: an UNCORROBORATED repeat
+/// (a clean, all-succeeded turn with no other negative indicator) now stays
+/// `unknown` — no confidence movement — and only a repeat ALSO accompanied by a
+/// same-turn negative indicator (a `Partial` outcome, i.e. some-but-not-most tool
+/// calls failed — `Failure` already wins its own branch above and never reaches
+/// here — or an explicit `feedback_react` negative/correction call within this same
+/// turn's tool-call log) is labeled `RepeatRequest`. The caller
+/// (`haily-core::agent::record_outcome_and_update_skill`) computes this flag.
+pub fn derive_label(
+    outcome: TaskOutcome,
+    undo_within_5min: bool,
+    is_repeat_request: bool,
+    has_corroborating_negative_signal: bool,
+) -> Label {
+    if undo_within_5min {
+        return Label {
+            source: LabelSource::UndoWithinN,
+            confidence: UNDO_LABEL_CONFIDENCE,
+        };
+    }
+    if outcome == TaskOutcome::Failure {
+        return Label {
+            source: LabelSource::ToolErrorRatio,
+            confidence: TOOL_ERROR_RATIO_CONFIDENCE,
+        };
+    }
+    if is_repeat_request && has_corroborating_negative_signal {
+        return Label {
+            source: LabelSource::RepeatRequest,
+            confidence: REPEAT_REQUEST_CONFIDENCE,
+        };
+    }
+    Label::unknown()
+}
+
+/// Word-overlap similarity between two strings — public wrapper over the same
+/// Jaccard function `cluster_traces` uses for hourly clustering, exposed so
+/// `haily-core::agent` can reuse it turn-to-turn for repeat-request detection
+/// (researcher-03 §1: "next user message is a near-duplicate of the previous
+/// task_description" is the single most literature-cited implicit failure signal).
+pub fn jaccard_similarity(a: &str, b: &str) -> f32 {
+    jaccard(a, b)
+}
+
+/// Whether `current` is a near-duplicate of `previous` at the SAME similarity bar
+/// hourly clustering uses (`CLUSTER_SIMILARITY_THRESHOLD`) — reusing one constant
+/// keeps "similar enough to cluster into a skill" and "similar enough to look like a
+/// retry" a single tunable knob rather than two independently-drifting ones.
+pub fn is_repeat_request(previous: &str, current: &str) -> bool {
+    jaccard(previous, current) >= CLUSTER_SIMILARITY_THRESHOLD
+}
+
+/// Find the active skill whose `description` best matches `task_description`, above
+/// the clustering similarity bar. This is the seam that lets `update_skill_confidence`
+/// (previously dead code — nothing ever called it) target a concrete skill: a turn's
+/// trace has no direct skill foreign key (traces predate per-turn skill matching), so
+/// the best-effort correlation is textual similarity to what a skill's own
+/// `description` says it covers. Returns `None` when no active skill clears the bar —
+/// most turns don't correspond to any synthesized skill yet, and that must not be
+/// forced into a false match.
+pub fn find_matching_skill<'a>(
+    task_description: &str,
+    active_skills: &'a [db_skills::Skill],
+) -> Option<&'a db_skills::Skill> {
+    active_skills
+        .iter()
+        .map(|s| (s, jaccard(task_description, &s.description)))
+        .filter(|(_, sim)| *sim >= CLUSTER_SIMILARITY_THRESHOLD)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(s, _)| s)
+}
+
+// ---------------------------------------------------------------------------
 // Injection screening
 // ---------------------------------------------------------------------------
 
@@ -351,12 +522,100 @@ pub async fn update_skill_confidence(db: &DbHandle, skill_id: &str, reward: f64)
     db_skills::update_skill_confidence(db, skill_id, reward, EMA_ALPHA).await
 }
 
-/// Apply exponential decay to all active skills. Archive any whose confidence
-/// drops below ARCHIVE_THRESHOLD. Should be called every 24 hours.
+/// Corroboration floor (Harness Completion phase 5, M1 review fix — researcher-03 §2.3
+/// "corroboration floor before high-confidence auto-action"): a skill must have at
+/// least this many recent negative-labeled traces matched to it before decay is
+/// allowed to archive it, mirroring Haily's own prior red-teamed conclusion (memory
+/// 2026-06-21 project-memory-anti-reinforcement-plan) that the SAME weak signal must
+/// not both produce a low confidence AND validate the decision to act on it.
+const MIN_CORROBORATING_NEGATIVES: usize = 2;
+
+/// How far back `apply_skill_decay` looks for negative-labeled traces when checking
+/// corroboration — generous enough that a skill used only occasionally still has a
+/// fair chance to accumulate corroborating evidence before this cycle's decay would
+/// otherwise archive it outright.
+const CORROBORATION_LOOKBACK_DAYS: i64 = 30;
+
+/// Whether at least `MIN_CORROBORATING_NEGATIVES` negative-labeled traces (each
+/// matched to `skill` by the SAME Jaccard bar `find_matching_skill` uses) exist in
+/// `negative_traces`. Per the "at minimum" fallback in the phase's Risk Notes
+/// (distinct `label_source` values are a STRONGER bar than merely 2 negative traces,
+/// preferred when available but not required): this counts DISTINCT `label_source`
+/// values among the matches when at least 2 are present, but also accepts 2+ matches
+/// sharing one `label_source` (e.g. two separate `tool_error_ratio` turns) as the
+/// minimum viable corroboration — a single skill failing the exact same way twice on
+/// two DIFFERENT turns is still independent evidence, not a single restated signal.
+fn is_archival_corroborated(skill: &db_skills::Skill, negative_traces: &[db_skills::TaskTrace]) -> bool {
+    let matches: Vec<&db_skills::TaskTrace> = negative_traces
+        .iter()
+        .filter(|t| jaccard(&skill.description, &t.task_description) >= CLUSTER_SIMILARITY_THRESHOLD)
+        .collect();
+
+    if matches.len() < MIN_CORROBORATING_NEGATIVES {
+        return false;
+    }
+
+    // Prefer DISTINCT label_source diversity when it's present (stronger evidence:
+    // two independently-arrived-at negative signals, not the same detector firing
+    // twice), but do not require it — 2 traces alone already clears the floor above.
+    let distinct_sources: HashSet<&str> = matches
+        .iter()
+        .filter_map(|t| t.label_source.as_deref())
+        .collect();
+    if distinct_sources.len() >= MIN_CORROBORATING_NEGATIVES {
+        return true;
+    }
+
+    // Falls through to the "at minimum 2 independent negative-labeled traces on
+    // different turns" floor — `matches.len() >= MIN_CORROBORATING_NEGATIVES` was
+    // already confirmed above, and each element is a distinct trace row (a distinct
+    // turn) by construction of `negative_traces_since`.
+    true
+}
+
+/// Apply exponential decay to all active skills' confidence, then archive ONLY those
+/// whose decayed confidence falls below `ARCHIVE_THRESHOLD` AND clear the
+/// corroboration floor (`is_archival_corroborated`) — Should be called every 24 hours.
+///
+/// A skill that crosses below the threshold WITHOUT corroboration is deliberately
+/// left active at its (low) decayed confidence rather than archived: "hold at the
+/// floor" per the phase's M1 fix, so a skill is never removed purely because decay
+/// alone pushed a stale-but-unrefuted skill under the line — the same anti-
+/// reinforcement principle `derive_label`'s `unknown`-never-moves-confidence
+/// invariant applies to the EMA now also gates the archival action.
 pub async fn apply_skill_decay(db: &DbHandle) -> Result<()> {
-    let archived = db_skills::apply_exponential_decay(db, DECAY_LAMBDA, ARCHIVE_THRESHOLD).await?;
+    let touched = db_skills::apply_exponential_decay(db, DECAY_LAMBDA).await?;
+    if touched == 0 {
+        return Ok(());
+    }
+
+    let candidates = db_skills::skills_below_confidence(db, ARCHIVE_THRESHOLD).await?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let since = (chrono::Utc::now() - chrono::Duration::days(CORROBORATION_LOOKBACK_DAYS)).to_rfc3339();
+    let negative_traces = db_skills::negative_traces_since(db, &since).await?;
+
+    let mut archived = 0usize;
+    let mut held = 0usize;
+    for skill in &candidates {
+        if is_archival_corroborated(skill, &negative_traces) {
+            db_skills::archive_skill(db, &skill.id).await?;
+            archived += 1;
+        } else {
+            held += 1;
+        }
+    }
+
     if archived > 0 {
-        info!(count = archived, "skills archived by decay");
+        info!(count = archived, "skills archived by decay (corroborated)");
+    }
+    if held > 0 {
+        info!(
+            count = held,
+            "skills held at low confidence — decay threshold crossed WITHOUT corroboration, archival withheld"
+        );
     }
     Ok(())
 }

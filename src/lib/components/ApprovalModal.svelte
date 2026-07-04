@@ -5,10 +5,27 @@
   // 1:1 to `resolveApproval` — there is no other way to unblock the pending turn
   // from the GUI.
   import { resolveApproval, type PendingApproval } from '$lib/tauri';
+  import { toolVerb } from '$lib/tool-verbs';
 
   let { pending = $bindable<PendingApproval | null>(null) } = $props();
 
   let resolving = $state(false);
+
+  // Human-verb headline replaces the raw-JSON `<pre>` (R4). `toolVerb` only reads a
+  // fixed whitelist of arg keys per known tool name — never arbitrary JSON — so a
+  // crafted title in `args` can only ever land inside the returned string, which
+  // Svelte's `{expression}` auto-escapes below. NEVER swap this for `{@html}`.
+  let verb = $derived(pending ? toolVerb(pending.tool, pending.args) : '');
+
+  // Every approval that reaches this modal was, at dispatch time, `RiskTier::IrreversibleWrite`
+  // — but that tier is reached two ways (see `haily-core::tool_call::dispatch`): a tool that is
+  // genuinely irreversible (e.g. `memory_forget`, `worktree_apply`), OR a normally-`ReversibleWrite`
+  // delete (task/note/reminder) that got escalated for THIS call because the per-turn delete cap
+  // was already hit. `pending.reversible` (server-derived from the tool's OWN tier, pre-escalation
+  // — never LLM/task text) distinguishes the two, so the badge only claims "can't be undone" when
+  // that is actually true.
+  const FINAL_BADGE = "Không thể hoàn tác";
+  const CAPPED_BADGE = 'Đã đạt giới hạn — cần bạn xác nhận (vẫn hoàn tác được)';
 
   async function decide(approved: boolean) {
     if (!pending || resolving) return;
@@ -25,21 +42,19 @@
 {#if pending}
   <div class="backdrop" role="presentation"></div>
   <div class="modal" role="alertdialog" aria-modal="true" aria-label="Yêu cầu phê duyệt công cụ">
-    <!-- Every approval that reaches this modal is an IrreversibleWrite (Read and
-         ReversibleWrite tools never gate — see haily-core::tool_call::dispatch), so
-         the badge is a constant, not a per-tool computed value. Plain, non-technical
-         copy per the phase-6 spec — no "RiskTier"/"IrreversibleWrite" jargon in the UI. -->
-    <span class="tier-badge">⚠ Can't be undone</span>
-    <h2>I'll ask you first</h2>
+    <span class="tier-badge" class:reversible={pending.reversible}>
+      ⚠ {pending.reversible ? CAPPED_BADGE : FINAL_BADGE}
+    </span>
+    <h2>{verb}</h2>
     <p class="tool-name"><code>{pending.tool}</code></p>
     {#if pending.origin}
       <p class="origin">Requested by: <code>{pending.origin}</code></p>
     {/if}
-    <pre class="args">{pending.args}</pre>
     <div class="actions">
       <button class="deny" onclick={() => decide(false)} disabled={resolving}>❌ Không</button>
       <button class="approve" onclick={() => decide(true)} disabled={resolving}>✅ Có</button>
     </div>
+    <p class="promise">Không việc gì tôi làm là không cứu được — hoặc hoàn tác được, hoặc tôi hỏi bạn trước.</p>
   </div>
 {/if}
 
@@ -78,6 +93,13 @@
     margin-bottom: 10px;
   }
 
+  /* Cap-escalated but genuinely reversible — softer tone than a true final warning. */
+  .tier-badge.reversible {
+    background: #2e2a1f;
+    color: #eab308;
+    border-color: #7f6a1d;
+  }
+
   h2 {
     font-size: 15px;
     color: #e0dff5;
@@ -100,24 +122,20 @@
     color: #a8a4c8;
   }
 
-  .args {
-    background: #0f0f12;
-    border: 1px solid #2a2a45;
-    border-radius: 8px;
-    padding: 10px;
-    font-size: 12px;
-    color: #a8a4c8;
-    max-height: 160px;
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    margin-bottom: 16px;
-  }
-
   .actions {
     display: flex;
     gap: 10px;
     justify-content: flex-end;
+    margin-bottom: 14px;
+  }
+
+  .promise {
+    font-size: 11px;
+    color: #6b6b8a;
+    line-height: 1.5;
+    border-top: 1px solid #2a2a45;
+    padding-top: 10px;
+    margin: 0;
   }
 
   button {

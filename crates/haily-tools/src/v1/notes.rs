@@ -1,6 +1,9 @@
+use super::set_last_journal_id;
+use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
+use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
 use haily_db::queries::notes;
 use serde_json::{json, Value};
 
@@ -57,14 +60,35 @@ impl Tool for NoteSaveTool {
             .ok_or_else(|| anyhow::anyhow!("content required"))?;
         let tags = args["tags"].as_str();
         let wikilinks = extract_wikilinks(content);
+        let wikilinks = if wikilinks.is_empty() {
+            None
+        } else {
+            Some(wikilinks.as_str())
+        };
 
-        let note = notes::insert(&ctx.db, title, content, tags, None, None).await?;
-
-        if !wikilinks.is_empty() {
-            notes::set_wikilinks(&ctx.db, &note.id, &wikilinks).await?;
-        }
-
-        Ok(format!("Đã lưu note: \"{}\" (id: {})", note.title, note.id))
+        // The id is minted here (not by `notes::insert`) because the journal outbox row and
+        // the forward INSERT must reference the SAME id inside one transaction (C2).
+        let id = uuid::Uuid::new_v4().to_string();
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::NoteSave {
+                id: &id,
+                title,
+                content,
+                tags,
+                wikilinks,
+            },
+            &ctx.session_id.to_string(),
+            "note_save",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(format!("Đã lưu note: \"{title}\" (id: {id})"))
     }
 }
 
@@ -161,8 +185,24 @@ impl Tool for NoteUpdateTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("content required"))?;
 
-        notes::update_content(&ctx.db, id, title, content).await?;
-        Ok(format!("Đã cập nhật note id={id}."))
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::NoteUpdate { id, title, content },
+            &ctx.session_id.to_string(),
+            "note_update",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(if outcome.is_some() {
+            format!("Đã cập nhật note id={id}.")
+        } else {
+            format!("Không tìm thấy note id={id}.")
+        })
     }
 }
 
@@ -188,18 +228,33 @@ impl Tool for NoteDeleteTool {
             "required": ["id"]
         })
     }
+    /// Re-tiered `ReversibleWrite` (Harness Completion phase 2) — see the safety-net
+    /// rationale on `RiskTier::ReversibleWrite`.
     fn risk_tier(&self, _args: &Value) -> RiskTier {
-        RiskTier::IrreversibleWrite
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("id required"))?;
-        if notes::soft_delete(&ctx.db, id).await? {
-            Ok(format!("Đã xóa note id={id}."))
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::NoteDelete { id },
+            &ctx.session_id.to_string(),
+            "note_delete",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(if outcome.is_some() {
+            format!("Đã xóa note id={id}.")
         } else {
-            Ok(format!("Không tìm thấy note id={id}."))
-        }
+            format!("Không tìm thấy note id={id}.")
+        })
     }
 }

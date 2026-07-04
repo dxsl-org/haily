@@ -7,6 +7,7 @@
 //! src-tauri always builds with the `llama` feature enabled. Reading it here without
 //! the matching `#[cfg(feature = "llama")]` guard would break `--no-default-features`
 //! builds (e.g. `haily-cli` without `--features llama`), so the gate is preserved.
+use crate::credential_store::CredentialStore;
 use haily_db::queries::meta;
 use haily_kms::KmsHandle;
 use haily_llm::LlmConfig;
@@ -85,19 +86,23 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
 }
 
 /// Preference key holding the Odoo connector's API key (Safe Operator Harness phase 5,
-/// Decision 2: `kms_preferences`, NOT keyring). The value is the SECRET; callers store only
-/// this key NAME as the journal credential reference (C4) and read the secret by reference
-/// at call time — the secret itself must never be logged or copied into a journal row.
+/// originally `kms_preferences`-only; Harness Completion phase 4 moves the actual secret
+/// into the OS keyring under this same NAME as the cred-by-reference — see
+/// [`crate::credential_store`]). Callers store only this key NAME as the journal
+/// credential reference (C4) and read the secret by reference at call time — the secret
+/// itself must never be logged or copied into a journal row.
 pub const ODOO_API_KEY_PREF: &str = "connector.odoo.api_key";
 
-/// Load the Odoo connector API key from `kms_preferences` (`connector.odoo.api_key`),
-/// falling back to the `HAILY_ODOO_API_KEY` env var (useful for Docker/CI where the CI
-/// bootstrap exports a freshly-generated scoped key). Returns `None` if unset in both.
+/// Load the Odoo connector API key: keyring first (via `store`, cred-by-reference under
+/// [`ODOO_API_KEY_PREF`]), then the `HAILY_ODOO_API_KEY` env var (useful for Docker/CI
+/// where the bootstrap exports a freshly-generated scoped key). Returns `None` if unset in
+/// both. `store` already implements the M5 read-fallback-to-plaintext-DB split internally —
+/// this function does not duplicate that policy.
 ///
 /// The returned string is the raw secret — the caller must NOT log it or persist it in a
 /// journal row; only the preference key NAME ([`ODOO_API_KEY_PREF`]) is a safe reference (C4).
-pub async fn load_odoo_api_key(kms: &KmsHandle) -> Option<String> {
-    if let Ok(Some(key)) = meta::get_preference(kms.db(), ODOO_API_KEY_PREF).await {
+pub async fn load_odoo_api_key(store: &CredentialStore) -> Option<String> {
+    if let Ok(Some(key)) = store.get_secret(ODOO_API_KEY_PREF).await {
         if !key.is_empty() {
             return Some(key);
         }
@@ -110,27 +115,36 @@ pub async fn load_odoo_api_key(kms: &KmsHandle) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential_store::CredentialPolicy;
     use haily_db::DbHandle;
+    use std::sync::Arc;
 
-    async fn kms(dir: &std::path::Path) -> KmsHandle {
-        let db = DbHandle::init(&dir.join("kms.db")).await.unwrap();
-        KmsHandle::init(db, dir).await.unwrap()
+    fn use_mock_keyring() {
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+    }
+
+    async fn store(dir: &std::path::Path) -> CredentialStore {
+        let db = Arc::new(DbHandle::init(&dir.join("t.db")).await.unwrap());
+        CredentialStore::new(db, CredentialPolicy::default())
     }
 
     #[tokio::test]
     async fn odoo_api_key_read_from_preference_by_name() {
+        use_mock_keyring();
         let dir = tempfile::tempdir().unwrap();
-        let kms = kms(dir.path()).await;
-        // Unset: neither preference nor env → None.
+        let store = store(dir.path()).await;
+        // Unset: neither keyring/DB preference nor env → None.
         std::env::remove_var("HAILY_ODOO_API_KEY");
-        assert!(load_odoo_api_key(&kms).await.is_none());
+        assert!(load_odoo_api_key(&store).await.is_none());
 
-        // A stored preference under the reference key name is returned verbatim.
-        meta::upsert_preference(kms.db(), ODOO_API_KEY_PREF, "sk-scoped-XYZ", "test")
+        // A stored credential under the reference key name is returned verbatim,
+        // regardless of which backing store (keyring vs. plaintext DB) it landed in.
+        store
+            .set_secret(ODOO_API_KEY_PREF, "sk-scoped-XYZ")
             .await
             .unwrap();
         assert_eq!(
-            load_odoo_api_key(&kms).await.as_deref(),
+            load_odoo_api_key(&store).await.as_deref(),
             Some("sk-scoped-XYZ")
         );
         // The reference name is the stable public constant (what the journal records, C4).

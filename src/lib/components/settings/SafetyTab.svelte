@@ -33,6 +33,25 @@
     }
   }
 
+  // Harness Completion phase 4 (M5a/M5b): the backend sets `credential.fallback_active`
+  // as a PERSISTED row (not just a log line) whenever it had to read/write a connector
+  // secret through the plaintext DB fallback instead of the OS keyring — e.g. headless/
+  // Session-0 boot (M5a) or a platform keyring RPC failure (M5b). Surfaced here since this
+  // tab already receives the full preference map on every open; acknowledging clears the
+  // flag so a resolved one-time event doesn't keep reappearing every time Settings opens.
+  const credentialFallbackActive = () => prefs['credential.fallback_active'] === 'true';
+
+  let dismissingFallback = $state(false);
+  async function dismissFallbackWarning() {
+    if (dismissingFallback) return;
+    dismissingFallback = true;
+    try {
+      await save('credential.fallback_active', 'false');
+    } finally {
+      dismissingFallback = false;
+    }
+  }
+
   let entries = $state<JournalEntry[]>([]);
   let loading = $state(false);
   let loadError = $state('');
@@ -97,6 +116,21 @@
 </script>
 
 <div class="section">
+  {#if credentialFallbackActive()}
+    <div class="block fallback-warning">
+      <span class="warning-title">⚠️ A saved login had to use a less secure backup</span>
+      <span class="hint">
+        Haily couldn't reach your device's secure credential storage, so it temporarily
+        used its own database instead. Your data is still local-only. This usually
+        resolves itself — try again later, or check the Odoo connector setup if it
+        keeps happening.
+      </span>
+      <button class="dismiss-btn" onclick={dismissFallbackWarning} disabled={dismissingFallback}>
+        {dismissingFallback ? 'Closing…' : 'Got it'}
+      </button>
+    </div>
+  {/if}
+
   <div class="block">
     <div class="switch-row">
       <div class="switch-copy">
@@ -171,6 +205,28 @@
   .switch-copy { display: flex; flex-direction: column; gap: 4px; }
   .switch-title { font-size: 13px; color: #e0dff5; font-weight: 600; }
   .hint { font-size: 11px; color: #6b6b8a; line-height: 1.5; }
+
+  .fallback-warning {
+    padding: 12px;
+    background: #2a1f0f;
+    border: 1px solid #7f5a1d;
+    border-radius: 10px;
+  }
+  .warning-title { font-size: 12px; font-weight: 600; color: #fbbf24; }
+  .dismiss-btn {
+    align-self: flex-start;
+    margin-top: 2px;
+    padding: 5px 12px;
+    border: 1px solid #7f5a1d;
+    border-radius: 7px;
+    background: #16162a;
+    color: #fbbf24;
+    font-size: 11px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .dismiss-btn:hover:not(:disabled) { border-color: #fbbf24; background: #1e1e35; }
+  .dismiss-btn:disabled { opacity: 0.5; cursor: default; }
 
   .switch {
     flex-shrink: 0;

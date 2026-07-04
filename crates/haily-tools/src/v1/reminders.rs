@@ -1,6 +1,9 @@
+use super::set_last_journal_id;
+use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
+use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
 use haily_db::queries::reminders;
 use serde_json::{json, Value};
 
@@ -46,12 +49,29 @@ impl Tool for ReminderAddTool {
         let recurrence = args["recurrence"].as_str();
         let session_id = ctx.session_id.to_string();
 
-        let reminder =
-            reminders::insert(&ctx.db, title, fire_at, recurrence, Some(&session_id)).await?;
-        Ok(format!(
-            "Đã đặt nhắc nhở: \"{}\" vào {} (id: {})",
-            reminder.title, reminder.fire_at, reminder.id
-        ))
+        // The id is minted here (not by `reminders::insert`) because the journal outbox row
+        // and the forward INSERT must reference the SAME id inside one transaction (C2).
+        let id = uuid::Uuid::new_v4().to_string();
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::ReminderAdd {
+                id: &id,
+                title,
+                fire_at,
+                recurrence,
+                session_id: &session_id,
+            },
+            &session_id,
+            "reminder_add",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(format!("Đã đặt nhắc nhở: \"{title}\" vào {fire_at} (id: {id})"))
     }
 }
 
@@ -121,18 +141,33 @@ impl Tool for ReminderDeleteTool {
             "required": ["id"]
         })
     }
+    /// Re-tiered `ReversibleWrite` (Harness Completion phase 2) — see the safety-net
+    /// rationale on `RiskTier::ReversibleWrite`.
     fn risk_tier(&self, _args: &Value) -> RiskTier {
-        RiskTier::IrreversibleWrite
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("id required"))?;
-        if reminders::soft_delete(&ctx.db, id).await? {
-            Ok(format!("Đã hủy nhắc nhở id={id}."))
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::ReminderDelete { id },
+            &ctx.session_id.to_string(),
+            "reminder_delete",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(if outcome.is_some() {
+            format!("Đã hủy nhắc nhở id={id}.")
         } else {
-            Ok(format!("Không tìm thấy nhắc nhở id={id}."))
-        }
+            format!("Không tìm thấy nhắc nhở id={id}.")
+        })
     }
 }

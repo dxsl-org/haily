@@ -172,6 +172,19 @@ impl Tool for DelegateTool {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
+            // Harness Completion phase 2: reuse the CALLING context's turn identity/counter
+            // rather than minting a fresh one. A delegated sub-turn is part of the turn that
+            // requested it (the parent LLM chose to delegate mid-turn), not a new logical
+            // unit of work — its journal rows must undo together with the parent's under one
+            // `undo_turn(turn_id, session_id)` call, and its re-tiered deletes must count
+            // toward the SAME M2 cap so delegation cannot be used to bypass the ceiling.
+            // `ctx` here is whatever turn/sub-turn CALLED this tool — at L0 that is the root
+            // turn's id/counter; for a NESTED delegation (a sub-agent that itself delegates)
+            // it is that sub-turn's `ToolContext`, which already carries the root turn's
+            // values forward (this same rule applied one level up) — so the whole delegation
+            // chain converges on one shared turn_id/counter, however deep it nests.
+            turn_id: ctx.turn_id,
+            turn_deletes: Arc::clone(&ctx.turn_deletes),
         });
 
         let result = run_with_pausable_timeout(
@@ -411,11 +424,14 @@ mod reload_propagation_tests {
             db: Arc::clone(&db),
             kms: Arc::clone(&kms),
             session_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
             depth: 0,
             domain: None,
             approval_gate: Arc::new(crate::approval::ApprovalBroker::new()),
             approval_tx,
             cancel: tokio_util::sync::CancellationToken::new(),
+            turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         };
         let args = serde_json::json!({ "task": "short task before reload" });
         let before = delegate
@@ -479,6 +495,8 @@ mod seam_tests {
             .send(ResponseChunk::ToolResult {
                 name: "note_save".into(),
                 ok: true,
+                reversible: false,
+                journal_id: None,
             })
             .await
             .unwrap();
@@ -489,6 +507,7 @@ mod seam_tests {
                 args: "{}".into(),
                 approval_id,
                 origin: Some("L1:developer".into()),
+                reversible: false,
             })
             .await
             .unwrap();

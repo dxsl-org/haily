@@ -7,7 +7,7 @@
 use crate::DbHandle;
 use anyhow::Result;
 use serde::Serialize;
-use sqlx::FromRow;
+use sqlx::{Executor, FromRow, Sqlite, Transaction};
 use uuid::Uuid;
 
 /// A single recorded connector write. `pre_state`/`post_state`/`compensation_plan` are
@@ -31,6 +31,11 @@ pub struct ActionJournalRow {
     pub pre_state: Option<String>,
     pub pre_state_version: Option<String>,
     pub post_state: Option<String>,
+    /// Server-derived correlation id shared by every journal row written during ONE agent
+    /// turn (migration 0016) — lets `list_by_turn` collect a turn's writes for group undo.
+    /// `None` for any row written before this column existed, or by a caller that never
+    /// threaded a turn identity through.
+    pub turn_id: Option<String>,
     /// The opaque version token (Odoo `write_date`) AS OF our forward write's completion —
     /// the C10 concurrency baseline for a self-undo. Set post-write (mutable, migration 0014),
     /// so the undo refuses only on a THIRD-PARTY change beyond our own write. `None` until the
@@ -61,17 +66,20 @@ pub struct NewAction<'a> {
     pub pre_state: Option<&'a str>,
     pub pre_state_version: Option<&'a str>,
     pub compensation_plan: Option<&'a str>,
+    /// Server-derived turn correlation id (migration 0016) — see `ActionJournalRow::turn_id`.
+    /// `None` is valid (row excluded from any turn's undo group, never mis-grouped).
+    pub turn_id: Option<&'a str>,
     /// Days until PII in this row is eligible for purge.
     pub retention_days: i64,
 }
 
-/// Outbox insert — MUST be called BEFORE the external write so a crash mid-write still
-/// leaves the compensation_plan + pre_state on disk for reconciliation.
-///
-/// # Errors
-/// Returns an error on a UNIQUE conflict on `idempotency_key` (a duplicate submit of the
-/// same logical op) or any DB failure.
-pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow> {
+/// Shared insert body for [`insert`]/[`insert_tx`] — generic over any sqlx `Executor` so the
+/// pool and transaction-scoped callers share one copy of the SQL/bind-list instead of two
+/// hand-kept-in-sync copies.
+async fn insert_via<'e, E>(exec: E, a: NewAction<'_>) -> Result<ActionJournalRow>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let created_at = now.to_rfc3339();
@@ -81,8 +89,8 @@ pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow>
              (id, session_id, tool_name, tool_tier, compensability, idempotency_key,
               correlation_ref, request_params, pre_state, pre_state_version,
               readback_status, compensation_plan, undo_status, undo_attempts,
-              created_at, retention_expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?)
+              created_at, retention_expires_at, turn_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -98,8 +106,54 @@ pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow>
     .bind(a.compensation_plan)
     .bind(&created_at)
     .bind(&retention_expires_at)
-    .fetch_one(db.pool())
+    .bind(a.turn_id)
+    .fetch_one(exec)
     .await?)
+}
+
+/// Outbox insert — MUST be called BEFORE the external write so a crash mid-write still
+/// leaves the compensation_plan + pre_state on disk for reconciliation.
+///
+/// # Errors
+/// Returns an error on a UNIQUE conflict on `idempotency_key` (a duplicate submit of the
+/// same logical op) or any DB failure.
+pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow> {
+    insert_via(db.pool(), a).await
+}
+
+/// Transaction-scoped variant of [`insert`] — the LOCAL-tool write path (phase 1) needs the
+/// outbox insert to commit atomically with its own forward mutate (C2), unlike a connector
+/// write which cannot be transactional (it involves a network call between insert and
+/// read-back). Identical semantics and columns to `insert`, just bound to a caller-owned
+/// `Transaction` instead of the pool.
+///
+/// # Errors
+/// Returns an error on a UNIQUE conflict on `idempotency_key` or any DB failure.
+pub async fn insert_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    a: NewAction<'_>,
+) -> Result<ActionJournalRow> {
+    insert_via(&mut **tx, a).await
+}
+
+/// Shared update body for [`set_readback`]/[`set_readback_tx`] — one copy of the SQL for
+/// both the pool-scoped and transaction-scoped callers.
+async fn set_readback_via<'e, E>(
+    exec: E,
+    id: &str,
+    readback_status: &str,
+    post_state: Option<&str>,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query("UPDATE action_journal SET readback_status = ?, post_state = ? WHERE id = ?")
+        .bind(readback_status)
+        .bind(post_state)
+        .bind(id)
+        .execute(exec)
+        .await?;
+    Ok(())
 }
 
 /// Record the read-back verdict + post_state after the external write (or during a
@@ -113,13 +167,7 @@ pub async fn set_readback(
     readback_status: &str,
     post_state: Option<&str>,
 ) -> Result<()> {
-    sqlx::query("UPDATE action_journal SET readback_status = ?, post_state = ? WHERE id = ?")
-        .bind(readback_status)
-        .bind(post_state)
-        .bind(id)
-        .execute(db.pool())
-        .await?;
-    Ok(())
+    set_readback_via(db.pool(), id, readback_status, post_state).await
 }
 
 /// Rewrite the `compensation_plan` after the external call, once the created record's id
@@ -147,12 +195,51 @@ pub async fn update_compensation_plan(db: &DbHandle, id: &str, plan_json: &str) 
 /// # Errors
 /// Returns an error if the update fails. Silently succeeds if no row matches `id`.
 pub async fn set_post_state_version(db: &DbHandle, id: &str, version: &str) -> Result<()> {
+    set_post_state_version_via(db.pool(), id, version).await
+}
+
+/// Shared update body for [`set_post_state_version`]/[`set_post_state_version_tx`].
+async fn set_post_state_version_via<'e, E>(exec: E, id: &str, version: &str) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query("UPDATE action_journal SET post_state_version = ? WHERE id = ?")
         .bind(version)
         .bind(id)
-        .execute(db.pool())
+        .execute(exec)
         .await?;
     Ok(())
+}
+
+/// Transaction-scoped variant of [`set_readback`] — the local write path (C2) sets
+/// `readback_status` to `match` INSIDE the same transaction as the forward mutate: a
+/// committed local write is, by construction, verified (it is the same SQLite connection
+/// that just performed it, not a third-party system reached over the network), so there is
+/// no separate post-write GET/diff step to run outside the transaction.
+///
+/// # Errors
+/// Returns an error if the update fails. Silently succeeds if no row matches `id`.
+pub async fn set_readback_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    readback_status: &str,
+    post_state: Option<&str>,
+) -> Result<()> {
+    set_readback_via(&mut **tx, id, readback_status, post_state).await
+}
+
+/// Transaction-scoped variant of [`set_post_state_version`] — used by the local write path
+/// (C2) so the version write-back commits atomically with the outbox insert + forward
+/// mutate rather than as a separate post-commit statement.
+///
+/// # Errors
+/// Returns an error if the update fails. Silently succeeds if no row matches `id`.
+pub async fn set_post_state_version_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    version: &str,
+) -> Result<()> {
+    set_post_state_version_via(&mut **tx, id, version).await
 }
 
 /// Advance the undo state machine. `undone_at` is set only on the terminal `undone`.
@@ -207,6 +294,28 @@ pub async fn get_by_id(db: &DbHandle, id: &str) -> Result<Option<ActionJournalRo
     )
 }
 
+/// Session-scoped variant of [`get_by_id`] (M1) — `None` both when the id does not exist AND
+/// when it belongs to a DIFFERENT session, so a caller cannot distinguish "not found" from
+/// "not yours" by timing/response shape. Journal ids are parsed by the LLM out of free text
+/// (a note/task the user wrote), so this is a security boundary, not a nicety: without it, a
+/// crafted id from another session's journal could be undone by session A.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn get_by_id_scoped(
+    db: &DbHandle,
+    id: &str,
+    session_id: &str,
+) -> Result<Option<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE id = ? AND session_id = ?",
+    )
+    .bind(id)
+    .bind(session_id)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
 /// Fetch one row by its idempotency key — used to detect a retry of a known op.
 ///
 /// # Errors
@@ -228,6 +337,29 @@ pub async fn list_by_session(db: &DbHandle, session_id: &str) -> Result<Vec<Acti
     Ok(sqlx::query_as::<_, ActionJournalRow>(
         "SELECT * FROM action_journal WHERE session_id = ? ORDER BY created_at DESC",
     )
+    .bind(session_id)
+    .fetch_all(db.pool())
+    .await?)
+}
+
+/// All rows sharing `turn_id`, scoped to `session_id` (M1 — mirrors `get_by_id_scoped`):
+/// a `turn_id` is only ever meaningful within the session that minted it, and scoping
+/// here (rather than trusting the caller to pre-filter) means a cross-session `turn_id`
+/// collision or a forged id from another session's turn yields an empty result, not a
+/// leak of that session's rows. Used by `undo_turn` to collect the group before calling
+/// the existing `batch_undo` (no ordering — see the local-write FK-free rationale there).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_by_turn(
+    db: &DbHandle,
+    turn_id: &str,
+    session_id: &str,
+) -> Result<Vec<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE turn_id = ? AND session_id = ? ORDER BY created_at ASC",
+    )
+    .bind(turn_id)
     .bind(session_id)
     .fetch_all(db.pool())
     .await?)
@@ -289,6 +421,7 @@ mod tests {
             pre_state: None,
             pre_state_version: None,
             post_state: None,
+            turn_id: None,
             post_state_version: None,
             readback_status: "pending".into(),
             compensation_plan: Some(r#"{"op":"unlink"}"#.into()),

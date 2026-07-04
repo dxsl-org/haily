@@ -51,4 +51,21 @@ impl DbHandle {
             .await?;
         Ok(row.map(|(busy, _, _)| busy != 0).unwrap_or(false))
     }
+
+    /// Reclaim space freed by deletes (e.g. the daily rollup's raw-trace pruning,
+    /// `queries::skills::delete_traces_older_than`) by rewriting the whole DB file.
+    /// Exposed here (not as a bare query in `queries/`) since `VACUUM` is a
+    /// whole-database maintenance operation, not a domain-scoped query — kept on
+    /// `DbHandle` alongside `wal_checkpoint_truncate` for the same reason. Callers
+    /// outside this crate (e.g. `haily-proactive`'s daily rollup worker) reach this
+    /// instead of depending on `sqlx` directly, preserving "SQL only in
+    /// `haily-db`" (CLAUDE.md).
+    ///
+    /// # Errors
+    /// Returns an error if the `VACUUM` statement fails (e.g. another connection
+    /// holds an exclusive lock).
+    pub async fn vacuum(&self) -> Result<()> {
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        Ok(())
+    }
 }
