@@ -5,9 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] — Phase 12: Agentic Optimization
+## [Unreleased]
 
 ### Added
+- db: action journal and undo for local tools
+- tools: generic snapshot compensator for tasks/notes/reminders
+- core: per-turn destructive-op cap with approval escalation
+- core: turn_id groups a turn's writes for undo
+- gui: human-verb approval cards with inline undo
+- app: OS-keyring credential storage with fallback
+- tools: manifest version-drift re-approval gate
+- kms: task outcome drives skill confidence
+- db: per-turn telemetry columns and daily rollup
+- core: deterministic offline golden-task eval harness
 - core: three-tier agent delegation hierarchy
 - core: delegate tools for six domains
 - core: stateless sub-agent turn execution
@@ -17,19 +27,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - cli: work item status panel above prompt
 
 ### Security
+- kms: unknown outcomes never move confidence
+- kms: archival requires two independent negatives
+- core: feedback downgrade parses only user message
+- app: plaintext credential write fails closed
 - core: block approval tools inside sub-agents
 - core: strip tool markup from results
 
 ### Fixed
+- db: guard FTS5 triggers against index corruption
 - core: loop guard terminates runaway turns
 - telegram: handle work items changed notification
 
 ### Changed
+- tools: soft-delete tools re-tiered to reversible
+- core: sub-turns record traces without moving confidence
 - db: calendar and facts use param structs
-
-### In Progress
-- routing: auto-select model tier by complexity
-- routing: cost optimization per deployment cohort
 
 ---
 
