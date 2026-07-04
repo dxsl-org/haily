@@ -10,7 +10,19 @@
 # plus paste/bincode/proc-macro-error) are reported as warnings by cargo-audit
 # and do not fail the run — no action needed unless a real vuln is published.
 
+# quick-xml (v0.39.4) is a TRANSITIVE dependency of Tauri only, via
+# `plist` → `tauri-utils` (largely build-dependencies: tauri-build/tauri-plugin
+# parse the app's OWN Info.plist / bundle config at BUILD time). Haily never feeds
+# external or attacker-controlled XML to quick-xml at runtime, so the DoS attack
+# surface both advisories describe (malicious XML input) does not exist in this app.
+# No semver-compatible fix is reachable: the fix landed in quick-xml 0.41, but
+# `plist` v1.9.0 (the latest release) pins `quick-xml = "^0.39.2"` (< 0.40), and no
+# newer `plist` exists — a real fix needs an upstream plist/Tauri release. Both
+# advisories pre-date this on `main` (newly published against an existing dep, not
+# introduced by any Haily change). Revisit when plist/Tauri ship a patched quick-xml.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071", # rsa Marvin timing side-channel — not in build graph (sqlite-only), no fixed release
+    "RUSTSEC-2026-0194", # quick-xml quadratic-runtime DoS — Tauri build-transitive, no runtime XML input, no in-range fix
+    "RUSTSEC-2026-0195", # quick-xml namespace-alloc DoS — Tauri build-transitive, no runtime XML input, no in-range fix
 ]
