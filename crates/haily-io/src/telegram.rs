@@ -287,6 +287,7 @@ impl Adapter for TelegramAdapter {
                 args,
                 approval_id,
                 origin,
+                reversible: _,
             } => {
                 if let Some(chat_id) = self.session_to_chat.get(&session_id) {
                     // `origin` (e.g. "L1:developer") is display-only — who is asking.
