@@ -75,10 +75,10 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-db/src/queries/connectors.rs` | Connector manifest CRUD (Safe Operator Harness phase 4) |
 | `crates/haily-db/src/queries/` | All SQL — one file per domain |
 | `crates/haily-tools/src/lib.rs` | RiskTier enum, Tool trait, ApprovalGate trait (via haily-types re-export) |
-| `crates/haily-tools/src/connector/manifest.rs` | Manifest schema (version, ops, risk_tier, compensability) |
-| `crates/haily-tools/src/connector/http_connector_tool.rs` | Generic HTTP tool interpreting a manifest op (outbox, read-back diff) |
-| `crates/haily-tools/src/connector/odoo_executor.rs` | Odoo-specific executor (execute_kw, fault classification, C4 cred-by-ref) |
-| `crates/haily-tools/src/connector/executor.rs` | ConnectorExecutor trait, UnconfiguredExecutor placeholder |
+| `crates/haily-tools/src/connector/manifest/` | Manifest schema v2 (schema.rs: version, auth, protocol, ops, risk_tier, compensability; diff.rs: re-approval diff) |
+| `crates/haily-tools/src/connector/protocol/` | Declarative protocol interpreter (envelope/arg/fault/read-back substitution, connection overlay) |
+| `crates/haily-tools/src/connector/http_connector_tool.rs` | Generic HTTP executor interpreting any manifest op (host-scoped auth injection, protocol translation, outbox, read-back diff) |
+| `crates/haily-tools/src/connector/executor.rs` | ConnectorExecutor trait, implementations for HTTP (generic) |
 | `crates/haily-tools/src/journal_undo/mod.rs` | JournalUndoTool (IrreversibleWrite, kill-switch-exempt) |
 | `crates/haily-tools/src/journal_undo/reconcile.rs` | Reconciliation state machine (attempt_undo, refusal logic) |
 | `crates/haily-tools/src/security.rs` | ssrf_guard_with_allowance (IP/CIDR pin, metadata block) |
@@ -106,7 +106,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 **Comments:** Document *why* and contract, not *what*. Public API requires doc comments with params/returns/errors.
 
-**Adding tools:** Tools and connectors live in `crates/haily-tools/src/`. V1 tools in `v1/` are registered in `ToolRegistry::build_v1()`. Connector tools (generic HTTP + Odoo-specific) live in `crates/haily-tools/src/connector/` and are registered via `register_connectors()`. Journal undo tool in `crates/haily-tools/src/journal_undo/` is registered in `build_v1()`.
+**Adding tools:** Tools and connectors live in `crates/haily-tools/src/`. V1 tools in `v1/` are registered in `ToolRegistry::build_v1()`. Connector tools use a single generic `HttpExecutor` (lives in `crates/haily-tools/src/connector/http_connector_tool.rs`) that interprets manifest v2 schema for any connector; connectors are registered via `register_connectors()` which reads manifests from the DB. Journal undo tool in `crates/haily-tools/src/journal_undo/` is registered in `build_v1()`.
 
 **Adding I/O adapters:** New module in `crates/haily-io/src/` + wire up at app layer only.
 
