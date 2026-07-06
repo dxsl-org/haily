@@ -161,3 +161,14 @@ export interface JournalEntry {
 export async function listJournal(sessionIds: string[]): Promise<JournalEntry[]> {
   return invoke('list_journal', { sessionIds });
 }
+
+/**
+ * Write a consistent standalone copy of the database to `destPath` (Phase 6 manual
+ * export — same `VACUUM INTO` mechanism the scheduled backup worker uses). Callers
+ * should pick `destPath` via `@tauri-apps/plugin-dialog`'s `save()` and warn the user
+ * first that the exported file is unencrypted and contains all local data — this
+ * function performs no confirmation of its own.
+ */
+export async function exportDatabase(destPath: string): Promise<void> {
+  return invoke('export_database', { destPath });
+}

@@ -8,6 +8,7 @@
 //! there is no background worker; a `stuck` row links its raw `compensation_plan` for
 //! manual action.
 use super::local_compensator::{is_local_row, local_attempt_undo};
+use super::ConnectorResolver;
 use crate::connector::{redact, ConnectorExecutor, ExecOutcome};
 use anyhow::Result;
 use haily_db::{queries::journal, queries::journal::ActionJournalRow, DbHandle};
@@ -115,20 +116,23 @@ pub async fn write_date_unchanged(
     Ok(live == recorded)
 }
 
-/// Drive one undo attempt for `row` through `executor`, persisting each state transition.
+/// Drive one undo attempt for `row`, resolving its executor from `resolver`, persisting each
+/// state transition.
 ///
 /// C1 dispatch split: a LOCAL row (tasks/notes/reminders — `is_local_row`) is routed to
 /// `local_attempt_undo` BEFORE any connector logic runs. This MUST happen before
 /// `refusal_reason`, which refuses any row with `compensation_plan.is_none()` — exactly the
 /// shape every local row legitimately has. `session_id` scopes the local path (M1); the
-/// connector path below is unchanged from phase 3/4/5.
+/// connector path below is unchanged from phase 3/4/5 except for M5c's per-row routing.
 ///
-/// Sequence (connector path): refusal rules → C10 version re-check → read-back-before-
-/// compensation (skip-if-already-target) → compensate → OWN read-back → `undone`. Every
-/// terminal state is persisted so a USER-initiated retry resumes from the recorded state.
+/// Sequence (connector path): refusal rules → M5c executor resolution (no executor found for
+/// this row's op = refused) → M2 manifest-hash pin check → M6a credential pre-flight → C10
+/// version re-check → read-back-before-compensation (skip-if-already-target) → compensate →
+/// OWN read-back → `undone`. Every terminal state is persisted so a USER-initiated retry
+/// resumes from the recorded state.
 pub async fn attempt_undo(
     db: &DbHandle,
-    executor: &dyn ConnectorExecutor,
+    resolver: &ConnectorResolver,
     row: &ActionJournalRow,
     session_id: &str,
 ) -> Result<UndoOutcome> {
@@ -139,6 +143,47 @@ pub async fn attempt_undo(
         journal::advance_undo_status(db, &row.id, "refused").await?;
         return Ok(UndoOutcome::Refused(reason));
     }
+
+    // M5c: resolve THIS row's own executor by its tool_name (a manifest op) — never a
+    // single frozen executor shared across every op regardless of which connector actually
+    // owns it (the routing gap the harness explicitly deferred).
+    let executor = match resolver.executor(&row.tool_name) {
+        Some(e) => e.as_ref(),
+        None => {
+            journal::advance_undo_status(db, &row.id, "refused").await?;
+            return Ok(UndoOutcome::Refused(
+                "không tìm thấy kết nối cho hành động này (chưa cấu hình hoặc đã gỡ bỏ)"
+                    .to_string(),
+            ));
+        }
+    };
+
+    // M2: refuse if the manifest that owns this op has been re-approved/moved since the
+    // forward write — otherwise the compensation (and the credential it carries) could be
+    // sent to a base_url/schema the original write never touched.
+    if !resolver.hash_matches(&row.tool_name, row.manifest_hash.as_deref()) {
+        journal::advance_undo_status(db, &row.id, "refused").await?;
+        return Ok(UndoOutcome::Refused(
+            "kết nối đã thay đổi kể từ khi ghi nhận hành động này — từ chối để tránh gửi nhầm hệ thống"
+                .to_string(),
+        ));
+    }
+
+    // M6a: credential pre-flight BEFORE anything that would need it (both the C10
+    // write_date re-check below and the compensation call resolve auth the same way) — a
+    // locked/unconfigured credential is not a compensation FAILURE, so it must not consume
+    // the MAX_UNDO_ATTEMPTS budget or land the row in the terminal `stuck` state; it gets
+    // its own non-terminal `pending_credential` state that a later explicit retry (calling
+    // `journal_undo` again — there is no background poller) re-evaluates from scratch.
+    if let Some(false) = executor.credential_preflight().await {
+        journal::advance_undo_status(db, &row.id, "pending_credential").await?;
+        return Ok(UndoOutcome::Failed(
+            "hoàn tác bị chặn: chưa lấy được thông tin xác thực (keyring khoá hoặc chưa cấu hình) \
+             — hệ thống sẽ thử lại khi bạn yêu cầu hoàn tác lần nữa"
+                .to_string(),
+        ));
+    }
+
     journal::advance_undo_status(db, &row.id, "undo_requested").await?;
 
     // C10: refuse if the record changed under us since we recorded it.
@@ -366,7 +411,7 @@ pub struct BatchCounts {
 /// existence-vs-ownership oracle).
 pub async fn batch_undo(
     db: &DbHandle,
-    executor: &dyn ConnectorExecutor,
+    resolver: &ConnectorResolver,
     ids: &[String],
     session_id: &str,
 ) -> BatchCounts {
@@ -379,7 +424,7 @@ pub async fn batch_undo(
                 continue;
             }
         };
-        match attempt_undo(db, executor, &row, session_id).await {
+        match attempt_undo(db, resolver, &row, session_id).await {
             Ok(UndoOutcome::Undone) | Ok(UndoOutcome::AlreadyDone) => counts.undone += 1,
             Ok(_) => counts.failed += 1,
             Err(_) => counts.failed += 1,
@@ -406,11 +451,11 @@ pub async fn batch_undo(
 /// logic, just a different way to name the row set.
 pub async fn undo_turn(
     db: &DbHandle,
-    executor: &dyn ConnectorExecutor,
+    resolver: &ConnectorResolver,
     turn_id: &str,
     session_id: &str,
 ) -> Result<BatchCounts> {
     let rows = journal::list_by_turn(db, turn_id, session_id).await?;
     let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
-    Ok(batch_undo(db, executor, &ids, session_id).await)
+    Ok(batch_undo(db, resolver, &ids, session_id).await)
 }

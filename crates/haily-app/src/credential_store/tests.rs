@@ -4,6 +4,7 @@
 //! real file-level DB inspection (the M5c residue-scrub byte grep) live in the external
 //! integration test `tests/credential_store.rs` instead.
 use super::*;
+use haily_tools::connector::CredentialGetter;
 
 /// Installs the crate's built-in mock backend so every test in this module runs against a
 /// platform-independent, non-persistent fake store — no real OS credential manager is
@@ -169,6 +170,80 @@ async fn headless_policy_never_attempts_keyring_and_sets_persisted_warning_on_wr
     assert_eq!(db_row.as_deref(), Some("headless-secret"));
 }
 
+/// M6b (Activate-and-Measure phase 4b): the FALSE premise this phase corrects is that
+/// headless "keeps a migrated connector working" via the DB-read path alone — once a
+/// secret is migrated, its DB row holds only the marker, and `read_db_plaintext` never
+/// returns a marker as a secret. This test simulates EXACTLY that state (marker present,
+/// no env source) and confirms headless returns `None`, proving the premise really was
+/// false before M6b's fix — then the companion tests below prove the fix.
+#[tokio::test]
+async fn headless_after_migration_with_no_env_source_cannot_read_the_secret() {
+    use_mock_backend();
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), CredentialPolicy::headless()).await;
+
+    meta::upsert_preference(&s.db, "test.migrated_no_env", &super::marker::keyring_marker("test.migrated_no_env"), "test")
+        .await
+        .unwrap();
+
+    assert!(
+        s.get_secret("test.migrated_no_env").await.unwrap().is_none(),
+        "headless with no env/file source and a migrated (marker-only) row must be None, \
+         never the marker string itself"
+    );
+}
+
+/// M6b: the per-connector env var (`HAILY_CRED__<CRED_REF_UPPER_SNAKE>`) is resolved
+/// BEFORE the marker check — a headless boot recovers a migrated secret even though its
+/// DB row holds only the marker.
+#[tokio::test]
+async fn headless_reads_per_connector_env_var_before_the_marker_check() {
+    use_mock_backend();
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), CredentialPolicy::headless()).await;
+
+    let cred_ref = "connector.odoo.api_key";
+    meta::upsert_preference(&s.db, cred_ref, &super::marker::keyring_marker(cred_ref), "test")
+        .await
+        .unwrap();
+
+    std::env::set_var("HAILY_CRED__CONNECTOR_ODOO_API_KEY", "sk-from-env-var");
+    let result = s.get_secret(cred_ref).await.unwrap();
+    std::env::remove_var("HAILY_CRED__CONNECTOR_ODOO_API_KEY");
+
+    assert_eq!(
+        result.as_deref(),
+        Some("sk-from-env-var"),
+        "the per-connector env var must resolve BEFORE the DB marker check blinds the read"
+    );
+}
+
+/// M6b: `HAILY_CRED_FILE` (a JSON object `{cred_ref: secret}`) is checked first, ahead of
+/// even the per-connector env var, and — like the env var — before the marker check.
+#[tokio::test]
+async fn headless_reads_cred_file_before_the_marker_check() {
+    use_mock_backend();
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), CredentialPolicy::headless()).await;
+
+    let cred_ref = "connector.custom.api_key";
+    meta::upsert_preference(&s.db, cred_ref, &super::marker::keyring_marker(cred_ref), "test")
+        .await
+        .unwrap();
+
+    let cred_file = dir.path().join("creds.json");
+    std::fs::write(&cred_file, format!(r#"{{"{cred_ref}":"sk-from-file"}}"#)).unwrap();
+    std::env::set_var("HAILY_CRED_FILE", &cred_file);
+    let result = s.get_secret(cred_ref).await.unwrap();
+    std::env::remove_var("HAILY_CRED_FILE");
+
+    assert_eq!(
+        result.as_deref(),
+        Some("sk-from-file"),
+        "HAILY_CRED_FILE must resolve BEFORE the DB marker check blinds the read"
+    );
+}
+
 #[tokio::test]
 async fn headless_write_without_optin_fails_closed() {
     use_mock_backend();
@@ -226,6 +301,37 @@ async fn migration_is_idempotent_on_repeat_boots() {
     );
 }
 
+/// M6c: simulates a crash/SQLITE_BUSY that landed the marker write but never reached the
+/// scrub — the marker is present but `SCRUB_CONFIRMED_PREF` is not. The NEXT `migrate_from_db`
+/// call (next boot) must still run the scrub and confirm it, rather than short-circuiting on
+/// the marker's own presence forever (the exact bug this fix closes).
+#[tokio::test]
+async fn crash_between_marker_and_scrub_heals_on_next_boot() {
+    use_mock_backend();
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), CredentialPolicy::default()).await;
+
+    // Simulate the marker having ALREADY landed (as if `set_secret` + the marker overwrite
+    // succeeded) but the process crashed before `scrub_residue`/the confirmation flag ran.
+    meta::upsert_preference(&s.db, "test.crash", &super::marker::keyring_marker("test.crash"), "test")
+        .await
+        .unwrap();
+    assert!(
+        meta::get_preference(&s.db, SCRUB_CONFIRMED_PREF).await.unwrap().is_none(),
+        "sanity: scrub confirmation absent before healing"
+    );
+
+    // Next boot's migrate_from_db call must heal it: run the scrub and confirm it, even
+    // though the DB row already holds the marker (no fresh plaintext to migrate).
+    s.migrate_from_db("test.crash").await.unwrap();
+
+    assert_eq!(
+        meta::get_preference(&s.db, SCRUB_CONFIRMED_PREF).await.unwrap().as_deref(),
+        Some("true"),
+        "the interrupted scrub must be re-run and confirmed on the next boot"
+    );
+}
+
 #[tokio::test]
 async fn migration_never_touches_db_row_when_keyring_write_fails() {
     use_mock_backend();
@@ -247,4 +353,24 @@ async fn migration_never_touches_db_row_when_keyring_write_fails() {
     // The DB row must be untouched — still the raw secret, not a marker, not empty.
     let db_row = meta::get_preference(&s.db, "test.migrate_fail").await.unwrap().unwrap();
     assert_eq!(db_row, "must-not-be-lost", "no data loss on a failed migration");
+}
+
+/// Safe Operator Harness phase 2: `HttpExecutor` is injected an `Arc<dyn CredentialGetter>`,
+/// never a concrete `CredentialStore` — this proves the trait-object seam actually delegates
+/// to the SAME read path (cache → keyring → policy-gated DB fallback) as calling the
+/// inherent method directly, not a divergent or infinitely-recursive one.
+#[tokio::test]
+async fn credential_store_as_trait_object_delegates_to_the_same_read_path() {
+    use_mock_backend();
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path(), CredentialPolicy::default()).await;
+    s.set_secret("test.trait_object", "via-trait-object").await.unwrap();
+
+    let getter: Arc<dyn CredentialGetter> = Arc::new(s);
+    assert_eq!(
+        getter.get_secret("test.trait_object").await.unwrap().as_deref(),
+        Some("via-trait-object")
+    );
+    // An unconfigured reference is `Ok(None)` through the trait object too, not an error.
+    assert!(getter.get_secret("test.never_configured").await.unwrap().is_none());
 }

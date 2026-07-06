@@ -352,7 +352,15 @@ impl Adapter for TelegramAdapter {
             Notification::ReminderFired { title, .. } => {
                 format!("⏰ <b>Reminder</b>: {}", escape_html(&title))
             }
-            Notification::WorkItemsChanged(_) => unreachable!(),
+            // Unreachable in practice (the early-return above handles it), but the
+            // match must be total: a future refactor removing that guard must degrade
+            // to a dropped notification, never panic the always-on daemon.
+            Notification::WorkItemsChanged(_) => {
+                tracing::debug!(
+                    "WorkItemsChanged reached notify() text-match; handled upstream — ignoring"
+                );
+                return Ok(());
+            }
         };
 
         // Broadcast to all known chats
@@ -531,5 +539,18 @@ mod tests {
             .await
             .unwrap();
         assert!(adapter.text_buffer.get(&session_id).is_none());
+    }
+
+    /// Regression: `WorkItemsChanged` must never panic `notify()`. This is currently
+    /// caught by the early-return guard, but the test also protects the match arm
+    /// itself (see the comment on that arm) if the guard is ever removed. No chats
+    /// are bound, so the broadcast loop makes no network call.
+    #[tokio::test]
+    async fn notify_work_items_changed_does_not_panic() {
+        let adapter = test_adapter();
+
+        let result = adapter.notify(Notification::WorkItemsChanged(vec![])).await;
+
+        assert!(result.is_ok());
     }
 }

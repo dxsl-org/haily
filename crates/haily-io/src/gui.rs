@@ -73,7 +73,15 @@ impl Adapter for GuiAdapter {
             Notification::MorningBrief(brief) => format!("[Morning Brief]\n{brief}"),
             Notification::Alert { title, body, .. } => format!("{title}\n{body}"),
             Notification::ReminderFired { title, .. } => format!("⏰ {title}"),
-            Notification::WorkItemsChanged(_) => unreachable!(),
+            // Unreachable in practice (the early-return above handles it), but the
+            // match must be total: a future refactor removing that guard must degrade
+            // to a dropped notification, never panic the always-on daemon.
+            Notification::WorkItemsChanged(_) => {
+                tracing::debug!(
+                    "WorkItemsChanged reached notify() text-match; handled upstream — ignoring"
+                );
+                return Ok(());
+            }
         };
         // Delivered on a synthetic session so Phase 10 can route it to a notification panel.
         let synthetic_session = Uuid::nil();
@@ -90,5 +98,23 @@ impl Adapter for GuiAdapter {
 
     fn id(&self) -> &str {
         "gui"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Adapter;
+
+    /// Regression: `WorkItemsChanged` must never panic `notify()`. This is currently
+    /// caught by the early-return guard, but the test also protects the match arm
+    /// itself (see the comment on that arm) if the guard is ever removed.
+    #[tokio::test]
+    async fn notify_work_items_changed_does_not_panic() {
+        let (adapter, _req_tx, _resp_rx) = GuiAdapter::new();
+
+        let result = adapter.notify(Notification::WorkItemsChanged(vec![])).await;
+
+        assert!(result.is_ok());
     }
 }

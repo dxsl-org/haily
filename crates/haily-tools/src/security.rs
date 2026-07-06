@@ -321,7 +321,7 @@ pub async fn ssrf_guard_with_allowance(
 /// [`ssrf_guard_with_allowance`]. The carve-out is narrow by construction: it NEVER relaxes
 /// the metadata/link-local surface (169.254/16 IMDS, 100.100.100/24, fd00:ec2::/64,
 /// fe80::/10) — those stay never-allowable even with the flag set. Production connector
-/// wiring (`Orchestrator::init` → `HttpExecutor`/`OdooExecutor`) always constructs with
+/// wiring (`Orchestrator::init` → `HttpExecutor`) always constructs with
 /// `allow_loopback=false`.
 ///
 /// # Errors
@@ -506,7 +506,10 @@ pub async fn follow_redirects_with_guard(
             .map_err(|e| anyhow::anyhow!("invalid redirect Location '{location}': {e}"))?
             .to_string();
 
-        tracing::warn!(hop, target = %current_url, "following redirect (re-vetting on next hop)");
+        // A caller-supplied URL (e.g. url_fetch/http_request with `?token=…`) can carry a
+        // secret that a same-host redirect echoes into `current_url`; redact the query so it
+        // never lands in this diagnostic line (parity with the allowance follower below).
+        tracing::warn!(hop, target = %redact_query_for_log(&current_url), "following redirect (re-vetting on next hop)");
     }
 
     unreachable!("loop always returns or bails by the last iteration")
@@ -590,10 +593,31 @@ pub async fn follow_redirects_with_guard_allowance_loopback(
             .map_err(|e| anyhow::anyhow!("invalid redirect Location '{location}': {e}"))?
             .to_string();
 
-        tracing::warn!(hop, target = %current_url, "connector redirect (re-vetting allowance)");
+        // m1: a manifest's query-param auth secret is applied per-hop by the caller's
+        // `build_request` closure via `.query()`, never by mutating `current_url` — but a
+        // redirect `Location` that itself echoes the query string (e.g. a proxy that
+        // preserves it, or a compromised base host) WOULD otherwise land the secret in
+        // `current_url` and thus in this diagnostic line. `redact_query_for_log` drops it.
+        tracing::warn!(hop, target = %redact_query_for_log(&current_url), "connector redirect (re-vetting allowance)");
     }
 
     unreachable!("loop always returns or bails by the last iteration")
+}
+
+/// m1: strip the query component from a URL string before it is used in a diagnostic log —
+/// a manifest's query-param auth secret must never reach a log line, even when a same-host
+/// redirect happens to echo the incoming query back in its `Location` header. Dropping the
+/// WHOLE query (rather than redacting only a known param name) is deliberate: the log only
+/// needs to communicate which host/path redirected, never the exact querystring, and this
+/// way a future auth scheme's param name never has to be threaded into the redirect walker
+/// just to keep the log safe. An unparseable URL never has its raw (unvetted) text echoed.
+fn redact_query_for_log(url: &str) -> String {
+    Url::parse(url)
+        .map(|mut u| {
+            u.set_query(None);
+            u.to_string()
+        })
+        .unwrap_or_else(|_| "<unparseable-redirect-target>".to_string())
 }
 
 /// HTTP request headers `http_request` must reject outright — each would let the
@@ -1216,6 +1240,34 @@ mod tests {
         assert!(validate_rel_path("/etc/passwd").is_err());
         #[cfg(windows)]
         assert!(validate_rel_path("C:\\Windows\\System32").is_err());
+    }
+
+    // ---- redact_query_for_log (m1) ------------------------------------------------
+
+    #[test]
+    fn redact_query_for_log_strips_a_secret_bearing_query_string() {
+        // The exact worst case this guards against: a same-host redirect Location that
+        // echoes the incoming query-param auth secret back verbatim.
+        assert_eq!(
+            redact_query_for_log("http://127.0.0.1:8080/next?api_key=SECRET123&x=1"),
+            "http://127.0.0.1:8080/next"
+        );
+    }
+
+    #[test]
+    fn redact_query_for_log_is_a_no_op_with_no_query() {
+        assert_eq!(
+            redact_query_for_log("http://127.0.0.1:8080/next"),
+            "http://127.0.0.1:8080/next"
+        );
+    }
+
+    #[test]
+    fn redact_query_for_log_never_echoes_unparseable_input_raw() {
+        // An unparseable string must never be logged verbatim (it could itself embed a
+        // secret from a caller that failed to build a valid redirect URL) — a fixed
+        // placeholder is used instead.
+        assert_eq!(redact_query_for_log("not a url"), "<unparseable-redirect-target>");
     }
 
     // ---- is_denied_header ---------------------------------------------------------

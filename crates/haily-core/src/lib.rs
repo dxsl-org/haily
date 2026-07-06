@@ -54,6 +54,13 @@ impl Orchestrator {
     /// `auto_approve` MUST already be validated by the caller (`haily_app::auto_approve
     /// ::validate_auto_approve` — rejects any `RequireApproval`-class tool name at
     /// startup) — this constructor trusts it and does not re-check.
+    ///
+    /// `credential_getter` (Safe Operator Harness phase 2) is forwarded to
+    /// `register_connectors` → every `HttpExecutor`, so a manifest's declared `auth` section
+    /// can be resolved at call time. `None` is a legitimate value (no connector manifest
+    /// declares `auth` yet, or the app layer opted out) — it only matters for manifests that
+    /// actually declare `auth`, which then fail closed rather than sending an unauthenticated
+    /// request (see `HttpExecutor::resolve_auth`).
     pub async fn init(
         kms: Arc<KmsHandle>,
         db: Arc<DbHandle>,
@@ -61,6 +68,7 @@ impl Orchestrator {
         shutdown: CancellationToken,
         tasks: TaskTracker,
         auto_approve: std::collections::HashSet<String>,
+        credential_getter: Option<Arc<dyn haily_tools::connector::CredentialGetter>>,
     ) -> Result<Self> {
         let llm_inner = Arc::new(LlmRouter::init(config).await);
         let llm_provider = llm_inner.provider_name().to_string();
@@ -92,6 +100,12 @@ impl Orchestrator {
         // interactive connector op should complete well within this; a hang is treated as
         // a transport error the C7 read-back path recovers from.
         const CONNECTOR_TIMEOUT_SECS: u64 = 30;
+        // C3 (Activate-and-Measure phase 4b): outer bound on the ENTIRE startup
+        // reconciliation sweep, regardless of row count or how many connector hosts turn
+        // out to be unreachable. The sweep's own per-executor short-circuit (reconcile.rs)
+        // already stops hammering a dead host after its first failure; this is a second,
+        // coarser belt-and-suspenders bound on the background task as a whole.
+        const RECONCILE_SWEEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         // Phase 3 kill switch (C8): seed from the persisted `safety.disable_writes`
         // preference so a restart preserves a thrown switch. This Arc is the runtime
         // source of truth from here on; the app layer flips it live via `kill_handle()`.
@@ -113,7 +127,11 @@ impl Orchestrator {
         // An unparseable manifest, or one whose base_url resolves into a blocked
         // metadata/link-local range, is SKIPPED (logged) rather than registered — a
         // connector tool that would fail-closed on every call is worse than absent.
-        let mut parsed_manifests = Vec::new();
+        // M2 (Activate-and-Measure phase 4b): each manifest is paired with its OWN
+        // `content_hash` (already integrity-verified above) — pinned into every journal
+        // row `register_connectors` wires up, and into the `ConnectorResolver` the undo/
+        // reconcile paths compare a row's pinned hash against.
+        let mut parsed_manifests: Vec<(haily_tools::connector::Manifest, String)> = Vec::new();
         match haily_db::queries::connectors::list_active(&db).await {
             Ok(rows) => {
                 for row in rows {
@@ -141,7 +159,7 @@ impl Orchestrator {
                                 );
                                 continue;
                             }
-                            parsed_manifests.push(m);
+                            parsed_manifests.push((m, row.content_hash.clone()));
                         }
                         Err(e) => tracing::warn!(
                             connector = %row.connector_name,
@@ -153,18 +171,26 @@ impl Orchestrator {
             }
             Err(e) => tracing::warn!("failed to load connector manifests: {e:#}"),
         }
-        if !parsed_manifests.is_empty() {
-            let op_count: usize = parsed_manifests.iter().map(|m| m.ops.len()).sum();
-            base_v1.register_connectors(
+        // M5c: the op→executor(+manifest-hash) routing table `register_connectors` builds —
+        // handed to the background reconcile sweep below. Empty when no manifest registered
+        // (every op then fails closed to "unconfigured" in undo/reconcile, matching the prior
+        // placeholder's intent).
+        let connector_routing = if !parsed_manifests.is_empty() {
+            let op_count: usize = parsed_manifests.iter().map(|(m, _)| m.ops.len()).sum();
+            let routing = base_v1.register_connectors(
                 parsed_manifests,
                 Arc::clone(&kill),
                 std::time::Duration::from_secs(CONNECTOR_TIMEOUT_SECS),
                 // Credential preference key convention: "<connector>.api_key". The secret
                 // is redacted (C4); only this reference name is journaled.
                 |connector_name| format!("{connector_name}.api_key"),
+                credential_getter.clone(),
             );
             tracing::info!(ops = op_count, "registered connector ops into base_v1");
-        }
+            routing
+        } else {
+            haily_tools::journal_undo::ConnectorResolver::new()
+        };
 
         let mut tools = base_v1.sub_registry(L0_QUICK_TOOLS);
 
@@ -211,6 +237,37 @@ impl Orchestrator {
             }));
         }
 
+        // M8a (Activate-and-Measure phase 4b): WARN for any domain/specialist tool
+        // reference with no registered implementation — most commonly a connector op a
+        // manifest never registered (Odoo not configured, or a manifest revoked) but a
+        // domain still whitelists it by name. `sub_registry` silently drops an unresolved
+        // name (C2, by design), so without this WARN a "CRM" domain feature would be
+        // dormant with zero operator-visible signal. Landed here (not phase 5) because this
+        // is exactly the point `base_v1` reflects every op that DID register.
+        for domain in domains::DOMAINS {
+            for name in domain.allowed_tools {
+                if base_v1.get(name).is_none() {
+                    tracing::warn!(
+                        domain = domain.tool_name,
+                        tool = *name,
+                        "domain whitelists a tool with no registered implementation \
+                         (connector not configured, manifest revoked, or a stale name)"
+                    );
+                }
+            }
+        }
+        for spec in specialists::SPECIALISTS {
+            for name in spec.allowed_tools {
+                if base_v1.get(name).is_none() {
+                    tracing::warn!(
+                        specialist = spec.tool_name,
+                        tool = *name,
+                        "specialist whitelists a tool with no registered implementation"
+                    );
+                }
+            }
+        }
+
         let tools = Arc::new(tools);
         tracing::info!(
             llm = llm_provider,
@@ -227,30 +284,48 @@ impl Orchestrator {
 
         // Phase 3 reconciliation sweep (C6/C7): classify orphan `pending` journal rows
         // left by a crash/kill mid-write via a read-back GET — NEVER a blind create-retry
-        // (M4). Placed right next to `reset_stale_running` (same crash-recovery boundary).
-        // A row past its grace window and still `pending` is an orphan; a fresh in-flight
-        // write is skipped.
+        // (M4). A row past its grace window and still `pending` is an orphan; a fresh
+        // in-flight write is skipped.
         //
-        // PHASE 4 decision — reconciliation stays on `UnconfiguredExecutor`: the sweep runs
-        // ONCE over ALL incomplete rows regardless of connector, but each row's read-back
-        // must go to ITS OWN manifest's base_url + pinned allowance (routing by
-        // `row.tool_name` → op → manifest). That per-row executor selection is real routing
-        // logic, deferred to phase 5 with the Odoo executor (noted in the plan). Until then
-        // the fail-closed placeholder marks unclassifiable rows `unverified` — the safe C7
-        // direction, which never blocks a later undo.
-        let reconcile_executor = haily_tools::connector::UnconfiguredExecutor;
-        let reconciled = haily_tools::journal_undo::reconcile::reconcile_incomplete(
-            &db,
-            &reconcile_executor,
-            haily_tools::journal_undo::reconcile::RECONCILE_GRACE_SECS,
-        )
-        .await;
-        if reconciled > 0 {
-            tracing::info!(
-                count = reconciled,
-                "reconciled orphan action-journal rows at startup"
-            );
-        }
+        // C3 (Activate-and-Measure phase 4b): the sweep now routes each row to its OWN
+        // manifest's executor via `connector_routing` (M5c) instead of the phase-3/4
+        // fail-closed placeholder — a real read-back is a serial, `CONNECTOR_TIMEOUT_SECS`-
+        // bounded network call (reconcile.rs), so awaiting the WHOLE sweep here would hang
+        // boot for up to `N * CONNECTOR_TIMEOUT_SECS` with a single unreachable connector
+        // host. Spawn it as a background task instead: it selects on shutdown, is bounded
+        // by `RECONCILE_SWEEP_TIMEOUT` for the sweep as a whole, and `reconcile_incomplete`
+        // itself short-circuits per-executor after its first read-back failure (never
+        // retry-storms a dead host). Boot returns without awaiting any of this — an orphan
+        // row simply stays `pending` a little longer, which is safe (see the phase's Risk
+        // Notes: the fail-closed direction never blocks a later undo).
+        let reconcile_db = Arc::clone(&db);
+        let reconcile_shutdown = shutdown.child_token();
+        tasks.spawn(async move {
+            tokio::select! {
+                _ = reconcile_shutdown.cancelled() => {
+                    tracing::info!("startup reconciliation sweep cancelled by shutdown");
+                }
+                result = tokio::time::timeout(
+                    RECONCILE_SWEEP_TIMEOUT,
+                    haily_tools::journal_undo::reconcile::reconcile_incomplete(
+                        &reconcile_db,
+                        &connector_routing,
+                        haily_tools::journal_undo::reconcile::RECONCILE_GRACE_SECS,
+                    ),
+                ) => {
+                    match result {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(count = n, "reconciled orphan action-journal rows at startup");
+                        }
+                        Ok(_) => {}
+                        Err(_) => tracing::warn!(
+                            timeout_secs = RECONCILE_SWEEP_TIMEOUT.as_secs(),
+                            "startup reconciliation sweep timed out — remaining orphan rows stay pending"
+                        ),
+                    }
+                }
+            }
+        });
 
         Self::spawn_self_improvement_workers(Arc::clone(&kms), Arc::clone(&llm), shutdown, tasks);
 
@@ -524,10 +599,11 @@ mod wiring_tests {
         let manifest = haily_tools::connector::manifest::parse(&json).unwrap();
         let mut base = ToolRegistry::build_v1();
         base.register_connectors(
-            vec![manifest],
+            vec![(manifest, "test-hash".to_string())],
             Arc::new(AtomicBool::new(false)),
             std::time::Duration::from_secs(30),
             |c| format!("{c}.api_key"),
+            None,
         );
         base
     }

@@ -13,14 +13,27 @@
 //!   FAIL-CLOSED by default. The caller gets an `Err`, never a silent plaintext write,
 //!   unless `allow_write_plaintext` is explicitly set in [`CredentialPolicy`].
 //!
-//! ## Headless/Session-0 (M5a)
+//! ## Headless/Session-0 (M5a) + the env/file credential source (M6b)
 //! Windows Credential Manager (DPAPI, tied to the interactive session) and Linux
 //! secret-service (needs a D-Bus session bus) are both structurally unavailable in a true
 //! daemon/Session-0 context. `--headless` sets [`CredentialPolicy::attempt_keyring`] to
-//! `false` BEFORE any keyring call — the DB-read path is used directly, and a PERSISTED
-//! warning flag is set (`credential.fallback_active` in `kms_preferences`) so the GUI can
-//! surface it as a banner on next open. This is a policy decision, made once at startup;
-//! it never bricks the daemon over an environment the daemon cannot fix.
+//! `false` BEFORE any keyring call.
+//!
+//! CORRECTION (Activate-and-Measure phase 4b, M6 premise): the doc above used to claim "the
+//! DB-read path is used directly" keeps a migrated connector working headless — that is
+//! FALSE once a secret has been migrated ([`migration`]): the DB row then holds only the
+//! keyring marker (see [`is_keyring_marker`]), and [`CredentialStore::read_db_plaintext`]
+//! deliberately never returns a marker as if it were a real secret. So after an interactive
+//! migration, the DB-read path alone permanently blinds a headless boot. `get_secret`
+//! therefore tries [`headless_env_source`] FIRST when `attempt_keyring` is `false` — an
+//! `HAILY_CRED_FILE` (JSON `{cred_ref: secret}`) or a per-connector
+//! `HAILY_CRED__<CRED_REF_UPPER_SNAKE>` env var, USER-DECIDED (2026-07-06) over a
+//! keyring-export alternative (rejected: extra attack surface, a second key layer) — and
+//! only falls back to the DB-read path if neither resolves anything. A PERSISTED warning
+//! flag is ALSO set on any keyring failure (`credential.fallback_active` in
+//! `kms_preferences`) so the GUI can surface it as a banner on next open. This is a policy
+//! decision, made once at startup; it never bricks the daemon over an environment the
+//! daemon cannot fix.
 //!
 //! ## Concurrency
 //! The keyring API is fully synchronous — every call goes through `spawn_blocking`, wrapped
@@ -37,13 +50,15 @@ mod rpc;
 #[cfg(test)]
 mod tests;
 
-pub use marker::{is_keyring_marker, FALLBACK_WARNING_PREF, KEYRING_MARKER_PREFIX};
+pub use marker::{is_keyring_marker, FALLBACK_WARNING_PREF, KEYRING_MARKER_PREFIX, SCRUB_CONFIRMED_PREF};
 pub use policy::CredentialPolicy;
 use rpc::KeyringRpc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use haily_db::queries::meta;
 use haily_db::DbHandle;
+use haily_tools::connector::CredentialGetter;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -90,7 +105,12 @@ impl CredentialStore {
         }
 
         if !self.policy.attempt_keyring {
-            // M5a: headless/Session-0 — go straight to the DB path, no keyring RPC.
+            // M5a/M6b: headless/Session-0 — no keyring RPC. Try the env/file source FIRST
+            // (resolved BEFORE the DB marker check — see the module doc's M6 correction),
+            // then fall back to the DB-read path for a connector never migrated at all.
+            if let Some(secret) = Self::headless_env_source(cred_ref) {
+                return Ok(Some(secret));
+            }
             return self.read_db_plaintext(cred_ref).await;
         }
 
@@ -194,11 +214,38 @@ impl CredentialStore {
         }
     }
 
+    /// Returns `None` for a MARKER row (see the module doc's M6 correction) — a migrated
+    /// secret is NEVER served from here; only [`Self::headless_env_source`] (checked first
+    /// in `get_secret`, M6b) or the live keyring can serve it once migrated.
     async fn read_db_plaintext(&self, cred_ref: &str) -> Result<Option<String>> {
         match meta::get_preference(&self.db, cred_ref).await? {
             Some(v) if !v.is_empty() && !is_keyring_marker(&v) => Ok(Some(v)),
             _ => Ok(None),
         }
+    }
+
+    /// M6b (Activate-and-Measure phase 4b, USER-DECIDED 2026-07-06): the headless/Session-0
+    /// credential source, resolved BEFORE the DB marker check. First `HAILY_CRED_FILE` — a
+    /// path to a JSON object `{"<cred_ref>": "<secret>", ...}` (e.g. an IT-provisioned file
+    /// rotated without a restart) — then a per-connector env var
+    /// `HAILY_CRED__<CRED_REF_UPPER_SNAKE>` (dots/hyphens become underscores). Neither is
+    /// cached: a rotated file/env var must be picked up on the very next call, not after a
+    /// restart. Never logs the resolved value.
+    fn headless_env_source(cred_ref: &str) -> Option<String> {
+        if let Ok(path) = std::env::var("HAILY_CRED_FILE") {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+                    if let Some(secret) = map.get(cred_ref).filter(|s| !s.is_empty()) {
+                        return Some(secret.clone());
+                    }
+                }
+            }
+        }
+        let env_name = format!(
+            "HAILY_CRED__{}",
+            cred_ref.to_ascii_uppercase().replace(['.', '-'], "_")
+        );
+        std::env::var(env_name).ok().filter(|v| !v.is_empty())
     }
 
     /// TEST-SUPPORT ONLY (`#[cfg(any(test, feature = "test-support"))]`) — see
@@ -207,5 +254,18 @@ impl CredentialStore {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn force_next_keyring_error(&self, cred_ref: &str, err: keyring::Error) {
         self.rpc.force_next_error(cred_ref, err).await;
+    }
+}
+
+/// Safe Operator Harness phase 2: `haily-tools` (a lower layer) defines the
+/// [`CredentialGetter`] seam; `haily-app` (this crate, which depends on `haily-tools`) is
+/// the only place that can implement it against the concrete keyring-backed store — the
+/// dependency graph only points one way. This is a thin delegation: `CredentialStore`
+/// already encapsulates the full cache → keyring → policy-gated DB-fallback order (M5b); a
+/// `HttpExecutor` holding this trait object never needs to know any of that.
+#[async_trait]
+impl CredentialGetter for CredentialStore {
+    async fn get_secret(&self, cred_ref: &str) -> Result<Option<String>> {
+        self.get_secret(cred_ref).await
     }
 }

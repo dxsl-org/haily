@@ -1,8 +1,42 @@
 {
   "connector_name": "odoo-crm",
-  "version": "1",
+  "version": "2",
   "base_url": "https://erp.example.com",
   "allowed_ip_cidrs": [],
+  "auth": {
+    "scheme": "header",
+    "cred_ref": "connector.odoo.api_key",
+    "header_name": "X-Ignored"
+  },
+  "protocol": {
+    "endpoint_suffix": "/jsonrpc",
+    "envelope": {
+      "jsonrpc": "2.0",
+      "method": "call",
+      "id": null,
+      "params": {
+        "service": "object",
+        "method": "execute_kw",
+        "args": ["{{db}}", "{{uid}}", "{{key}}", "{{model}}", "{{method}}", "{{args}}", "{{kwargs}}"]
+      }
+    },
+    "methods": [
+      { "method": "create", "arg_template": ["{{values}}"] },
+      { "method": "write", "arg_template": ["{{ids}}", "{{values}}"] },
+      { "method": "unlink", "arg_template": ["{{ids}}"] }
+    ],
+    "fault_rules": [
+      { "match_field": "name", "match_value": "odoo.exceptions.AccessError", "normalized": "AccessError" },
+      { "match_field": "name", "match_value": "odoo.exceptions.ValidationError", "normalized": "ValidationError" },
+      { "match_field": "name", "match_value": "odoo.exceptions.MissingError", "normalized": "MissingError" }
+    ],
+    "readback": { "locate_by": "id", "active_test": true, "unwrap_first": true },
+    "context": { "lang": "en_US", "tz": "UTC" },
+    "prevalidate": [
+      { "model": "res.partner", "required_fields": ["name"] },
+      { "model": "crm.lead", "required_fields": ["name", "type"] }
+    ]
+  },
   "ops": [
     {
       "name": "odoo_contact_create",

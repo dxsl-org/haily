@@ -1,3 +1,4 @@
+pub mod backup;
 mod cross_domain;
 mod daily_rollup;
 mod dnd;

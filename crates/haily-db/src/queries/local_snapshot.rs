@@ -567,6 +567,9 @@ pub async fn local_journaled_write(
             compensation_plan: None,
             turn_id,
             retention_days,
+            // Local rows have no connector manifest to pin (M2 applies to connector rows
+            // only) — `is_local_row` short-circuits before any hash comparison is reached.
+            manifest_hash: None,
         },
     )
     .await?;

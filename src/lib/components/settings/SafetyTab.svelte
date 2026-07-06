@@ -3,7 +3,8 @@
   // Plain, non-technical copy throughout — no "RiskTier"/"kill switch"/"compensation"
   // jargon in anything the user reads (the code comments keep those terms for devs).
   import { sendMessage } from '$lib/tauri';
-  import { listJournal, type JournalEntry } from '$lib/tauri';
+  import { listJournal, exportDatabase, type JournalEntry } from '$lib/tauri';
+  import { save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 
   let {
     prefs,
@@ -113,6 +114,48 @@
   function canUndo(entry: JournalEntry): boolean {
     return entry.undoStatus === 'not_requested' || entry.undoStatus === 'compensation_failed';
   }
+
+  // Phase 6 ("Activate & Measure"): `backup.age_warning_active` is a PERSISTED flag the
+  // scheduled backup worker refreshes every cycle (mirrors `credential.fallback_active`'s
+  // pattern) — a silently-starved backup (disk full, permissions, crash loop) must not
+  // stay invisible. Dismissing here just clears the flag until the worker's next cycle;
+  // it re-raises it if the underlying staleness has not actually resolved.
+  const backupAgeWarningActive = () => prefs['backup.age_warning_active'] === 'true';
+
+  let dismissingBackupWarning = $state(false);
+  async function dismissBackupWarning() {
+    if (dismissingBackupWarning) return;
+    dismissingBackupWarning = true;
+    try {
+      await save('backup.age_warning_active', 'false');
+    } finally {
+      dismissingBackupWarning = false;
+    }
+  }
+
+  let exporting = $state(false);
+  let exportError = $state('');
+  let exportSuccessPath = $state('');
+  async function exportDb() {
+    if (exporting) return;
+    exportError = '';
+    exportSuccessPath = '';
+    try {
+      const destPath = await saveFileDialog({
+        title: 'Export Haily database',
+        defaultPath: 'haily-export.db',
+        filters: [{ name: 'SQLite database', extensions: ['db'] }],
+      });
+      if (!destPath) return; // user cancelled the dialog
+      exporting = true;
+      await exportDatabase(destPath);
+      exportSuccessPath = destPath;
+    } catch (e) {
+      exportError = String(e);
+    } finally {
+      exporting = false;
+    }
+  }
 </script>
 
 <div class="section">
@@ -130,6 +173,39 @@
       </button>
     </div>
   {/if}
+
+  {#if backupAgeWarningActive()}
+    <div class="block fallback-warning">
+      <span class="warning-title">⚠️ Your data hasn't been backed up recently</span>
+      <span class="hint">
+        Haily makes a local backup copy of your data automatically, but the last one
+        didn't complete in time. Check that Haily has been able to run recently and that
+        there's enough free disk space.
+      </span>
+      <button class="dismiss-btn" onclick={dismissBackupWarning} disabled={dismissingBackupWarning}>
+        {dismissingBackupWarning ? 'Closing…' : 'Got it'}
+      </button>
+    </div>
+  {/if}
+
+  <div class="block">
+    <div class="switch-copy">
+      <span class="switch-title">Export your data</span>
+      <span class="hint">
+        Save a complete copy of your local database to a file of your choice. This file
+        is not encrypted and contains everything Haily knows — keep it somewhere safe.
+      </span>
+    </div>
+    <button class="undo-btn" onclick={exportDb} disabled={exporting}>
+      {exporting ? 'Exporting…' : 'Export database…'}
+    </button>
+    {#if exportSuccessPath}
+      <div class="hint">Exported to {exportSuccessPath}</div>
+    {/if}
+    {#if exportError}
+      <div class="status-error">⚠️ {exportError}</div>
+    {/if}
+  </div>
 
   <div class="block">
     <div class="switch-row">

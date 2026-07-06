@@ -4,6 +4,7 @@
 use haily_db::{queries::journal, queries::work_items, DbHandle};
 use haily_io::{AdapterManager, Notification, WorkItemStatus};
 use haily_proactive::ProactiveDaemon;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -92,4 +93,30 @@ pub fn spawn_journal_purge(db: Arc<DbHandle>, shutdown: CancellationToken, tasks
             }
         }
     });
+}
+
+/// Spawn the scheduled GFS (grandfather-father-son) SQLite backup worker (Phase 6,
+/// "Activate & Measure" — full design in `haily_proactive::backup`). Registered
+/// separately from `ProactiveDaemon` (mirrors `spawn_journal_purge`, not one of the
+/// daemon's fixed four loops) since it needs extra construction-time arguments the
+/// daemon's other loops don't (a filesystem directory, a credential-posture bool).
+///
+/// `credential_migration_clean` is a boot-time snapshot computed in `bootstrap.rs` —
+/// the only layer with visibility into `CredentialStore`/keyring state, since this
+/// crate's `haily-proactive` dependency sits BELOW `haily-app` and must not reach back
+/// up into it. Passed down as a plain `bool` so the worker itself stays ignorant of
+/// keyring internals entirely.
+pub fn spawn_backup(
+    db: Arc<DbHandle>,
+    backups_dir: PathBuf,
+    credential_migration_clean: bool,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
+) {
+    tasks.spawn(haily_proactive::backup::loop_forever(
+        db,
+        backups_dir,
+        credential_migration_clean,
+        shutdown,
+    ));
 }

@@ -530,24 +530,24 @@ fn split_safe(buffer: &str) -> (&str, &str) {
 /// producer (llama's blocking decode loop / the cloud SSE task) to notice on its own
 /// — dropping `rx` here is itself the second half of the cancellation signal those
 /// producers watch for (see `llama.rs`/`cloud.rs` doc comments).
-/// Returns `(full_text, total_tokens)`. NOTE (Harness Completion phase 5, H2 review
-/// fix): despite the field's name, `total_tokens` is NOT a trustworthy token count
-/// for telemetry purposes and must never be persisted as `kms_task_traces.
-/// completion_tokens` — see that call site's comment. The llama.cpp backend
-/// increments it once per actually-decoded token (genuinely accurate there), but the
-/// cloud SSE backend (`haily_llm::cloud`) increments it once per `Delta` EVENT, and a
-/// provider may batch several tokens' worth of text into one SSE delta — undercounting
-/// the real count. `run_turn` has no backend-agnostic way to know which producer served
-/// a given call (`LlmRouter` can fail over between them mid-lifetime), so a single
-/// "total_tokens" number here cannot be trusted as accurate across both. Kept as a
-/// `u32` return (not removed) only because callers still find the raw per-call count
-/// useful for internal flow/logging purposes distinct from the persisted-metric
-/// honesty bar `TraceMetrics::completion_tokens` must clear.
+///
+/// Returns `(full_text, total_tokens, prompt_tokens)`. CONTRACT (Phase 8, C2 —
+/// supersedes the prior H2-review note): `prompt_tokens` is `StreamChunk::Done`'s own
+/// provenance signal — `Some` only on the llama.cpp backend, which tokenizes the
+/// prompt up front and increments `total_tokens` once per actually-decoded token, so
+/// BOTH numbers are genuine measurements there. It is `None` on the cloud SSE
+/// backend, which counts `Delta` EVENTS, not tokens (a provider may batch several
+/// tokens into one delta) and exposes no real `usage` field on any dialect this crate
+/// speaks. Callers MUST gate trusting `total_tokens` as a completion-token count on
+/// `prompt_tokens.is_some()` — never persist `total_tokens` as
+/// `TraceMetrics::completion_tokens` when `prompt_tokens` is `None` (see this
+/// function's main-turn caller and the cloud-NULL honesty tests in
+/// `outcome_signal_tests`).
 async fn stream_llm_response(
     rx: &mut mpsc::Receiver<StreamChunk>,
     tx: &mpsc::Sender<ResponseChunk>,
     cancel: &CancellationToken,
-) -> Result<(String, u32)> {
+) -> Result<(String, u32, Option<u32>)> {
     let mut full = String::new();
     // Buffer of bytes not yet flushed to `tx`. While `Scanning`, holds only the
     // tail that might still become a tag; while `InTag`, holds the entire withheld
@@ -635,7 +635,7 @@ async fn stream_llm_response(
                     }
                 }
             }
-            Some(StreamChunk::Done { total_tokens }) => {
+            Some(StreamChunk::Done { total_tokens, prompt_tokens }) => {
                 // Any residual `pending` text at clean end-of-stream was never
                 // confirmed to close out a tag (a real closed tag would already have
                 // been drained above) — either an incomplete tag prefix (e.g. a lone
@@ -646,7 +646,7 @@ async fn stream_llm_response(
                 // stay invisible to the user (the security invariant this function
                 // exists for), and a plain incomplete prefix will be re-rendered by
                 // `strip_tool_markup` at the loop's end instead.
-                return Ok((full, total_tokens));
+                return Ok((full, total_tokens, prompt_tokens));
             }
             Some(StreamChunk::Error(msg)) => {
                 return Err(anyhow::anyhow!("{msg}"));
@@ -1075,6 +1075,14 @@ pub async fn run_turn(
     // never streamed and DOES need this final send.
     let mut final_text_already_streamed = false;
 
+    // C2 (Phase 8): the LAST LLM call's token counts, matching `final_response`
+    // (also only ever the last iteration's text) — see the loop body's comment for
+    // why only the final iteration's counts are kept, and `stream_llm_response`'s doc
+    // comment for the llama-vs-cloud provenance contract these two must stay
+    // gated on together (`Some`/`Some` or `None`/`None`, never mixed).
+    let mut turn_prompt_tokens: Option<i64> = None;
+    let mut turn_completion_tokens: Option<i64> = None;
+
     // Capture the loop result without propagating `?` immediately so the
     // WorkItem finalization block below always runs — even when LLM calls fail
     // mid-turn after the WorkItem has already been created.
@@ -1091,13 +1099,27 @@ pub async fn run_turn(
                 Ok(rx) => rx,
                 Err(e) => break 'turn Err(e),
             };
-            // `_total_tokens` is deliberately discarded (H2 review fix): not a
-            // trustworthy cross-backend measurement — see `stream_llm_response`'s doc
-            // comment. `TraceMetrics::completion_tokens` is persisted as `None`
-            // below rather than fabricated from this count.
-            let (response, _total_tokens) = match stream_llm_response(&mut stream, &tx, cancel).await {
-                Ok(r) => r,
-                Err(e) => break 'turn Err(e),
+            // C2 (Phase 8): `prompt_tokens` is `StreamChunk::Done`'s own llama-vs-cloud
+            // provenance signal (see `stream_llm_response`'s doc comment) — captured
+            // per LLM call so the LAST call's counts (the one whose response becomes
+            // `final_response`) can be persisted below. A turn with tool calls makes
+            // several LLM calls in this loop; only the final iteration's counts are
+            // kept, matching `final_response` itself (which is also only the last
+            // iteration's text).
+            let (response, total_tokens, prompt_tokens) =
+                match stream_llm_response(&mut stream, &tx, cancel).await {
+                    Ok(r) => r,
+                    Err(e) => break 'turn Err(e),
+                };
+            // Only trust `total_tokens` as a real completion-token count when
+            // `prompt_tokens` is `Some` (i.e. the llama.cpp backend served this call —
+            // see the contract on `stream_llm_response`). Cloud calls leave both
+            // `None`, preserving the NULL-honesty invariant `outcome_signal_tests`
+            // asserts. Overwritten every iteration so only the LAST call's counts
+            // survive to the `record_outcome_and_update_skill` call after the loop.
+            (turn_prompt_tokens, turn_completion_tokens) = match prompt_tokens {
+                Some(p) => (Some(p as i64), Some(total_tokens as i64)),
+                None => (None, None),
             };
 
             if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
@@ -1225,16 +1247,13 @@ pub async fn run_turn(
     // against a 5-minute window and avoids a second DB round-trip just to read the
     // row back before checking undo.
     let elapsed_ms = turn_start.elapsed().as_millis() as i64;
-    // H2 review fix: neither `prompt_tokens` nor `completion_tokens` has a
-    // trustworthy source today. `estimate_tokens` (chars/4) is a heuristic guess, not
-    // a measurement; `completion_tokens_total` is a real per-token count on the
-    // llama.cpp backend but an SSE-delta/frame count (NOT tokens) on the cloud
-    // backend, and `run_turn` has no backend-agnostic way to tell which one served
-    // any given call. Persisting either as a number would look like a real
-    // measurement it is not — `TraceMetrics` fields are `Option<i64>` precisely so a
-    // genuinely-unknown metric can be `None` instead of a fabricated value (CLAUDE.md
-    // "real code only"). Revisit if/when a backend surfaces a real `usage` field
-    // (see `haily_llm::sse`'s parsers — neither currently exposes one).
+    // C2 (Phase 8) — supersedes the prior H2 review note: `turn_prompt_tokens`/
+    // `turn_completion_tokens` are populated from the LAST LLM call's
+    // `StreamChunk::Done` frame, gated on `stream_llm_response`'s llama-vs-cloud
+    // provenance signal (see that function's doc comment and the loop body above).
+    // A llama-backed turn persists real measurements; a cloud-backed turn persists
+    // `None` — still no fabricated `estimate_tokens`-style guess (CLAUDE.md "real
+    // code only"), just now a genuine value where one actually exists.
     record_outcome_and_update_skill(
         &db,
         &session_id,
@@ -1245,8 +1264,8 @@ pub async fn run_turn(
         elapsed_ms,
         OutcomeMetricsInput {
             model_tier: None, // L0 turns don't select a Tier today — see `SubTurnRequest::model_tier` doc.
-            prompt_tokens: None,
-            completion_tokens: None,
+            prompt_tokens: turn_prompt_tokens,
+            completion_tokens: turn_completion_tokens,
             delegate_overhead_ms: None, // L0 turns have no delegate-spawn overhead of their own.
             confidence_update_failure_msg: "failed to update skill confidence from outcome label",
             // M3 review fix: the L0 turn is the SOLE owner of learning — see
@@ -1339,6 +1358,7 @@ mod streaming_tests {
         llm_tx
             .send(StreamChunk::Done {
                 total_tokens: pieces.len() as u32,
+                prompt_tokens: None,
             })
             .await
             .unwrap();
@@ -1346,7 +1366,7 @@ mod streaming_tests {
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let (full, _total_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+        let (full, _total_tokens, _prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
             .await
             .unwrap();
         drop(user_tx);
@@ -1497,6 +1517,62 @@ mod streaming_tests {
         assert!(
             result.is_err(),
             "cancellation must surface as an Err so the turn fails cleanly"
+        );
+    }
+
+    /// C2 (Phase 8): `stream_llm_response` must pass `StreamChunk::Done`'s
+    /// `prompt_tokens` straight through — a llama-shaped `Done` frame (`Some`) comes
+    /// back `Some`, unmodified.
+    #[tokio::test]
+    async fn done_frame_prompt_tokens_some_is_threaded_through_unmodified() {
+        let (llm_tx, mut llm_rx) = mpsc::channel(64);
+        llm_tx.send(StreamChunk::Token("hi".to_string())).await.unwrap();
+        llm_tx
+            .send(StreamChunk::Done { total_tokens: 3, prompt_tokens: Some(42) })
+            .await
+            .unwrap();
+        drop(llm_tx);
+
+        let (user_tx, mut user_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (_full, total_tokens, prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+            .await
+            .unwrap();
+        drop(user_tx);
+        while user_rx.recv().await.is_some() {}
+
+        assert_eq!(total_tokens, 3);
+        assert_eq!(
+            prompt_tokens,
+            Some(42),
+            "a llama-shaped Done frame's real prompt-token count must survive threading"
+        );
+    }
+
+    /// C2 (Phase 8): a cloud-shaped `Done` frame (`prompt_tokens: None`) must stay
+    /// `None` — the NULL-honesty invariant this function's contract exists to
+    /// preserve (never upgraded into a fabricated number by this pass-through layer).
+    #[tokio::test]
+    async fn done_frame_prompt_tokens_none_stays_none() {
+        let (llm_tx, mut llm_rx) = mpsc::channel(64);
+        llm_tx.send(StreamChunk::Token("hi".to_string())).await.unwrap();
+        llm_tx
+            .send(StreamChunk::Done { total_tokens: 3, prompt_tokens: None })
+            .await
+            .unwrap();
+        drop(llm_tx);
+
+        let (user_tx, mut user_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (_full, _total_tokens, prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+            .await
+            .unwrap();
+        drop(user_tx);
+        while user_rx.recv().await.is_some() {}
+
+        assert_eq!(
+            prompt_tokens, None,
+            "a cloud-shaped Done frame must never be upgraded into a fabricated prompt-token count"
         );
     }
 }
@@ -3018,12 +3094,16 @@ mod outcome_signal_tests {
         );
     }
 
-    /// Metrics persistence: a turn's trace carries `tool_call_count`. H2 review fix:
-    /// `prompt_tokens`/`completion_tokens` must be honest `None` rather than a
-    /// fabricated-looking number — neither has a trustworthy cross-backend source
-    /// today (see `stream_llm_response`'s doc comment for why the cloud SSE path's
-    /// per-delta count is a frame count, not a token count, and `estimate_tokens` is
-    /// a heuristic guess, not a measurement).
+    /// Metrics persistence: a turn's trace carries `tool_call_count`. C2 (Phase 8,
+    /// supersedes the prior H2 review note): `run_plain_turn` drives `run_turn`
+    /// through the CLOUD backend (`spawn_plain_answer_sse_server`) — no dialect this
+    /// crate speaks exposes a real prompt-token usage field, so `StreamChunk::Done`'s
+    /// `prompt_tokens` is `None` for this call, and `run_turn` must persist BOTH
+    /// `prompt_tokens`/`completion_tokens` as honest `NULL`, never a fabricated
+    /// frame-count number (see `stream_llm_response`'s doc comment for the full
+    /// llama-vs-cloud provenance contract; the llama-side `Some` case is proven by
+    /// `streaming_tests::done_frame_prompt_tokens_some_is_threaded_through_unmodified`,
+    /// since a real llama.cpp model isn't available in this test environment).
     #[tokio::test]
     async fn turn_trace_persists_tool_call_count_and_leaves_unmeasured_token_fields_null() {
         let (db, kms, _dir) = test_db_kms().await;
@@ -3102,6 +3182,7 @@ mod outcome_signal_tests {
                 compensation_plan: Some(r#"{"op":"unlink","id":1}"#),
                 turn_id: None,
                 retention_days: 30,
+                manifest_hash: None,
             },
         )
         .await

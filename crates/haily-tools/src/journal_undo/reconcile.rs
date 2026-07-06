@@ -16,9 +16,12 @@
 use crate::connector::{readback_diff, redact, ConnectorExecutor};
 use crate::journal_undo::local_compensator::{is_local_row, local_table_for};
 use crate::journal_undo::logic::plan_target_id;
+use crate::journal_undo::ConnectorResolver;
 use haily_db::queries::local_snapshot;
 use haily_db::{queries::journal, DbHandle};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Grace window: a row inserted less than this many seconds ago is assumed to be a write
 /// still legitimately in flight, not an orphan, and is skipped.
@@ -29,17 +32,30 @@ pub const RECONCILE_GRACE_SECS: i64 = 30;
 /// `RECONCILE_GRACE_SECS`; tests pass a smaller (or negative) window to include freshly
 /// inserted rows without waiting.
 ///
+/// M5c: each non-local row resolves its OWN executor from `resolver` by `tool_name` (a
+/// manifest op) — never a single shared executor regardless of which connector owns it. An
+/// unresolvable op (unconfigured/removed connector) fails closed to `unverified`, same as
+/// the old placeholder's behavior, just now decided per-row instead of globally.
+///
+/// M2: a row whose pinned `manifest_hash` no longer matches the CURRENT manifest hash for
+/// its op is also `unverified` — the manifest changed/moved since the write, so a read-back
+/// against its NEW location would say nothing trustworthy about the OLD write.
+///
+/// C3: once ONE row's read-back against a given executor comes back `unverified` (read-back
+/// GET failure — see `classify_one`), every REMAINING row that resolves to the SAME executor
+/// this sweep is marked `unverified` WITHOUT another network call. Without this, a single
+/// unreachable connector host would serially burn `CONNECTOR_TIMEOUT_SECS` per orphan row
+/// instead of once — exactly the boot-hang risk this phase's C3 fix targets (the sweep itself
+/// now runs off the boot critical path; this short-circuit additionally bounds ITS OWN
+/// duration once running).
+///
 /// Classification:
 /// - read-back shows the record present, matching request_params fields → `match`
 /// - read-back shows it present but diverging → `mismatch`
-/// - read-back GET itself failed (C7 lost response / flaky GET) → `unverified` (does NOT
-///   block a later undo)
+/// - read-back GET itself failed (C7 lost response / flaky GET), no executor resolved, or a
+///   hash-pin mismatch (M2) → `unverified` (does NOT block a later undo)
 /// - record absent / genuinely unknown outcome → `unknown`
-pub async fn reconcile_incomplete(
-    db: &DbHandle,
-    executor: &dyn ConnectorExecutor,
-    grace_secs: i64,
-) -> u64 {
+pub async fn reconcile_incomplete(db: &DbHandle, resolver: &ConnectorResolver, grace_secs: i64) -> u64 {
     let rows = match journal::list_incomplete(db, grace_secs).await {
         Ok(r) => r,
         Err(e) => {
@@ -48,17 +64,52 @@ pub async fn reconcile_incomplete(
         }
     };
     let mut classified = 0u64;
+    // C3: executors already observed unreachable THIS sweep, keyed by pointer identity —
+    // see the function doc.
+    let mut unreachable_executors: HashSet<usize> = HashSet::new();
     for row in rows {
         // C1: a LOCAL row is classified from a live SELECT on THIS process's own SQLite
-        // connection — never via `executor.read_back`, which would bail against an
-        // `UnconfiguredExecutor` (or simply the wrong system) and misclassify forever.
-        let status = if is_local_row(&row) {
-            classify_local(db, &row).await
+        // connection — never via a `ConnectorExecutor`, which would bail (or simply query
+        // the wrong system) and misclassify forever.
+        let (status, secret_source): (_, Option<&Arc<dyn ConnectorExecutor>>) = if is_local_row(&row) {
+            (classify_local(db, &row).await, None)
         } else {
-            classify_one(executor, &row).await
+            match resolver.executor(&row.tool_name) {
+                None => (("unverified", None), None), // unowned/unconfigured op — fail-closed
+                Some(_) if !resolver.hash_matches(&row.tool_name, row.manifest_hash.as_deref()) => {
+                    (("unverified", None), None) // M2: manifest changed since this write
+                }
+                Some(exec) => {
+                    let key = executor_identity(exec);
+                    if unreachable_executors.contains(&key) {
+                        (("unverified", None), None) // C3: already known unreachable
+                    } else {
+                        let result = classify_one(exec.as_ref(), &row).await;
+                        if result.0 == "unverified" {
+                            unreachable_executors.insert(key);
+                        }
+                        let has_body = result.1.is_some();
+                        (result, if has_body { Some(exec) } else { None })
+                    }
+                }
+            }
         };
-        // Tag-strip the post_state summary before it is persisted / can reach an LLM (C5).
-        let summary = status.1.map(|v| summarize(&v));
+        // M3 + C5: scrub the executor's currently-resolved secret (if any) alongside the
+        // tag-strip before the post_state summary is persisted / can reach an LLM — a
+        // reflected credential in a reconciliation read-back must not leak here any more
+        // than in the live write path (`HttpConnectorTool::execute`). Only resolved when
+        // there IS a body to summarize (a local row's body is always `None`), so a local
+        // row's reconciliation never triggers a needless third-party credential lookup.
+        let summary = match status.1 {
+            Some(v) => {
+                let secret = match secret_source {
+                    Some(exec) => exec.resolved_secret().await,
+                    None => None,
+                };
+                Some(summarize(&v, secret.as_deref()))
+            }
+            None => None,
+        };
         if journal::set_readback(db, &row.id, status.0, summary.as_deref())
             .await
             .is_ok()
@@ -70,6 +121,14 @@ pub async fn reconcile_incomplete(
         tracing::info!(count = classified, "reconciled incomplete journal rows");
     }
     classified
+}
+
+/// Stable per-sweep identity for an executor, used only to detect "the SAME executor
+/// already failed a read-back this sweep" (C3) — never persisted, never compared across
+/// sweeps. Casting the fat trait-object pointer to `*const ()` drops the vtable half,
+/// leaving just the data address, which is stable for the lifetime of the `Arc`.
+fn executor_identity(exec: &Arc<dyn ConnectorExecutor>) -> usize {
+    Arc::as_ptr(exec) as *const () as usize
 }
 
 /// Read back one row and return its terminal `readback_status` + optional body.
@@ -153,8 +212,11 @@ fn request_fields_present(request_params: &str, body: &Value) -> bool {
     readback_diff::request_fields_match(expected, body)
 }
 
-fn summarize(body: &Value) -> String {
-    let raw = body.to_string();
+/// M3 + C5: scrub the resolved secret (if any) before truncating/tag-stripping, mirroring
+/// `http_connector_tool::summarize` so the crash-recovery sweep and the live write path never
+/// diverge on what counts as "safe to journal."
+fn summarize(body: &Value, secret: Option<&str>) -> String {
+    let raw = redact::redact_secret_value(&body.to_string(), secret);
     let trimmed: String = raw.chars().take(512).collect();
     redact::strip_tool_tags(&trimmed)
 }

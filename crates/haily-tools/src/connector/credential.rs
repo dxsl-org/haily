@@ -4,11 +4,11 @@
 //!
 //! `haily-app` owns `credential_store::CredentialStore` (spawn_blocking keyring wrapper +
 //! read/write fallback policy, M5). That crate sits ABOVE `haily-tools` in the dependency
-//! graph (`haily-app` → `haily-core` → `haily-tools`), so the dependency can only point
-//! one way: `haily-app` implements this trait and the executor is handed a trait object at
-//! construction time — mirroring how `db: Arc<DbHandle>` is already injected into
-//! [`crate::connector::odoo_executor::OdooExecutor`] rather than the executor reaching out
-//! to a global.
+//! graph (`haily-app` → `haily-core` → `haily-tools`), so the dependency can only point one
+//! way: `haily-app` implements this trait and hands the executor a trait object at
+//! construction time — the SAME injection pattern
+//! [`crate::connector::http_connector_tool::HttpExecutor`] already uses for its own
+//! `credential_getter` field, rather than the executor reaching out to a global.
 use anyhow::Result;
 use async_trait::async_trait;
 
