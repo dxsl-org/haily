@@ -142,6 +142,16 @@ async fn set_preference(key: String, value: String, state: State<'_, AppState>) 
     meta::upsert_preference(&state.db, &key, &value, "gui").await.map_err(|e| e.to_string())
 }
 
+/// Manual "export database" action (Phase 6) — writes a consistent standalone copy to a
+/// user-chosen path via the same `VACUUM INTO` mechanism the scheduled backup worker
+/// uses. `dest_path` is picked by the frontend through `@tauri-apps/plugin-dialog`'s save
+/// dialog; the frontend's dialog copy warns that the exported file is unencrypted and
+/// contains all local data — this command performs no additional confirmation.
+#[tauri::command]
+async fn export_database(dest_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.db.backup_to(std::path::Path::new(&dest_path)).await.map_err(|e| e.to_string())
+}
+
 /// Forward `GuiAdapter` response chunks to the frontend as `haily-chunk` events.
 fn spawn_chunk_bridge(ah: TauriAppHandle, mut rx: GuiResponseReceiver) {
     tauri::async_runtime::spawn(async move {
@@ -168,6 +178,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = haily_app::default_data_dir();
             std::fs::create_dir_all(&data_dir)?;
@@ -202,6 +213,7 @@ pub fn run() {
             list_local_models,
             reload_llm,
             list_journal,
+            export_database,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

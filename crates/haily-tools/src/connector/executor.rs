@@ -76,6 +76,36 @@ pub trait ConnectorExecutor: Send + Sync {
         model_hint: Option<&str>,
         id_hint: Option<&str>,
     ) -> Result<Value>;
+
+    /// Best-effort: the secret this executor would currently apply to an outbound request
+    /// (if any), so a caller can scrub it out of a THIRD-PARTY response body before it
+    /// reaches a journal row (M3) — tag-stripping alone (`redact::strip_tool_tags`) does not
+    /// remove a credential a hostile/misconfigured server reflects back in a fault/error
+    /// body. Default `None` (no secret to scrub) preserves every implementor that never
+    /// resolves a secret (`MockExecutor`, `UnconfiguredExecutor`); only `HttpExecutor`
+    /// overrides it. `None` here means EITHER "no auth declared" OR "resolution failed just
+    /// now" — a caller must treat both the same (nothing further to scrub; the
+    /// already-redacted `request_params`, C4, remains the primary guarantee). Never logs or
+    /// journals the returned value itself.
+    async fn resolved_secret(&self) -> Option<String> {
+        None
+    }
+
+    /// M6a (Activate-and-Measure phase 4b): a best-effort PRE-FLIGHT of whether this
+    /// executor's declared credential is available RIGHT NOW, distinct from a generic
+    /// transport/server failure — `journal_undo` uses `Some(false)` to route a compensation
+    /// into its own non-terminal `pending_credential` state (retried on the next explicit
+    /// undo call) instead of letting a locked/unconfigured keyring masquerade as a
+    /// retryable-then-`stuck` compensation failure.
+    ///
+    /// `None` when there is nothing meaningful to check (no auth declared) or the
+    /// implementor does not track this — callers must treat `None` exactly like `Some(true)`
+    /// (proceed normally); only `Some(false)` is actionable. Default `None` preserves every
+    /// implementor that never resolves a credential (`MockExecutor`, `UnconfiguredExecutor`);
+    /// only `HttpExecutor` overrides it.
+    async fn credential_preflight(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[cfg(test)]

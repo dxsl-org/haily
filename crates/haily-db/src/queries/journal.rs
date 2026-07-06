@@ -49,6 +49,12 @@ pub struct ActionJournalRow {
     pub created_at: String,
     pub undone_at: Option<String>,
     pub retention_expires_at: String,
+    /// M2 (Activate-and-Measure phase 4b): the owning connector manifest's content hash,
+    /// pinned at outbox-insert time. `None` for a local row (no manifest) or a row written
+    /// before migration 0019. Compared against the manifest's CURRENT hash at undo/reconcile
+    /// time — a mismatch means the manifest moved/changed since this write and the
+    /// compensation must refuse rather than target a base_url/schema the write never touched.
+    pub manifest_hash: Option<String>,
 }
 
 /// Fields required to record a write. Grouped so `insert` stays within a sane arity and
@@ -71,6 +77,9 @@ pub struct NewAction<'a> {
     pub turn_id: Option<&'a str>,
     /// Days until PII in this row is eligible for purge.
     pub retention_days: i64,
+    /// M2 (Activate-and-Measure phase 4b) — see `ActionJournalRow::manifest_hash`. `None`
+    /// for a local row (no connector manifest exists to pin).
+    pub manifest_hash: Option<&'a str>,
 }
 
 /// Shared insert body for [`insert`]/[`insert_tx`] — generic over any sqlx `Executor` so the
@@ -89,8 +98,8 @@ where
              (id, session_id, tool_name, tool_tier, compensability, idempotency_key,
               correlation_ref, request_params, pre_state, pre_state_version,
               readback_status, compensation_plan, undo_status, undo_attempts,
-              created_at, retention_expires_at, turn_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?)
+              created_at, retention_expires_at, turn_id, manifest_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -107,6 +116,7 @@ where
     .bind(&created_at)
     .bind(&retention_expires_at)
     .bind(a.turn_id)
+    .bind(a.manifest_hash)
     .fetch_one(exec)
     .await?)
 }
@@ -430,6 +440,7 @@ mod tests {
             created_at: "2026-07-03T00:00:00Z".into(),
             undone_at: None,
             retention_expires_at: "2026-08-02T00:00:00Z".into(),
+            manifest_hash: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["sessionId"], "s1");

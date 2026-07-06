@@ -6,12 +6,12 @@
 //! exits — always call `shutdown()` on the signal/exit-event path.
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
-use crate::credential_store::{CredentialPolicy, CredentialStore};
+use crate::credential_store::{is_keyring_marker, CredentialPolicy, CredentialStore};
 use crate::turns::TurnRegistry;
 use crate::{dispatch, watchers};
 use anyhow::Result;
 use haily_core::Orchestrator;
-use haily_db::DbHandle;
+use haily_db::{queries::meta, DbHandle};
 use haily_io::{Adapter, AdapterManager};
 use haily_kms::KmsHandle;
 use haily_tools::ToolRegistry;
@@ -44,6 +44,21 @@ impl Default for BootstrapOptions {
             attempt_keyring: true,
         }
     }
+}
+
+/// Write a consistent standalone copy of the database at `data_dir` to `dest_path`
+/// (Phase 6 manual export — backs both the CLI `export` subcommand and the GUI export
+/// command). Opens the DB directly rather than running the full [`AppHandle::bootstrap`]
+/// (LLM router, orchestrator, adapters, background workers): none of that is needed for
+/// a one-shot file copy, and starting it would have real side effects (e.g. spawning the
+/// proactive daemon) for a command that should just write a file and exit.
+///
+/// # Errors
+/// Returns an error if the source DB cannot be opened or [`DbHandle::backup_to`] fails
+/// (e.g. `dest_path`'s parent directory does not exist).
+pub async fn export_database(data_dir: &Path, dest_path: &Path) -> Result<()> {
+    let db = DbHandle::init(&data_dir.join("haily.db")).await?;
+    db.backup_to(dest_path).await
 }
 
 /// Owns every long-lived handle for one running instance of the app.
@@ -115,12 +130,33 @@ impl AppHandle {
             }
         }
 
+        // Phase 6 (M7a, backup credential posture): a scheduled backup taken before the
+        // one known connector credential has migrated out of plaintext would retain it in
+        // the copy. Checked HERE (not in `haily-proactive`, which sits below this crate and
+        // has no visibility into keyring state) right after the migration attempt above —
+        // `Ok(None)`/a marker row means nothing plaintext-bearing is left behind; a
+        // residual plaintext row (attempt_keyring off, or a failed keyring write) means
+        // "not clean yet". A DB read error fails closed (treated as not-clean) rather than
+        // risking a plaintext-bearing first backup on an inconclusive check.
+        let credential_migration_clean = match meta::get_preference(&db, ODOO_API_KEY_PREF).await {
+            Ok(None) => true,
+            Ok(Some(v)) => v.is_empty() || is_keyring_marker(&v),
+            Err(e) => {
+                warn!("credential posture check for backup gating failed: {e:#} — treating as not-clean");
+                false
+            }
+        };
+
         // Validate the auto_approve allowlist against the same tool set the
         // orchestrator will build from. A destructive/exfil tool listed here is a
         // config error at boot — never silently ignored, never auto-approved.
         let auto_approve_raw = load_auto_approve(&kms).await;
         let auto_approve = validate_auto_approve(&auto_approve_raw, &ToolRegistry::build_v1())?;
 
+        // Phase 2 (C1/M2): the credential store is the SOLE credential source `HttpExecutor`
+        // consults for a manifest's declared `auth` — a raw-DB fallback on top of it would
+        // silently defeat a deployment that disabled read-fallback (M5b), mirroring the same
+        // "getter is authoritative" contract `OdooExecutor::read_key` already enforces.
         let orchestrator = Arc::new(
             Orchestrator::init(
                 Arc::clone(&kms),
@@ -129,6 +165,7 @@ impl AppHandle {
                 shutdown.child_token(),
                 tasks.clone(),
                 auto_approve,
+                Some(Arc::clone(&credential_store) as Arc<dyn haily_tools::connector::CredentialGetter>),
             )
             .await?,
         );
@@ -182,6 +219,18 @@ impl AppHandle {
         // recorded PII (request_params/pre_state/post_state) is bounded. Registered on the
         // root tracker + selecting on shutdown, same contract as the watcher/daemon.
         watchers::spawn_journal_purge(Arc::clone(&db), shutdown.child_token(), tasks.clone());
+
+        // Phase 6 ("Activate & Measure"): scheduled GFS backup — the durability guarantee
+        // for the single `haily.db` file this whole app's memory lives in. Runs regardless
+        // of `opts.enable_daemon`/`enable_watcher` (durability is not an optional feature
+        // toggle the way the proactive daemon's notifications are).
+        watchers::spawn_backup(
+            Arc::clone(&db),
+            data_dir.join("backups"),
+            credential_migration_clean,
+            shutdown.child_token(),
+            tasks.clone(),
+        );
 
         info!(
             watcher = opts.enable_watcher,

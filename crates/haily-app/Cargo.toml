@@ -21,10 +21,7 @@ serde_json  = { workspace = true }
 dashmap     = "6"
 uuid        = { workspace = true }
 keyring     = { workspace = true }
-# Only for `credential_store::scrub_residue`'s raw `VACUUM` — `DbHandle` (haily-db) does
-# not expose a generic raw-execute helper, and adding one is outside this crate's
-# file-ownership for this phase. `sqlite` (no other backend) matches haily-db's own features.
-sqlx        = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+async-trait = "0.1"
 
 [features]
 default = []
@@ -52,7 +49,6 @@ keyring = { workspace = true, features = ["sync-secret-service", "linux-native"]
 
 [dev-dependencies]
 tempfile = "3"
-async-trait = "0.1"
 # Self-dependency so `tests/*.rs` integration tests (compiled as an external crate) can
 # see `CredentialStore::force_next_keyring_error` behind the `test-support` feature above.
 haily-app = { path = ".", features = ["test-support"] }

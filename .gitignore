@@ -24,7 +24,7 @@ haily-*.log
 
 # Agent plans — gitignored per docs/documentation-management
 .agents/
-.docs/
+docs/
 models/
 data/
 

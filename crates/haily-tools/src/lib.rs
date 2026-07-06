@@ -186,10 +186,13 @@ impl ToolRegistry {
             reg.register(tool);
         }
         // Undo tool for the action journal (Safe Operator Harness phase 3). Registered
-        // with a fail-closed placeholder executor; phase 4 re-registers it with the real
-        // HTTP executor. `IrreversibleWrite` + kill-switch-EXEMPT (see `journal_undo`).
+        // with an EMPTY routing table (every connector op resolves to "no executor" —
+        // fail-closed, mirrors the old `UnconfiguredExecutor` placeholder's intent);
+        // `register_connectors` (M5c, Activate-and-Measure phase 4b) re-registers it with
+        // the real per-op routing built from whatever manifests are actually approved.
+        // `IrreversibleWrite` + kill-switch-EXEMPT (see `journal_undo`).
         reg.register(Arc::new(journal_undo::JournalUndoTool {
-            executor: Arc::new(connector::UnconfiguredExecutor),
+            resolver: journal_undo::ConnectorResolver::new(),
         }));
         reg
     }
@@ -209,23 +212,43 @@ impl ToolRegistry {
     /// tool AND its `HttpExecutor` so the M5 re-check observes a mid-write kill at any
     /// depth. `cred_ref_for` yields the credential preference-key name per connector so the
     /// journal records WHICH credential a write used (the secret itself is redacted, C4).
-    /// `timeout` bounds every external connector call.
+    /// `timeout` bounds every external connector call. `credential_getter` (phase 2) is
+    /// injected into every `HttpExecutor` so it can apply a manifest's declared `auth`
+    /// section; `None` preserves pre-phase-2 behavior (a manifest with no `auth` section is
+    /// unaffected either way — the getter is only ever consulted when `auth` is present).
+    ///
+    /// `manifests` pairs each parsed manifest with its `ConnectorManifestRow::content_hash`
+    /// (M2, Activate-and-Measure phase 4b) — pinned into every op's `HttpConnectorTool` so
+    /// outbox rows record which exact manifest version they wrote against.
+    ///
+    /// M5c: builds the op→executor routing table this method RETURNS (a
+    /// `journal_undo::ConnectorResolver`, wrapping the concrete map — no "inject a resolver"
+    /// abstraction), then re-registers `JournalUndoTool` with it — `register` performs a
+    /// `HashMap` insert, so this OVERWRITES the fail-closed empty-routing placeholder
+    /// `build_v1` sealed (or, if called more than once, a prior call's routing — harmless;
+    /// production calls this exactly once at startup). The caller (`Orchestrator::init`)
+    /// also hands the returned table to the startup reconcile sweep.
     pub fn register_connectors(
         &mut self,
-        manifests: Vec<connector::Manifest>,
+        manifests: Vec<(connector::Manifest, String)>,
         kill: Arc<std::sync::atomic::AtomicBool>,
         timeout: std::time::Duration,
         cred_ref_for: impl Fn(&str) -> String,
-    ) {
-        for manifest in manifests {
+        credential_getter: Option<Arc<dyn connector::CredentialGetter>>,
+    ) -> journal_undo::ConnectorResolver {
+        let mut routing = journal_undo::ConnectorResolver::new();
+        for (manifest, content_hash) in manifests {
             let manifest = Arc::new(manifest);
             let cred_ref = cred_ref_for(&manifest.connector_name);
             // One executor shared across all ops of a manifest (same base_url + allowance).
             let shared_executor: Arc<dyn crate::connector::ConnectorExecutor> =
                 Arc::new(connector::HttpExecutor::new(
-                    Arc::clone(&manifest),
-                    Arc::clone(&kill),
-                    timeout,
+                    connector::HttpExecutorConfig::production(
+                        Arc::clone(&manifest),
+                        Arc::clone(&kill),
+                        timeout,
+                    )
+                    .with_credential_getter(credential_getter.clone()),
                 ));
             for op in &manifest.ops {
                 self.register(Arc::new(connector::HttpConnectorTool {
@@ -234,9 +257,19 @@ impl ToolRegistry {
                     executor: Arc::clone(&shared_executor),
                     kill: Arc::clone(&kill),
                     cred_ref: cred_ref.clone(),
+                    manifest_hash: content_hash.clone(),
                 }));
             }
+            routing.merge(journal_undo::ConnectorResolver::for_manifest(
+                &manifest,
+                shared_executor,
+                content_hash,
+            ));
         }
+        self.register(Arc::new(journal_undo::JournalUndoTool {
+            resolver: routing.clone(),
+        }));
+        routing
     }
 
     /// Build a sub-registry containing only the named tools.
@@ -413,10 +446,11 @@ mod tests {
         .unwrap();
         let mut base = ToolRegistry::build_v1();
         base.register_connectors(
-            vec![manifest],
+            vec![(manifest, "test-hash".to_string())],
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             std::time::Duration::from_secs(30),
             |c| format!("{c}.api_key"),
+            None,
         );
         // Now visible in base AND in a whitelist-scoped sub_registry that names the op.
         assert!(base.get("odoo_contact_create").is_some());

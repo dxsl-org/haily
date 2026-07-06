@@ -19,24 +19,104 @@ pub use logic::{
     MAX_UNDO_ATTEMPTS,
 };
 
-use crate::connector::ConnectorExecutor;
+use crate::connector::{ConnectorExecutor, Manifest};
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::queries::journal;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The tool name dispatch keys the kill-switch `is_compensation` exemption on. A single
 /// authoritative constant so the exemption cannot drift from the registered name.
 pub const IS_COMPENSATION_TOOL: &str = "journal_undo";
 
+/// Per-op connector routing (M5c, Activate-and-Measure phase 4b) — the ONE concrete
+/// mechanism `ToolRegistry::register_connectors` builds and hands to `JournalUndoTool` and
+/// the startup reconcile sweep, replacing the single frozen executor a batch/turn used to
+/// share across every row regardless of which connector actually owned that op (the routing
+/// gap the harness explicitly deferred). `executors` resolves a journal row's `tool_name` (a
+/// manifest op) to the executor that owns it; `manifest_hashes` carries that SAME manifest's
+/// CURRENT content hash (M2) so a row's pinned `manifest_hash` can be compared against it —
+/// a mismatch means the manifest was re-approved/moved since the forward write, and undo
+/// must refuse rather than send a compensation (and its credential) to a schema the
+/// original write never touched.
+#[derive(Clone, Default)]
+pub struct ConnectorResolver {
+    executors: HashMap<String, Arc<dyn ConnectorExecutor>>,
+    manifest_hashes: HashMap<String, String>,
+}
+
+impl ConnectorResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Map every op `manifest` declares to the SAME `executor`/`manifest_hash` — the shape
+    /// one manifest's ops always take (one shared executor per manifest, mirroring
+    /// `register_connectors`'s own `shared_executor`).
+    pub fn for_manifest(
+        manifest: &Manifest,
+        executor: Arc<dyn ConnectorExecutor>,
+        manifest_hash: impl Into<String>,
+    ) -> Self {
+        let hash = manifest_hash.into();
+        let mut executors = HashMap::new();
+        let mut manifest_hashes = HashMap::new();
+        for op in &manifest.ops {
+            executors.insert(op.name.clone(), Arc::clone(&executor));
+            manifest_hashes.insert(op.name.clone(), hash.clone());
+        }
+        Self {
+            executors,
+            manifest_hashes,
+        }
+    }
+
+    /// Map exactly ONE op name — for a single-connector test/integration harness that has
+    /// no full `Manifest` to hand `for_manifest`.
+    pub fn single(
+        op: impl Into<String>,
+        executor: Arc<dyn ConnectorExecutor>,
+        manifest_hash: impl Into<String>,
+    ) -> Self {
+        let op = op.into();
+        let mut r = Self::new();
+        r.executors.insert(op.clone(), executor);
+        r.manifest_hashes.insert(op, manifest_hash.into());
+        r
+    }
+
+    /// Fold `other`'s entries into `self` — used by `register_connectors` to accumulate one
+    /// manifest's routing at a time across multiple approved connectors.
+    pub fn merge(&mut self, other: Self) {
+        self.executors.extend(other.executors);
+        self.manifest_hashes.extend(other.manifest_hashes);
+    }
+
+    pub(crate) fn executor(&self, op: &str) -> Option<&Arc<dyn ConnectorExecutor>> {
+        self.executors.get(op)
+    }
+
+    /// `true` when `pinned` (a row's own `manifest_hash`) matches the CURRENT manifest hash
+    /// routed for `op`, OR when `pinned` is `None` (a local row, or a row written before the
+    /// hash-pin column existed — nothing to compare, never a false refusal).
+    pub(crate) fn hash_matches(&self, op: &str, pinned: Option<&str>) -> bool {
+        match pinned {
+            None => true,
+            Some(p) => self.manifest_hashes.get(op).is_some_and(|cur| cur == p),
+        }
+    }
+}
+
 /// Undo one or more recorded connector writes.
 ///
-/// Holds an `Arc<dyn ConnectorExecutor>` — in phase-3 tests this is the mock; phase 4
-/// injects the real HTTP executor at construction. The tool is `IrreversibleWrite` (so a
-/// human still approves an undo) but is kill-switch-EXEMPT via `IS_COMPENSATION_TOOL`.
+/// Holds a [`ConnectorResolver`] — in phase-3 tests this mapped a single mock; phase 4b
+/// (M5c) makes it a real per-op routing table `register_connectors` builds and re-registers
+/// this tool with. The tool is `IrreversibleWrite` (so a human still approves an undo) but
+/// is kill-switch-EXEMPT via `IS_COMPENSATION_TOOL`.
 pub struct JournalUndoTool {
-    pub executor: Arc<dyn ConnectorExecutor>,
+    pub resolver: ConnectorResolver,
 }
 
 #[async_trait]
@@ -76,7 +156,7 @@ impl Tool for JournalUndoTool {
         // collects zero rows rather than leaking that session's group. Loop-guard-EXEMPT
         // for the same reason `ids` batch is (one logical op).
         if let Some(turn_id) = args.get("turn_id").and_then(|v| v.as_str()) {
-            let counts = undo_turn(&ctx.db, self.executor.as_ref(), turn_id, &session_id).await?;
+            let counts = undo_turn(&ctx.db, &self.resolver, turn_id, &session_id).await?;
             return Ok(format_batch_counts(&counts, " (theo lượt)"));
         }
 
@@ -88,7 +168,7 @@ impl Tool for JournalUndoTool {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            let counts = batch_undo(&ctx.db, self.executor.as_ref(), &ids, &session_id).await;
+            let counts = batch_undo(&ctx.db, &self.resolver, &ids, &session_id).await;
             return Ok(format_batch_counts(&counts, ""));
         }
 
@@ -103,7 +183,7 @@ impl Tool for JournalUndoTool {
             .await?
             .ok_or_else(|| anyhow::anyhow!("không tìm thấy hành động '{id}'"))?;
 
-        let outcome = attempt_undo(&ctx.db, self.executor.as_ref(), &row, &session_id).await?;
+        let outcome = attempt_undo(&ctx.db, &self.resolver, &row, &session_id).await?;
         Ok(match outcome {
             UndoOutcome::Undone => "Đã hoàn tác thành công.".to_string(),
             UndoOutcome::AlreadyDone => {
@@ -129,12 +209,29 @@ fn format_batch_counts(counts: &BatchCounts, suffix: &str) -> String {
 mod tests {
     use super::logic::{attempt_undo, batch_undo, undo_turn, UndoOutcome, MAX_UNDO_ATTEMPTS};
     use super::reconcile::reconcile_incomplete;
+    use super::ConnectorResolver;
     use crate::connector::executor::mock::MockExecutor;
     use crate::connector::redact;
-    use crate::connector::ExecOutcome;
+    use crate::connector::{ConnectorExecutor, ExecOutcome};
     use haily_db::queries::journal::{self, ActionJournalRow, NewAction};
     use haily_db::DbHandle;
     use serde_json::json;
+    use std::sync::Arc;
+
+    /// An empty routing table — for a test whose row is LOCAL (`is_local_row` bypasses
+    /// executor resolution entirely) or whose refusal fires before any resolver lookup, so
+    /// no real op→executor mapping is ever consulted.
+    fn empty_resolver() -> ConnectorResolver {
+        ConnectorResolver::new()
+    }
+
+    /// A routing table mapping exactly ONE op name to `exec`, plus a fixed `"test-hash"` so
+    /// the M2 hash-pin check passes by default (rows built by `insert_row`/`base_action` in
+    /// this module carry no `manifest_hash`, i.e. `None`, which always matches per
+    /// `ConnectorResolver::hash_matches`'s contract regardless of this constant).
+    fn resolver_for<E: ConnectorExecutor + 'static>(op: &str, exec: Arc<E>) -> ConnectorResolver {
+        ConnectorResolver::single(op, exec as Arc<dyn ConnectorExecutor>, "test-hash")
+    }
 
     async fn db() -> (DbHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -171,6 +268,7 @@ mod tests {
                 compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
                 turn_id: None,
                 retention_days: 30,
+                manifest_hash: None,
             },
         )
         .await
@@ -223,7 +321,9 @@ mod tests {
             vec![Some(body.clone()), Some(body)],
         );
         let row = insert_row(&db, "tag-1", "compensatable", None, "pending").await;
-        attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        attempt_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &row, "sess-1")
+            .await
+            .unwrap();
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         let post = after.post_state.unwrap_or_default();
         assert!(
@@ -245,14 +345,16 @@ mod tests {
         )
         .await;
         // Read-back reports a DIFFERENT write_date → C10 refusal, no compensation call.
-        let exec = MockExecutor::new(
+        let exec = Arc::new(MockExecutor::new(
             vec![ExecOutcome::Ok {
                 returned_id: None,
                 body: json!({}),
             }],
             vec![Some(json!({"write_date": "2026-07-03 12:00:00"}))],
-        );
-        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        ));
+        let outcome = attempt_undo(&db, &resolver_for("odoo_create", Arc::clone(&exec)), &row, "sess-1")
+            .await
+            .unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "must refuse on version change: {outcome:?}"
@@ -276,7 +378,9 @@ mod tests {
             // read-back#1 (pre-comp target check) fails, read-back#2 (own verify) fails.
             vec![None],
         );
-        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        let outcome = attempt_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &row, "sess-1")
+            .await
+            .unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Failed(_)),
             "a 200 without a verifying read-back must NOT be undone: {outcome:?}"
@@ -299,7 +403,9 @@ mod tests {
             }],
             vec![Some(json!({"id": 42}))],
         );
-        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        let outcome = attempt_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &row, "sess-1")
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             UndoOutcome::AlreadyDone,
@@ -337,6 +443,7 @@ mod tests {
                 ),
                 turn_id: None,
                 retention_days: 30,
+                manifest_hash: None,
             },
         )
         .await
@@ -345,8 +452,17 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
 
         // A dummy executor: the guard must fire BEFORE any call, so no outcome is scripted.
-        let exec = MockExecutor::new(vec![], vec![Some(json!({"id": 42}))]);
-        let outcome = attempt_undo(&db, &exec, &row, "sess-noid").await.unwrap();
+        // Resolvable (not absent) so the flow reaches the REAL "no target id" guard rather
+        // than short-circuiting on the (also-Refused, but distinct) "no executor" check.
+        let exec = Arc::new(MockExecutor::new(vec![], vec![Some(json!({"id": 42}))]));
+        let outcome = attempt_undo(
+            &db,
+            &resolver_for("odoo_contact_create", Arc::clone(&exec)),
+            &row,
+            "sess-noid",
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "a targetless compensation must be refused, not compensated blind: {outcome:?}"
@@ -367,22 +483,26 @@ mod tests {
         // call transport-Errs (retryable) — so the row lands in `compensation_failed` and a
         // USER-initiated retry can run again, up to the cap.
         for i in 1..=MAX_UNDO_ATTEMPTS {
-            let failing = FailingCall {
+            let failing = Arc::new(FailingCall {
                 read: json!({"id": 42}),
-            };
+            });
             let cur = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
-            let outcome = attempt_undo(&db, &failing, &cur, "sess-1").await.unwrap();
+            let outcome = attempt_undo(&db, &resolver_for("odoo_create", failing), &cur, "sess-1")
+                .await
+                .unwrap();
             assert!(
                 matches!(outcome, UndoOutcome::Failed(_)),
                 "attempt {i} should be retryable-failed: {outcome:?}"
             );
         }
         // The 4th attempt exceeds the cap → stuck.
-        let failing = FailingCall {
+        let failing = Arc::new(FailingCall {
             read: json!({"id": 42}),
-        };
+        });
         let cur = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
-        let outcome = attempt_undo(&db, &failing, &cur, "sess-1").await.unwrap();
+        let outcome = attempt_undo(&db, &resolver_for("odoo_create", failing), &cur, "sess-1")
+            .await
+            .unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Stuck(_)),
             "4th attempt must be stuck (cap=3): {outcome:?}"
@@ -410,7 +530,7 @@ mod tests {
             // ok_row: pre-comp read-back present → compensate → own read-back present → undone
             vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
         );
-        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
+        let counts = batch_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &ids, "sess-1").await;
         assert_eq!(counts.undone, 1, "one row undone");
         assert_eq!(counts.failed, 1, "final row refused counts as failed");
         assert_eq!(counts.not_attempted, 1, "unknown id not attempted");
@@ -430,7 +550,7 @@ mod tests {
         }
         // A dummy executor is fine — every row refuses before any external call.
         let exec = MockExecutor::new(vec![], vec![Some(json!({}))]);
-        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
+        let counts = batch_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &ids, "sess-1").await;
         assert_eq!(
             counts.failed, 15,
             "all 15 rows attempted in one batch, none skipped by a loop guard"
@@ -471,7 +591,7 @@ mod tests {
                 Some(json!({"unlinked": true})),
             ],
         );
-        let counts = batch_undo(&db, &exec, &ids, "sess-1").await;
+        let counts = batch_undo(&db, &resolver_for("odoo_create", Arc::new(exec)), &ids, "sess-1").await;
         assert_eq!(counts.undone, 2, "first and last rows undone");
         assert_eq!(counts.failed, 1, "middle refusal counts as failed");
         assert_eq!(counts.not_attempted, 0);
@@ -538,9 +658,8 @@ mod tests {
 
         assert_ne!(create_row.id, create_row_2.id, "two distinct journal rows");
 
-        // A dummy executor: both rows are LOCAL (is_local_row) so undo never touches it.
-        let exec = MockExecutor::new(vec![], vec![]);
-        let counts = undo_turn(&db, &exec, turn_id, "sess-1").await.unwrap();
+        // An empty resolver: both rows are LOCAL (is_local_row) so undo never touches it.
+        let counts = undo_turn(&db, &empty_resolver(), turn_id, "sess-1").await.unwrap();
         assert_eq!(counts.undone, 2, "both writes of the turn must reverse");
         assert_eq!(counts.failed, 0);
         assert_eq!(counts.not_attempted, 0);
@@ -581,8 +700,7 @@ mod tests {
         .unwrap()
         .expect("target exists");
 
-        let exec = MockExecutor::new(vec![], vec![]);
-        let counts = undo_turn(&db, &exec, turn_id, "sess-attacker").await.unwrap();
+        let counts = undo_turn(&db, &empty_resolver(), turn_id, "sess-attacker").await.unwrap();
         assert_eq!(counts.undone, 0);
         assert_eq!(counts.failed, 0);
         assert_eq!(counts.not_attempted, 0, "a foreign session sees an EMPTY group, not a failure");
@@ -614,17 +732,18 @@ mod tests {
             compensation_plan: Some(r#"{"op":"unlink"}"#),
             turn_id: None,
             retention_days: 30,
+            manifest_hash: None,
         };
         act.tool_name = "odoo_create";
         let row = journal::insert(&db, act).await.unwrap();
 
         // Read-back shows the record present and matching → classified `match` (the write
         // DID land before the kill), not blind-retried.
-        let exec = MockExecutor::new(
+        let exec = Arc::new(MockExecutor::new(
             vec![],
             vec![Some(json!({"name": "Bob", "create_date": "x"}))],
-        );
-        let n = reconcile_incomplete(&db, &exec, -1).await;
+        ));
+        let n = reconcile_incomplete(&db, &resolver_for("odoo_create", exec), -1).await;
         assert_eq!(n, 1);
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert_eq!(
@@ -642,7 +761,7 @@ mod tests {
         // Reconcile with a read-back that SUCCEEDS (record present) — proving the sweep
         // reads back by correlation_ref rather than concluding the lost write failed.
         let exec = MockExecutor::new(vec![], vec![Some(json!({"name": "Bob"}))]);
-        reconcile_incomplete(&db, &exec, -1).await;
+        reconcile_incomplete(&db, &resolver_for("odoo_create", Arc::new(exec)), -1).await;
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert_eq!(
             after.readback_status, "match",
@@ -656,7 +775,7 @@ mod tests {
         let row = journal::insert(&db, base_action("unv-1")).await.unwrap();
         // Read-back GET fails during reconcile → unverified (does NOT block a later undo).
         let exec = MockExecutor::new(vec![], vec![None]);
-        reconcile_incomplete(&db, &exec, -1).await;
+        reconcile_incomplete(&db, &resolver_for("odoo_create", Arc::new(exec)), -1).await;
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert_eq!(after.readback_status, "unverified");
 
@@ -669,7 +788,9 @@ mod tests {
             }],
             vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
         );
-        let outcome = attempt_undo(&db, &comp, &after, "sess-1").await.unwrap();
+        let outcome = attempt_undo(&db, &resolver_for("odoo_create", Arc::new(comp)), &after, "sess-1")
+            .await
+            .unwrap();
         assert!(
             !matches!(outcome, UndoOutcome::Refused(_)),
             "unverified must NOT permanently block undo: {outcome:?}"
@@ -701,6 +822,7 @@ mod tests {
                 compensation_plan: None, // lost write-back — the exact crash scenario
                 turn_id: None,
                 retention_days: 30,
+                manifest_hash: None,
             },
         )
         .await
@@ -709,10 +831,9 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert!(!super::is_local_row(&row), "not in the closed allowlist");
 
-        // A dummy executor: the CONNECTOR refusal (no compensation_plan) fires before any
-        // read-back/call, so no outcome needs scripting.
-        let exec = MockExecutor::new(vec![], vec![]);
-        let outcome = attempt_undo(&db, &exec, &row, "sess-1").await.unwrap();
+        // No resolver entry needed: the CONNECTOR refusal (no compensation_plan) fires
+        // before any resolver lookup/read-back/call, so no outcome needs scripting.
+        let outcome = attempt_undo(&db, &empty_resolver(), &row, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "NULL-plan CONNECTOR row must hit the connector's own refusal: {outcome:?}"
@@ -765,14 +886,18 @@ mod tests {
                 compensation_plan: None,
                 turn_id: None,
                 retention_days: 30,
+                manifest_hash: None,
             },
         )
         .await
         .unwrap();
         assert_eq!(row.readback_status, "pending");
 
-        let exec = PanicOnCall;
-        let n = reconcile_incomplete(&db, &exec, -1).await;
+        // Regression guard: even though `is_local_row` should route around the resolver
+        // entirely, map the op to a panicking executor anyway — if that check is ever
+        // accidentally removed/reordered, this still fails loudly instead of silently
+        // reading back against the wrong (or no) executor.
+        let n = reconcile_incomplete(&db, &resolver_for("task_create", Arc::new(PanicOnCall)), -1).await;
         assert_eq!(n, 1);
         let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert_eq!(
@@ -795,6 +920,7 @@ mod tests {
             compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
             turn_id: None,
             retention_days: 30,
+            manifest_hash: None,
         }
     }
 
@@ -818,5 +944,227 @@ mod tests {
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self.read.clone())
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // M2 — manifest hash-pin refuse-on-mismatch.
+    // -----------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn undo_refuses_when_manifest_hash_changed_since_the_write() {
+        let (db, _d) = db().await;
+        // A row pinned to "hash-at-write-time" — simulating a manifest re-approval/move
+        // AFTER this row was journaled.
+        let mut act = base_action("hash-1");
+        act.manifest_hash = Some("hash-at-write-time");
+        let row = journal::insert(&db, act).await.unwrap();
+        journal::set_readback(&db, &row.id, "match", None).await.unwrap();
+        let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+
+        // The resolver's CURRENT hash for this op is different — must refuse before any
+        // read-back/call.
+        let exec = Arc::new(MockExecutor::new(vec![], vec![Some(json!({"id": 42}))]));
+        let resolver = ConnectorResolver::single("odoo_create", Arc::clone(&exec) as Arc<dyn ConnectorExecutor>, "hash-after-reapproval");
+        let outcome = attempt_undo(&db, &resolver, &row, "sess-1").await.unwrap();
+        assert!(
+            matches!(outcome, UndoOutcome::Refused(_)),
+            "a manifest-hash mismatch must refuse, never compensate against a moved schema: {outcome:?}"
+        );
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "no external write may run when the manifest hash no longer matches"
+        );
+        let after = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert_eq!(after.undo_status, "refused");
+    }
+
+    #[tokio::test]
+    async fn undo_proceeds_when_manifest_hash_unchanged() {
+        let (db, _d) = db().await;
+        let mut act = base_action("hash-2");
+        act.manifest_hash = Some("stable-hash");
+        let row = journal::insert(&db, act).await.unwrap();
+        journal::set_readback(&db, &row.id, "match", None).await.unwrap();
+        let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+
+        let exec = MockExecutor::new(
+            vec![ExecOutcome::Ok {
+                returned_id: None,
+                body: json!({}),
+            }],
+            vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
+        );
+        let resolver = ConnectorResolver::single("odoo_create", Arc::new(exec) as Arc<dyn ConnectorExecutor>, "stable-hash");
+        let outcome = attempt_undo(&db, &resolver, &row, "sess-1").await.unwrap();
+        assert_eq!(
+            outcome,
+            UndoOutcome::Undone,
+            "a matching manifest hash must proceed normally: {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // M6a — credential pre-flight: a locked/unconfigured keyring must not strand a
+    // compensation in `stuck`; it gets a non-terminal `pending_credential` state a later
+    // explicit retry re-evaluates.
+    // -----------------------------------------------------------------------------------
+
+    /// Wraps a `MockExecutor`'s `call`/`read_back` but reports a CONTROLLABLE
+    /// `credential_preflight` — simulating a keyring that starts locked, then becomes
+    /// available, without needing a real `HttpExecutor`/`CredentialGetter`.
+    struct GatedExecutor {
+        available: std::sync::atomic::AtomicBool,
+        inner: MockExecutor,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connector::ConnectorExecutor for GatedExecutor {
+        async fn call(&self, op: &str, params: &serde_json::Value) -> anyhow::Result<ExecOutcome> {
+            self.inner.call(op, params).await
+        }
+        async fn read_back(
+            &self,
+            op: &str,
+            correlation_ref: &str,
+            model_hint: Option<&str>,
+            id_hint: Option<&str>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner.read_back(op, correlation_ref, model_hint, id_hint).await
+        }
+        async fn credential_preflight(&self) -> Option<bool> {
+            Some(self.available.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_blocked_by_locked_credential_then_retries_once_available() {
+        let (db, _d) = db().await;
+        let row = insert_row(&db, "cred-1", "compensatable", None, "match").await;
+
+        let gated = Arc::new(GatedExecutor {
+            available: std::sync::atomic::AtomicBool::new(false),
+            inner: MockExecutor::new(
+                vec![ExecOutcome::Ok {
+                    returned_id: None,
+                    body: json!({}),
+                }],
+                vec![Some(json!({"id": 42})), Some(json!({"unlinked": true}))],
+            ),
+        });
+        let resolver = resolver_for("odoo_create", Arc::clone(&gated));
+
+        // Locked: undo is blocked, not stuck — and never even attempts a read-back/call.
+        let outcome = attempt_undo(&db, &resolver, &row, "sess-1").await.unwrap();
+        assert!(
+            matches!(outcome, UndoOutcome::Failed(_)),
+            "a locked credential must be a non-terminal Failed, not Stuck/Refused: {outcome:?}"
+        );
+        let mid = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert_eq!(
+            mid.undo_status, "pending_credential",
+            "the row must land in its own pending_credential state, not compensation_failed/stuck"
+        );
+        assert_eq!(
+            mid.undo_attempts, 0,
+            "a credential pre-flight failure must not consume the MAX_UNDO_ATTEMPTS budget"
+        );
+        assert!(
+            gated.inner.calls.lock().unwrap().is_empty(),
+            "no external call may run while the credential is unavailable"
+        );
+
+        // Unlocked: an explicit retry (same call, no new tool invocation semantics) must
+        // now succeed — pending_credential is not a refusal-blocking terminal state.
+        gated.available.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = attempt_undo(&db, &resolver, &mid, "sess-1").await.unwrap();
+        assert_eq!(
+            outcome,
+            UndoOutcome::Undone,
+            "once the credential is available, the retried undo must succeed: {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // C3 — reconcile must never retry-storm an unreachable connector host. Drives a REAL
+    // `HttpExecutor` (TEST-ONLY `allow_loopback`) against a real TCP listener that accepts
+    // every connection but never responds, proving the executor's OWN timeout — not a hang
+    // — ends the read-back, and that a SECOND row resolving to the SAME executor never
+    // dials out again. This is the mechanism `Orchestrator::init`'s background reconcile
+    // task relies on to bound its own duration; the full end-to-end path through
+    // `Orchestrator::init` cannot itself be driven at a loopback address in a test, because
+    // `security::validate_manifest_base_url` correctly rejects loopback/private hosts at
+    // registration time (a production safety property, not a testing gap) — this is the
+    // one layer below that boundary where the real behavior is directly observable.
+    // -----------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_short_circuits_after_first_unreachable_host_and_completes_promptly() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let (db, _d) = db().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = Arc::clone(&connection_count);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Read the request, then hold the connection open WITHOUT ever writing a
+                // response — the client's own configured timeout, not this server, must
+                // be what ends the wait.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let manifest_json = format!(
+            r#"{{"connector_name":"hung","version":"1","base_url":"http://{addr}",
+                "allowed_ip_cidrs":["127.0.0.1/32"],
+                "ops":[{{"name":"hung_op","risk_tier":"IrreversibleWrite",
+                         "compensability":"compensatable","compensation":{{"op":"unlink"}}}}]}}"#
+        );
+        let manifest = crate::connector::manifest::parse(&manifest_json).unwrap();
+        let mut cfg = crate::connector::HttpExecutorConfig::production(
+            Arc::new(manifest),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_millis(300),
+        );
+        cfg.allow_loopback = true; // TEST ONLY — see `HttpExecutor::allow_loopback`.
+        let exec: Arc<dyn ConnectorExecutor> = Arc::new(crate::connector::HttpExecutor::new(cfg));
+        let resolver = ConnectorResolver::single("hung_op", exec, "test-hash");
+
+        // Two orphan rows resolving to the SAME (hung) executor.
+        let mut act1 = base_action("hung-1");
+        act1.tool_name = "hung_op";
+        let row1 = journal::insert(&db, act1).await.unwrap();
+        let mut act2 = base_action("hung-2");
+        act2.tool_name = "hung_op";
+        journal::insert(&db, act2).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), reconcile_incomplete(&db, &resolver, -1))
+            .await
+            .expect("the sweep itself must never hang past a small multiple of the executor timeout");
+        let elapsed = started.elapsed();
+
+        assert_eq!(n, 2, "both rows classified");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "C3: the short-circuit must bound the WHOLE sweep near ONE executor timeout, \
+             not N times it: took {elapsed:?}"
+        );
+        assert_eq!(
+            connection_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the SECOND row must never dial an executor already known unreachable this sweep"
+        );
+        let after1 = journal::get_by_id(&db, &row1.id).await.unwrap().unwrap();
+        assert_eq!(after1.readback_status, "unverified");
     }
 }

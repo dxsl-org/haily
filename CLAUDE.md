@@ -136,7 +136,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 ## Docs
 
-Full documentation is in `.docs/`:
+Full documentation is in `docs/`:
 - `architecture.md` — 25 technical decisions (Decision 25 added 2026-07-04: outcome signal design & eval harness; Decisions 14–24 from earlier phases)
 - `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait, out-param side-channel, credential-getter seam)
 - `project-structure.md` — 10-crate layout (haily-types, haily-app added), dependency graph, layering test

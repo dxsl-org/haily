@@ -14,19 +14,24 @@
 //! human throwing the switch in that window must still block the write (M5). The re-check
 //! is per-record so a batch does not race past a mid-batch kill.
 //!
-//! The Odoo-specific executor (execute_kw / faultString classification) is phase 5; this
-//! module ships the GENERIC HTTP executor and interprets a manifest op over it.
-use crate::connector::manifest::{Manifest, OpSpec};
+//! Odoo's `execute_kw`/faultString shape (phase 5, proved against a live sandbox) is now
+//! reproduced by this GENERIC HTTP executor interpreting the manifest's `protocol` section
+//! (Phase 4a) rather than a bespoke Odoo executor — see [`HttpExecutor::call_protocol`].
+use crate::connector::credential::CredentialGetter;
+use crate::connector::manifest::{Manifest, OpSpec, ProtocolSpec, ResolvedAuthScheme};
+use crate::connector::odoo_fault;
+use crate::connector::protocol::{self, ConnectionOverlay};
 use crate::connector::{readback_diff, redact, ConnectorExecutor, ExecOutcome};
 use crate::security;
 use crate::{RiskTier, Tool, ToolContext};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use haily_db::queries::journal::{self, NewAction};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 
 /// Days a connector journal row's PII is retained before purge (mirrors phase-3 default).
 const CONNECTOR_RETENTION_DAYS: i64 = 30;
@@ -41,6 +46,10 @@ pub struct HttpConnectorTool {
     pub executor: Arc<dyn ConnectorExecutor>,
     pub kill: Arc<AtomicBool>,
     pub cred_ref: String,
+    /// M2 (Activate-and-Measure phase 4b): this manifest's content hash (`ConnectorManifestRow::content_hash`),
+    /// pinned into every journal row this tool writes so undo/reconcile can detect the
+    /// manifest changing/moving since the write (see `journal_undo::ConnectorResolver`).
+    pub manifest_hash: String,
 }
 
 impl HttpConnectorTool {
@@ -204,12 +213,13 @@ impl Tool for HttpConnectorTool {
                         .get("write_date")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    // Tag-strip the third-party pre_state before it is persisted (C5).
-                    (
-                        Some(body.clone()),
-                        Some(redact::strip_tool_tags(&body.to_string())),
-                        version,
-                    )
+                    // M3 + C5: scrub the resolved secret VALUE (if any) alongside the
+                    // tool-protocol tag-strip before this third-party body is persisted —
+                    // tag-stripping alone would not remove a credential a server reflects
+                    // back in a pre-write read.
+                    let secret = self.executor.resolved_secret().await;
+                    let safe = redact::sanitize_third_party_body(&body.to_string(), secret.as_deref());
+                    (Some(body.clone()), Some(safe), version)
                 }
                 // A failed pre-read is not fatal — record an empty pre_state and proceed;
                 // the post-write read-back is the runtime backstop.
@@ -240,6 +250,7 @@ impl Tool for HttpConnectorTool {
                 compensation_plan: compensation_plan.as_deref(),
                 turn_id: Some(&ctx.turn_id.to_string()),
                 retention_days: CONNECTOR_RETENTION_DAYS,
+                manifest_hash: Some(&self.manifest_hash),
             },
         )
         .await?;
@@ -264,9 +275,12 @@ impl Tool for HttpConnectorTool {
                 code,
                 ..
             } => {
-                // A server-returned fault is not a transport loss — record it and surface a
-                // tag-stripped summary (the fault_string is third-party text, C5).
-                let summary = redact::strip_tool_tags(fault_string);
+                // A server-returned fault is not a transport loss — record it. M3 + C5: the
+                // fault_string is third-party text that may already be tag-stripped by the
+                // executor, but a reflected credential survives a tag-strip — scrub the
+                // resolved secret VALUE too before this summary reaches the journal.
+                let secret = self.executor.resolved_secret().await;
+                let summary = redact::sanitize_third_party_body(fault_string, secret.as_deref());
                 journal::set_readback(&ctx.db, &row.id, "mismatch", Some(&summary)).await?;
                 anyhow::bail!(
                     "connector op '{}' faulted: {} ({})",
@@ -325,7 +339,11 @@ impl Tool for HttpConnectorTool {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 };
-                (status, Some(summarize(&body)), version)
+                // M3: scrub the resolved secret VALUE (if any) alongside the C5 tag-strip
+                // `summarize` already does — a reflected credential in the post-write body
+                // must not reach the journal any more than in the fault/pre_state paths.
+                let secret = self.executor.resolved_secret().await;
+                (status, Some(summarize(&body, secret.as_deref())), version)
             }
             // C7: the read-back GET itself failed — do NOT conclude failure. Mark
             // unverified (does not block a later undo).
@@ -369,41 +387,510 @@ fn request_fields_match(params: &Value, body: &Value) -> bool {
     readback_diff::request_fields_match(expected, body)
 }
 
-/// Bounded, tag-stripped one-line summary of a read-back body for the journal post_state.
-fn summarize(body: &Value) -> String {
-    let raw = body.to_string();
+/// Bounded, secret-scrubbed (M3) + tag-stripped (C5) one-line summary of a read-back body for
+/// the journal post_state. `secret` is the executor's currently-resolved credential (if any,
+/// see [`ConnectorExecutor::resolved_secret`]) — scrubbed from the body BEFORE truncation so a
+/// secret cannot be half-truncated into an unrecognizable-but-still-leaked fragment.
+fn summarize(body: &Value, secret: Option<&str>) -> String {
+    let raw = redact::redact_secret_value(&body.to_string(), secret);
     let trimmed: String = raw.chars().take(512).collect();
     redact::strip_tool_tags(&trimmed)
 }
 
-/// The generic HTTP connector executor (R3): performs a manifest op as a raw HTTP call
-/// through the SSRF-allowance guard. The Odoo-specific executor (execute_kw / faultString
-/// classification) is phase 5 — this is the substrate it will specialize.
+/// The generic HTTP connector executor (R3/phase-3): performs a manifest op either as the
+/// v1 generic `{"op","params"}` POST (no `protocol` declared — unchanged behavior) or, when
+/// `manifest.protocol` is present, by INTERPRETING it (envelope substitution, per-method arg
+/// shaping, fault classification, read-back) — the step that lets a REST/JSON-RPC connector
+/// be expressed entirely as manifest data, built to reproduce `OdooExecutor`'s `execute_kw`
+/// shape exactly (M5b parity).
 ///
 /// M5: `call` re-runs the kill-switch check at the network boundary too, so even a caller
 /// that bypassed the tool's own re-check cannot slip a write past a live kill.
+///
+/// Auth (phase 2, C1): a manifest's `auth` section is applied per-request, ONLY when the
+/// request's target host equals the (overlay-resolved, M4) base_url host. `follow_redirects_
+/// with_guard_allowance*` re-invokes the request-builder closure per redirect hop with that
+/// hop's own URL, and its SSRF re-vet only blocks private/metadata IPs — a `302` to a
+/// DIFFERENT public host would otherwise still receive the credential. The host check is the
+/// actual exfil control here, not the SSRF guard. The SAME host gate governs the phase-3
+/// envelope `{{key}}` token (C1 carryover): a cross-host hop resends the request body with
+/// `{{key}}` resolved to an EMPTY string, never the real secret.
 pub struct HttpExecutor {
     manifest: Arc<Manifest>,
     kill: Arc<AtomicBool>,
     timeout: Duration,
+    /// See [`CredentialGetter`]. `None` preserves pre-phase-2 behavior: a manifest with no
+    /// `auth` section sends no credential regardless; a manifest WITH an `auth` section but
+    /// no injected getter fails closed (never an unauthenticated request for a manifest that
+    /// declares auth) — see [`HttpExecutor::resolve_auth`].
+    credential_getter: Option<Arc<dyn CredentialGetter>>,
+    /// The M4 per-deployment overlay (base_url override, `db`/`uid` envelope tokens, cred_ref
+    /// override) — see [`ConnectionOverlay`]. `None` preserves pre-phase-3 behavior (no
+    /// override; `{{db}}`/`{{uid}}` in an envelope then fail closed as unresolvable tokens).
+    connection: Option<ConnectionOverlay>,
+    /// TEST ONLY — never true in production. Mirrors `OdooExecutor::allow_loopback`: lets the
+    /// SSRF allowance permit a pinned LOOPBACK address so this executor's own test suite can
+    /// exercise the real redirect/auth path against a local fixture server. Production wiring
+    /// (`Orchestrator::init` → `register_connectors`) always constructs via
+    /// [`HttpExecutorConfig::production`], which sets this `false`.
+    allow_loopback: bool,
 }
 
-impl HttpExecutor {
-    /// Build an executor bound to a manifest's base_url + pinned allowance + the shared
-    /// kill switch. `timeout` bounds every external call.
-    pub fn new(manifest: Arc<Manifest>, kill: Arc<AtomicBool>, timeout: Duration) -> Self {
+/// Constructor parameters for [`HttpExecutor`], grouped so adding a field (credential
+/// getter, then the test-only loopback flag, then the M4 connection overlay) never grows the
+/// constructor's arity. Mirrors `OdooExecutorConfig`'s `production()` + builder shape.
+pub struct HttpExecutorConfig {
+    pub manifest: Arc<Manifest>,
+    pub kill: Arc<AtomicBool>,
+    pub timeout: Duration,
+    /// See [`HttpExecutor::credential_getter`]. Defaults to `None` via
+    /// [`HttpExecutorConfig::production`]; opt in via [`Self::with_credential_getter`].
+    pub credential_getter: Option<Arc<dyn CredentialGetter>>,
+    /// See [`HttpExecutor::connection`]. Defaults to `None` via
+    /// [`HttpExecutorConfig::production`]; opt in via [`Self::with_connection_overlay`].
+    pub connection: Option<ConnectionOverlay>,
+    /// TEST ONLY — see [`HttpExecutor::allow_loopback`]. Defaults `false` via
+    /// [`HttpExecutorConfig::production`]; only this crate's own test suite sets it `true`.
+    pub allow_loopback: bool,
+}
+
+impl HttpExecutorConfig {
+    /// Build a production config: no keyring credential source, no connection overlay,
+    /// loopback SSRF carve-out disabled. Use this at every non-test construction site so the
+    /// TEST-ONLY `allow_loopback` can never be set by accident.
+    #[must_use]
+    pub fn production(manifest: Arc<Manifest>, kill: Arc<AtomicBool>, timeout: Duration) -> Self {
         Self {
             manifest,
             kill,
             timeout,
+            credential_getter: None,
+            connection: None,
+            allow_loopback: false,
         }
     }
 
-    /// The op-independent request URL: the manifest's approved base_url. Op-specific path
-    /// routing (execute_kw JSON body etc.) is phase 5's Odoo specialization.
-    fn endpoint(&self) -> &str {
-        &self.manifest.base_url
+    /// Opt into (or explicitly omit) an injected credential source. Takes an `Option` rather
+    /// than a bare `Arc` because callers (`register_connectors`) already hold an
+    /// `Option<Arc<dyn CredentialGetter>>` — a manifest declaring no `auth` never reads it,
+    /// so "no getter configured at all" is a legitimate, common case, not an error.
+    #[must_use]
+    pub fn with_credential_getter(mut self, getter: Option<Arc<dyn CredentialGetter>>) -> Self {
+        self.credential_getter = getter;
+        self
     }
+
+    /// Opt into (or explicitly omit) the M4 per-deployment connection overlay.
+    #[must_use]
+    pub fn with_connection_overlay(mut self, overlay: Option<ConnectionOverlay>) -> Self {
+        self.connection = overlay;
+        self
+    }
+}
+
+impl HttpExecutor {
+    /// Build an executor from its config. The credential is NOT read here — only at call
+    /// time (C4), so a rotated key is picked up without reconstructing the executor.
+    #[must_use]
+    pub fn new(cfg: HttpExecutorConfig) -> Self {
+        Self {
+            manifest: cfg.manifest,
+            kill: cfg.kill,
+            timeout: cfg.timeout,
+            credential_getter: cfg.credential_getter,
+            connection: cfg.connection,
+            allow_loopback: cfg.allow_loopback,
+        }
+    }
+
+    /// The op-independent request URL: the M4 overlay's `base_url_override` when set, else
+    /// the manifest's own approved `base_url`.
+    fn endpoint(&self) -> &str {
+        match &self.connection {
+            Some(overlay) => overlay.effective_base_url(&self.manifest.base_url),
+            None => &self.manifest.base_url,
+        }
+    }
+
+    /// The endpoint under `protocol.endpoint_suffix` (e.g. `/jsonrpc`), or [`Self::endpoint`]
+    /// unchanged when the protocol declares no suffix. `proto` names the parameter (rather
+    /// than `protocol`) purely to avoid shadowing the `protocol` MODULE this file imports —
+    /// both would compile (separate namespaces), but a distinct name reads less ambiguously.
+    fn protocol_endpoint(&self, proto: &ProtocolSpec) -> String {
+        match proto.endpoint_suffix.as_deref() {
+            Some(suffix) => format!("{}{suffix}", self.endpoint().trim_end_matches('/')),
+            None => self.endpoint().to_string(),
+        }
+    }
+
+    /// Resolve the manifest's declared auth against the injected [`CredentialGetter`], once
+    /// per `call`/`read_back` invocation — never cached on `self` (mirrors
+    /// `OdooExecutor::read_key`), so a rotated secret is picked up without reconstructing the
+    /// executor. `Ok(None)` means the manifest declares no `auth` at all (v1 backward
+    /// compatibility: no header/param/envelope-key is ever applied). An `auth`-declaring
+    /// manifest with an unresolvable secret is a hard `Err` (fail-closed, C1/m2's headline
+    /// contract) — the caller must never fall back to sending the request unauthenticated.
+    /// The credential reference NAME is the M4 overlay's `cred_ref_override` when set, else
+    /// the manifest auth's own `cred_ref`.
+    async fn resolve_auth(&self) -> Result<Option<(ResolvedAuthScheme, String)>> {
+        let Some(auth) = &self.manifest.auth else {
+            return Ok(None);
+        };
+        // `manifest::parse` already validated the scheme at load time (an unresolvable
+        // scheme never registers a tool at all); resolving again here is cheap and keeps the
+        // resolved shape colocated with its secret rather than caching it separately.
+        let scheme = auth
+            .resolve()
+            .map_err(|e| anyhow::anyhow!("connector '{}': {e}", self.manifest.connector_name))?;
+        let cred_ref: &str = self
+            .connection
+            .as_ref()
+            .map_or(auth.cred_ref.as_str(), |o| o.effective_cred_ref(&auth.cred_ref));
+        let getter = self.credential_getter.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "connector '{}' declares auth (cred_ref '{cred_ref}') but no credential getter \
+                 is configured — refusing to send an unauthenticated request",
+                self.manifest.connector_name,
+            )
+        })?;
+        let secret = getter
+            .get_secret(cred_ref)
+            .await
+            .with_context(|| format!("credential getter failed for '{cred_ref}'"))?
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential '{cred_ref}' not available — refusing to send an \
+                     unauthenticated request for a manifest that declares auth",
+                )
+            })?;
+        Ok(Some((scheme, secret)))
+    }
+
+    /// The EFFECTIVE endpoint's normalized host (lowercase, no trailing dot; overlay-resolved,
+    /// M4) — the C1 anchor every redirect hop's host is compared against. Parsed ONCE per
+    /// call so the per-hop closure (a plain `Fn`, which cannot itself return a `Result`) only
+    /// ever does infallible string comparison.
+    fn base_host(&self) -> Result<String> {
+        let endpoint = self.endpoint();
+        let url = Url::parse(endpoint)
+            .map_err(|e| anyhow::anyhow!("connector base_url '{endpoint}' invalid: {e}"))?;
+        url.host_str()
+            .map(normalize_host)
+            .ok_or_else(|| anyhow::anyhow!("connector base_url '{endpoint}' has no host"))
+    }
+
+    /// POST `body_with_secret` on a hop whose host matches the manifest's own (C1), or
+    /// `body_without_secret` on any other hop — extending the SAME per-hop host gate that
+    /// already governs header/query-param auth to a secret embedded IN the body (the
+    /// protocol-path `{{key}}` envelope token, Odoo-shaped). A caller with no body-embedded
+    /// secret passes the SAME string for both parameters, making the gate a no-op. Header/
+    /// query-param auth (when the manifest ALSO declares one) is applied identically on top,
+    /// gated by the same host check.
+    async fn send_post(&self, endpoint: &str, body_with_secret: String, body_without_secret: String) -> Result<(u16, String)> {
+        let auth = self.resolve_auth().await?;
+        let base_host = self.base_host()?;
+        let resp = security::follow_redirects_with_guard_allowance_loopback(
+            endpoint,
+            &self.manifest.allowed_ip_cidrs,
+            self.timeout,
+            self.allow_loopback,
+            move |client, url| {
+                let is_home = hop_host_matches(url, &base_host);
+                let body = if is_home { body_with_secret.clone() } else { body_without_secret.clone() };
+                let target = hop_target_url(url, &auth, &base_host);
+                let mut builder = client.post(&target).header("content-type", "application/json").body(body);
+                if let Some((scheme, secret)) = &auth {
+                    if is_home {
+                        builder = apply_auth(builder, scheme, secret);
+                    }
+                }
+                builder
+            },
+        )
+        .await?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("connector call: body read failed: {e}"))?;
+        Ok((status, text))
+    }
+
+    /// GET `endpoint` with `query`, applying auth (host-gated, C1) exactly as [`Self::send_post`].
+    async fn send_get(&self, endpoint: &str, query: &[(&str, &str)]) -> Result<(u16, String)> {
+        let auth = self.resolve_auth().await?;
+        let base_host = self.base_host()?;
+        let query_owned: Vec<(String, String)> =
+            query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let resp = security::follow_redirects_with_guard_allowance_loopback(
+            endpoint,
+            &self.manifest.allowed_ip_cidrs,
+            self.timeout,
+            self.allow_loopback,
+            move |client, url| {
+                let target = hop_target_url(url, &auth, &base_host);
+                let mut builder = client.get(&target).query(&query_owned);
+                if let Some((scheme, secret)) = &auth {
+                    if hop_host_matches(url, &base_host) {
+                        builder = apply_auth(builder, scheme, secret);
+                    }
+                }
+                builder
+            },
+        )
+        .await?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("connector read_back: body read failed: {e}"))?;
+        Ok((status, text))
+    }
+
+    /// Substitute `protocol.envelope` with `{model, method, args, kwargs}` plus, when the M4
+    /// overlay supplies them, `{db, uid}`, plus `key` = `secret.unwrap_or("")`. `secret` is
+    /// ALWAYS resolvable as a token (never an unresolvable-token error) — the caller decides
+    /// per-hop (C1) whether to pass the real value or `None`/empty, mirroring the
+    /// header/query-param auth's own "drop the credential on a cross-host hop" semantics. A
+    /// `{{db}}`/`{{uid}}` referenced with no overlay value DOES fail closed (an unresolvable
+    /// token) — those identify WHICH database/user, and silently sending a wrong/absent one
+    /// is a correctness bug the manifest author must fix, unlike the secret's deliberate
+    /// per-hop drop.
+    fn build_envelope(
+        &self,
+        proto: &ProtocolSpec,
+        model: &str,
+        method: &str,
+        args: Value,
+        kwargs: Value,
+        secret: Option<&str>,
+    ) -> Result<String> {
+        let envelope = proto
+            .envelope
+            .as_ref()
+            .context("connector protocol declares no envelope template")?;
+        let mut ctx = Map::new();
+        ctx.insert("model".to_string(), Value::String(model.to_string()));
+        ctx.insert("method".to_string(), Value::String(method.to_string()));
+        ctx.insert("args".to_string(), args);
+        ctx.insert("kwargs".to_string(), kwargs);
+        if let Some(overlay) = &self.connection {
+            if let Some(db) = &overlay.db {
+                ctx.insert("db".to_string(), Value::String(db.clone()));
+            }
+            if let Some(uid) = overlay.uid {
+                ctx.insert("uid".to_string(), Value::from(uid));
+            }
+        }
+        ctx.insert("key".to_string(), Value::String(secret.unwrap_or("").to_string()));
+        let body = protocol::substitute(envelope, &ctx)?;
+        Ok(body.to_string())
+    }
+
+    /// The protocol-interpreting `call()` path: builds the wire body PURELY from
+    /// `protocol` templates + substitution, mirroring `OdooExecutor::call`'s method dispatch
+    /// (create embeds the correlation ref + prevalidates; write/unlink/read shape `[ids, ...]`;
+    /// any other method passes the caller's own `args` through) so an Odoo-shaped manifest
+    /// reproduces `OdooExecutor` exactly (M5b).
+    async fn call_protocol(&self, proto: &ProtocolSpec, op: &str, params: &Value) -> Result<ExecOutcome> {
+        let (model, method) = protocol::op_resolve::resolve_op_model_method(&self.manifest, op, params)?;
+        let correlation_ref = params.get("correlation_ref").and_then(Value::as_str).unwrap_or("").to_string();
+        let mut values = params.get("values").cloned().unwrap_or(Value::Null);
+
+        if method == "create" {
+            protocol::op_resolve::prevalidate(&proto.prevalidate, &model, &values)?;
+            if let Some(field) = protocol::op_resolve::correlation_field_for(&self.manifest, &model) {
+                if let Some(obj) = values.as_object_mut() {
+                    obj.entry(field).or_insert_with(|| Value::String(correlation_ref.clone()));
+                }
+            }
+        }
+        let ids = params
+            .get("ids")
+            .cloned()
+            .or_else(|| params.get("id").map(|id| serde_json::json!([id])))
+            .unwrap_or(Value::Null);
+
+        let mut shape_ctx = Map::new();
+        shape_ctx.insert("values".to_string(), values);
+        shape_ctx.insert("ids".to_string(), ids);
+        shape_ctx.insert("correlation_ref".to_string(), Value::String(correlation_ref));
+        let fallback_args = params.get("args").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let args = protocol::shape::shape_args(&proto.methods, &method, &shape_ctx, fallback_args)?;
+        let kwargs = serde_json::json!({ "context": proto.context.clone().unwrap_or_else(|| serde_json::json!({})) });
+
+        let secret = self.resolve_auth().await?;
+        let secret_str = secret.as_ref().map(|(_, s)| s.as_str());
+        let body_with = self.build_envelope(proto, &model, &method, args.clone(), kwargs.clone(), secret_str)?;
+        let body_without = self.build_envelope(proto, &model, &method, args, kwargs, None)?;
+        let endpoint = self.protocol_endpoint(proto);
+        let (status, text) = self.send_post(&endpoint, body_with, body_without).await?;
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Ok(self.outcome_from_parsed(proto, status, &text, parsed))
+    }
+
+    /// Classify a protocol call's response into an `ExecOutcome`, reusing
+    /// `odoo_fault::extract_fault` (the SAME JSON-RPC error-shape reader `OdooExecutor` uses)
+    /// so an Odoo-shaped `error` object classifies identically. A connector with no such
+    /// object but an HTTP error status still classifies via a `status`-keyed `fault_rules`
+    /// entry, rather than being silently read as success.
+    fn outcome_from_parsed(&self, proto: &ProtocolSpec, status: u16, text: &str, body: Value) -> ExecOutcome {
+        if let Some(fault) = odoo_fault::extract_fault(&body) {
+            let token = protocol::fault::classify_fault(&proto.fault_rules, &fault, Some(status));
+            return ExecOutcome::Fault {
+                fault_string: redact::strip_tool_tags(&fault.fault_string),
+                code: Some(token),
+                name: fault.name,
+            };
+        }
+        if status >= 400 {
+            let fault = odoo_fault::OdooFault {
+                code: Some(status.to_string()),
+                name: None,
+                fault_string: text.to_string(),
+            };
+            let token = protocol::fault::classify_fault(&proto.fault_rules, &fault, Some(status));
+            return ExecOutcome::Fault {
+                fault_string: redact::strip_tool_tags(&fault.fault_string),
+                code: Some(token),
+                name: None,
+            };
+        }
+        let result = body.get("result").cloned().unwrap_or(Value::Null);
+        let returned_id = extract_first_id(&result);
+        ExecOutcome::Ok { returned_id, body: result }
+    }
+
+    /// The protocol-interpreting `read_back()` path: resolves the model (manifest op, else
+    /// the compensation model hint, else fail-closed), builds the locate-domain + kwargs, and
+    /// POSTs the same envelope shape `call_protocol` uses with `method="search_read"` —
+    /// mirroring `OdooExecutor::read_back` exactly (M5b).
+    async fn read_back_protocol(
+        &self,
+        proto: &ProtocolSpec,
+        op: &str,
+        correlation_ref: &str,
+        model_hint: Option<&str>,
+        id_hint: Option<&str>,
+    ) -> Result<Value> {
+        let model = match protocol::op_resolve::resolve_op_model_method(&self.manifest, op, &Value::Null) {
+            Ok((model, _method)) => model,
+            Err(_) => match model_hint {
+                Some(m) => m.to_string(),
+                None => self
+                    .manifest
+                    .ops
+                    .iter()
+                    .find_map(|o| o.model.clone())
+                    .with_context(|| format!("read_back '{op}': no model hint and none resolvable from manifest"))?,
+            },
+        };
+        let corr_field = protocol::op_resolve::correlation_field_for(&self.manifest, &model);
+        let domain = protocol::readback::build_domain(id_hint, corr_field.as_deref(), correlation_ref);
+        let kwargs = protocol::readback::build_kwargs(proto.context.as_ref(), proto.readback.as_ref());
+
+        let secret = self.resolve_auth().await?;
+        let secret_str = secret.as_ref().map(|(_, s)| s.as_str());
+        let body_with = self.build_envelope(proto, &model, "search_read", domain.clone(), kwargs.clone(), secret_str)?;
+        let body_without = self.build_envelope(proto, &model, "search_read", domain, kwargs, None)?;
+        let endpoint = self.protocol_endpoint(proto);
+        let (_status, text) = self.send_post(&endpoint, body_with, body_without).await?;
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(fault) = odoo_fault::extract_fault(&parsed) {
+            let safe = redact::strip_tool_tags(&fault.fault_string);
+            anyhow::bail!("connector read_back '{op}' faulted: {safe}");
+        }
+        let result = parsed.get("result").cloned().unwrap_or(Value::Null);
+        Ok(protocol::readback::unwrap_first(result, proto.readback.as_ref()))
+    }
+}
+
+/// Extract a record id from a `create`/`search`/`read`-shaped result — ported from
+/// `OdooExecutor::extract_id` for parity (M5b): `create` returns the new integer id;
+/// `search` returns `[ids]`; `read` returns `[{...}]`.
+fn extract_first_id(result: &Value) -> Option<String> {
+    match result {
+        Value::Number(n) => Some(n.to_string()),
+        Value::Array(arr) => arr.first().and_then(|first| match first {
+            Value::Number(n) => Some(n.to_string()),
+            Value::Object(o) => o.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Lowercase + strip a trailing dot, so `Example.com` and `example.com.` compare equal to
+/// `example.com` — the same normalization the SSRF guard's own host handling assumes.
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// C1: `true` only when `hop_url`'s host equals `base_host` (both normalized). Deliberately
+/// compares HOST ONLY, never the full URL — a scheme/port/path difference on the SAME host
+/// (e.g. a load balancer redirecting to a different port on itself) must still carry auth,
+/// while a different host must never carry it. An unparseable hop URL fails closed (`false`
+/// — no auth) rather than panicking or guessing.
+fn hop_host_matches(hop_url: &str, base_host: &str) -> bool {
+    Url::parse(hop_url)
+        .ok()
+        .and_then(|u| u.host_str().map(normalize_host))
+        .is_some_and(|h| h == base_host)
+}
+
+/// Apply a resolved auth scheme to a per-hop request builder. `query-param` is applied via
+/// the builder's own `.query()` (never by mutating the URL string the redirect follower
+/// carries forward) so the secret can never leak into the next hop's `Location`-derived URL
+/// or its diagnostic log (m1).
+fn apply_auth(builder: reqwest::RequestBuilder, scheme: &ResolvedAuthScheme, secret: &str) -> reqwest::RequestBuilder {
+    match scheme {
+        ResolvedAuthScheme::Bearer => builder.bearer_auth(secret),
+        ResolvedAuthScheme::Header(name) => builder.header(name.as_str(), secret),
+        ResolvedAuthScheme::QueryParam(name) => builder.query(&[(name.as_str(), secret)]),
+    }
+}
+
+/// The actual request-target URL for one hop. When a `query-param` auth scheme applies to
+/// THIS hop (host matches, C1), any EXISTING occurrence of the auth's own param name is
+/// stripped from the hop URL first — `reqwest::RequestBuilder::query` APPENDS rather than
+/// replaces, so a same-host redirect whose `Location` happens to echo a stale or
+/// attacker-supplied value under the SAME key would otherwise ride along next to our
+/// authoritative one (`?api_key=stale&api_key=ours`), leaving it to the receiving server's
+/// (unspecified) duplicate-key handling which one wins. Every other case — host mismatch, a
+/// non-query-param scheme, or no auth at all — uses the hop URL unchanged.
+fn hop_target_url(hop_url: &str, auth: &Option<(ResolvedAuthScheme, String)>, base_host: &str) -> String {
+    match auth {
+        Some((ResolvedAuthScheme::QueryParam(name), _)) if hop_host_matches(hop_url, base_host) => {
+            strip_query_param(hop_url, name)
+        }
+        _ => hop_url.to_string(),
+    }
+}
+
+/// Remove every occurrence of `param_name` from `url`'s query string, leaving other params
+/// (if any) intact and in order. An unparseable `url` is returned unchanged (the caller's
+/// own guard rejects it before this ever matters for a real request).
+fn strip_query_param(url: &str, param_name: &str) -> String {
+    let Ok(mut parsed) = Url::parse(url) else {
+        return url.to_string();
+    };
+    let remaining: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| k != param_name)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if remaining.is_empty() {
+        parsed.set_query(None);
+    } else {
+        let mut qp = parsed.query_pairs_mut();
+        qp.clear();
+        for (k, v) in &remaining {
+            qp.append_pair(k, v);
+        }
+        drop(qp);
+    }
+    parsed.to_string()
 }
 
 #[async_trait]
@@ -414,24 +901,16 @@ impl ConnectorExecutor for HttpExecutor {
         if self.kill.load(Ordering::Acquire) {
             anyhow::bail!("kill switch engaged — connector call '{op}' blocked");
         }
+        // Phase 3: a manifest declaring `protocol` is INTERPRETED (envelope substitution,
+        // per-method shaping, fault classification) instead of the v1 generic body below.
+        if let Some(proto) = &self.manifest.protocol {
+            return self.call_protocol(proto, op, params).await;
+        }
+        // v1 generic path (no `protocol` declared): unchanged `{"op","params"}` POST. No
+        // secret is ever embedded in this body, so the SAME string is passed for both
+        // `send_post` parameters — the C1 host gate is then a no-op (nothing to drop).
         let body = serde_json::json!({ "op": op, "params": params }).to_string();
-        let resp = security::follow_redirects_with_guard_allowance(
-            self.endpoint(),
-            &self.manifest.allowed_ip_cidrs,
-            self.timeout,
-            move |client, url| {
-                client
-                    .post(url)
-                    .header("content-type", "application/json")
-                    .body(body.clone())
-            },
-        )
-        .await?;
-        let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("connector call '{op}': body read failed: {e}"))?;
+        let (status, text) = self.send_post(self.endpoint(), body.clone(), body).await?;
         // A transport-level failure surfaces as Err (above); a reachable server that
         // returns an error status is a structured fault (C7 — caller reads back).
         if status >= 400 {
@@ -455,28 +934,41 @@ impl ConnectorExecutor for HttpExecutor {
         &self,
         op: &str,
         correlation_ref: &str,
-        _model_hint: Option<&str>,
-        _id_hint: Option<&str>,
+        model_hint: Option<&str>,
+        id_hint: Option<&str>,
     ) -> Result<Value> {
-        // The generic HTTP executor routes purely by op/correlation_ref; it has no per-model
-        // path, so the model/id hints are not needed here (only the Odoo specialization
-        // resolves a model and locates by id). Kept in the signature for trait uniformity.
-        let resp = security::follow_redirects_with_guard_allowance(
-            self.endpoint(),
-            &self.manifest.allowed_ip_cidrs,
-            self.timeout,
-            move |client, url| {
-                client
-                    .get(url)
-                    .query(&[("op", op), ("correlation_ref", correlation_ref)])
-            },
-        )
-        .await?;
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("connector read_back '{op}': body read failed: {e}"))?;
+        if let Some(proto) = &self.manifest.protocol {
+            return self.read_back_protocol(proto, op, correlation_ref, model_hint, id_hint).await;
+        }
+        // v1 generic path: the executor routes purely by op/correlation_ref; it has no
+        // per-model path, so the model/id hints are unused here (only the protocol-
+        // interpreting path resolves a model and locates by id).
+        //
+        // read_back is a GET, but a query-param auth scheme (and the C1 host check) still
+        // applies to it — auth is not call()-only.
+        let (_status, text) = self
+            .send_get(self.endpoint(), &[("op", op), ("correlation_ref", correlation_ref)])
+            .await?;
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// M3: the secret this executor would apply RIGHT NOW (host-independent — the caller
+    /// scrubs it from a THIRD-PARTY body regardless of which host actually replied), so a
+    /// reflected credential in a fault/pre_state/post_state body never reaches the journal.
+    /// `None` when the manifest declares no `auth`, or resolution fails (nothing to scrub).
+    async fn resolved_secret(&self) -> Option<String> {
+        self.resolve_auth().await.ok().flatten().map(|(_, secret)| secret)
+    }
+
+    /// M6a: `None` when the manifest declares no `auth` (nothing to preflight — every other
+    /// caller treats `None` like "fine, proceed"). When `auth` IS declared, `Some(true)`
+    /// means [`Self::resolve_auth`] would succeed right now; `Some(false)` means it would
+    /// fail (locked keyring, unconfigured getter, empty secret) — the exact condition
+    /// `journal_undo`'s pending-undo path checks for BEFORE attempting a compensation call
+    /// that would otherwise fail generically and burn an undo-attempt.
+    async fn credential_preflight(&self) -> Option<bool> {
+        self.manifest.auth.as_ref()?;
+        Some(self.resolve_auth().await.is_ok())
     }
 }
 
@@ -574,6 +1066,7 @@ mod tests {
             executor: exec.clone(),
             kill: Arc::new(AtomicBool::new(false)),
             cred_ref: "odoo.api_key".into(),
+            manifest_hash: "test-hash".into(),
         };
         let (ctx, _kd) = ctx(db.clone()).await;
         let out = tool
@@ -616,6 +1109,7 @@ mod tests {
             executor: exec.clone(),
             kill: kill.clone(),
             cred_ref: "odoo.api_key".into(),
+            manifest_hash: "test-hash".into(),
         };
         let (ctx, _kd) = ctx(db.clone()).await;
         let res = tool
@@ -654,7 +1148,134 @@ mod tests {
             executor: Arc::new(MockExecutor::new(vec![], vec![])),
             kill: Arc::new(AtomicBool::new(false)),
             cred_ref: "c.key".into(),
+            manifest_hash: "test-hash".into(),
         };
         assert_eq!(tool.risk_tier(&json!({})), RiskTier::IrreversibleWrite);
+    }
+
+    // ---- M6a credential pre-flight ------------------------------------------------------
+
+    #[tokio::test]
+    async fn credential_preflight_none_when_manifest_declares_no_auth() {
+        let m = Arc::new(
+            manifest::parse(
+                r#"{"connector_name":"c","version":"1","base_url":"https://x.example.com",
+                    "allowed_ip_cidrs":[],"ops":[]}"#,
+            )
+            .unwrap(),
+        );
+        let exec = HttpExecutor::new(HttpExecutorConfig::production(
+            m,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+        ));
+        assert_eq!(
+            exec.credential_preflight().await,
+            None,
+            "nothing to preflight when the manifest declares no auth section"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_preflight_false_when_auth_declared_but_no_getter_configured() {
+        let m = Arc::new(
+            manifest::parse(
+                r#"{"connector_name":"c","version":"1","base_url":"https://x.example.com",
+                    "allowed_ip_cidrs":[],"ops":[],
+                    "auth":{"scheme":"bearer","cred_ref":"c.key"}}"#,
+            )
+            .unwrap(),
+        );
+        // No `with_credential_getter` call — `production()` defaults it to `None`.
+        let exec = HttpExecutor::new(HttpExecutorConfig::production(
+            m,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+        ));
+        assert_eq!(
+            exec.credential_preflight().await,
+            Some(false),
+            "auth declared but no getter configured must preflight as unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_preflight_true_when_getter_resolves_the_secret() {
+        let m = Arc::new(
+            manifest::parse(
+                r#"{"connector_name":"c","version":"1","base_url":"https://x.example.com",
+                    "allowed_ip_cidrs":[],"ops":[],
+                    "auth":{"scheme":"bearer","cred_ref":"c.key"}}"#,
+            )
+            .unwrap(),
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("c.key".to_string(), "sk-resolvable".to_string());
+        let getter = Arc::new(crate::connector::credential::mock::MockCredentialGetter(map));
+        let exec = HttpExecutor::new(
+            HttpExecutorConfig::production(m, Arc::new(AtomicBool::new(false)), std::time::Duration::from_secs(5))
+                .with_credential_getter(Some(getter)),
+        );
+        assert_eq!(
+            exec.credential_preflight().await,
+            Some(true),
+            "a resolvable credential must preflight as available"
+        );
+    }
+
+    // ---- C1 host-scoping + m1 query-param stripping (unit-level) ----------------------
+
+    #[test]
+    fn hop_host_matches_normalizes_case_and_trailing_dot_but_ignores_port_and_path() {
+        assert!(hop_host_matches("https://Example.com:8443/x", "example.com"));
+        assert!(hop_host_matches("https://example.com./y", "example.com"));
+        // Same host, different port/path/scheme — still a match (C1 is host-only).
+        assert!(hop_host_matches("http://example.com/other", "example.com"));
+        assert!(!hop_host_matches("https://attacker.example/x", "example.com"));
+        // Unparseable hop URL fails closed to "no match" rather than panicking.
+        assert!(!hop_host_matches("not a url", "example.com"));
+    }
+
+    #[test]
+    fn strip_query_param_removes_only_the_named_param() {
+        assert_eq!(
+            strip_query_param("http://h/x?api_key=stale&other=1", "api_key"),
+            "http://h/x?other=1"
+        );
+        // Removing the only param drops the `?` entirely, not just its value.
+        assert_eq!(strip_query_param("http://h/x?api_key=stale", "api_key"), "http://h/x");
+        // No matching param — URL unchanged (aside from normalization round-trip).
+        assert_eq!(strip_query_param("http://h/x?other=1", "api_key"), "http://h/x?other=1");
+        // Unparseable input is returned as-is.
+        assert_eq!(strip_query_param("not a url", "api_key"), "not a url");
+    }
+
+    #[test]
+    fn hop_target_url_strips_only_for_query_param_scheme_on_a_matching_host() {
+        let base_host = "example.com".to_string();
+        let query_auth = Some((ResolvedAuthScheme::QueryParam("api_key".to_string()), "S".to_string()));
+        // Matching host + query-param scheme: the stale param is stripped.
+        assert_eq!(
+            hop_target_url("http://example.com/x?api_key=stale", &query_auth, &base_host),
+            "http://example.com/x"
+        );
+        // Cross-host: the hop URL passes through untouched even though the scheme is
+        // query-param — C1 host-scoping applies uniformly to the auth PATH, not just the
+        // header/param application.
+        assert_eq!(
+            hop_target_url("http://attacker.example/x?api_key=stale", &query_auth, &base_host),
+            "http://attacker.example/x?api_key=stale"
+        );
+        // A non-query-param scheme never triggers stripping, even on the matching host.
+        let bearer_auth = Some((ResolvedAuthScheme::Bearer, "S".to_string()));
+        assert_eq!(
+            hop_target_url("http://example.com/x?api_key=stale", &bearer_auth, &base_host),
+            "http://example.com/x?api_key=stale"
+        );
+        // No auth at all: unchanged.
+        assert_eq!(
+            hop_target_url("http://example.com/x?api_key=stale", &None, &base_host),
+            "http://example.com/x?api_key=stale"
+        );
     }
 }

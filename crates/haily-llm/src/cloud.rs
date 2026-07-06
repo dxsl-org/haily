@@ -248,7 +248,14 @@ impl CloudClient {
                         }
                     }
                     ParsedEvent::Done => {
-                        let _ = tx.send(StreamChunk::Done { total_tokens }).await;
+                        // NULL-honest (Phase 8, C2): no dialect this crate speaks
+                        // (OpenAI-compatible or Anthropic SSE) exposes a real prompt-
+                        // token usage field on the wire — `None` here, never a
+                        // fabricated estimate. See `StreamChunk::Done::prompt_tokens`'s
+                        // doc comment for the full contract.
+                        let _ = tx
+                            .send(StreamChunk::Done { total_tokens, prompt_tokens: None })
+                            .await;
                         return;
                     }
                     ParsedEvent::Error(msg) => {

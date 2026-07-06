@@ -146,6 +146,7 @@ pub async fn run_golden_task(task: &GoldenTask) -> RunOutcome {
         shutdown.clone(),
         tasks.clone(),
         std::collections::HashSet::new(),
+        None,
     )
     .await
     .expect("orchestrator init");

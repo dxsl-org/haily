@@ -503,7 +503,33 @@ pub struct DailyRollup {
     pub avg_prompt_tokens: Option<f64>,
     pub avg_completion_tokens: Option<f64>,
     pub undo_count: i64,
+    // --- Phase 8 (Activate & Measure), migration 0020 ---
+    // SUMs of the already-recorded per-turn `kms_task_traces.approval_requested`/
+    // `approval_denied` booleans (migration 0017) — see that migration's doc comment
+    // for why `0` (not `NULL`) is the honest default here.
+    pub approval_requested_count: i64,
+    pub approval_denied_count: i64,
     pub created_at: String,
+}
+
+/// One `GROUP BY tier` bucket of the daily aggregation query — a dedicated
+/// `FromRow` struct instead of a bare tuple so adding a column (e.g. migration
+/// 0020's approval counts) is a one-line addition here rather than growing an
+/// already-long tuple type past comfortable readability.
+#[derive(Debug, FromRow)]
+struct RollupAggRow {
+    tier: String,
+    cnt: i64,
+    success_count: i64,
+    partial_count: i64,
+    failure_count: i64,
+    unknown_count: i64,
+    avg_duration_ms: Option<f64>,
+    avg_prompt_tokens: Option<f64>,
+    avg_completion_tokens: Option<f64>,
+    undo_count: i64,
+    approval_requested_count: i64,
+    approval_denied_count: i64,
 }
 
 /// Aggregate every `kms_task_traces` row whose `created_at` date (UTC, `YYYY-MM-DD`)
@@ -521,7 +547,7 @@ pub async fn compute_daily_rollup(db: &DbHandle, date: &str) -> Result<usize> {
     let day_start = format!("{date}T00:00:00");
     let day_end = format!("{date}T23:59:59.999999");
 
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, Option<f64>, Option<f64>, Option<f64>, i64)>(
+    let rows = sqlx::query_as::<_, RollupAggRow>(
         "SELECT
              COALESCE(model_tier, '')                                        AS tier,
              COUNT(*)                                                        AS cnt,
@@ -532,7 +558,9 @@ pub async fn compute_daily_rollup(db: &DbHandle, date: &str) -> Result<usize> {
              AVG(duration_ms)                                                AS avg_duration_ms,
              AVG(prompt_tokens)                                              AS avg_prompt_tokens,
              AVG(completion_tokens)                                          AS avg_completion_tokens,
-             SUM(CASE WHEN undo_within_5min = 1 THEN 1 ELSE 0 END)           AS undo_count
+             SUM(CASE WHEN undo_within_5min = 1 THEN 1 ELSE 0 END)           AS undo_count,
+             SUM(CASE WHEN approval_requested = 1 THEN 1 ELSE 0 END)         AS approval_requested_count,
+             SUM(CASE WHEN approval_denied = 1 THEN 1 ELSE 0 END)            AS approval_denied_count
          FROM kms_task_traces
          WHERE created_at >= ? AND created_at <= ?
          GROUP BY tier",
@@ -544,55 +572,63 @@ pub async fn compute_daily_rollup(db: &DbHandle, date: &str) -> Result<usize> {
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut upserted = 0usize;
-    for (
-        tier,
-        count,
-        success_count,
-        partial_count,
-        failure_count,
-        unknown_count,
-        avg_duration_ms,
-        avg_prompt_tokens,
-        avg_completion_tokens,
-        undo_count,
-    ) in rows
-    {
+    for row in rows {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO kms_daily_rollup
                  (id, date, model_tier, count, success_count, partial_count, failure_count,
                   unknown_count, avg_duration_ms, avg_prompt_tokens, avg_completion_tokens,
-                  undo_count, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  undo_count, approval_requested_count, approval_denied_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(date, model_tier) DO UPDATE SET
-                 count                 = excluded.count,
-                 success_count         = excluded.success_count,
-                 partial_count         = excluded.partial_count,
-                 failure_count         = excluded.failure_count,
-                 unknown_count         = excluded.unknown_count,
-                 avg_duration_ms       = excluded.avg_duration_ms,
-                 avg_prompt_tokens     = excluded.avg_prompt_tokens,
-                 avg_completion_tokens = excluded.avg_completion_tokens,
-                 undo_count            = excluded.undo_count",
+                 count                     = excluded.count,
+                 success_count             = excluded.success_count,
+                 partial_count             = excluded.partial_count,
+                 failure_count             = excluded.failure_count,
+                 unknown_count             = excluded.unknown_count,
+                 avg_duration_ms           = excluded.avg_duration_ms,
+                 avg_prompt_tokens         = excluded.avg_prompt_tokens,
+                 avg_completion_tokens     = excluded.avg_completion_tokens,
+                 undo_count                = excluded.undo_count,
+                 approval_requested_count  = excluded.approval_requested_count,
+                 approval_denied_count     = excluded.approval_denied_count",
         )
         .bind(&id)
         .bind(date)
-        .bind(&tier)
-        .bind(count)
-        .bind(success_count)
-        .bind(partial_count)
-        .bind(failure_count)
-        .bind(unknown_count)
-        .bind(avg_duration_ms)
-        .bind(avg_prompt_tokens)
-        .bind(avg_completion_tokens)
-        .bind(undo_count)
+        .bind(&row.tier)
+        .bind(row.cnt)
+        .bind(row.success_count)
+        .bind(row.partial_count)
+        .bind(row.failure_count)
+        .bind(row.unknown_count)
+        .bind(row.avg_duration_ms)
+        .bind(row.avg_prompt_tokens)
+        .bind(row.avg_completion_tokens)
+        .bind(row.undo_count)
+        .bind(row.approval_requested_count)
+        .bind(row.approval_denied_count)
         .bind(&now)
         .execute(db.pool())
         .await?;
         upserted += 1;
     }
     Ok(upserted)
+}
+
+/// Most recent date present in `kms_daily_rollup` (`YYYY-MM-DD`, lexicographically
+/// sortable so `MAX` is also date-max), or `None` on a fresh install with no rollup
+/// rows yet. Drives the M7b backfill loop (`haily_proactive::daily_rollup`): resuming
+/// from the day AFTER this one, rather than always re-targeting a fixed
+/// `now - 1 day`, is what lets a slept-through gap day get rolled instead of skipped
+/// forever.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn latest_rollup_date(db: &DbHandle) -> Result<Option<String>> {
+    let row: (Option<String>,) = sqlx::query_as("SELECT MAX(date) FROM kms_daily_rollup")
+        .fetch_one(db.pool())
+        .await?;
+    Ok(row.0)
 }
 
 /// Rollup rows for a given date, newest-tier-first is not meaningful here — returned

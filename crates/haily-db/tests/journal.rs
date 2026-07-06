@@ -36,6 +36,7 @@ fn new_action<'a>(session_id: &'a str, key: &'a str) -> journal::NewAction<'a> {
         compensation_plan: Some(r#"{"op":"unlink","id":42}"#),
         turn_id: None,
         retention_days: 30,
+        manifest_hash: None,
     }
 }
 

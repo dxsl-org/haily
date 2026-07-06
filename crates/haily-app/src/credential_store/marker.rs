@@ -12,6 +12,15 @@ pub const FALLBACK_WARNING_PREF: &str = "credential.fallback_active";
 /// holds the raw secret" (needs migration). Never a valid secret value itself.
 pub const KEYRING_MARKER_PREFIX: &str = "keyring:";
 
+/// M6c (Activate-and-Measure phase 4b): confirms the plaintext-residue scrub (WAL
+/// checkpoint + VACUUM) has ACTUALLY completed after a migration overwrote a secret's DB
+/// row with the keyring marker. Kept SEPARATE from the marker itself: a crash/SQLITE_BUSY
+/// between the marker write and the scrub used to strand plaintext in the WAL/freelist
+/// forever, because the marker's own idempotency check short-circuited BEFORE the scrub
+/// could ever run a second time. A single GLOBAL flag (the scrub walks the whole DB file,
+/// not a per-cred_ref residue) — re-checked and re-run on every boot until it is set.
+pub const SCRUB_CONFIRMED_PREF: &str = "credential.scrub_confirmed";
+
 /// `true` when `value` is the migration marker written over a migrated secret's DB row,
 /// not a raw secret — used both to skip a re-migration and to make sure the DB
 /// read-fallback path never returns a marker string as if it were a real secret.

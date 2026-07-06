@@ -86,7 +86,27 @@ impl CompletionRequest {
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
     Token(String),
-    Done { total_tokens: u32 },
+    Done {
+        total_tokens: u32,
+        /// Prompt token count for THIS call, tokenized the same way `complete()`
+        /// computes `actual_prompt_tokens` (see `llama.rs`) — `Some` only when the
+        /// backend has a genuine tokenizer-backed count to report.
+        ///
+        /// CONTRACT (Phase 8, C2 — dogfooding instrumentation): this field is the
+        /// provenance signal `haily-core::agent::stream_llm_response` uses to decide
+        /// whether `total_tokens` itself may be trusted as a real completion-token
+        /// count. `LlamaClient::complete_stream` sets `Some(n)` — llama.cpp tokenizes
+        /// the prompt up front (`run_inference_streaming`) and increments
+        /// `total_tokens` once per actually-decoded token, so both numbers are
+        /// genuine measurements there. `CloudClient::complete_stream` always sets
+        /// `None` — no cloud SSE dialect this crate speaks exposes a `usage` field on
+        /// the wire, and counting SSE delta *events* is NOT a token count (a provider
+        /// may batch multiple tokens into one delta). Fabricating a value here would
+        /// violate the NULL-honesty invariant `TraceMetrics::prompt_tokens`/
+        /// `completion_tokens` enforce (see `haily-core::agent`'s honesty tests) — so
+        /// `None` must never be "estimated" into a number by any caller.
+        prompt_tokens: Option<u32>,
+    },
     Error(String),
 }
 

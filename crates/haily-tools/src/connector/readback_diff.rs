@@ -139,7 +139,8 @@ fn id_list(v: &Value) -> Option<Vec<i64>> {
 /// that express a complete set: `SET (6, 0, [ids])` and a raw list of scalar ids (treated as a
 /// full set). Partial/mutating commands (LINK/UNLINK/CREATE/DELETE/UPDATE/CLEAR) cannot be
 /// diffed against a read snapshot without the prior state, so they return `None` (ambiguous →
-/// field excluded, never false-flagged). Codes mirror [`super::odoo_executor::command`].
+/// field excluded, never false-flagged). Command codes per the Odoo ORM's `Command` class
+/// (`fields.py`): `SET == 6` is the only code carrying a complete, order-free id set.
 fn command_target_ids(sent: &Value) -> Option<Vec<i64>> {
     let arr = sent.as_array()?;
     // A bare list of scalar ids `[1, 2, 3]` = the full membership.

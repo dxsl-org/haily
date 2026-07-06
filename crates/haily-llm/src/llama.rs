@@ -23,6 +23,44 @@ use llama_cpp_2::{
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, sync::OnceLock};
 use tokio::sync::mpsc;
 
+/// Vietnamese-fitted chars-per-token divisor for `complete()`'s prompt-token
+/// estimate-vs-actual debug log — replaces the earlier flat `chars/3` heuristic
+/// (phase-11, m4).
+///
+/// PROVENANCE CONTRACT: this value MUST be derived from `(char_count,
+/// actual_prompt_tokens)` pairs collected on the STREAMING path
+/// (`complete_stream` → `run_inference_streaming`'s returned prompt-token count →
+/// `StreamChunk::Done.prompt_tokens`, wired in Phase 8/C2) — NEVER from
+/// `complete()`'s own pairs, since `complete()` is the sub-turn-only path (main
+/// user turns stream) and fitting from it would be circular. See
+/// `.agents/260706-0952-activate-and-measure/reports/vn-tokenizer-divisor.md` for
+/// the measurement procedure and this value's current provenance.
+///
+/// INTERIM VALUE (2026-07-06): the `llama` feature compiles in the phase-11
+/// implementation environment (llama-cpp-2's native build succeeds), but no GGUF
+/// model file was available to actually load and run inference, so the real
+/// STREAMING measurement (driving real turns through `complete_stream` and
+/// recording `StreamChunk::Done.prompt_tokens`) could not be executed. `2.5` is
+/// therefore a reasoned placeholder — NOT a fitted empirical value —
+/// grounded in published BPE-tokenizer behavior for Vietnamese (see the report:
+/// diacritic-heavy Vietnamese text tokenizes denser than English on
+/// English/Chinese-majority multilingual vocabularies like Qwen2.5's/Gemma's,
+/// commonly cited in the ~2–3 chars/token range vs English's ~4). This constant is
+/// a LOGGING-ONLY heuristic — it never gates context-window or batch sizing (those
+/// use the real `tokens.len()` from `str_to_token`, see `run_inference_streaming`
+/// below) — so an imprecise interim value has no behavioral effect beyond one
+/// debug-log line's accuracy. Replace with the empirical fit once a llama-enabled
+/// environment can run the measurement procedure in the report above.
+const VN_PROMPT_CHARS_PER_TOKEN: f64 = 2.5;
+
+/// Estimate a prompt's token count from its character count using
+/// `VN_PROMPT_CHARS_PER_TOKEN`. Extracted as a pure function (mirrors
+/// `validate_n_ctx`/`compute_n_batch` below) so the divisor's arithmetic is
+/// unit-testable without a loaded GGUF model.
+fn estimate_prompt_tokens(char_count: usize) -> usize {
+    (char_count as f64 / VN_PROMPT_CHARS_PER_TOKEN).ceil() as usize
+}
+
 /// Process-global llama backend. llama.cpp's backend is a singleton guarded by a
 /// global flag: `LlamaBackend::init()` errors if called while another backend is
 /// alive, and dropping it frees global state. Re-initializing across a model
@@ -100,11 +138,12 @@ impl LlamaClient {
 impl LlmClient for LlamaClient {
     async fn complete(&self, req: CompletionRequest) -> Result<String> {
         let prompt_text = self.fmt.format(&req.messages);
-        // chars/3 heuristic from `haily_core::budget::estimate` — duplicated here (not
-        // imported: haily-llm is a leaf crate and must not depend on haily-core) purely
-        // to log estimate-vs-actual so the heuristic's accuracy can be validated against
-        // this call's real tokenize() count (research report 03 §A2 risk note).
-        let estimated_prompt_tokens = prompt_text.chars().count().div_ceil(3);
+        // Estimate-vs-actual log only (research report 03 §A2 risk note) — not
+        // imported from `haily_core::budget::estimate` since haily-llm is a leaf
+        // crate and must not depend on haily-core; this is a narrower, local
+        // instance of the same heuristic, purely for this call's debug log below.
+        // Divisor provenance: see `VN_PROMPT_CHARS_PER_TOKEN`'s doc comment.
+        let estimated_prompt_tokens = estimate_prompt_tokens(prompt_text.chars().count());
         let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
         let temperature = req.temperature;
         let n_ctx = self.n_ctx;
@@ -172,7 +211,12 @@ impl LlmClient for LlamaClient {
             let mut holdback = String::new();
             let mut total_tokens: u32 = 0;
 
-            let result = (|| -> Result<()> {
+            // C2 (Phase 8): `run_inference_streaming` returns `(output, prompt_token_count)`
+            // — the SAME tokenize()-backed count `complete()` logs as `actual_prompt_tokens`
+            // (line ~124 above). Captured here so the streaming path — the one MAIN user
+            // turns actually use (`complete()` is sub-turn-only) — can finally emit a real
+            // prompt-token measurement instead of none at all.
+            let result = (|| -> Result<usize> {
                 let backend = backend()?;
                 run_inference_streaming(
                     backend,
@@ -197,11 +241,11 @@ impl LlmClient for LlamaClient {
                         true
                     },
                 )
-                .map(|_| ())
+                .map(|(_output, prompt_tokens)| prompt_tokens)
             })();
 
             match result {
-                Ok(()) => {
+                Ok(prompt_tokens) => {
                     if cancel.is_cancelled() {
                         let _ = tx.blocking_send(StreamChunk::Error("cancelled".to_string()));
                     } else {
@@ -211,7 +255,10 @@ impl LlmClient for LlamaClient {
                         if !holdback.is_empty() {
                             let _ = tx.blocking_send(StreamChunk::Token(holdback));
                         }
-                        let _ = tx.blocking_send(StreamChunk::Done { total_tokens });
+                        let _ = tx.blocking_send(StreamChunk::Done {
+                            total_tokens,
+                            prompt_tokens: Some(prompt_tokens as u32),
+                        });
                     }
                 }
                 Err(e) => {
@@ -418,6 +465,28 @@ fn run_inference_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_prompt_tokens_zero_chars_is_zero_tokens() {
+        assert_eq!(estimate_prompt_tokens(0), 0);
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_rounds_up_to_the_next_whole_token() {
+        // 2.5 chars/token: 5 chars → exactly 2 tokens; 6 chars → ceil(2.4) = 3.
+        assert_eq!(estimate_prompt_tokens(5), 2);
+        assert_eq!(estimate_prompt_tokens(6), 3);
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_scales_with_the_named_divisor() {
+        // Locks the estimate to `VN_PROMPT_CHARS_PER_TOKEN` itself (not a hardcoded
+        // literal) so this test still passes once the interim value is replaced
+        // with the empirical fit from the streaming-pairs measurement.
+        let chars = 1000;
+        let expected = (chars as f64 / VN_PROMPT_CHARS_PER_TOKEN).ceil() as usize;
+        assert_eq!(estimate_prompt_tokens(chars), expected);
+    }
 
     #[test]
     fn validate_n_ctx_rejects_zero() {

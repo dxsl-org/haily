@@ -36,6 +36,7 @@ fn new_action<'a>(session_id: &'a str, key: &'a str) -> journal::NewAction<'a> {
         compensation_plan: Some(r#"{"op":"unlink","id":1}"#),
         turn_id: None,
         retention_days: 30,
+        manifest_hash: None,
     }
 }
 
@@ -523,4 +524,104 @@ async fn delete_traces_older_than_removes_only_stale_rows() {
     let remaining = skills::recent_traces(&db, 10).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, fresh.id);
+}
+
+// -- Phase 8 (Activate & Measure): approval aggregation + backfill cursor ---
+
+/// Migration 0020: `compute_daily_rollup` must SUM the per-turn
+/// `approval_requested`/`approval_denied` booleans (already recorded on
+/// `kms_task_traces` by `record_outcome_and_update_skill`'s `approval_stats` call)
+/// into the daily counters, so a day's approval activity survives past
+/// `RAW_RETENTION_DAYS` raw-trace pruning.
+#[tokio::test]
+async fn compute_daily_rollup_sums_approval_requested_and_denied_counts() {
+    let (db, _dir) = setup().await;
+    let sid = make_session(&db).await;
+    let date = "2026-06-20";
+
+    // Three turns: one approval requested+granted, one requested+denied, one with
+    // no approval interaction at all.
+    for (requested, denied) in [(Some(true), Some(false)), (Some(true), Some(true)), (Some(false), Some(false))] {
+        let trace = skills::insert_trace(
+            &db,
+            &sid,
+            "task",
+            "[]",
+            "success",
+            Some(10),
+            skills::TraceMetrics {
+                approval_requested: requested,
+                approval_denied: denied,
+                ..skills::TraceMetrics::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE kms_task_traces SET created_at = ? WHERE id = ?")
+            .bind(format!("{date}T10:00:00+00:00"))
+            .bind(&trace.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    skills::compute_daily_rollup(&db, date).await.unwrap();
+
+    let rows = skills::rollup_for_date(&db, date).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].approval_requested_count, 2, "two of three turns requested approval");
+    assert_eq!(rows[0].approval_denied_count, 1, "one of the two requested turns was denied");
+}
+
+/// A rollup row written with no approval interaction (both columns `Some(false)` or
+/// `None`) must read back as a real `0`, never fabricate a non-zero count.
+#[tokio::test]
+async fn compute_daily_rollup_approval_counts_are_zero_when_no_approvals_occurred() {
+    let (db, _dir) = setup().await;
+    let sid = make_session(&db).await;
+    let date = "2026-06-21";
+
+    let trace = skills::insert_trace(&db, &sid, "task", "[]", "success", Some(10), no_metrics())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE kms_task_traces SET created_at = ? WHERE id = ?")
+        .bind(format!("{date}T10:00:00+00:00"))
+        .bind(&trace.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    skills::compute_daily_rollup(&db, date).await.unwrap();
+    let rows = skills::rollup_for_date(&db, date).await.unwrap();
+    assert_eq!(rows[0].approval_requested_count, 0);
+    assert_eq!(rows[0].approval_denied_count, 0);
+}
+
+/// `latest_rollup_date` is the M7b backfill cursor — must be `None` before any
+/// rollup has ever run, and the lexicographically (== chronologically, for
+/// `YYYY-MM-DD`) largest date once rows exist, regardless of insertion order.
+#[tokio::test]
+async fn latest_rollup_date_tracks_the_most_recent_rolled_date() {
+    let (db, _dir) = setup().await;
+    assert_eq!(skills::latest_rollup_date(&db).await.unwrap(), None);
+
+    let sid = make_session(&db).await;
+    for date in ["2026-06-10", "2026-06-12", "2026-06-11"] {
+        let trace = skills::insert_trace(&db, &sid, "task", "[]", "success", Some(10), no_metrics())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kms_task_traces SET created_at = ? WHERE id = ?")
+            .bind(format!("{date}T10:00:00+00:00"))
+            .bind(&trace.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        skills::compute_daily_rollup(&db, date).await.unwrap();
+    }
+
+    assert_eq!(
+        skills::latest_rollup_date(&db).await.unwrap().as_deref(),
+        Some("2026-06-12"),
+        "latest_rollup_date must be the max date, not the last one inserted"
+    );
 }

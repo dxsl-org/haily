@@ -2,24 +2,30 @@
 //!
 //! Phase 3 provided the `ConnectorExecutor` trait + a test mock; phase 4 adds the generic,
 //! manifest-interpreting `HttpConnectorTool` + `HttpExecutor` (raw HTTP through the SSRF
-//! allowance guard) + the `Manifest`/`OpSpec` schema. Phase 5 adds the Odoo specialization.
+//! allowance guard) + the `Manifest`/`OpSpec` schema. Phase 5 proved an Odoo-specific
+//! `OdooExecutor` end-to-end against a live sandbox; Phase 4a authored the Odoo manifest's
+//! `auth`+`protocol` sections to reproduce that behavior on the GENERIC `HttpExecutor` and
+//! retired `OdooExecutor` — Odoo is now the first protocol-config, not a bespoke executor.
+//! `odoo_fault` (fault-shape extraction) stays: it is still the generic path's own reader
+//! (`HttpExecutor::outcome_from_parsed`), never Odoo-executor-specific.
 pub mod credential;
 pub mod executor;
 pub mod http_connector_tool;
 pub mod manifest;
-pub mod odoo_executor;
 pub mod odoo_fault;
+pub mod protocol;
 pub mod readback_diff;
 pub mod redact;
 
 pub use credential::CredentialGetter;
 pub use executor::{ConnectorExecutor, ExecOutcome};
-pub use http_connector_tool::{HttpConnectorTool, HttpExecutor};
+pub use http_connector_tool::{HttpConnectorTool, HttpExecutor, HttpExecutorConfig};
 pub use manifest::{
-    approved_version_pref_key, check_version, manifest_diff, Manifest, ManifestDiff, OpDiff,
-    OpSpec, VersionCheck,
+    approved_version_pref_key, check_version, manifest_diff, AuthSpec, FaultRule, Manifest,
+    ManifestDiff, MethodShape, ModelRequiredFields, OpDiff, OpSpec, ProtocolSpec, ReadbackSpec,
+    ResolvedAuthScheme, VersionCheck,
 };
-pub use odoo_executor::{OdooExecutor, OdooExecutorConfig};
+pub use protocol::ConnectionOverlay;
 
 use anyhow::Result;
 use async_trait::async_trait;

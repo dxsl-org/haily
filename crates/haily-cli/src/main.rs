@@ -25,6 +25,13 @@ enum Mode {
     Headless,
     /// Desktop GUI (Tauri) — use `haily gui` or run without a subcommand on desktop
     Gui,
+    /// Write a consistent standalone copy of the database to the given path (Phase 6,
+    /// manual export — same `VACUUM INTO` mechanism the scheduled backup worker uses).
+    Export {
+        /// Destination file path. The parent directory must already exist; an existing
+        /// file at this path is overwritten.
+        path: PathBuf,
+    },
 }
 
 /// Windows console-close (`CTRL_CLOSE_EVENT`) gives a hard ~5s OS kill window before
@@ -46,7 +53,20 @@ async fn main() -> Result<()> {
         Mode::Cli => run_cli(data_dir).await,
         Mode::Headless => run_headless(data_dir).await,
         Mode::Gui => run_gui(),
+        Mode::Export { path } => run_export(data_dir, path).await,
     }
+}
+
+/// `haily export <path>` — writes a consistent standalone copy of the database (same
+/// `VACUUM INTO` mechanism the scheduled backup worker uses) without starting the full
+/// app. The exported file is unencrypted and contains all local data, same trust
+/// boundary as `haily.db` itself — warned about here since there is no GUI dialog to
+/// carry that copy in this mode.
+async fn run_export(data_dir: PathBuf, dest: PathBuf) -> Result<()> {
+    eprintln!("Warning: the exported file is unencrypted and contains all local data.");
+    haily_app::export_database(&data_dir, &dest).await?;
+    eprintln!("Database exported to {}", dest.display());
+    Ok(())
 }
 
 async fn run_cli(data_dir: PathBuf) -> Result<()> {
@@ -92,6 +112,20 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
         ..BootstrapOptions::default()
     };
     let handle = AppHandle::bootstrap(&data_dir, adapters, opts).await?;
+
+    // M6b (Activate-and-Measure phase 4b): gate visibility, not activation — the env/file
+    // credential source (`HAILY_CRED_FILE` / `HAILY_CRED__*`) can be provisioned later
+    // without a restart (see `CredentialStore::headless_env_source`), so hard-blocking
+    // connector registration here would be wrong. This is a soft gate: warn loudly so an
+    // operator is never left assuming headless connectors work when every auth-requiring
+    // call will actually fail closed one at a time.
+    if haily_app::load_odoo_api_key(&handle.credential_store).await.is_none() {
+        warn!(
+            "headless: no Odoo connector credential resolvable (HAILY_CRED_FILE, \
+             HAILY_CRED__CONNECTOR_ODOO_API_KEY, or HAILY_ODOO_API_KEY) — any connector call \
+             requiring auth will fail closed until one is configured"
+        );
+    }
 
     eprintln!(
         "Haily — Headless  |  LLM: {}  |  data: {}",
