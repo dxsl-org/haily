@@ -3,6 +3,7 @@ pub mod hnsw;
 pub mod search;
 pub mod skills;
 pub mod system_prompt;
+pub mod voice_check;
 
 #[cfg(feature = "embeddings")]
 pub mod embedder;
