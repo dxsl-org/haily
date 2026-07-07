@@ -3,10 +3,14 @@
   import ModelTab from './settings/ModelTab.svelte';
   import PersonaTab from './settings/PersonaTab.svelte';
   import SafetyTab from './settings/SafetyTab.svelte';
+  import JournalBrowser from './JournalBrowser.svelte';
 
-  let { open = $bindable(false), sessionIds = () => [] as string[] } = $props();
+  let {
+    open = $bindable(false),
+    sessionIds = () => [] as string[],
+  }: { open?: boolean; sessionIds?: () => string[] } = $props();
 
-  type Tab = 'model' | 'persona' | 'safety';
+  type Tab = 'model' | 'persona' | 'safety' | 'journal';
   let tab = $state<Tab>('model');
   let prefs = $state<Record<string, string>>({});
   let loading = $state(false);
@@ -39,6 +43,7 @@
     { id: 'model',   label: 'Model LLM' },
     { id: 'persona', label: 'Persona' },
     { id: 'safety',  label: 'Safety' },
+    { id: 'journal', label: 'Nhật ký' },
   ];
 </script>
 
@@ -72,8 +77,10 @@
         <ModelTab {prefs} {save} />
       {:else if tab === 'persona'}
         <PersonaTab {prefs} {save} />
+      {:else if tab === 'safety'}
+        <SafetyTab {prefs} {save} />
       {:else}
-        <SafetyTab {prefs} {save} {sessionIds} />
+        <JournalBrowser {sessionIds} />
       {/if}
     </div>
   </div>

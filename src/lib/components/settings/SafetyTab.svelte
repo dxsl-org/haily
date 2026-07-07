@@ -1,22 +1,19 @@
 <script lang="ts">
-  // Phase 6 surface: the kill switch (pause all writes) and a recent-actions/undo list.
-  // Plain, non-technical copy throughout — no "RiskTier"/"kill switch"/"compensation"
-  // jargon in anything the user reads (the code comments keep those terms for devs).
-  import { sendMessage } from '$lib/tauri';
-  import { listJournal, exportDatabase, type JournalEntry } from '$lib/tauri';
+  // Phase 6 surface: the kill switch (pause all writes) + data export. The recent-actions/
+  // undo list that used to live here was extracted into its own Settings tab
+  // (`JournalBrowser.svelte`, mounted from `Settings.svelte`) — this tab stays
+  // safety-toggle-only. Plain, non-technical copy throughout — no "RiskTier"/"kill
+  // switch"/"compensation" jargon in anything the user reads (the code comments keep
+  // those terms for devs).
+  import { exportDatabase } from '$lib/tauri';
   import { save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 
   let {
     prefs,
     save,
-    sessionIds,
   }: {
     prefs: Record<string, string>;
     save: (key: string, value: string) => Promise<void>;
-    /** Every session id this GUI instance has started — see `+page.svelte`. There is no
-     * single "current session" (each turn mints a fresh one), so the recent-actions list
-     * is scoped to "this app run" rather than to one conversation. */
-    sessionIds: () => string[];
   } = $props();
 
   // `safety.disable_writes` defaults to unset (writes enabled) until the user first
@@ -51,68 +48,6 @@
     } finally {
       dismissingFallback = false;
     }
-  }
-
-  let entries = $state<JournalEntry[]>([]);
-  let loading = $state(false);
-  let loadError = $state('');
-
-  async function loadEntries() {
-    loading = true;
-    loadError = '';
-    try {
-      entries = await listJournal(sessionIds());
-    } catch (e) {
-      loadError = String(e);
-    } finally {
-      loading = false;
-    }
-  }
-
-  $effect(() => {
-    loadEntries();
-  });
-
-  // Undo has no dedicated backend call (phase 6 is surface-only) — it sends a precise
-  // chat instruction naming the journal id, which the LLM turns into a `journal_undo`
-  // tool call through the normal approval-gated path. The tool's own reply text already
-  // reports the three batch counts (undone/failed/not_attempted), so it renders in the
-  // main chat like any other assistant message rather than being re-parsed here.
-  let undoing = $state<string | null>(null);
-  let undoError = $state('');
-  async function requestUndo(id: string) {
-    if (undoing) return;
-    undoing = id;
-    undoError = '';
-    try {
-      await sendMessage(`Undo the action with journal id "${id}".`);
-    } catch (e) {
-      undoError = String(e);
-    } finally {
-      undoing = null;
-    }
-  }
-
-  function statusLabel(entry: JournalEntry): string {
-    switch (entry.undoStatus) {
-      case 'undone':
-        return 'Undone';
-      case 'stuck':
-        return 'Stuck — needs manual action';
-      case 'compensation_failed':
-        return 'Undo failed — can retry';
-      case 'refused':
-        return 'Undo refused';
-      case 'undo_requested':
-      case 'compensating':
-        return 'Undo in progress…';
-      default:
-        return 'Not undone';
-    }
-  }
-
-  function canUndo(entry: JournalEntry): boolean {
-    return entry.undoStatus === 'not_requested' || entry.undoStatus === 'compensation_failed';
   }
 
   // Phase 6 ("Activate & Measure"): `backup.age_warning_active` is a PERSISTED flag the
@@ -226,51 +161,6 @@
       </button>
     </div>
   </div>
-
-  <div class="block">
-    <div class="list-header">
-      <span class="switch-title">Recent actions</span>
-      <button class="refresh-btn icon" onclick={loadEntries} title="Refresh" disabled={loading}>↻</button>
-    </div>
-
-    {#if loading}
-      <div class="empty">Loading…</div>
-    {:else if loadError}
-      <div class="status-error">⚠️ {loadError}</div>
-    {:else if entries.length === 0}
-      <div class="empty">Nothing to undo yet.</div>
-    {:else}
-      <div class="entry-list">
-        {#each entries as entry (entry.id)}
-          <div class="entry">
-            <div class="entry-main">
-              <span class="entry-tool"><code>{entry.toolName}</code></span>
-              <span class="entry-status">{statusLabel(entry)}</span>
-            </div>
-            <div class="entry-meta">{entry.createdAt}</div>
-            {#if entry.undoStatus === 'stuck'}
-              <div class="stuck-plan">
-                <span class="hint">This one couldn't be undone automatically. Raw plan for manual action:</span>
-                <pre>{entry.compensationPlan ?? '(none recorded)'}</pre>
-              </div>
-            {:else if canUndo(entry)}
-              <button
-                class="undo-btn"
-                onclick={() => requestUndo(entry.id)}
-                disabled={undoing === entry.id}
-              >
-                {undoing === entry.id ? 'Undoing…' : 'Undo'}
-              </button>
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/if}
-
-    {#if undoError}
-      <div class="status-error">⚠️ {undoError}</div>
-    {/if}
-  </div>
 </div>
 
 <style>
@@ -328,61 +218,6 @@
   }
   .switch.on { background: #4c1d95; border-color: #7c3aed; }
   .switch.on .knob { transform: translateX(18px); background: #e0dff5; }
-
-  .list-header { display: flex; align-items: center; justify-content: space-between; }
-
-  .refresh-btn {
-    flex-shrink: 0;
-    padding: 6px 10px;
-    border: 1px solid #2e2e4a;
-    border-radius: 8px;
-    background: #16162a;
-    color: #8884aa;
-    font-size: 13px;
-    cursor: pointer;
-    transition: color 0.15s, border-color 0.15s;
-  }
-  .refresh-btn.icon { width: 30px; padding: 4px 0; text-align: center; }
-  .refresh-btn:hover:not(:disabled) { color: #c084fc; border-color: #4a3a7a; }
-  .refresh-btn:disabled { opacity: 0.5; cursor: default; }
-
-  .empty {
-    font-size: 12px;
-    color: #6b6b8a;
-    padding: 10px;
-    background: #0f0f18;
-    border-radius: 8px;
-    border: 1px dashed #2e2e4a;
-  }
-
-  .entry-list { display: flex; flex-direction: column; gap: 8px; }
-  .entry {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 10px;
-    background: #0f0f18;
-    border: 1px solid #23233a;
-    border-radius: 8px;
-  }
-  .entry-main { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .entry-tool code { color: #a09ac0; font-size: 12px; }
-  .entry-status { font-size: 11px; color: #8884aa; }
-  .entry-meta { font-size: 10px; color: #4a4a6a; }
-
-  .stuck-plan { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
-  .stuck-plan pre {
-    background: #16162a;
-    border: 1px solid #2a2a45;
-    border-radius: 6px;
-    padding: 8px;
-    font-size: 11px;
-    color: #f87171;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 120px;
-    overflow: auto;
-  }
 
   .undo-btn {
     align-self: flex-start;

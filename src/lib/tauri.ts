@@ -150,6 +150,10 @@ export interface JournalEntry {
   createdAt: string;
   undoneAt: string | null;
   retentionExpiresAt: string;
+  /** Owning connector manifest's content hash (Phase 6, additive) — `null` for a local-tool
+   * row (no manifest) or one written before this column existed. Mirrors
+   * `haily_db::queries::journal::ActionJournalRow::manifest_hash`. */
+  manifestHash: string | null;
 }
 
 /**
