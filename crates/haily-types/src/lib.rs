@@ -103,6 +103,60 @@ pub enum Notification {
     WorkItemsChanged(Vec<WorkItemStatus>),
 }
 
+/// A single discrete proactive event, shaped for a dedicated display surface (the
+/// GUI's card panel — phase 08) rather than the raw daemon-wide `Notification`
+/// broadcast. Deliberately a SEPARATE type rather than re-wrapping `Notification`
+/// directly: `Notification::WorkItemsChanged` is a full-snapshot concern with its own
+/// channel/panel (phase 5) and does not belong on a "discrete event" surface, and
+/// keeping this enum closed to the other three variants stops that surface from
+/// silently growing new unrelated cases underneath it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProactiveCard {
+    /// Synthetic per-event id — a stable list key for the frontend, NOT a DB row id
+    /// (a `ReminderFired` card's `reminder_id` is the DB-backed id, when one exists).
+    pub id: Uuid,
+    /// RFC3339 generation time, for display only ("fired at HH:MM"). Ordering of
+    /// cards for eviction/rendering purposes comes from `Vec` insertion order, not
+    /// this field — see `ProactiveCard::from_notification`'s callers.
+    pub created_at: String,
+    pub kind: ProactiveCardKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ProactiveCardKind {
+    MorningBrief { text: String },
+    Alert { title: String, body: String, urgent: bool },
+    ReminderFired { reminder_id: Uuid, title: String },
+}
+
+impl ProactiveCard {
+    /// Builds a card from a `Notification`. Returns `None` for `WorkItemsChanged` —
+    /// that variant is forwarded over its own dedicated channel (see
+    /// `haily_io::gui::GuiWorkItemsReceiver`) and has no card representation; callers
+    /// must treat `None` as "nothing to forward on this surface", not an error.
+    pub fn from_notification(msg: &Notification) -> Option<Self> {
+        let kind = match msg {
+            Notification::MorningBrief(text) => ProactiveCardKind::MorningBrief { text: text.clone() },
+            Notification::Alert { title, body, urgent } => ProactiveCardKind::Alert {
+                title: title.clone(),
+                body: body.clone(),
+                urgent: *urgent,
+            },
+            Notification::ReminderFired { reminder_id, title } => ProactiveCardKind::ReminderFired {
+                reminder_id: *reminder_id,
+                title: title.clone(),
+            },
+            Notification::WorkItemsChanged(_) => return None,
+        };
+        Some(ProactiveCard {
+            id: Uuid::new_v4(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            kind,
+        })
+    }
+}
+
 pub type RequestSender = tokio::sync::mpsc::Sender<Request>;
 pub type RequestReceiver = tokio::sync::mpsc::Receiver<Request>;
 
@@ -363,6 +417,74 @@ mod tests {
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
+    }
+
+    /// `WorkItemsChanged` has no card representation — this is the load-bearing
+    /// guarantee `haily_io::gui::GuiAdapter::notify` relies on to know when NOT to
+    /// touch the proactive-card watch channel.
+    #[test]
+    fn proactive_card_from_work_items_changed_is_none() {
+        let msg = Notification::WorkItemsChanged(vec![]);
+        assert!(ProactiveCard::from_notification(&msg).is_none());
+    }
+
+    /// Every non-`WorkItemsChanged` variant maps to a card carrying the same data,
+    /// plus a freshly-minted id and timestamp.
+    #[test]
+    fn proactive_card_from_each_discrete_kind() {
+        let brief = ProactiveCard::from_notification(&Notification::MorningBrief("hi".into()))
+            .expect("MorningBrief must produce a card");
+        assert!(matches!(brief.kind, ProactiveCardKind::MorningBrief { text } if text == "hi"));
+
+        let alert = ProactiveCard::from_notification(&Notification::Alert {
+            title: "t".into(),
+            body: "b".into(),
+            urgent: true,
+        })
+        .expect("Alert must produce a card");
+        match alert.kind {
+            ProactiveCardKind::Alert { title, body, urgent } => {
+                assert_eq!(title, "t");
+                assert_eq!(body, "b");
+                assert!(urgent);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        let rid = Uuid::new_v4();
+        let reminder = ProactiveCard::from_notification(&Notification::ReminderFired {
+            reminder_id: rid,
+            title: "call mom".into(),
+        })
+        .expect("ReminderFired must produce a card");
+        match reminder.kind {
+            ProactiveCardKind::ReminderFired { reminder_id, title } => {
+                assert_eq!(reminder_id, rid);
+                assert_eq!(title, "call mom");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    /// Wire shape sanity: the frontend's discriminated union (`src/lib/tauri.ts`)
+    /// expects `{"type": "...", "data": {...}}` nested under the `kind` field —
+    /// mirrors `ResponseChunk`'s existing `type`/`data` convention exactly.
+    #[test]
+    fn proactive_card_kind_serializes_with_type_and_data_tags() {
+        let card = ProactiveCard {
+            id: Uuid::nil(),
+            created_at: "2026-07-07T00:00:00Z".into(),
+            kind: ProactiveCardKind::Alert {
+                title: "t".into(),
+                body: "b".into(),
+                urgent: false,
+            },
+        };
+        let json = serde_json::to_string(&card).expect("serialize");
+        assert!(json.contains("\"type\":\"Alert\""));
+        assert!(json.contains("\"data\":"));
+        let round_tripped: ProactiveCard = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(round_tripped.kind, ProactiveCardKind::Alert { urgent: false, .. }));
     }
 
     #[test]

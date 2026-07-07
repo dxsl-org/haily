@@ -10,8 +10,8 @@ use haily_db::{
     DbHandle,
 };
 use haily_io::{
-    Adapter, ApprovalResolver, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver,
-    Request, WorkItemStatus,
+    Adapter, ApprovalResolver, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver,
+    GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
 use haily_kms::KmsHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -245,6 +245,22 @@ fn spawn_work_items_bridge(ah: TauriAppHandle, mut rx: GuiWorkItemsReceiver) {
     });
 }
 
+/// Forward live proactive-card snapshots to the frontend as `haily-proactive-cards`
+/// events (phase 08). Same shape/lifecycle as `spawn_work_items_bridge` — `rx` is a
+/// latest-wins watch receiver, so this loop is idle between updates and ends only
+/// when the `GuiAdapter` (sender side) is dropped at process teardown. Unlike the
+/// work-items snapshot, the VALUE itself is already accumulated/capped per-kind on
+/// the `GuiAdapter` side (see `haily_io::gui::GuiProactiveReceiver`), so a value
+/// observed here already reflects every still-live card, not just the latest event.
+fn spawn_proactive_cards_bridge(ah: TauriAppHandle, mut rx: GuiProactiveReceiver) {
+    tauri::async_runtime::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let snapshot = rx.borrow_and_update().clone();
+            let _ = ah.emit("haily-proactive-cards", snapshot);
+        }
+    });
+}
+
 /// Best-effort shutdown on exit. A hard kill (taskkill /F, power loss) skips this
 /// entirely — SQLite WAL crash-safety is the real correctness backstop, not this path.
 fn handle_exit_requested(app_handle: &TauriAppHandle) {
@@ -265,7 +281,8 @@ pub fn run() {
         .setup(|app| {
             let data_dir = haily_app::default_data_dir();
             std::fs::create_dir_all(&data_dir)?;
-            let (gui_adapter, gui_req_tx, gui_resp_rx, gui_work_items_rx) = haily_io::GuiAdapter::new();
+            let (gui_adapter, gui_req_tx, gui_resp_rx, gui_work_items_rx, gui_proactive_rx) =
+                haily_io::GuiAdapter::new();
             let adapters: Vec<Arc<dyn Adapter>> = vec![Arc::new(gui_adapter)];
             let bootstrap = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default());
             let app_handle = tauri::async_runtime::block_on(bootstrap)
@@ -288,6 +305,7 @@ pub fn run() {
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
             spawn_work_items_bridge(app.handle().clone(), gui_work_items_rx);
+            spawn_proactive_cards_bridge(app.handle().clone(), gui_proactive_rx);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

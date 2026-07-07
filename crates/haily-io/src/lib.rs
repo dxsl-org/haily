@@ -1,12 +1,17 @@
 pub mod cli;
 pub mod gui;
 pub mod manager;
+/// Internal to this crate — pure card accumulation/eviction logic `gui.rs`'s
+/// `Adapter` impl delegates to (phase 08). Not part of the public API surface.
+mod proactive_cards;
 
 #[cfg(feature = "telegram")]
 pub mod telegram;
 
 pub use cli::CliAdapter;
-pub use gui::{GuiAdapter, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver};
+pub use gui::{
+    GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver,
+};
 pub use manager::AdapterManager;
 
 #[cfg(feature = "telegram")]
@@ -16,7 +21,8 @@ pub use telegram::TelegramAdapter;
 // without importing this adapter layer. Re-exported here so existing call sites
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
 pub use haily_types::{
-    ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus,
+    ApprovalResolver, Notification, ProactiveCard, ProactiveCardKind, Request, RequestSender,
+    ResponseChunk, WorkItemStatus,
 };
 
 use anyhow::Result;

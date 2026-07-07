@@ -210,6 +210,44 @@ export async function onWorkItemsChanged(
   return listen<WorkItemStatus[]>('haily-work-items', (event) => callback(event.payload));
 }
 
+/** Mirrors `haily_types::ProactiveCardKind`'s `#[serde(tag = "type", content = "data")]`
+ * envelope — same discriminated-union shape as `Chunk` above, for the same reason
+ * (each variant's `data` differs). */
+export type ProactiveCardKind =
+  | { type: 'MorningBrief'; data: { text: string } }
+  | { type: 'Alert'; data: { title: string; body: string; urgent: boolean } }
+  | { type: 'ReminderFired'; data: { reminder_id: string; title: string } };
+
+/** Mirrors `haily_types::ProactiveCard` — one discrete proactive event (morning brief,
+ * alert, or fired reminder) for the dedicated card panel (phase 08), distinct from the
+ * chat stream. */
+export interface ProactiveCard {
+  id: string;
+  created_at: string;
+  kind: ProactiveCardKind;
+}
+
+/**
+ * Subscribe to live proactive-card snapshots. The backend forwards these over a
+ * dedicated `watch`-channel bridge (`haily-io::gui::GuiAdapter`'s `proactive_tx`),
+ * intentionally separate from the bounded `haily-chunk` channel so a burst of
+ * proactive events can never compete with (or block behind) in-flight chat chunks —
+ * mirrors `onWorkItemsChanged`'s channel discipline exactly.
+ *
+ * Unlike work-items, the payload here is NOT a full authoritative snapshot re-fetched
+ * on demand: there is no `list_*` reconcile command for proactive events (they are
+ * discrete, not a single replaceable state), so delivery is best-effort by design —
+ * the backend already accumulates/caps cards per kind before forwarding (see
+ * `GuiProactiveReceiver`'s doc comment), but a card CAN still be lost if the frontend
+ * was never mounted to observe it. Callers should not assume every event that ever
+ * fired is eventually delivered.
+ */
+export async function onProactiveCards(
+  callback: (cards: ProactiveCard[]) => void,
+): Promise<UnlistenFn> {
+  return listen<ProactiveCard[]>('haily-proactive-cards', (event) => callback(event.payload));
+}
+
 /** Mirrors `haily_tools::connector::manifest::ManifestDiff` (Rust struct, NO camelCase
  * rename — kept snake_case here to match exactly, rather than introducing a case mismatch
  * between this and its parent `ReapprovalState`, which also stays snake_case for the same
