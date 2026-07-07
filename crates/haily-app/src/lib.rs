@@ -6,6 +6,7 @@
 //! `haily-core` itself stays io-free per the workspace's layering invariant.
 mod auto_approve;
 mod config;
+pub mod connector_config;
 pub mod credential_store;
 mod dispatch;
 mod turns;

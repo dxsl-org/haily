@@ -209,3 +209,80 @@ export async function onWorkItemsChanged(
 ): Promise<UnlistenFn> {
   return listen<WorkItemStatus[]>('haily-work-items', (event) => callback(event.payload));
 }
+
+/** Mirrors `haily_tools::connector::manifest::ManifestDiff` (Rust struct, NO camelCase
+ * rename — kept snake_case here to match exactly, rather than introducing a case mismatch
+ * between this and its parent `ReapprovalState`, which also stays snake_case for the same
+ * reason). Every tuple is `[old, new]`; `null` means that field did not change. */
+export interface ManifestDiffDto {
+  added_ops: string[];
+  removed_ops: string[];
+  changed_ops: { op_name: string; risk_tier: [string, string] | null; compensability: [string, string] | null }[];
+  auth_scheme: [string, string] | null;
+  auth_cred_ref: [string, string] | null;
+  auth_header_name: [string, string] | null;
+  auth_param_name: [string, string] | null;
+  protocol_endpoint_suffix: [string, string] | null;
+  protocol_envelope: [string, string] | null;
+  protocol_methods: [string, string] | null;
+  protocol_fault_rules: [string, string] | null;
+  protocol_readback: [string, string] | null;
+  protocol_context: [string, string] | null;
+  protocol_prevalidate: [string, string] | null;
+  /** (M1) Only populated when the manifest carries an `auth` section on either version. */
+  base_url: [string, string] | null;
+  allowed_ip_cidrs: [string[], string[]] | null;
+}
+
+/** Surfaced when a connector's live manifest version differs from the last version a human
+ * explicitly acknowledged (`acknowledgeConnectorVersion`). Mirrors
+ * `haily_app::connector_config::ReapprovalState`. */
+export interface ReapprovalState {
+  approved_version: string;
+  live_version: string;
+  diff: ManifestDiffDto;
+}
+
+/** One installed connector, for the config UI (Phase 7). Mirrors
+ * `haily_app::connector_config::ConnectorSummary`. `cred_ref` is `null` when the manifest
+ * declares no `auth` section — the credential form must not render in that case. */
+export interface ConnectorSummary {
+  id: string;
+  connector_name: string;
+  version: string;
+  status: string;
+  base_url_host: string;
+  risk_tier: string;
+  cred_ref: string | null;
+  reapproval: ReapprovalState | null;
+}
+
+/** List installed connectors (latest version per connector, any status) with their
+ * re-approval state. Read-only. */
+export async function listConnectors(): Promise<ConnectorSummary[]> {
+  return invoke('list_connectors');
+}
+
+/**
+ * Set/rotate a connector's credential. Writes straight to the OS keyring (never SQLite) and
+ * scrubs any overwritten plaintext's WAL/freelist residue server-side — the caller passes
+ * the plain secret once, over the same in-process IPC channel every other command uses, and
+ * it is never echoed back or persisted client-side.
+ */
+export async function setConnectorCredential(credRef: string, secret: string): Promise<void> {
+  return invoke('set_connector_credential', { credRef, secret });
+}
+
+/**
+ * Enable/disable a connector manifest version. Takes effect at the NEXT restart only — the
+ * backend does not hot-reload the connector registry. Callers should surface that in the UI
+ * rather than imply the toggle is instant.
+ */
+export async function setConnectorStatus(id: string, status: 'active' | 'disabled'): Promise<void> {
+  return invoke('set_connector_status', { id, status });
+}
+
+/** Acknowledge a connector's live manifest version, clearing its `reapproval` banner. */
+export async function acknowledgeConnectorVersion(connectorName: string, version: string): Promise<void> {
+  return invoke('acknowledge_connector_version', { connectorName, version });
+}

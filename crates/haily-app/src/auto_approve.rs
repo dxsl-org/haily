@@ -138,13 +138,12 @@ mod tests {
         // moved off in Phase 13b (assistant-depth: occurrence-vs-series undo +
         // exceptions) — see `retiered_delete_tools_are_no_longer_rejected` below.
         let registry = ToolRegistry::build_v1();
-        for name in ["http_request"] {
-            let names = vec![name.to_string()];
-            assert!(
-                validate_auto_approve(&names, &registry).is_err(),
-                "expected '{name}' to be rejected as a startup config error"
-            );
-        }
+        let name = "http_request";
+        let names = vec![name.to_string()];
+        assert!(
+            validate_auto_approve(&names, &registry).is_err(),
+            "expected '{name}' to be rejected as a startup config error"
+        );
     }
 
     /// Harness Completion phase 2 (`task_delete`/`note_delete`/`reminder_delete`),
