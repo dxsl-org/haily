@@ -6,7 +6,7 @@ pub mod manager;
 pub mod telegram;
 
 pub use cli::CliAdapter;
-pub use gui::{GuiAdapter, GuiRequestSender, GuiResponseReceiver};
+pub use gui::{GuiAdapter, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver};
 pub use manager::AdapterManager;
 
 #[cfg(feature = "telegram")]

@@ -11,6 +11,29 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::info;
 
+/// Convert a DB row to its wire-facing snapshot. Shared by `list_work_items_status`
+/// and the poll loop below so both clamp `progress` identically.
+fn to_status(item: work_items::WorkItem) -> WorkItemStatus {
+    WorkItemStatus {
+        title: item.title,
+        status: item.status,
+        progress: item.progress.min(100) as u8,
+        phase: item.phase,
+    }
+}
+
+/// Fetch the current active work-item set as the wire-facing `WorkItemStatus`
+/// snapshot — used by the `list_work_items` Tauri command (on-mount reconcile path,
+/// GUI phase 5). The poll loop below independently calls `work_items::list_active`
+/// (it needs the raw rows' ids for its own diffing) and reuses `to_status`.
+///
+/// # Errors
+/// Returns an error if the underlying query fails.
+pub async fn list_work_items_status(db: &DbHandle) -> anyhow::Result<Vec<WorkItemStatus>> {
+    let items = work_items::list_active(db).await?;
+    Ok(items.into_iter().map(to_status).collect())
+}
+
 /// Poll active work items every second; broadcast changes to all adapters.
 ///
 /// Adapters cache the snapshot and render it at their next natural update point
@@ -44,15 +67,7 @@ pub fn spawn_work_item_watcher(
                 continue;
             }
             last_ids = ids;
-            let summaries: Vec<WorkItemStatus> = items
-                .into_iter()
-                .map(|i| WorkItemStatus {
-                    title: i.title,
-                    status: i.status,
-                    progress: i.progress.min(100) as u8,
-                    phase: i.phase,
-                })
-                .collect();
+            let summaries: Vec<WorkItemStatus> = items.into_iter().map(to_status).collect();
             am.notify_all(Notification::WorkItemsChanged(summaries))
                 .await
                 .ok();

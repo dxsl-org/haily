@@ -172,3 +172,36 @@ export async function listJournal(sessionIds: string[]): Promise<JournalEntry[]>
 export async function exportDatabase(destPath: string): Promise<void> {
   return invoke('export_database', { destPath });
 }
+
+/** Mirrors `haily_types::WorkItemStatus` — a snapshot of one active work item. */
+export interface WorkItemStatus {
+  title: string;
+  status: string;
+  progress: number;
+  phase?: string | null;
+}
+
+/**
+ * Current active work items (queued/running/paused/interrupted), authoritative as of
+ * the call. Call this on every (re)mount of the work-items panel: the live event
+ * below is delivered over a latest-wins channel that best-effort drops intermediate
+ * snapshots under load (see `onWorkItemsChanged`), so mount-time state must always
+ * come from this fetch, never from accumulated event history alone.
+ */
+export async function listWorkItems(): Promise<WorkItemStatus[]> {
+  return invoke('list_work_items');
+}
+
+/**
+ * Subscribe to live work-item snapshot updates. The backend forwards these over a
+ * dedicated `watch`-channel bridge (`haily-io::gui::GuiAdapter`'s `work_items_tx`)
+ * that is intentionally separate from the bounded `haily-chunk` channel and is
+ * latest-wins: a burst of updates collapses to only the most recent snapshot, and an
+ * intermediate one may never reach this callback. Always pair this with a
+ * `listWorkItems()` call on mount so a dropped snapshot self-corrects.
+ */
+export async function onWorkItemsChanged(
+  callback: (items: WorkItemStatus[]) => void,
+): Promise<UnlistenFn> {
+  return listen<WorkItemStatus[]>('haily-work-items', (event) => callback(event.payload));
+}
