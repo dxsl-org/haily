@@ -2,7 +2,7 @@ use crate::recurrence::RecurrenceRule;
 use crate::DbHandle;
 use anyhow::Result;
 use chrono::{DateTime, FixedOffset};
-use sqlx::FromRow;
+use sqlx::{FromRow, Sqlite, Transaction};
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -65,9 +65,9 @@ pub async fn insert(db: &DbHandle, event: NewCalendarEvent<'_>) -> Result<Calend
 /// start/end, so `id` stays the stable join key across every occurrence of the same series —
 /// what phase 13b's occurrence-vs-series undo scopes on.
 ///
-/// Exception-aware by construction (see `fetch_exceptions`): 13b's occurrence-delete/edit
-/// table does not exist yet, so the exception set is always empty here and every expanded
-/// occurrence passes through unfiltered.
+/// Exception-aware: a recorded `calendar_exceptions` row for `(id, start_at)` (phase 13b's
+/// occurrence-delete) removes exactly that expanded occurrence from the result, without
+/// touching any sibling occurrence of the same series (see `fetch_exceptions`).
 pub async fn upcoming(db: &DbHandle, from: &str, to: &str) -> Result<Vec<CalendarEvent>> {
     let window_from = DateTime::parse_from_rfc3339(from)
         .map_err(|e| anyhow::anyhow!("calendar::upcoming: invalid 'from' '{from}': {e}"))?;
@@ -91,7 +91,7 @@ pub async fn upcoming(db: &DbHandle, from: &str, to: &str) -> Result<Vec<Calenda
     .fetch_all(db.pool())
     .await?;
 
-    let exceptions = fetch_exceptions();
+    let exceptions = fetch_exceptions(db).await?;
     let mut occurrences = Vec::new();
     for event in candidates {
         expand_event(event, window_from, window_to, &mut occurrences);
@@ -101,14 +101,88 @@ pub async fn upcoming(db: &DbHandle, from: &str, to: &str) -> Result<Vec<Calenda
     Ok(occurrences)
 }
 
-/// Exception-subtraction seam for phase 13b: occurrence-level deletes/edits will be recorded
-/// as `(event_id, occurrence_start)` pairs in a table 13b adds (its own migration — 13a adds
-/// none). That table does not exist yet, so this always returns an empty set and every
-/// expanded occurrence in `upcoming` passes through untouched. 13b only needs to replace this
-/// body with a real query against its new table — `upcoming`'s expansion/filter shape does
-/// not need to change.
-fn fetch_exceptions() -> HashSet<(String, String)> {
-    HashSet::new()
+/// Every recorded single-occurrence exception, as `(event_id, occurrence_start)` pairs —
+/// the set `upcoming` subtracts its expanded occurrences against. A plain pool-scoped read
+/// (not part of any write transaction): staleness here only means a just-deleted occurrence
+/// might still surface for the remainder of one `upcoming` call, never a correctness issue
+/// for the exception record itself.
+async fn fetch_exceptions(db: &DbHandle) -> Result<HashSet<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_id, occurrence_start FROM calendar_exceptions",
+    )
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Pre-check for `local_journaled_write`'s duplicate-attempt guard: true if this exact
+/// `(event_id, occurrence_start)` exception already exists. Run inside the caller's
+/// transaction (same connection, so no separate lock is needed — SQLite serializes writers
+/// on one transaction anyway) BEFORE the journal row is minted, since a duplicate
+/// occurrence-delete's `idempotency_key` is stable across attempts (see
+/// `LocalMutation::idempotency_id`) and would otherwise hit `action_journal`'s UNIQUE
+/// constraint directly instead of a graceful no-op.
+pub async fn exception_exists_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    event_id: &str,
+    occurrence_start: &str,
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM calendar_exceptions WHERE event_id = ? AND occurrence_start = ?",
+    )
+    .bind(event_id)
+    .bind(occurrence_start)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some())
+}
+
+/// Record a single-occurrence delete as an exception, run inside the caller's transaction
+/// (`local_journaled_write`'s C2 one-transaction contract). Idempotent via
+/// `UNIQUE(event_id, occurrence_start)` — a duplicate occurrence-delete is a no-op,
+/// `rows_affected() == 0`, which the caller treats exactly like "target not found" for any
+/// other local mutation (roll back, no journal row minted for a write that didn't happen).
+pub async fn insert_exception_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    event_id: &str,
+    occurrence_start: &str,
+) -> Result<u64> {
+    let id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    Ok(sqlx::query(
+        "INSERT INTO calendar_exceptions (id, event_id, occurrence_start, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(event_id, occurrence_start) DO NOTHING",
+    )
+    .bind(&id)
+    .bind(event_id)
+    .bind(occurrence_start)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected())
+}
+
+/// Undo of an occurrence-delete: remove the exception row — the inverse of
+/// `insert_exception_tx`, and deliberately NOT `restore_row`/`clear_deleted_at`. An
+/// exception has no mutable-field lifecycle of its own (no `deleted_at`, no other
+/// columns worth restoring): its bare EXISTENCE *is* the forward mutation, so deleting the
+/// row *is* the entire undo. `rows_affected() == 0` (already removed — e.g. a replayed
+/// undo) is the same "refuse via the mutating statement's own row count, never a separate
+/// SELECT" contract the rest of this module's C10 guards use.
+pub async fn remove_exception_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    event_id: &str,
+    occurrence_start: &str,
+) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM calendar_exceptions WHERE event_id = ? AND occurrence_start = ?")
+            .bind(event_id)
+            .bind(occurrence_start)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected(),
+    )
 }
 
 /// Expand one candidate row into its in-window occurrence(s), appending to `out`.

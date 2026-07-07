@@ -103,31 +103,34 @@ pub enum RiskTier {
     /// undoable. Covers every plain local create/update (calendar_add, note_save,
     /// note_update, memory_remember, reminder_add, task_create, task_complete,
     /// work_item_resume) AND, as of the Harness Completion phase (re-tier +
-    /// turn_id group undo), Phase 12 (KmsHandle-aware compensator), and Phase 11
-    /// assistant-depth (work_items closes its harness gap), the FIVE local
-    /// soft-delete tools whose journal/undo coverage now matches: `task_delete`,
-    /// `note_delete`, `reminder_delete`, `memory_forget`, `work_item_delete`.
-    /// `memory_forget`'s undo is a DISTINCT KMS-aware compensator
+    /// turn_id group undo), Phase 12 (KmsHandle-aware compensator), Phase 11
+    /// assistant-depth (work_items closes its harness gap), and Phase 13b
+    /// assistant-depth (calendar occurrence-vs-series undo + exceptions), the SIX
+    /// local soft-delete tools whose journal/undo coverage now matches: `task_delete`,
+    /// `note_delete`, `reminder_delete`, `memory_forget`, `work_item_delete`,
+    /// `calendar_delete`. `memory_forget`'s undo is a DISTINCT KMS-aware compensator
     /// (`KmsHandle::restore_fact`), not the generic `restore_row`, because it must
     /// ALSO re-insert/un-tombstone the fact's vector in the live HNSW index — see
-    /// `journal_undo::local_compensator`'s `LocalTable::KmsFacts` branch. The other
-    /// four (including `work_item_delete`) undo via the fully generic snapshot
-    /// compensator. Their safety net is no longer the approval prompt but: (1) the
-    /// journal + undo path, (2) a per-turn destructive-op cap enforced in DISPATCH,
-    /// not here (`MAX_AUTO_DELETES_PER_TURN` — see its doc; `haily-core::tool_call::
-    /// RETIERED_DELETE_TOOLS` MUST list every tool in this covered set — C1), and (3)
-    /// the kill switch (C8), which still blocks every `ReversibleWrite` exactly as it
-    /// blocks `IrreversibleWrite`. A tool must NEVER vary this return by args (see the
-    /// fail-closed contract above) — the cap's escalation happens in
-    /// `haily-core::tool_call::dispatch`, which treats an over-cap call as
-    /// `IrreversibleWrite` FOR THAT CALL ONLY, without this method's return value
-    /// ever changing.
+    /// `journal_undo::local_compensator`'s `LocalTable::KmsFacts` branch.
+    /// `calendar_delete` is ALSO not purely generic: its `scope='occurrence'` path
+    /// undoes via a THIRD distinct compensator arm (`LocalOpKind::DeleteOccurrence` —
+    /// removes an exception row from `calendar_exceptions`, a table separate from the
+    /// event row itself), while its `scope='series'` path undoes via the fully
+    /// generic snapshot compensator, same as `task_delete`. The remaining three
+    /// (`task_delete`/`note_delete`/`work_item_delete`) undo via that same fully
+    /// generic snapshot compensator. Their safety net is no longer the approval
+    /// prompt but: (1) the journal + undo path, (2) a per-turn destructive-op cap
+    /// enforced in DISPATCH, not here (`MAX_AUTO_DELETES_PER_TURN` — see its doc;
+    /// `haily-core::tool_call::RETIERED_DELETE_TOOLS` MUST list every tool in this
+    /// covered set — C1), and (3) the kill switch (C8), which still blocks every
+    /// `ReversibleWrite` exactly as it blocks `IrreversibleWrite`. A tool must NEVER
+    /// vary this return by args (see the fail-closed contract above) — the cap's
+    /// escalation happens in `haily-core::tool_call::dispatch`, which treats an
+    /// over-cap call as `IrreversibleWrite` FOR THAT CALL ONLY, without this method's
+    /// return value ever changing.
     ReversibleWrite,
     /// Requires human approval before executing: external egress, or a local
     /// operation gated for safety even though it may be physically reversible.
-    /// The re-tier ban still applies to `calendar_delete` (recurrence semantics —
-    /// undoing one occurrence vs. a whole series is unresolved). Do not re-tier it
-    /// until a journal/undo path that actually covers its specific semantics lands.
     IrreversibleWrite,
     /// Never executes.
     Blocked,

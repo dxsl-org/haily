@@ -8,13 +8,19 @@
 //! carry no external compensation plan — they are restored from `pre_state` directly).
 //!
 //! `LOCAL_TOOL_TABLES` is a CLOSED compile-time allowlist covering tasks/notes/reminders,
-//! `memory_forget` (Phase 12: memory-undo via KmsHandle compensator), and `work_item_delete`
-//! (Phase 11, assistant-depth: work_items closes its harness gap) — calendar (recurrence
-//! undo unresolved) is deliberately excluded and stays on its current tier/path.
+//! `memory_forget` (Phase 12: memory-undo via KmsHandle compensator), `work_item_delete`
+//! (Phase 11, assistant-depth: work_items closes its harness gap), and — Phase 13b,
+//! assistant-depth — `calendar_add`/`calendar_delete_series`/`calendar_delete_occurrence`.
 //! `memory_forget`'s undo is NOT purely generic like the other tools: it ALSO mutates
 //! the in-memory HNSW index, which cannot participate in a `sqlx::Transaction` — see the
 //! `LocalTable::KmsFacts` branch in `local_attempt_undo` below. `work_item_delete` IS
-//! purely generic (pure relational table, no vector/index coupling).
+//! purely generic (pure relational table, no vector/index coupling). `calendar_add`/
+//! `calendar_delete_series` are ALSO purely generic (plain row create/soft-delete);
+//! `calendar_delete_occurrence` is a THIRD flavor of partial membership — its undo is
+//! neither the generic restore/clear NOR a KMS-style external index call, but a dedicated
+//! `LocalOpKind::DeleteOccurrence` arm that removes an exception row from a table
+//! (`calendar_exceptions`) different from the one `LocalTable::Calendar` names — see that
+//! arm's doc comment for why a plain `restore_row` cannot express this inverse.
 use anyhow::Result;
 use haily_db::queries::journal::{self, ActionJournalRow};
 use haily_db::queries::local_snapshot::{self, LocalTable};
@@ -40,6 +46,13 @@ const LOCAL_TOOL_TABLES: &[(&str, LocalTable)] = &[
     // Phase 11 (assistant-depth): the only tool-driven work_items mutation — see
     // `LocalMutation::WorkItemDelete`'s doc comment for why create/update are absent.
     ("work_item_delete", LocalTable::WorkItems),
+    // Phase 13b (assistant-depth): `calendar_delete`'s TWO scopes are journaled under
+    // DISTINCT internal tool_name strings (the public `Tool::name()` stays
+    // `"calendar_delete"` for both — see `CalendarDeleteTool::execute`) so `op_kind`
+    // below can tell them apart without inspecting `pre_state`/`request_params`.
+    ("calendar_add", LocalTable::Calendar),
+    ("calendar_delete_series", LocalTable::Calendar),
+    ("calendar_delete_occurrence", LocalTable::Calendar),
 ];
 
 /// The kind of forward mutation a local tool performed — decides HOW to invert it.
@@ -51,14 +64,20 @@ enum LocalOpKind {
     Update,
     /// The tool soft-deleted the row. Undo = clear `deleted_at`.
     Delete,
+    /// Phase 13b: the tool recorded a single-occurrence exception (a row in
+    /// `calendar_exceptions`, NOT a mutation of the `calendar_events` row `pre_state`
+    /// would otherwise describe). Undo = remove that exception row — see this kind's
+    /// arm in `local_attempt_undo` and `calendar::remove_exception_tx`.
+    DeleteOccurrence,
 }
 
 fn op_kind(tool_name: &str) -> Option<LocalOpKind> {
     match tool_name {
-        "task_create" | "note_save" | "reminder_add" => Some(LocalOpKind::Create),
+        "task_create" | "note_save" | "reminder_add" | "calendar_add" => Some(LocalOpKind::Create),
         "task_complete" | "note_update" => Some(LocalOpKind::Update),
         "task_delete" | "note_delete" | "reminder_delete" | "memory_forget"
-        | "work_item_delete" => Some(LocalOpKind::Delete),
+        | "work_item_delete" | "calendar_delete_series" => Some(LocalOpKind::Delete),
+        "calendar_delete_occurrence" => Some(LocalOpKind::DeleteOccurrence),
         _ => None,
     }
 }
@@ -232,6 +251,38 @@ pub async fn local_attempt_undo(
             };
             local_snapshot::restore_row(&mut tx, table, &row.correlation_ref, &pre, expected_updated_at)
                 .await?
+        }
+        // Phase 13b: the forward write inserted an EXCEPTION row (a table distinct from
+        // `table`/`LocalTable::Calendar`'s `calendar_events`) — its undo is a direct
+        // `DELETE FROM calendar_exceptions`, never `restore_row`/`clear_deleted_at` (which
+        // would operate on the wrong table entirely). `pre_state` here is the hand-built
+        // `{event_id, occurrence_start}` record from `LocalMutation::explicit_pre_state`,
+        // not a column snapshot. `expected_updated_at` (the calendar_events row's own
+        // version) is deliberately UNUSED for this arm — an exception's only meaningful
+        // "version" is its own existence, guarded by `rows_affected()` below exactly like
+        // every other C10 check in this module, just against a different table.
+        LocalOpKind::DeleteOccurrence => {
+            let pre: Value = match row.pre_state.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
+                Some(v) => v,
+                None => {
+                    tx.rollback().await.ok();
+                    return refuse(db, &row.id, "không có pre_state để khôi phục ngoại lệ lịch")
+                        .await;
+                }
+            };
+            let occurrence_start = match pre.get("occurrence_start").and_then(Value::as_str) {
+                Some(s) => s,
+                None => {
+                    tx.rollback().await.ok();
+                    return refuse(db, &row.id, "thiếu occurrence_start trong pre_state").await;
+                }
+            };
+            haily_db::queries::calendar::remove_exception_tx(
+                &mut tx,
+                &row.correlation_ref,
+                occurrence_start,
+            )
+            .await?
         }
     };
 
