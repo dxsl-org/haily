@@ -130,14 +130,20 @@ impl AppHandle {
             }
         }
 
-        // Phase 6 (M7a, backup credential posture): a scheduled backup taken before the
-        // one known connector credential has migrated out of plaintext would retain it in
-        // the copy. Checked HERE (not in `haily-proactive`, which sits below this crate and
-        // has no visibility into keyring state) right after the migration attempt above —
-        // `Ok(None)`/a marker row means nothing plaintext-bearing is left behind; a
-        // residual plaintext row (attempt_keyring off, or a failed keyring write) means
-        // "not clean yet". A DB read error fails closed (treated as not-clean) rather than
-        // risking a plaintext-bearing first backup on an inconclusive check.
+        // Phase 6 (M7a/M7b, backup credential posture): a scheduled backup taken before
+        // the one known connector credential has migrated out of plaintext would retain
+        // it in the copy unless scrubbed. Checked HERE (not in `haily-proactive`, which
+        // sits below this crate and has no visibility into keyring state) right after
+        // the migration attempt above — `Ok(None)`/a marker row means nothing
+        // plaintext-bearing is left behind; a residual plaintext row (attempt_keyring
+        // off, or a failed keyring write) means "not clean yet". A DB read error fails
+        // closed (treated as not-clean) rather than risking an unscrubbed plaintext
+        // backup on an inconclusive check.
+        //
+        // M7b: this bool no longer gates WHETHER a backup happens (that indefinitely
+        // starved durability when the keyring is persistently unavailable) — it only
+        // tells `haily_proactive::backup` whether to scrub `ODOO_API_KEY_PREF` out of
+        // each backup's copy before promoting it. See that module's doc comment.
         let credential_migration_clean = match meta::get_preference(&db, ODOO_API_KEY_PREF).await {
             Ok(None) => true,
             Ok(Some(v)) => v.is_empty() || is_keyring_marker(&v),
@@ -229,6 +235,7 @@ impl AppHandle {
             Arc::clone(&db),
             data_dir.join("backups"),
             credential_migration_clean,
+            vec![ODOO_API_KEY_PREF.to_string()],
             shutdown.child_token(),
             tasks.clone(),
         );

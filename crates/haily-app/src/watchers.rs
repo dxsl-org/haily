@@ -126,12 +126,15 @@ pub fn spawn_journal_purge(db: Arc<DbHandle>, shutdown: CancellationToken, tasks
 /// `credential_migration_clean` is a boot-time snapshot computed in `bootstrap.rs` —
 /// the only layer with visibility into `CredentialStore`/keyring state, since this
 /// crate's `haily-proactive` dependency sits BELOW `haily-app` and must not reach back
-/// up into it. Passed down as a plain `bool` so the worker itself stays ignorant of
-/// keyring internals entirely.
+/// up into it. Passed down as a plain `bool` (plus the preference key names that may
+/// hold a plaintext credential, M7b) so the worker itself stays ignorant of keyring
+/// internals entirely — it only knows "scrub these preference keys from the copy if
+/// migration wasn't clean," never why.
 pub fn spawn_backup(
     db: Arc<DbHandle>,
     backups_dir: PathBuf,
     credential_migration_clean: bool,
+    credential_preference_keys: Vec<String>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 ) {
@@ -139,6 +142,7 @@ pub fn spawn_backup(
         db,
         backups_dir,
         credential_migration_clean,
+        credential_preference_keys,
         shutdown,
     ));
 }
