@@ -1,5 +1,8 @@
+mod backup_maintenance;
 pub mod queries;
 pub mod recurrence;
+
+pub use backup_maintenance::open_standalone_copy_for_maintenance;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};

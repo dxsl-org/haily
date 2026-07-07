@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Proactive daemon — morning brief, alerts, DND, pattern detection"
 
 [dependencies]
+anyhow      = { workspace = true }
 haily-db    = { workspace = true }
 haily-io    = { workspace = true }
 haily-kms   = { workspace = true }
@@ -18,4 +19,3 @@ chrono      = { workspace = true }
 tempfile = "3"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono"] }
 async-trait = "0.1"
-anyhow = { workspace = true }

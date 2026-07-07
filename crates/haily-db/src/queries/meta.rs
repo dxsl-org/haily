@@ -55,6 +55,19 @@ pub async fn upsert_preference(db: &DbHandle, key: &str, value: &str, source: &s
     Ok(())
 }
 
+/// Deletes a preference row by key. Used by the scheduled backup worker to scrub a
+/// plaintext-holding credential row out of a standalone backup COPY (never the live
+/// database) when boot-time credential-migration status is not clean, so no plaintext
+/// secret ships in a backup file (M7b, see `haily-proactive::backup::credential_scrub`).
+/// A no-op (not an error) if `key` is already absent.
+pub async fn delete_preference(db: &DbHandle, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM kms_preferences WHERE key = ?")
+        .bind(key)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 pub async fn all_preferences(db: &DbHandle) -> Result<Vec<Preference>> {
     Ok(
         sqlx::query_as::<_, Preference>("SELECT * FROM kms_preferences ORDER BY key")

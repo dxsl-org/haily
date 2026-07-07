@@ -58,7 +58,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | File | Purpose |
 |------|---------|
 | `crates/haily-core/src/lib.rs` | Orchestrator export, module coordination |
-| `crates/haily-core/src/agent.rs` | Agent loop, tool dispatch, streaming, multi-turn state, kill-switch re-check |
+| `crates/haily-core/src/agent/` | Agent loop split into modules — turn.rs (run_turn, TurnRuntime), sub_turn.rs (run_sub_turn, delegation memory), stream.rs (streaming + tag hold-back), outcome.rs (TaskOutcome→EMA recording, approval stats); mod.rs re-exports the public API |
 | `crates/haily-core/src/approval.rs` | Session-bound tool approval broker (real implementation) |
 | `crates/haily-core/src/budget.rs` | Token-budgeted context assembly (replaces 15-turn window) |
 | `crates/haily-core/src/feedback_parser.rs` | Vietnamese + English feedback signal detection |
@@ -67,13 +67,16 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-core/src/tool_call.rs` | Tool dispatch, risk tier gating, kill-switch exemption logic |
 | `crates/haily-kms/src/skills.rs` | Skill synthesis (Jaccard clustering), EMA confidence, exponential decay |
 | `crates/haily-kms/src/feedback.rs` | FeedbackSignal enum (Positive, Negative, Correction) |
-| `crates/haily-kms/src/hnsw.rs` | HNSW index w/ tombstones, dump/load persistence, atomic swap |
+| `crates/haily-kms/src/hnsw.rs` | HNSW index w/ tombstones, dump/load persistence, atomic swap; contains/un_tombstone primitives for memory-undo |
+| `crates/haily-kms/src/search.rs` | Hybrid recall: BM25 + HNSW-ANN fusion, per-channel relevance thresholds (default off, measure-first), recency tie-break |
+| `crates/haily-kms/src/voice_check.rs` | Deterministic persona/voice-consistency eval (no LLM-judge) — model-upgrade drift gate |
 | `crates/haily-llm/src/router.rs` | LLM routing: llama.cpp primary → cloud fallback |
 | `crates/haily-llm/src/sse.rs` | SSE parser for cloud streaming (OpenAI, Anthropic) |
 | `crates/haily-llm/src/breaker.rs` | Circuit breaker (real file; not circuit_breaker.rs) |
 | `crates/haily-db/src/queries/journal.rs` | Action journal insert, readback, undo queries (Safe Operator Harness) |
 | `crates/haily-db/src/queries/connectors.rs` | Connector manifest CRUD (Safe Operator Harness phase 4) |
 | `crates/haily-db/src/queries/` | All SQL — one file per domain |
+| `crates/haily-db/src/recurrence.rs` | RecurrenceRule engine + next_after (strict forward-progress) + occurrences_in_window; shared by reminders (proactive) and calendar |
 | `crates/haily-tools/src/lib.rs` | RiskTier enum, Tool trait, ApprovalGate trait (via haily-types re-export) |
 | `crates/haily-tools/src/connector/manifest/` | Manifest schema v2 (schema.rs: version, auth, protocol, ops, risk_tier, compensability; diff.rs: re-approval diff) |
 | `crates/haily-tools/src/connector/protocol/` | Declarative protocol interpreter (envelope/arg/fault/read-back substitution, connection overlay) |
@@ -86,9 +89,16 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-io/src/lib.rs` | Adapter trait definition, manager |
 | `crates/haily-app/src/bootstrap.rs` | Shared bootstrap (LlmConfig, db, orchestrator) |
 | `crates/haily-app/src/dispatch.rs` | Mode dispatch (GUI/CLI/headless) + adapter wiring |
-| `crates/haily-app/src/watchers.rs` | Signal handlers (Windows + Unix), graceful shutdown |
+| `crates/haily-app/src/watchers.rs` | Signal handlers (Windows + Unix), graceful shutdown, worker spawns (rollup, backup, proactive) |
+| `crates/haily-app/src/connector_config/` | Connector config admin (summary read, credential→keyring set with WAL scrub, status) — surfaced in GUI |
+| `crates/haily-proactive/src/morning_brief.rs` | Morning brief with cross-domain synthesis (task↔calendar↔reminder↔memory) |
+| `crates/haily-proactive/src/cross_domain/` | Cross-domain nudges + persistent cooldown ledger (survives restart) |
+| `crates/haily-proactive/src/backup/` | GFS SQLite backup worker (daily/weekly/monthly, configurable retention), plaintext-credential scrub of the copy |
+| `crates/haily-tools/src/schedule/` | VN/EN natural-language schedule parser (feeds reminder_add) |
+| `crates/haily-io/src/proactive_cards.rs` | Typed proactive card model + per-kind coalesce/eviction for the GUI panel |
 | `src-tauri/src/lib.rs` | Tauri app initialization (Tauri glue only) |
 | `src/lib/tauri.ts` | Typed Tauri invoke wrappers |
+| `src/lib/components/` | GUI panels: WorkItemsPanel, ProactivePanel, JournalBrowser, ConnectorConfig + settings tabs |
 
 ## Code Standards
 
