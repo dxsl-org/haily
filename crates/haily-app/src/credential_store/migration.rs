@@ -49,6 +49,44 @@ impl CredentialStore {
             .with_context(|| format!("migration: residue scrub failed after migrating '{cred_ref}'"))
     }
 
+    /// Phase 7 (Connector config UI, GUI-initiated credential set/rotate): unlike
+    /// [`Self::migrate_from_db`] (which moves a pre-existing plaintext DB value into the
+    /// keyring), this writes a BRAND NEW secret a human just typed straight into the
+    /// keyring and marks the DB row — the new value never touches SQLite at all. Still
+    /// scrubs afterward because the row being overwritten MAY have held a legacy plaintext
+    /// secret (never migrated, or written by the write-fallback opt-in) — the same hazard
+    /// `migrate_from_db` guards against.
+    ///
+    /// Deliberately calls [`Self::scrub_residue`] directly rather than the flag-gated
+    /// [`Self::ensure_scrubbed`]: `ensure_scrubbed`'s `SCRUB_CONFIRMED_PREF` check is a
+    /// boot-time optimization (skip a redundant whole-DB VACUUM once nothing has changed
+    /// since the last scrub — safe at boot because nothing new happens between checks). A
+    /// GUI credential set is the OPPOSITE case: it is the one moment something may have
+    /// just been overwritten, so skipping the scrub because an EARLIER, unrelated
+    /// credential already flipped the global flag would strand THIS call's own residue
+    /// forever. A human-initiated set/rotate is rare enough that paying the VACUUM cost
+    /// unconditionally here is the correct trade, not a per-boot one.
+    ///
+    /// # Errors
+    /// Returns `Err` if the keyring write, the marker write, or the residue scrub fails. On
+    /// a keyring failure the DB row is left untouched (same no-data-loss contract as
+    /// `set_secret`/`migrate_from_db`).
+    pub async fn set_credential(&self, cred_ref: &str, secret: &str) -> Result<()> {
+        self.set_secret(cred_ref, secret)
+            .await
+            .with_context(|| format!("set_credential: failed to write '{cred_ref}' to keyring"))?;
+        meta::upsert_preference(&self.db, cred_ref, &keyring_marker(cred_ref), "connector_config_gui")
+            .await
+            .with_context(|| format!("set_credential: failed to write marker for '{cred_ref}'"))?;
+        self.scrub_residue()
+            .await
+            .with_context(|| format!("set_credential: residue scrub failed after setting '{cred_ref}'"))?;
+        meta::upsert_preference(&self.db, SCRUB_CONFIRMED_PREF, "true", "connector_config_gui")
+            .await
+            .with_context(|| "set_credential: failed to persist scrub confirmation".to_string())?;
+        Ok(())
+    }
+
     /// M6c: re-run the residue scrub until the SEPARATE `SCRUB_CONFIRMED_PREF` flag is set —
     /// idempotent and safe to call every boot regardless of which cred_ref triggered it (the
     /// scrub walks the WHOLE database file, not per-cred_ref residue). A scrub that itself

@@ -114,6 +114,24 @@ async fn status_update_succeeds_positive_trigger() {
     );
 }
 
+/// Phase 7 (Connector config UI): `list_all` is the GUI's read path — unlike `list_active`
+/// (registry-only, excludes `disabled`), it must show every row so a human can re-enable a
+/// disabled connector from the config screen.
+#[tokio::test]
+async fn list_all_includes_disabled_rows_that_list_active_excludes() {
+    let (db, _dir) = setup().await;
+    let j1 = manifest_json("1");
+    let row = connectors::insert_version(&db, new_manifest("1", &j1))
+        .await
+        .unwrap();
+    connectors::set_status(&db, &row.id, "disabled").await.unwrap();
+
+    assert!(connectors::list_active(&db).await.unwrap().is_empty());
+    let all = connectors::list_all(&db).await.unwrap();
+    assert_eq!(all.len(), 1, "list_all must still surface the disabled row");
+    assert_eq!(all[0].status, "disabled");
+}
+
 #[tokio::test]
 async fn manifest_json_update_aborts_negative_trigger() {
     // NEGATIVE: manifest_json/content_hash/version are immutable per version — a direct

@@ -333,6 +333,26 @@ impl HnswIndex {
     pub fn tombstoned_ids(&self) -> Vec<String> {
         self.tombstones.read().expect("tombstones read lock").iter().cloned().collect()
     }
+
+    /// True if `id` has EVER been inserted into `id_map` — regardless of tombstone
+    /// status. This is the branch a `memory_forget` undo (`KmsHandle::restore_fact`)
+    /// uses to decide `un_tombstone` (id still physically present — no compaction has
+    /// run since it was forgotten) vs. re-insert-from-BLOB (a rebuild already dropped
+    /// it from the graph). Linear scan over `id_map`: acceptable here because a
+    /// restore is a rare, user-initiated undo action, not a hot path like `search`.
+    pub fn contains(&self, id: &str) -> bool {
+        self.id_map.read().expect("id_map read lock").iter().any(|existing| existing == id)
+    }
+
+    /// Clear a tombstone (undo of `tombstone`), restoring ANN visibility for an id that
+    /// is STILL present in `id_map`. Callers MUST check `contains(id)` first — calling
+    /// this for an id absent from `id_map` is a silent no-op on the tombstone set (the
+    /// id was never hiding anything), never a `contains`-vs-`insert` substitute: an
+    /// absent id must go through `insert` (from the stored embedding BLOB) instead, or
+    /// it stays permanently unsearchable.
+    pub fn un_tombstone(&self, id: &str) {
+        self.tombstones.write().expect("tombstones write lock").remove(id);
+    }
 }
 
 impl Default for HnswIndex {

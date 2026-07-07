@@ -70,11 +70,20 @@ impl HttpConnectorTool {
     /// PREVIOUS field values are lifted from the captured `pre_state` for exactly the fields
     /// this write changes — that is what makes "restore the previous values" a real undo rather
     /// than a no-op. Fields absent from pre_state are left out (nothing to restore).
+    ///
+    /// `secret` (Phase 6 write-side fix): `pre_state` here is the RAW `pre_state_body`, NOT the
+    /// already-scrubbed `pre_state` string stored separately — a value lifted verbatim out of it
+    /// could still carry a server-reflected resolved credential. `restore_values` scrubs every
+    /// lifted value through the same M3 sanitize pass BEFORE it is written into this (mutable,
+    /// undo-critical) `compensation_plan` column, so the honored contract documented on
+    /// `journal.rs`'s `ActionJournalRow::request_params` ("caller-sanitized") now actually holds
+    /// for `compensation_plan` too.
     fn compensation_plan(
         &self,
         params: &Value,
         pre_state: Option<&Value>,
         returned_id: Option<&str>,
+        secret: Option<&str>,
     ) -> Option<String> {
         let mut plan = self.op.compensation.clone()?;
         let obj = plan.as_object_mut()?;
@@ -102,7 +111,7 @@ impl HttpConnectorTool {
         let is_write_back =
             obj.get("op").and_then(Value::as_str) == Some("write") && !obj.contains_key("values");
         if is_write_back {
-            if let Some(restored) = restore_values(params, pre_state) {
+            if let Some(restored) = restore_values(params, pre_state, secret) {
                 obj.insert("values".to_string(), restored);
             }
         }
@@ -129,19 +138,44 @@ fn params_target_id(params: &Value) -> Option<String> {
 /// `pre_state` — the object to write back to undo the change. Returns `None` when there is
 /// nothing to restore (no pre_state or no writable fields), so the caller leaves the
 /// compensation template untouched rather than writing an empty `values`.
-fn restore_values(params: &Value, pre_state: Option<&Value>) -> Option<Value> {
+///
+/// `pre_state` is the RAW pre-write body (unlike the already-scrubbed `pre_state` string the
+/// journal row separately stores) — every lifted value is run through
+/// [`sanitize_restored_value`] before insertion so a resolved credential a server reflected
+/// back into a to-be-restored field can never reach `compensation_plan` (Phase 6 write-side fix).
+fn restore_values(params: &Value, pre_state: Option<&Value>, secret: Option<&str>) -> Option<Value> {
     let pre = pre_state?;
     let written = params.get("values")?.as_object()?;
     let mut restored = serde_json::Map::new();
     for key in written.keys() {
         if let Some(prev) = pre.get(key) {
-            restored.insert(key.clone(), prev.clone());
+            restored.insert(key.clone(), sanitize_restored_value(prev, secret));
         }
     }
     if restored.is_empty() {
         None
     } else {
         Some(Value::Object(restored))
+    }
+}
+
+/// Recursively scrub every string leaf of `value` through [`redact::sanitize_third_party_body`]
+/// (M3 secret-scrub + C5 tag-strip) — applied to values lifted verbatim out of the RAW
+/// `pre_state_body` before they enter the mutable, undo-critical `compensation_plan` column.
+/// Non-string leaves (numbers/bools/null) pass through unchanged: nothing to scrub, and
+/// stringifying them would corrupt the value's type for a later compensating write.
+fn sanitize_restored_value(value: &Value, secret: Option<&str>) -> Value {
+    match value {
+        Value::String(s) => Value::String(redact::sanitize_third_party_body(s, secret)),
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|v| sanitize_restored_value(v, secret)).collect())
+        }
+        Value::Object(obj) => Value::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), sanitize_restored_value(v, secret)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -229,8 +263,12 @@ impl Tool for HttpConnectorTool {
 
         // 2. Build the compensation plan: an UPDATE/ARCHIVE carries its target ids (from the
         //    request) + restored previous values now; a CREATE's returned id is filled in
-        //    post-call (step 5b).
-        let compensation_plan = self.compensation_plan(&params, pre_state_body.as_ref(), None);
+        //    post-call (step 5b). `comp_secret` is resolved fresh here (never cached, mirroring
+        //    every other `resolved_secret()` call site in this method) so `restore_values` can
+        //    scrub it out of any RAW pre_state field it lifts into `values` (Phase 6 fix).
+        let comp_secret = self.executor.resolved_secret().await;
+        let compensation_plan =
+            self.compensation_plan(&params, pre_state_body.as_ref(), None, comp_secret.as_deref());
 
         // 3. OUTBOX insert BEFORE the external call — redacted params (C4). A crash after
         //    this point still leaves the plan + pre_state on disk for reconciliation.
@@ -300,7 +338,10 @@ impl Tool for HttpConnectorTool {
         //     absent at undo time (a lost create leaves no compensation target).
         if self.op.is_create() {
             if let Some(id) = returned_id.as_deref() {
-                if let Some(plan) = self.compensation_plan(&params, None, Some(id)) {
+                // `pre_state` is `None` for a create (step 1), so `restore_values` never runs
+                // and there is nothing for `secret` to scrub here — `None` is correct, not a
+                // shortcut.
+                if let Some(plan) = self.compensation_plan(&params, None, Some(id), None) {
                     journal::update_compensation_plan(&ctx.db, &row.id, &plan).await?;
                 }
             }
@@ -1047,6 +1088,102 @@ mod tests {
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         };
         (c, dir)
+    }
+
+    /// Wraps a [`MockExecutor`] to also resolve a fixed secret (`MockExecutor` itself never
+    /// overrides `resolved_secret`, per its trait default) — the write-side compensation-plan
+    /// scrub test needs `execute()`'s `self.executor.resolved_secret()` call to return
+    /// `Some(secret)` so the fix under test has something to scrub.
+    struct SecretMockExecutor {
+        inner: MockExecutor,
+        secret: String,
+    }
+
+    #[async_trait]
+    impl ConnectorExecutor for SecretMockExecutor {
+        async fn call(&self, op: &str, params: &Value) -> Result<ExecOutcome> {
+            self.inner.call(op, params).await
+        }
+        async fn read_back(
+            &self,
+            op: &str,
+            correlation_ref: &str,
+            model_hint: Option<&str>,
+            id_hint: Option<&str>,
+        ) -> Result<Value> {
+            self.inner.read_back(op, correlation_ref, model_hint, id_hint).await
+        }
+        async fn resolved_secret(&self) -> Option<String> {
+            Some(self.secret.clone())
+        }
+    }
+
+    /// An update-style op whose compensation is a plain write-back (`{"op":"write"}`, no
+    /// `values` template) — the `restore_values` path this test exercises only ever runs for
+    /// this shape (a create's plan has no pre_state to restore from).
+    fn update_op_spec() -> Arc<OpSpec> {
+        let m = manifest::parse(
+            r#"{"connector_name":"odoo","version":"1","base_url":"https://erp.example.com",
+                "allowed_ip_cidrs":[],
+                "ops":[{"name":"odoo_contact_update","model":"res.partner","method":"write",
+                        "risk_tier":"ReversibleWrite","compensability":"compensatable",
+                        "compensation":{"op":"write"}}]}"#,
+        )
+        .unwrap();
+        Arc::new(m.ops[0].clone())
+    }
+
+    #[tokio::test]
+    async fn compensation_plan_scrubs_resolved_secret_from_restored_pre_state_value() {
+        // Phase 6 write-side fix: `restore_values` lifts a field's PREVIOUS value out of the
+        // RAW pre_state_body — here that value happens to contain the connector's own
+        // resolved credential (a server reflecting it back in a third-party field, the same
+        // shape M3 already guards for `pre_state`/`post_state`). Before the fix this leaked
+        // verbatim into `compensation_plan`.
+        let (db, _d) = db().await;
+        let secret = "sk-LEAK-42".to_string();
+        let mock = MockExecutor::new(
+            vec![ExecOutcome::Ok {
+                returned_id: None,
+                body: json!({}),
+            }],
+            vec![
+                // pre-state: the field about to be overwritten currently holds the secret.
+                Some(json!({"note": format!("issued with {secret}"), "write_date": "v1"})),
+                // post-state read-back.
+                Some(json!({"note": "updated note", "write_date": "v2"})),
+            ],
+        );
+        let exec = Arc::new(SecretMockExecutor { inner: mock, secret: secret.clone() });
+        let tool = HttpConnectorTool {
+            manifest: full_manifest(),
+            op: update_op_spec(),
+            executor: exec,
+            kill: Arc::new(AtomicBool::new(false)),
+            cred_ref: "odoo.api_key".into(),
+            manifest_hash: "test-hash".into(),
+        };
+        let (ctx, _kd) = ctx(db.clone()).await;
+        tool.execute(
+            json!({"params": {"ids": [7], "values": {"note": "updated note"}}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let rows = journal::list_by_session(&db, &ctx.session_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let plan = rows[0].compensation_plan.as_deref().unwrap();
+        assert!(
+            !plan.contains(&secret),
+            "compensation_plan must not contain the resolved secret: {plan}"
+        );
+        assert!(
+            plan.contains("issued with"),
+            "non-secret restored text must be preserved: {plan}"
+        );
     }
 
     #[tokio::test]

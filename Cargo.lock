@@ -2240,6 +2240,7 @@ dependencies = [
  "haily-tools",
  "haily-types",
  "keyring",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2370,9 +2371,12 @@ dependencies = [
 name = "haily-proactive"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "chrono",
  "haily-db",
  "haily-io",
+ "haily-kms",
  "sqlx",
  "tempfile",
  "tokio",
@@ -2430,6 +2434,7 @@ name = "haily-types"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",

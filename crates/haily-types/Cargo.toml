@@ -10,6 +10,9 @@ uuid  = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = "0.1"
+# Only used for `ProactiveCard::created_at`'s RFC3339 stamp (phase 08) — already a
+# workspace dep used throughout the other crates.
+chrono = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

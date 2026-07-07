@@ -209,6 +209,7 @@ impl AppHandle {
         if opts.enable_daemon {
             watchers::spawn_proactive_daemon(
                 Arc::clone(&db),
+                Arc::clone(&kms),
                 am.clone(),
                 shutdown.child_token(),
                 tasks.clone(),

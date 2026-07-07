@@ -69,6 +69,21 @@ pub async fn list_active(db: &DbHandle) -> Result<Vec<ConnectorManifestRow>> {
     .await?)
 }
 
+/// Every manifest row regardless of status — used by the GUI connector-config surface
+/// (Phase 7) so a human can see (and re-enable) a `disabled` connector, unlike
+/// [`list_active`], which the registry uses at startup and deliberately excludes them.
+/// Read-only; still no Tool/LLM path reads or writes this.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_all(db: &DbHandle) -> Result<Vec<ConnectorManifestRow>> {
+    Ok(sqlx::query_as::<_, ConnectorManifestRow>(
+        "SELECT * FROM connector_manifests ORDER BY connector_name ASC, created_at DESC",
+    )
+    .fetch_all(db.pool())
+    .await?)
+}
+
 /// Fetch one manifest by its (connector_name, version) approval unit. `None` if absent.
 ///
 /// # Errors

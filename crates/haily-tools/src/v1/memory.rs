@@ -1,9 +1,16 @@
+use super::set_last_journal_id;
+use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::queries::facts;
+use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
 use haily_kms::feedback::{self, FeedbackSignal};
 use serde_json::{json, Value};
+
+/// Days a local-tool journal row's captured content is retained before purge — mirrors
+/// `crate::LOCAL_RETENTION_DAYS` (see `v1::tasks`'s identical constant/doc).
+const LOCAL_RETENTION_DAYS: i64 = crate::LOCAL_RETENTION_DAYS;
 
 // ---------------------------------------------------------------------------
 // MemoryRememberTool
@@ -252,18 +259,38 @@ impl Tool for MemoryForgetTool {
             "required": ["id"]
         })
     }
+    /// Re-tiered `ReversibleWrite` (Phase 12: memory-undo via KmsHandle compensator) —
+    /// journaled + undoable (`KmsHandle::restore_fact`) exactly like `task_delete`/
+    /// `note_delete`/`reminder_delete`. Covered by the SAME per-turn destructive-op cap
+    /// (`"memory_forget"` is in `haily-core::tool_call::RETIERED_DELETE_TOOLS`) and the
+    /// kill switch — see `RiskTier::ReversibleWrite`'s doc.
     fn risk_tier(&self, _args: &Value) -> RiskTier {
-        RiskTier::IrreversibleWrite
+        RiskTier::ReversibleWrite
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let id = args["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("id required"))?;
-        // Routes through `KmsHandle::forget_fact` (not `facts::soft_delete` directly)
-        // so the fact is tombstoned out of ANN search in this same process — a bare
-        // DB soft-delete would leave it reachable via HNSW until the next rebuild.
-        if ctx.kms.forget_fact(id).await? {
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        // The DB half runs inside `local_journaled_write`'s transaction (mints the
+        // journal row atomically with the soft-delete); the ANN half (`index_remove`)
+        // runs AFTER commit below, since the HNSW mutation cannot participate in a
+        // `sqlx::Transaction` (haily-db has no dependency on haily-kms).
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::MemoryForget { fact_id: id },
+            &ctx.session_id.to_string(),
+            "memory_forget",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        if outcome.is_some() {
+            ctx.kms.index_remove(id);
             Ok(format!("Đã xóa fact id={id} khỏi memory."))
         } else {
             Ok(format!("Không tìm thấy fact id={id}."))

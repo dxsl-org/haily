@@ -1,6 +1,9 @@
+use super::set_last_journal_id;
+use crate::connector::redact;
 use crate::{RiskTier, Tool, ToolContext};
 use anyhow::Result;
 use async_trait::async_trait;
+use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
 use haily_db::queries::work_items;
 use serde_json::{json, Value};
 
@@ -157,5 +160,72 @@ impl Tool for WorkItemResumeTool {
             started = started,
             checkpoint = checkpoint,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkItemDeleteTool
+// ---------------------------------------------------------------------------
+/// Phase 11 (assistant-depth): the sole tool-driven destructive mutation on
+/// work_items — closes the harness gap this table previously had (no `deleted_at`,
+/// hence no journal/undo coverage). Every OTHER work_items mutation
+/// (create/start/checkpoint/complete/fail/mark_interrupted) runs internally from
+/// `agent.rs`, never through a `Tool`, so it stays outside journal coverage by
+/// design (see `LocalMutation::WorkItemDelete`'s doc comment).
+///
+/// Re-tiered `ReversibleWrite` (mirrors `task_delete`/`note_delete`/
+/// `reminder_delete`/`memory_forget`): safe ONLY because this tool routes through
+/// `local_journaled_write` (undo via the generic snapshot compensator) AND
+/// `"work_item_delete"` is listed in `haily-core::tool_call::RETIERED_DELETE_TOOLS`
+/// (C1) — both landed in this SAME change.
+pub struct WorkItemDeleteTool;
+
+#[async_trait]
+impl Tool for WorkItemDeleteTool {
+    fn name(&self) -> &str {
+        "work_item_delete"
+    }
+
+    fn description(&self) -> &str {
+        "Xóa một công việc (work item) khỏi danh sách theo ID. \
+         Dùng khi user muốn dọn dẹp một việc dang dở không còn cần theo dõi."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Work item ID" }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn risk_tier(&self, _args: &Value) -> RiskTier {
+        RiskTier::ReversibleWrite
+    }
+
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        let id = args["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("id required"))?;
+        let request_params = redact::redact_to_string(args.clone(), "local");
+        let outcome = local_journaled_write(
+            &ctx.db,
+            LocalMutation::WorkItemDelete { id },
+            &ctx.session_id.to_string(),
+            "work_item_delete",
+            "ReversibleWrite",
+            &request_params,
+            Some(&ctx.turn_id.to_string()),
+            crate::LOCAL_RETENTION_DAYS,
+        )
+        .await?;
+        set_last_journal_id(ctx, outcome.as_ref());
+        Ok(if outcome.is_some() {
+            format!("Đã xóa công việc id={id}.")
+        } else {
+            format!("Không tìm thấy công việc id={id}.")
+        })
     }
 }

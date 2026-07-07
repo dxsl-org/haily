@@ -2,11 +2,12 @@ pub mod backup;
 mod cross_domain;
 mod daily_rollup;
 mod dnd;
-mod morning_brief;
+pub mod morning_brief;
 mod reminders;
 
 use haily_db::DbHandle;
 use haily_io::AdapterManager;
+use haily_kms::KmsHandle;
 use std::future::Future;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,10 @@ where
     let handle = tasks.spawn(fut);
     tasks.spawn(async move {
         match handle.await {
-            Ok(()) => error!(task = name, "proactive task exited (expected to run until shutdown)"),
+            Ok(()) => error!(
+                task = name,
+                "proactive task exited (expected to run until shutdown)"
+            ),
             Err(join_err) if join_err.is_panic() => {
                 error!(task = name, "proactive task panicked and died")
             }
@@ -41,23 +45,28 @@ where
 /// runs until `shutdown` is cancelled.
 pub struct ProactiveDaemon {
     db: Arc<DbHandle>,
+    /// Phase 3 (assistant-depth): the morning brief correlates tasks/calendar/
+    /// reminders with floored memory recall, which requires reaching KMS from the
+    /// daemon — the first proactive loop to need it.
+    kms: Arc<KmsHandle>,
     am: AdapterManager,
 }
 
 impl ProactiveDaemon {
-    pub fn new(db: Arc<DbHandle>, am: AdapterManager) -> Self {
-        Self { db, am }
+    pub fn new(db: Arc<DbHandle>, kms: Arc<KmsHandle>, am: AdapterManager) -> Self {
+        Self { db, kms, am }
     }
 
     /// Spawn all background loops onto `tasks`, each holding a `child_token()` of
     /// `shutdown`. Non-blocking — returns immediately once tasks are registered.
     pub fn start(self, shutdown: CancellationToken, tasks: &TaskTracker) {
         let db = self.db;
+        let kms = self.kms;
         let am = self.am;
 
         spawn_logged(
             "morning_brief",
-            morning_brief::loop_forever(db.clone(), am.clone(), shutdown.child_token()),
+            morning_brief::loop_forever(db.clone(), kms, am.clone(), shutdown.child_token()),
             tasks,
         );
         spawn_logged(
@@ -113,13 +122,19 @@ mod tests {
     async fn daemon_start_exits_all_loops_on_cancel() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("haily.db");
-        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let db = DbHandle::init(&db_path).await.expect("db init");
+        let kms = Arc::new(
+            KmsHandle::init(db.clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
+        let db = Arc::new(db);
         let am = AdapterManager::builder().build();
 
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
 
-        ProactiveDaemon::new(db, am).start(shutdown.clone(), &tasks);
+        ProactiveDaemon::new(db, kms, am).start(shutdown.clone(), &tasks);
 
         shutdown.cancel();
         tasks.close();

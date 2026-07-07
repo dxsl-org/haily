@@ -6,6 +6,7 @@
 //! `haily-core` itself stays io-free per the workspace's layering invariant.
 mod auto_approve;
 mod config;
+pub mod connector_config;
 pub mod credential_store;
 mod dispatch;
 mod turns;
@@ -18,6 +19,7 @@ pub use bootstrap::{export_database, AppHandle, BootstrapOptions};
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
 pub use credential_store::{CredentialPolicy, CredentialStore};
 pub use turns::TurnRegistry;
+pub use watchers::list_work_items_status;
 
 /// Default data directory, shared by every mode: `<exe_dir>/data/`.
 ///

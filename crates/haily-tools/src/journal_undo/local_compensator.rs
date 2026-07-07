@@ -1,18 +1,31 @@
-//! C1 dispatch split: undo/reconcile for the THREE local v1 tool families (tasks, notes,
-//! reminders) — a self-contained path that never touches a `ConnectorExecutor`.
+//! C1 dispatch split: undo/reconcile for the local v1 tool families (tasks, notes,
+//! reminders, — Phase 12 — memory, and — Phase 11 (assistant-depth) — work_items) —
+//! a self-contained path that never touches a `ConnectorExecutor`.
 //!
 //! `is_local_row` MUST be checked BEFORE `refusal_reason` in `attempt_undo` and before the
 //! executor read-back in `reconcile_incomplete`: the connector refusal set REFUSES any row
 //! with `compensation_plan.is_none()`, which every local row legitimately has (local rows
 //! carry no external compensation plan — they are restored from `pre_state` directly).
 //!
-//! `LOCAL_TOOL_TABLES` is a CLOSED compile-time allowlist covering only tasks/notes/reminders
-//! — memory (HNSW-index coupling, C3) and calendar (recurrence undo unresolved) are
-//! deliberately excluded and stay on their current tier/path.
+//! `LOCAL_TOOL_TABLES` is a CLOSED compile-time allowlist covering tasks/notes/reminders,
+//! `memory_forget` (Phase 12: memory-undo via KmsHandle compensator), `work_item_delete`
+//! (Phase 11, assistant-depth: work_items closes its harness gap), and — Phase 13b,
+//! assistant-depth — `calendar_add`/`calendar_delete_series`/`calendar_delete_occurrence`.
+//! `memory_forget`'s undo is NOT purely generic like the other tools: it ALSO mutates
+//! the in-memory HNSW index, which cannot participate in a `sqlx::Transaction` — see the
+//! `LocalTable::KmsFacts` branch in `local_attempt_undo` below. `work_item_delete` IS
+//! purely generic (pure relational table, no vector/index coupling). `calendar_add`/
+//! `calendar_delete_series` are ALSO purely generic (plain row create/soft-delete);
+//! `calendar_delete_occurrence` is a THIRD flavor of partial membership — its undo is
+//! neither the generic restore/clear NOR a KMS-style external index call, but a dedicated
+//! `LocalOpKind::DeleteOccurrence` arm that removes an exception row from a table
+//! (`calendar_exceptions`) different from the one `LocalTable::Calendar` names — see that
+//! arm's doc comment for why a plain `restore_row` cannot express this inverse.
 use anyhow::Result;
 use haily_db::queries::journal::{self, ActionJournalRow};
 use haily_db::queries::local_snapshot::{self, LocalTable};
 use haily_db::DbHandle;
+use haily_kms::KmsHandle;
 use serde_json::Value;
 
 use super::logic::UndoOutcome;
@@ -29,6 +42,17 @@ const LOCAL_TOOL_TABLES: &[(&str, LocalTable)] = &[
     ("note_delete", LocalTable::Notes),
     ("reminder_add", LocalTable::Reminders),
     ("reminder_delete", LocalTable::Reminders),
+    ("memory_forget", LocalTable::KmsFacts),
+    // Phase 11 (assistant-depth): the only tool-driven work_items mutation — see
+    // `LocalMutation::WorkItemDelete`'s doc comment for why create/update are absent.
+    ("work_item_delete", LocalTable::WorkItems),
+    // Phase 13b (assistant-depth): `calendar_delete`'s TWO scopes are journaled under
+    // DISTINCT internal tool_name strings (the public `Tool::name()` stays
+    // `"calendar_delete"` for both — see `CalendarDeleteTool::execute`) so `op_kind`
+    // below can tell them apart without inspecting `pre_state`/`request_params`.
+    ("calendar_add", LocalTable::Calendar),
+    ("calendar_delete_series", LocalTable::Calendar),
+    ("calendar_delete_occurrence", LocalTable::Calendar),
 ];
 
 /// The kind of forward mutation a local tool performed — decides HOW to invert it.
@@ -40,13 +64,20 @@ enum LocalOpKind {
     Update,
     /// The tool soft-deleted the row. Undo = clear `deleted_at`.
     Delete,
+    /// Phase 13b: the tool recorded a single-occurrence exception (a row in
+    /// `calendar_exceptions`, NOT a mutation of the `calendar_events` row `pre_state`
+    /// would otherwise describe). Undo = remove that exception row — see this kind's
+    /// arm in `local_attempt_undo` and `calendar::remove_exception_tx`.
+    DeleteOccurrence,
 }
 
 fn op_kind(tool_name: &str) -> Option<LocalOpKind> {
     match tool_name {
-        "task_create" | "note_save" | "reminder_add" => Some(LocalOpKind::Create),
+        "task_create" | "note_save" | "reminder_add" | "calendar_add" => Some(LocalOpKind::Create),
         "task_complete" | "note_update" => Some(LocalOpKind::Update),
-        "task_delete" | "note_delete" | "reminder_delete" => Some(LocalOpKind::Delete),
+        "task_delete" | "note_delete" | "reminder_delete" | "memory_forget"
+        | "work_item_delete" | "calendar_delete_series" => Some(LocalOpKind::Delete),
+        "calendar_delete_occurrence" => Some(LocalOpKind::DeleteOccurrence),
         _ => None,
     }
 }
@@ -111,13 +142,16 @@ async fn refuse(db: &DbHandle, row_id: &str, reason: impl Into<String>) -> Resul
 }
 
 /// Undo one local-tool journal row. NO `ConnectorExecutor` involved — the record lives in
-/// this process's own SQLite, so undo is a direct, C10-guarded UPDATE against `pre_state`.
+/// this process's own SQLite, so undo is a direct, C10-guarded UPDATE against `pre_state`
+/// (or, for `memory_forget`, a `KmsHandle::restore_fact` call — see the `LocalTable::KmsFacts`
+/// branch below).
 ///
 /// Sequence: session-scope + local refusal rules → resolve op kind/table → C10-guarded
-/// restore (via `local_snapshot`, `rows_affected()==0` => refused, never a separate SELECT)
-/// → `undone`.
+/// restore (via `local_snapshot`, `rows_affected()==0` => refused, never a separate SELECT,
+/// OR via `KmsHandle::restore_fact` for a KMS row) → `undone`.
 pub async fn local_attempt_undo(
     db: &DbHandle,
+    kms: &KmsHandle,
     row: &ActionJournalRow,
     session_id: &str,
 ) -> Result<UndoOutcome> {
@@ -177,6 +211,26 @@ pub async fn local_attempt_undo(
 
     journal::advance_undo_status(db, &row.id, "compensating").await?;
 
+    // KMS-aware branch (Phase 12, `memory_forget`): the compensation must ALSO mutate
+    // the in-memory HNSW index, which cannot participate in a `sqlx::Transaction` — so
+    // this bypasses the generic tx-scoped restore below entirely. See
+    // `KmsHandle::restore_fact`'s doc comment for the crash-ordering contract (DB clear
+    // commits first, ANN restore second, non-transactional).
+    if table == LocalTable::KmsFacts {
+        let restored = kms.restore_fact(&row.correlation_ref, expected_updated_at).await?;
+        if !restored {
+            return refuse(
+                db,
+                &row.id,
+                "bản ghi đã bị thay đổi kể từ khi ghi nhận — từ chối hoàn tác",
+            )
+            .await;
+        }
+        journal::set_readback(db, &row.id, "match", None).await?;
+        journal::advance_undo_status(db, &row.id, "undone").await?;
+        return Ok(UndoOutcome::Undone);
+    }
+
     let mut tx = db.pool().begin().await?;
     let affected = match kind {
         LocalOpKind::Create => {
@@ -197,6 +251,38 @@ pub async fn local_attempt_undo(
             };
             local_snapshot::restore_row(&mut tx, table, &row.correlation_ref, &pre, expected_updated_at)
                 .await?
+        }
+        // Phase 13b: the forward write inserted an EXCEPTION row (a table distinct from
+        // `table`/`LocalTable::Calendar`'s `calendar_events`) — its undo is a direct
+        // `DELETE FROM calendar_exceptions`, never `restore_row`/`clear_deleted_at` (which
+        // would operate on the wrong table entirely). `pre_state` here is the hand-built
+        // `{event_id, occurrence_start}` record from `LocalMutation::explicit_pre_state`,
+        // not a column snapshot. `expected_updated_at` (the calendar_events row's own
+        // version) is deliberately UNUSED for this arm — an exception's only meaningful
+        // "version" is its own existence, guarded by `rows_affected()` below exactly like
+        // every other C10 check in this module, just against a different table.
+        LocalOpKind::DeleteOccurrence => {
+            let pre: Value = match row.pre_state.as_deref().and_then(|s| serde_json::from_str(s).ok()) {
+                Some(v) => v,
+                None => {
+                    tx.rollback().await.ok();
+                    return refuse(db, &row.id, "không có pre_state để khôi phục ngoại lệ lịch")
+                        .await;
+                }
+            };
+            let occurrence_start = match pre.get("occurrence_start").and_then(Value::as_str) {
+                Some(s) => s,
+                None => {
+                    tx.rollback().await.ok();
+                    return refuse(db, &row.id, "thiếu occurrence_start trong pre_state").await;
+                }
+            };
+            haily_db::queries::calendar::remove_exception_tx(
+                &mut tx,
+                &row.correlation_ref,
+                occurrence_start,
+            )
+            .await?
         }
     };
 
@@ -220,16 +306,56 @@ pub async fn local_attempt_undo(
 mod tests {
     use super::*;
     use haily_db::queries::local_snapshot::{local_journaled_write, LocalMutation};
+    use std::sync::Arc;
 
-    async fn db() -> (DbHandle, tempfile::TempDir) {
+    async fn db() -> (DbHandle, Arc<KmsHandle>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
-        (db, dir)
+        let kms = Arc::new(KmsHandle::init(db.clone(), dir.path()).await.unwrap());
+        (db, kms, dir)
+    }
+
+    /// A cheap, deterministic 8-dim "embedding" (mirrors `haily-kms`'s own HNSW
+    /// lifecycle test fixtures) — used to drive `search_ann_by_vector` directly so
+    /// these tests exercise the ANN layer regardless of whether the `embeddings`
+    /// feature (real fastembed model) is enabled for this build.
+    fn fake_embedding(seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; 8];
+        for (i, slot) in v.iter_mut().enumerate() {
+            *slot = ((seed as usize + i) % 7) as f32 + 1.0;
+        }
+        v
+    }
+
+    /// Seed 9 throwaway embedded facts so a SINGLE subsequent forget keeps the
+    /// tombstone ratio under the 20% auto-rebuild watermark (`REBUILD_TOMBSTONE_
+    /// RATIO`) — otherwise a 1-fact index's own forget crosses the ratio and races
+    /// the KmsHandle's background rebuild against these tests' single-shot (not
+    /// polling) post-undo assertion.
+    async fn seed_filler_facts(db: &DbHandle) {
+        for i in 0..9u64 {
+            let blob: Vec<u8> =
+                fake_embedding(900 + i).iter().flat_map(|f| f.to_le_bytes()).collect();
+            haily_db::queries::facts::insert_fact(
+                db,
+                haily_db::queries::facts::NewFact {
+                    domain_id: "test",
+                    subject: &format!("filler-{i}"),
+                    predicate: "is",
+                    object: "seeded",
+                    source: "test",
+                    source_ref: None,
+                    embedding: Some(&blob),
+                },
+            )
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
     async fn create_then_undo_soft_deletes_row() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         let (row, _v) = local_journaled_write(
             &db,
             LocalMutation::TaskCreate {
@@ -252,7 +378,7 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert!(is_local_row(&row));
 
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert_eq!(outcome, UndoOutcome::Undone);
 
         let active = haily_db::queries::tasks::active(&db).await.unwrap();
@@ -264,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_then_undo_restores_previous_fields() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         haily_db::queries::tasks::insert(&db, "Original", None, "low", None, None)
             .await
             .unwrap();
@@ -286,7 +412,7 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert_eq!(row.correlation_ref, task.id);
 
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert_eq!(outcome, UndoOutcome::Undone);
 
         let active = haily_db::queries::tasks::active(&db).await.unwrap();
@@ -310,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_undo_restores_visibility() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         haily_db::queries::tasks::insert(&db, "To delete", None, "low", None, None)
             .await
             .unwrap();
@@ -331,7 +457,7 @@ mod tests {
         .expect("target exists");
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
 
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert_eq!(outcome, UndoOutcome::Undone);
 
         let active = haily_db::queries::tasks::active(&db).await.unwrap();
@@ -343,7 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn c10_refuses_on_external_edit_between_write_and_undo() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         haily_db::queries::tasks::insert(&db, "Racy", None, "low", None, None)
             .await
             .unwrap();
@@ -370,7 +496,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "must refuse via rows_affected==0, not blindly overwrite: {outcome:?}"
@@ -381,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_mismatch_refuses() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         let (row, _v) = local_journaled_write(
             &db,
             LocalMutation::TaskCreate {
@@ -403,7 +529,7 @@ mod tests {
         .expect("target exists");
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
 
-        let outcome = local_attempt_undo(&db, &row, "sess-attacker").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-attacker").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "cross-session undo must be refused: {outcome:?}"
@@ -421,7 +547,7 @@ mod tests {
         // updated_at again — `local_journaled_write` must capture `post_state_version`
         // AFTER that LAST write, or this undo's C10 guard would refuse on our own second
         // write. Undoing a CREATE with wikilinks must soft-delete the note cleanly.
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         let (row, _v) = local_journaled_write(
             &db,
             LocalMutation::NoteSave {
@@ -444,7 +570,7 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert!(is_local_row(&row));
 
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert_eq!(
             outcome,
             UndoOutcome::Undone,
@@ -459,7 +585,7 @@ mod tests {
     async fn notes_pre_state_never_contains_embedding_key() {
         // Constraint 10: the `embedding` BLOB column must never appear in a note's
         // pre_state snapshot (regenerable, and a BLOB has no meaningful JSON shape).
-        let (db, _d) = db().await;
+        let (db, _kms, _d) = db().await;
         haily_db::queries::notes::insert(&db, "T", "content", None, None, Some(&[1, 2, 3]))
             .await
             .unwrap();
@@ -495,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn fired_reminder_undo_refuses_as_final() {
-        let (db, _d) = db().await;
+        let (db, kms, _d) = db().await;
         let (row, _v) = local_journaled_write(
             &db,
             LocalMutation::ReminderAdd {
@@ -524,7 +650,7 @@ mod tests {
         // Undo the CREATE (mint of the reminder) — must refuse now that it has fired, even
         // though the journal recorded it as ordinary `compensatable` at write time.
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
-        let outcome = local_attempt_undo(&db, &row, "sess-1").await.unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert!(
             matches!(outcome, UndoOutcome::Refused(_)),
             "a fired reminder's undo must be refused as final: {outcome:?}"
@@ -533,6 +659,137 @@ mod tests {
         assert!(
             active.iter().any(|r| r.id == "rem-fired-1"),
             "the fired reminder must remain untouched after refusal"
+        );
+    }
+
+    /// Phase 12 (memory-undo via KmsHandle compensator): single-undo of a `memory_forget`
+    /// must clear `deleted_at` AND restore ANN searchability — the KMS-aware branch, not
+    /// the generic `restore_row`. Inserts the fact directly via `facts::insert_fact` (not
+    /// `kms.remember`) so the embedding BLOB is present regardless of whether this build
+    /// enables the `embeddings` feature (`kms.remember` stores `embedding: None` without
+    /// it) — mirrors `haily-kms`'s own HNSW lifecycle test fixtures.
+    ///
+    /// Facts are seeded BEFORE `KmsHandle::init` (NOT via the shared `db()` helper,
+    /// which constructs `KmsHandle` on an empty DB) so its initial `rebuild_from_db`
+    /// actually indexes them — inserting straight into the DB after `KmsHandle::init`
+    /// would leave the fact permanently absent from `id_map` (a state that cannot occur
+    /// in production, where every fact is created via `kms.remember`).
+    #[tokio::test]
+    async fn memory_forget_then_single_undo_restores_search_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        seed_filler_facts(&db).await;
+        let blob: Vec<u8> = fake_embedding(1).iter().flat_map(|f| f.to_le_bytes()).collect();
+        let fact = haily_db::queries::facts::insert_fact(
+            &db,
+            haily_db::queries::facts::NewFact {
+                domain_id: "test",
+                subject: "coffee",
+                predicate: "is",
+                object: "yummy",
+                source: "test",
+                source_ref: None,
+                embedding: Some(&blob),
+            },
+        )
+        .await
+        .unwrap();
+        let fact_id = fact.id.clone();
+        let kms = Arc::new(KmsHandle::init(db.clone(), dir.path()).await.unwrap());
+
+        let (row, _v) = local_journaled_write(
+            &db,
+            LocalMutation::MemoryForget { fact_id: &fact_id },
+            "sess-1",
+            "memory_forget",
+            "ReversibleWrite",
+            "{}",
+            None,
+            30,
+        )
+        .await
+        .unwrap()
+        .expect("target exists");
+        // Mirrors `MemoryForgetTool::execute`: the ANN tombstone runs AFTER the journaled
+        // DB write commits, since it cannot participate in the same `sqlx::Transaction`.
+        kms.index_remove(&fact_id);
+
+        let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        assert!(is_local_row(&row), "memory_forget must route through the local path");
+        assert!(
+            kms.search_ann_by_vector(&fake_embedding(1), 10)
+                .await
+                .iter()
+                .all(|(id, _)| id != &fact_id),
+            "forgotten fact must not surface in ANN search before undo"
+        );
+
+        let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
+        assert_eq!(outcome, UndoOutcome::Undone);
+
+        assert!(
+            kms.search_ann_by_vector(&fake_embedding(1), 10)
+                .await
+                .iter()
+                .any(|(id, _)| id == &fact_id),
+            "undo must restore ANN search visibility"
+        );
+        let hybrid = kms.search_hybrid("coffee yummy", 10).await.unwrap();
+        assert!(
+            hybrid.iter().any(|r| r.id == fact_id),
+            "undo must also restore hybrid/FTS visibility: {hybrid:?}"
+        );
+    }
+
+    /// C10 parity for the KMS branch: replaying undo against a STALE row snapshot (its
+    /// own `undo_status` field still reads "not_requested", captured before the first
+    /// undo advanced it — so `local_refusal_reason`'s own-row check does not catch the
+    /// replay) must still be refused, caught instead by `restore_fact`'s guard against
+    /// the LIVE `updated_at` (bumped by the first, successful restore).
+    #[tokio::test]
+    async fn memory_forget_undo_refuses_on_replay_with_stale_version() {
+        let (db, kms, _d) = db().await;
+        let blob: Vec<u8> = fake_embedding(2).iter().flat_map(|f| f.to_le_bytes()).collect();
+        let fact = haily_db::queries::facts::insert_fact(
+            &db,
+            haily_db::queries::facts::NewFact {
+                domain_id: "test",
+                subject: "tea",
+                predicate: "is",
+                object: "bitter",
+                source: "test",
+                source_ref: None,
+                embedding: Some(&blob),
+            },
+        )
+        .await
+        .unwrap();
+        let fact_id = fact.id.clone();
+
+        let (row, _v) = local_journaled_write(
+            &db,
+            LocalMutation::MemoryForget { fact_id: &fact_id },
+            "sess-1",
+            "memory_forget",
+            "ReversibleWrite",
+            "{}",
+            None,
+            30,
+        )
+        .await
+        .unwrap()
+        .expect("target exists");
+        kms.index_remove(&fact_id);
+
+        let stale_row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
+        let outcome = local_attempt_undo(&db, &kms, &stale_row, "sess-1").await.unwrap();
+        assert_eq!(outcome, UndoOutcome::Undone, "first undo must succeed normally");
+
+        let outcome2 = local_attempt_undo(&db, &kms, &stale_row, "sess-1").await.unwrap();
+        assert!(
+            matches!(outcome2, UndoOutcome::Refused(_)),
+            "a replay against the pre-undo snapshot must refuse via restore_fact's C10 \
+             guard, not double-restore: {outcome2:?}"
         );
     }
 

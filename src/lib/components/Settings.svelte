@@ -3,10 +3,15 @@
   import ModelTab from './settings/ModelTab.svelte';
   import PersonaTab from './settings/PersonaTab.svelte';
   import SafetyTab from './settings/SafetyTab.svelte';
+  import JournalBrowser from './JournalBrowser.svelte';
+  import ConnectorConfig from './ConnectorConfig.svelte';
 
-  let { open = $bindable(false), sessionIds = () => [] as string[] } = $props();
+  let {
+    open = $bindable(false),
+    sessionIds = () => [] as string[],
+  }: { open?: boolean; sessionIds?: () => string[] } = $props();
 
-  type Tab = 'model' | 'persona' | 'safety';
+  type Tab = 'model' | 'persona' | 'safety' | 'journal' | 'connectors';
   let tab = $state<Tab>('model');
   let prefs = $state<Record<string, string>>({});
   let loading = $state(false);
@@ -36,9 +41,11 @@
   }
 
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'model',   label: 'Model LLM' },
-    { id: 'persona', label: 'Persona' },
-    { id: 'safety',  label: 'Safety' },
+    { id: 'model',      label: 'Model LLM' },
+    { id: 'persona',    label: 'Persona' },
+    { id: 'safety',     label: 'Safety' },
+    { id: 'journal',    label: 'Nhật ký' },
+    { id: 'connectors', label: 'Kết nối' },
   ];
 </script>
 
@@ -72,8 +79,12 @@
         <ModelTab {prefs} {save} />
       {:else if tab === 'persona'}
         <PersonaTab {prefs} {save} />
+      {:else if tab === 'safety'}
+        <SafetyTab {prefs} {save} />
+      {:else if tab === 'journal'}
+        <JournalBrowser {sessionIds} />
       {:else}
-        <SafetyTab {prefs} {save} {sessionIds} />
+        <ConnectorConfig />
       {/if}
     </div>
   </div>

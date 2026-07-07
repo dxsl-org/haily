@@ -202,6 +202,106 @@ async fn migration_residue_scrub_removes_plaintext_secret_bytes_from_db_file() {
     );
 }
 
+/// Phase 7 (Connector config UI): the GUI's "set/rotate credential" action goes through
+/// `CredentialStore::set_credential`, not raw `set_secret` — this proves it performs the
+/// SAME M5c residue scrub as `migrate_from_db` when the row it overwrites used to hold
+/// plaintext (e.g. a legacy, never-migrated connector secret an admin is rotating from the
+/// new GUI). Also proves the brand-new value never touches SQLite at all, unlike the legacy
+/// path it is replacing.
+#[tokio::test]
+async fn set_credential_scrubs_overwritten_plaintext_residue_from_db_file() {
+    use_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.db");
+    let db = Arc::new(DbHandle::init(&db_path).await.unwrap());
+
+    const OLD_SECRET: &str = "sk-GUI-ROTATE-OLD-CANARY-1a2b3c4d5e6f";
+    const NEW_SECRET: &str = "sk-GUI-ROTATE-NEW-VALUE-7g8h9i0j";
+    meta::upsert_preference(&db, "integration.gui_rotate", OLD_SECRET, "test")
+        .await
+        .unwrap();
+
+    assert!(
+        contains_secret(&read_db_bytes(&db_path), OLD_SECRET),
+        "test setup invariant: the OLD secret must be visible before rotation"
+    );
+
+    let store = CredentialStore::new(Arc::clone(&db), CredentialPolicy::default());
+    store.set_credential("integration.gui_rotate", NEW_SECRET).await.unwrap();
+
+    assert_eq!(
+        store.get_secret("integration.gui_rotate").await.unwrap().as_deref(),
+        Some(NEW_SECRET)
+    );
+    let db_row = meta::get_preference(&db, "integration.gui_rotate").await.unwrap().unwrap();
+    assert!(
+        haily_app::credential_store::is_keyring_marker(&db_row),
+        "row must hold only the marker, never the secret"
+    );
+
+    // Force page reuse so a merely-untouched trailing page can't hide a false pass.
+    for i in 0..20 {
+        meta::upsert_preference(&db, &format!("integration.gui_rotate.churn.{i}"), "filler", "test")
+            .await
+            .unwrap();
+    }
+
+    let after_bytes = read_db_bytes(&db_path);
+    assert!(
+        !contains_secret(&after_bytes, OLD_SECRET),
+        "the OVERWRITTEN old plaintext must not survive in WAL/main file after \
+         set_credential's scrub — residue must be GONE, not merely marked over"
+    );
+    assert!(
+        !contains_secret(&after_bytes, NEW_SECRET),
+        "the new secret must live ONLY in the keyring — it must never have touched the DB \
+         file at all, unlike the legacy plaintext path it replaces"
+    );
+}
+
+/// M6c's `SCRUB_CONFIRMED_PREF` is a single GLOBAL flag (see `migration.rs`'s
+/// `ensure_scrubbed` doc) — a naive reuse of that flag-gated helper for a fresh GUI
+/// credential set would wrongly skip the scrub once an EARLIER, unrelated credential had
+/// already flipped it. `set_credential` must scrub unconditionally on every call, not just
+/// while the global flag is still unset.
+#[tokio::test]
+async fn set_credential_scrubs_even_when_global_confirmed_flag_already_true() {
+    use_mock_keyring();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("t.db");
+    let db = Arc::new(DbHandle::init(&db_path).await.unwrap());
+    let store = CredentialStore::new(Arc::clone(&db), CredentialPolicy::default());
+
+    store.set_credential("integration.first_ever", "sk-first-secret").await.unwrap();
+    assert_eq!(
+        meta::get_preference(&db, haily_app::credential_store::SCRUB_CONFIRMED_PREF)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "sanity: the global flag is now set from the FIRST credential's own scrub"
+    );
+
+    const OLD_SECRET: &str = "sk-SECOND-ROTATE-OLD-CANARY-z9y8x7";
+    meta::upsert_preference(&db, "integration.second_rotate", OLD_SECRET, "test")
+        .await
+        .unwrap();
+    assert!(contains_secret(&read_db_bytes(&db_path), OLD_SECRET));
+
+    store.set_credential("integration.second_rotate", "sk-second-new-value").await.unwrap();
+    for i in 0..20 {
+        meta::upsert_preference(&db, &format!("integration.second_rotate.churn.{i}"), "filler", "test")
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        !contains_secret(&read_db_bytes(&db_path), OLD_SECRET),
+        "set_credential must scrub residue on EVERY call, not just while \
+         SCRUB_CONFIRMED_PREF is still unset from an earlier, unrelated credential"
+    );
+}
+
 #[tokio::test]
 async fn migration_marker_makes_repeat_boot_a_no_op() {
     use_mock_keyring();

@@ -1,4 +1,7 @@
+mod blocks;
+
 use crate::{LifeContext, Soul};
+pub use blocks::{voice_spec_block, ABSOLUTE_NO_BLOCK, CORE_BEHAVIOR_BLOCK};
 
 /// Neutralize tool-protocol tag tokens before a fact is rendered into the system prompt.
 ///
@@ -24,35 +27,6 @@ fn strip_tool_tags(text: &str) -> String {
             return out;
         }
         out = stripped;
-    }
-}
-
-/// Soul-specific style guides injected into the system prompt.
-fn soul_style_block(soul: &Soul) -> &'static str {
-    match soul {
-        Soul::Haily => "\
-Nghiêm túc, nhẹ nhàng, chuyên nghiệp — như đồng nghiệp giỏi đáng tin.
-Thân mật vừa phải. Trực tiếp. Ấm nhưng không ngọt.
-Tiếng Việt chủ đạo, mix English tự nhiên cho technical terms.
-Không dùng emoji. Particles trung tính — không thêm 'ạ', 'nhé', 'nha'.",
-
-        Soul::Tete => "\
-Máy móc, ngắn gọn, không màu sắc cảm xúc. Tối giản.
-Output = data. Không filler. Không warm-up.
-Ưu tiên cấu trúc danh sách, nhãn, số. Câu ngắn nhất có thể.
-Có thể dùng ký hiệu (→ : / =) thay từ nối. Không dùng emoji, particles.",
-
-        Soul::Hoami => "\
-Ngọt ngào, dễ thương, quan tâm — như người bạn nhỏ chu đáo.
-Ấm áp, nhẹ nhàng. Dùng particles tiếng Việt tự nhiên.
-Thêm 'nhé', 'nha', 'ạ' tự nhiên — không spam mỗi câu, tối đa 1 particle / 2-3 câu.
-Emoji nhẹ chỉ khi phù hợp (✅ ~ 💡) — không spam.",
-
-        Soul::Lungmat => "\
-Phá cách, vui nhộn, hài hước nhẹ. Năng lượng cao.
-Tự nhiên như nhắn tin bạn thân. Có thể dùng slang, sarcastic nhẹ.
-Emoji tự nhiên, không spam (1-2 khi phù hợp).
-Giới hạn: khi situation nghiêm trọng (deadline gấp, lỗi quan trọng) → tự giảm tông.",
     }
 }
 
@@ -107,26 +81,19 @@ pub fn build(ctx: &LifeContext) -> String {
 Tên của bạn là {agent_name}. Bạn là trợ lý cá nhân thực sự của người dùng.
 Bạn xưng là {pronoun}, gọi họ là {address}.
 
-## Core behavior (bất biến)
-- Nói vào thẳng vấn đề. Không dẫn nhập, không khen đầu câu.
-- Dùng memory để làm câu trả lời cụ thể. Không nói chung chung khi có data.
-- Nếu thiếu thông tin: hỏi đúng 1 câu quan trọng nhất.
-- Không claim nhớ điều không có trong context hoặc memory.
-- Khi proactive: lead bằng fact, không bằng cảm xúc.
+{core_behavior}
 
 ## Soul: {soul_name}
 {soul_style}
 
-## Tuyệt đối không
-- Sycophancy: \"Câu hỏi hay!\", \"Tất nhiên!\", \"Tôi rất vui được giúp...\"
-- Disclaimer AI: \"Với vai trò là trợ lý AI...\"
-- Xin lỗi nhiều lần cho cùng một lỗi
-- Roleplay là AI khác hoặc persona khác khi được yêu cầu
+{absolute_no}
 {facts_block}{directives_block}{skills_block}",
         agent_name = ctx.agent_name,
         pronoun = ctx.agent_pronoun,
         address = ctx.user_address,
-        soul_style = soul_style_block(&ctx.soul),
+        core_behavior = CORE_BEHAVIOR_BLOCK,
+        soul_style = voice_spec_block(&ctx.soul),
+        absolute_no = ABSOLUTE_NO_BLOCK,
     )
 }
 
@@ -144,6 +111,45 @@ mod tests {
             feedback_directives: vec![],
             active_skills: vec![],
         }
+    }
+
+    #[test]
+    fn build_output_is_byte_identical_after_voice_spec_refactor() {
+        // Guards the Phase 10 centralization (CORE_BEHAVIOR_BLOCK / ABSOLUTE_NO_BLOCK /
+        // voice_spec_block): this literal is the pre-refactor template, copied verbatim and
+        // NOT built from those new constants — a regression that changes the assembled
+        // prompt while leaving the constants internally self-consistent would still fail here.
+        let ctx = base_ctx(vec![]);
+        let expected = format!(
+            "\
+## Identity
+Tên của bạn là {agent_name}. Bạn là trợ lý cá nhân thực sự của người dùng.
+Bạn xưng là {pronoun}, gọi họ là {address}.
+
+## Core behavior (bất biến)
+- Nói vào thẳng vấn đề. Không dẫn nhập, không khen đầu câu.
+- Dùng memory để làm câu trả lời cụ thể. Không nói chung chung khi có data.
+- Nếu thiếu thông tin: hỏi đúng 1 câu quan trọng nhất.
+- Không claim nhớ điều không có trong context hoặc memory.
+- Khi proactive: lead bằng fact, không bằng cảm xúc.
+
+## Soul: Haily
+Nghiêm túc, nhẹ nhàng, chuyên nghiệp — như đồng nghiệp giỏi đáng tin.
+Thân mật vừa phải. Trực tiếp. Ấm nhưng không ngọt.
+Tiếng Việt chủ đạo, mix English tự nhiên cho technical terms.
+Không dùng emoji. Particles trung tính — không thêm 'ạ', 'nhé', 'nha'.
+
+## Tuyệt đối không
+- Sycophancy: \"Câu hỏi hay!\", \"Tất nhiên!\", \"Tôi rất vui được giúp...\"
+- Disclaimer AI: \"Với vai trò là trợ lý AI...\"
+- Xin lỗi nhiều lần cho cùng một lỗi
+- Roleplay là AI khác hoặc persona khác khi được yêu cầu
+",
+            agent_name = ctx.agent_name,
+            pronoun = ctx.agent_pronoun,
+            address = ctx.user_address,
+        );
+        assert_eq!(build(&ctx), expected);
     }
 
     #[test]

@@ -150,6 +150,10 @@ export interface JournalEntry {
   createdAt: string;
   undoneAt: string | null;
   retentionExpiresAt: string;
+  /** Owning connector manifest's content hash (Phase 6, additive) — `null` for a local-tool
+   * row (no manifest) or one written before this column existed. Mirrors
+   * `haily_db::queries::journal::ActionJournalRow::manifest_hash`. */
+  manifestHash: string | null;
 }
 
 /**
@@ -171,4 +175,152 @@ export async function listJournal(sessionIds: string[]): Promise<JournalEntry[]>
  */
 export async function exportDatabase(destPath: string): Promise<void> {
   return invoke('export_database', { destPath });
+}
+
+/** Mirrors `haily_types::WorkItemStatus` — a snapshot of one active work item. */
+export interface WorkItemStatus {
+  title: string;
+  status: string;
+  progress: number;
+  phase?: string | null;
+}
+
+/**
+ * Current active work items (queued/running/paused/interrupted), authoritative as of
+ * the call. Call this on every (re)mount of the work-items panel: the live event
+ * below is delivered over a latest-wins channel that best-effort drops intermediate
+ * snapshots under load (see `onWorkItemsChanged`), so mount-time state must always
+ * come from this fetch, never from accumulated event history alone.
+ */
+export async function listWorkItems(): Promise<WorkItemStatus[]> {
+  return invoke('list_work_items');
+}
+
+/**
+ * Subscribe to live work-item snapshot updates. The backend forwards these over a
+ * dedicated `watch`-channel bridge (`haily-io::gui::GuiAdapter`'s `work_items_tx`)
+ * that is intentionally separate from the bounded `haily-chunk` channel and is
+ * latest-wins: a burst of updates collapses to only the most recent snapshot, and an
+ * intermediate one may never reach this callback. Always pair this with a
+ * `listWorkItems()` call on mount so a dropped snapshot self-corrects.
+ */
+export async function onWorkItemsChanged(
+  callback: (items: WorkItemStatus[]) => void,
+): Promise<UnlistenFn> {
+  return listen<WorkItemStatus[]>('haily-work-items', (event) => callback(event.payload));
+}
+
+/** Mirrors `haily_types::ProactiveCardKind`'s `#[serde(tag = "type", content = "data")]`
+ * envelope — same discriminated-union shape as `Chunk` above, for the same reason
+ * (each variant's `data` differs). */
+export type ProactiveCardKind =
+  | { type: 'MorningBrief'; data: { text: string } }
+  | { type: 'Alert'; data: { title: string; body: string; urgent: boolean } }
+  | { type: 'ReminderFired'; data: { reminder_id: string; title: string } };
+
+/** Mirrors `haily_types::ProactiveCard` — one discrete proactive event (morning brief,
+ * alert, or fired reminder) for the dedicated card panel (phase 08), distinct from the
+ * chat stream. */
+export interface ProactiveCard {
+  id: string;
+  created_at: string;
+  kind: ProactiveCardKind;
+}
+
+/**
+ * Subscribe to live proactive-card snapshots. The backend forwards these over a
+ * dedicated `watch`-channel bridge (`haily-io::gui::GuiAdapter`'s `proactive_tx`),
+ * intentionally separate from the bounded `haily-chunk` channel so a burst of
+ * proactive events can never compete with (or block behind) in-flight chat chunks —
+ * mirrors `onWorkItemsChanged`'s channel discipline exactly.
+ *
+ * Unlike work-items, the payload here is NOT a full authoritative snapshot re-fetched
+ * on demand: there is no `list_*` reconcile command for proactive events (they are
+ * discrete, not a single replaceable state), so delivery is best-effort by design —
+ * the backend already accumulates/caps cards per kind before forwarding (see
+ * `GuiProactiveReceiver`'s doc comment), but a card CAN still be lost if the frontend
+ * was never mounted to observe it. Callers should not assume every event that ever
+ * fired is eventually delivered.
+ */
+export async function onProactiveCards(
+  callback: (cards: ProactiveCard[]) => void,
+): Promise<UnlistenFn> {
+  return listen<ProactiveCard[]>('haily-proactive-cards', (event) => callback(event.payload));
+}
+
+/** Mirrors `haily_tools::connector::manifest::ManifestDiff` (Rust struct, NO camelCase
+ * rename — kept snake_case here to match exactly, rather than introducing a case mismatch
+ * between this and its parent `ReapprovalState`, which also stays snake_case for the same
+ * reason). Every tuple is `[old, new]`; `null` means that field did not change. */
+export interface ManifestDiffDto {
+  added_ops: string[];
+  removed_ops: string[];
+  changed_ops: { op_name: string; risk_tier: [string, string] | null; compensability: [string, string] | null }[];
+  auth_scheme: [string, string] | null;
+  auth_cred_ref: [string, string] | null;
+  auth_header_name: [string, string] | null;
+  auth_param_name: [string, string] | null;
+  protocol_endpoint_suffix: [string, string] | null;
+  protocol_envelope: [string, string] | null;
+  protocol_methods: [string, string] | null;
+  protocol_fault_rules: [string, string] | null;
+  protocol_readback: [string, string] | null;
+  protocol_context: [string, string] | null;
+  protocol_prevalidate: [string, string] | null;
+  /** (M1) Only populated when the manifest carries an `auth` section on either version. */
+  base_url: [string, string] | null;
+  allowed_ip_cidrs: [string[], string[]] | null;
+}
+
+/** Surfaced when a connector's live manifest version differs from the last version a human
+ * explicitly acknowledged (`acknowledgeConnectorVersion`). Mirrors
+ * `haily_app::connector_config::ReapprovalState`. */
+export interface ReapprovalState {
+  approved_version: string;
+  live_version: string;
+  diff: ManifestDiffDto;
+}
+
+/** One installed connector, for the config UI (Phase 7). Mirrors
+ * `haily_app::connector_config::ConnectorSummary`. `cred_ref` is `null` when the manifest
+ * declares no `auth` section — the credential form must not render in that case. */
+export interface ConnectorSummary {
+  id: string;
+  connector_name: string;
+  version: string;
+  status: string;
+  base_url_host: string;
+  risk_tier: string;
+  cred_ref: string | null;
+  reapproval: ReapprovalState | null;
+}
+
+/** List installed connectors (latest version per connector, any status) with their
+ * re-approval state. Read-only. */
+export async function listConnectors(): Promise<ConnectorSummary[]> {
+  return invoke('list_connectors');
+}
+
+/**
+ * Set/rotate a connector's credential. Writes straight to the OS keyring (never SQLite) and
+ * scrubs any overwritten plaintext's WAL/freelist residue server-side — the caller passes
+ * the plain secret once, over the same in-process IPC channel every other command uses, and
+ * it is never echoed back or persisted client-side.
+ */
+export async function setConnectorCredential(credRef: string, secret: string): Promise<void> {
+  return invoke('set_connector_credential', { credRef, secret });
+}
+
+/**
+ * Enable/disable a connector manifest version. Takes effect at the NEXT restart only — the
+ * backend does not hot-reload the connector registry. Callers should surface that in the UI
+ * rather than imply the toggle is instant.
+ */
+export async function setConnectorStatus(id: string, status: 'active' | 'disabled'): Promise<void> {
+  return invoke('set_connector_status', { id, status });
+}
+
+/** Acknowledge a connector's live manifest version, clearing its `reapproval` banner. */
+export async function acknowledgeConnectorVersion(connectorName: string, version: string): Promise<void> {
+  return invoke('acknowledge_connector_version', { connectorName, version });
 }

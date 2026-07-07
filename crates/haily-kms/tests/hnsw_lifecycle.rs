@@ -205,6 +205,54 @@ fn should_rebuild_fires_past_the_20_percent_tombstone_watermark() {
     assert!(index.should_rebuild(), "tombstone ratio past 20% must trigger a rebuild");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12 (memory-undo via KmsHandle compensator): `contains`/`un_tombstone`
+// primitives — the branch `KmsHandle::restore_fact` uses to decide un-tombstone
+// (id still present) vs. re-insert-from-BLOB (a compaction already dropped it).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contains_is_true_only_for_an_actually_inserted_id() {
+    let index = HnswIndex::new();
+    assert!(!index.contains("fact-0"), "an id never inserted must report absent");
+    index.insert("fact-0", &fake_embedding(0));
+    assert!(index.contains("fact-0"));
+    assert!(!index.contains("fact-1"), "a DIFFERENT id must still report absent");
+}
+
+#[test]
+fn un_tombstone_clears_visibility_without_touching_id_map() {
+    let index = HnswIndex::new();
+    index.insert("fact-0", &fake_embedding(0));
+    let len_before = index.len();
+
+    index.tombstone("fact-0");
+    assert!(index.is_tombstoned("fact-0"));
+    assert!(
+        index.contains("fact-0"),
+        "tombstoning must not remove the id from id_map — contains() stays true"
+    );
+
+    index.un_tombstone("fact-0");
+    assert!(!index.is_tombstoned("fact-0"));
+    assert!(
+        index.contains("fact-0"),
+        "un_tombstone must not touch id_map either — contains() still true"
+    );
+    assert_eq!(
+        index.len(),
+        len_before,
+        "un_tombstone must never grow id_map — no duplicate entry is ever created"
+    );
+
+    let results = index.search(&fake_embedding(0), 5);
+    assert_eq!(
+        results.iter().filter(|(id, _)| id == "fact-0").count(),
+        1,
+        "the id must be searchable exactly once after un_tombstone: {results:?}"
+    );
+}
+
 #[tokio::test]
 async fn search_never_errors_during_a_concurrent_background_rebuild() {
     let dir = tempfile::tempdir().expect("tempdir");

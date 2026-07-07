@@ -4,6 +4,8 @@
   import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
+  import WorkItemsPanel from '$lib/components/WorkItemsPanel.svelte';
+  import ProactivePanel from '$lib/components/ProactivePanel.svelte';
   import { cancelTurn, sendMessage } from '$lib/tauri';
   import type { ChunkPayload, PendingApproval } from '$lib/tauri';
   import { toolVerb } from '$lib/tool-verbs';
@@ -231,6 +233,8 @@
 
   <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
   <ApprovalModal bind:pending={pendingApproval} />
+  <WorkItemsPanel />
+  <ProactivePanel />
 
   <div class="messages">
     {#each messages as msg (msg.id)}

@@ -17,6 +17,7 @@ pub struct WorkItem {
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub deleted_at: Option<String>,
 }
 
 /// Create a new work item in queued state.
@@ -44,13 +45,14 @@ pub async fn create(db: &DbHandle, session_id: &str, title: &str) -> Result<Work
 /// Transition to running and record start time.
 ///
 /// # Errors
-/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`.
+/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`
+/// (including one that has since been soft-deleted).
 pub async fn start(db: &DbHandle, id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE work_items
          SET status = 'running', started_at = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&now)
     .bind(&now)
@@ -66,7 +68,8 @@ pub async fn start(db: &DbHandle, id: &str) -> Result<()> {
 /// and `checkpoint_json` is opaque serialized state for resumption.
 ///
 /// # Errors
-/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`.
+/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`
+/// (including one that has since been soft-deleted).
 pub async fn checkpoint(
     db: &DbHandle,
     id: &str,
@@ -78,7 +81,7 @@ pub async fn checkpoint(
     sqlx::query(
         "UPDATE work_items
          SET phase = ?, progress = ?, checkpoint = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(phase)
     .bind(progress)
@@ -93,13 +96,14 @@ pub async fn checkpoint(
 /// Mark as successfully completed.
 ///
 /// # Errors
-/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`.
+/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`
+/// (including one that has since been soft-deleted).
 pub async fn complete(db: &DbHandle, id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE work_items
          SET status = 'done', completed_at = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&now)
     .bind(&now)
@@ -112,13 +116,14 @@ pub async fn complete(db: &DbHandle, id: &str) -> Result<()> {
 /// Mark as failed with an error message.
 ///
 /// # Errors
-/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`.
+/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`
+/// (including one that has since been soft-deleted).
 pub async fn fail(db: &DbHandle, id: &str, error: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE work_items
          SET status = 'failed', error = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(error)
     .bind(&now)
@@ -131,13 +136,14 @@ pub async fn fail(db: &DbHandle, id: &str, error: &str) -> Result<()> {
 /// Mark as interrupted (called on shutdown or by the stale-reset sweep).
 ///
 /// # Errors
-/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`.
+/// Returns an error if the DB update fails. Silently succeeds if no row matches `id`
+/// (including one that has since been soft-deleted).
 pub async fn mark_interrupted(db: &DbHandle, id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE work_items
          SET status = 'interrupted', updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&now)
     .bind(id)
@@ -146,7 +152,30 @@ pub async fn mark_interrupted(db: &DbHandle, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// List all non-terminal work items (queued, running, paused, interrupted).
+/// Soft-delete a work item. C10-guarded (`WHERE id = ? AND deleted_at IS NULL`) so a
+/// double-delete or a race with an internal status update is detected via
+/// `rows_affected()` rather than a separate SELECT-then-UPDATE.
+///
+/// Returns `true` if a row was actually deleted, `false` if `id` did not match an
+/// active row (already deleted, or never existed).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE work_items SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// List all non-terminal, non-deleted work items (queued, running, paused, interrupted).
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -154,39 +183,40 @@ pub async fn list_active(db: &DbHandle) -> Result<Vec<WorkItem>> {
     Ok(sqlx::query_as::<_, WorkItem>(
         "SELECT * FROM work_items
          WHERE status IN ('queued', 'running', 'paused', 'interrupted')
+           AND deleted_at IS NULL
          ORDER BY created_at ASC",
     )
     .fetch_all(db.pool())
     .await?)
 }
 
-/// List only interrupted items (shown to user on startup).
+/// List only interrupted, non-deleted items (shown to user on startup).
 ///
 /// # Errors
 /// Returns an error if the query fails.
 pub async fn list_interrupted(db: &DbHandle) -> Result<Vec<WorkItem>> {
     Ok(sqlx::query_as::<_, WorkItem>(
         "SELECT * FROM work_items
-         WHERE status = 'interrupted'
+         WHERE status = 'interrupted' AND deleted_at IS NULL
          ORDER BY created_at ASC",
     )
     .fetch_all(db.pool())
     .await?)
 }
 
-/// Get a single work item by id.
+/// Get a single non-deleted work item by id.
 ///
-/// Returns `None` if no item with the given id exists.
+/// Returns `None` if no active item with the given id exists.
 ///
 /// # Errors
 /// Returns an error if the query fails.
 pub async fn get(db: &DbHandle, id: &str) -> Result<Option<WorkItem>> {
-    Ok(
-        sqlx::query_as::<_, WorkItem>("SELECT * FROM work_items WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db.pool())
-            .await?,
+    Ok(sqlx::query_as::<_, WorkItem>(
+        "SELECT * FROM work_items WHERE id = ? AND deleted_at IS NULL",
     )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await?)
 }
 
 /// On startup: reset any items stuck in 'running' state to 'interrupted'.
@@ -201,7 +231,7 @@ pub async fn reset_stale_running(db: &DbHandle) -> Result<u64> {
     let rows = sqlx::query(
         "UPDATE work_items
          SET status = 'interrupted', updated_at = ?
-         WHERE status = 'running'",
+         WHERE status = 'running' AND deleted_at IS NULL",
     )
     .bind(&now)
     .execute(db.pool())

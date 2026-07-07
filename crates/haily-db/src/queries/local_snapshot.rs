@@ -15,20 +15,43 @@
 //! updated_at = ?` and reports `rows_affected()` to the caller — a record changed under us
 //! is detected by the UPDATE itself finding zero rows, never by a separate SELECT-then-UPDATE
 //! (which would be a TOCTOU race).
+use crate::queries::calendar;
 use crate::queries::journal::{self, ActionJournalRow, NewAction};
 use crate::DbHandle;
 use anyhow::Result;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sqlx::{Row, Sqlite, Transaction};
 
-/// The three local tool tables this mechanism covers. A closed, compile-time set —
-/// deliberately excludes memory (HNSW-index coupling) and calendar (recurrence undo
-/// unresolved); see the phase's Risk Notes.
+/// The local tool tables this mechanism covers. A closed, compile-time set. `KmsFacts`
+/// (Phase 12 — memory-undo via KmsHandle compensator) is a PARTIAL member of this set: it
+/// is only ever snapshotted here (to capture pre_state / detect a missing target the same
+/// way the other three do) and its forward soft-delete runs through the ordinary tx-scoped
+/// `apply_mutation` below — but its UNDO never goes through the generic
+/// `clear_deleted_at`/`restore_row` in this module. A `memory_forget` undo must ALSO mutate
+/// the in-memory HNSW index, which cannot participate in a `sqlx::Transaction`, so
+/// `journal_undo::local_compensator::local_attempt_undo` special-cases `LocalTable::KmsFacts`
+/// and calls `KmsHandle::restore_fact` instead.
+///
+/// `Calendar` (phase 13b) is ALSO a partial member in a different way: `CalendarAdd`/
+/// `CalendarDeleteSeries` are full generic members (plain row create/soft-delete, exactly
+/// like `Tasks`), but `CalendarDeleteOccurrence`'s forward write targets a DIFFERENT table
+/// (`calendar_exceptions`, not `calendar_events`) — see `LocalMutation::explicit_pre_state`
+/// and `journal_undo::local_compensator`'s `LocalOpKind::DeleteOccurrence` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalTable {
     Tasks,
     Notes,
     Reminders,
+    KmsFacts,
+    /// Phase 11 (assistant-depth): work_items is a plain relational table like
+    /// tasks/notes/reminders — no vector/index side-channel, so it is a FULL member
+    /// of the generic snapshot compensator (unlike `KmsFacts`, which only partially
+    /// participates — see that variant's doc comment).
+    WorkItems,
+    /// Phase 13b (assistant-depth): `calendar_events` — see this enum's doc comment for
+    /// why `CalendarDeleteOccurrence` does NOT fully fit the generic snapshot/restore
+    /// model this table name otherwise backs.
+    Calendar,
 }
 
 impl LocalTable {
@@ -37,12 +60,17 @@ impl LocalTable {
             LocalTable::Tasks => "tasks",
             LocalTable::Notes => "notes",
             LocalTable::Reminders => "reminders",
+            LocalTable::KmsFacts => "kms_facts",
+            LocalTable::WorkItems => "work_items",
+            LocalTable::Calendar => "calendar_events",
         }
     }
 
     /// Whitelisted columns eligible for `snapshot_row`/`restore_row`. Deliberately excludes
-    /// `notes.embedding` (regenerable BLOB, never part of a pre-image) and `created_at`
-    /// (immutable, never restored).
+    /// `notes.embedding`/`kms_facts.embedding` (regenerable BLOBs, never part of a
+    /// pre-image — Phase 12's invariant: a `memory_forget` undo must NEVER re-embed, only
+    /// read the still-present BLOB back off the live row) and `created_at` (immutable,
+    /// never restored).
     fn whitelisted_columns(self) -> &'static [&'static str] {
         match self {
             LocalTable::Tasks => &[
@@ -71,6 +99,39 @@ impl LocalTable {
                 "outcome",
                 "outcome_at",
                 "session_id",
+                "updated_at",
+                "deleted_at",
+            ],
+            LocalTable::KmsFacts => &["id", "deleted_at", "updated_at"],
+            // `progress` (INTEGER) is deliberately excluded — every whitelisted column
+            // here is read/written as TEXT (see `row_to_json`'s doc comment); adding an
+            // INTEGER column would silently decode to `Null` in a snapshot (harmless
+            // today since Delete is the only op, but a landmine for a future Update).
+            LocalTable::WorkItems => &[
+                "id",
+                "session_id",
+                "title",
+                "status",
+                "phase",
+                "checkpoint",
+                "started_at",
+                "completed_at",
+                "error",
+                "updated_at",
+                "deleted_at",
+            ],
+            // `all_day` (INTEGER) is deliberately excluded — same landmine noted on
+            // `WorkItems::progress`: every whitelisted column here is read/written as TEXT.
+            // `CalendarDeleteSeries` (the only generic op today) never needs it restored;
+            // its undo just clears `deleted_at`.
+            LocalTable::Calendar => &[
+                "id",
+                "title",
+                "description",
+                "location",
+                "start_at",
+                "end_at",
+                "recurrence",
                 "updated_at",
                 "deleted_at",
             ],
@@ -121,6 +182,50 @@ pub enum LocalMutation<'a> {
     ReminderDelete {
         id: &'a str,
     },
+    /// Phase 12: forget = soft-delete `kms_facts` (mirrors `TaskDelete`/`NoteDelete`'s
+    /// shape). Deliberately carries NO embedding — the tool layer (`MemoryForgetTool`)
+    /// calls `KmsHandle::index_remove` for the ANN-side tombstone AFTER this commits,
+    /// since the HNSW mutation cannot run inside this `sqlx::Transaction`.
+    MemoryForget {
+        fact_id: &'a str,
+    },
+    /// Phase 11: the sole tool-driven destructive mutation on work_items — internal
+    /// lifecycle transitions (create/start/checkpoint/complete/fail/mark_interrupted)
+    /// run directly from `agent.rs`, never through a `Tool`, so they carry no journal
+    /// coverage (see the phase's Risk Notes). Only a user-invoked delete needs undo.
+    WorkItemDelete {
+        id: &'a str,
+    },
+    /// Phase 13b: mirrors `TaskCreate`'s shape — the tool mints `id` up front so the
+    /// journal row and the forward INSERT share it. `recurrence` (if set) is a string
+    /// already validated against `haily_db::recurrence::RecurrenceRule::parse` by the
+    /// caller — this module never re-validates it (repeats the `reminder_add` contract).
+    CalendarAdd {
+        id: &'a str,
+        title: &'a str,
+        description: Option<&'a str>,
+        location: Option<&'a str>,
+        start_at: &'a str,
+        end_at: &'a str,
+        all_day: bool,
+        recurrence: Option<&'a str>,
+    },
+    /// Delete the WHOLE series (soft-delete the `calendar_events` row) — mirrors
+    /// `TaskDelete`. Contrast `CalendarDeleteOccurrence` below, which never touches this
+    /// row at all.
+    CalendarDeleteSeries {
+        id: &'a str,
+    },
+    /// Delete exactly ONE occurrence of a recurring event by recording an exception —
+    /// the forward write targets `calendar_exceptions`, a DIFFERENT table from
+    /// `LocalTable::Calendar`'s `calendar_events`. See `explicit_pre_state` (this impl)
+    /// and `journal_undo::local_compensator`'s `LocalOpKind::DeleteOccurrence` for why
+    /// this cannot go through the generic snapshot/restore path despite sharing
+    /// `LocalTable::Calendar` for dispatch purposes.
+    CalendarDeleteOccurrence {
+        event_id: &'a str,
+        occurrence_start: &'a str,
+    },
 }
 
 impl<'a> LocalMutation<'a> {
@@ -135,12 +240,20 @@ impl<'a> LocalMutation<'a> {
             LocalMutation::ReminderAdd { .. } | LocalMutation::ReminderDelete { .. } => {
                 LocalTable::Reminders
             }
+            LocalMutation::MemoryForget { .. } => LocalTable::KmsFacts,
+            LocalMutation::WorkItemDelete { .. } => LocalTable::WorkItems,
+            LocalMutation::CalendarAdd { .. }
+            | LocalMutation::CalendarDeleteSeries { .. }
+            | LocalMutation::CalendarDeleteOccurrence { .. } => LocalTable::Calendar,
         }
     }
 
     /// The row id this mutation targets. `None` only for a create with a not-yet-inserted
     /// row — but callers always mint the id up front (see `local_journaled_write`), so a
-    /// create's id is known before this runs.
+    /// create's id is known before this runs. For `CalendarDeleteOccurrence` this is the
+    /// EVENT's id (used for `read_updated_at`'s post-write C10 baseline and the journal's
+    /// `correlation_ref`) — never the exception row's own id, which has no undo-time
+    /// meaning (see `explicit_pre_state`, which carries `occurrence_start` separately).
     fn row_id(&self) -> &'a str {
         match self {
             LocalMutation::TaskCreate { id, .. }
@@ -151,6 +264,12 @@ impl<'a> LocalMutation<'a> {
             | LocalMutation::NoteDelete { id }
             | LocalMutation::ReminderAdd { id, .. }
             | LocalMutation::ReminderDelete { id } => id,
+            LocalMutation::MemoryForget { fact_id } => fact_id,
+            LocalMutation::WorkItemDelete { id } => id,
+            LocalMutation::CalendarAdd { id, .. } | LocalMutation::CalendarDeleteSeries { id } => {
+                id
+            }
+            LocalMutation::CalendarDeleteOccurrence { event_id, .. } => event_id,
         }
     }
 
@@ -161,7 +280,46 @@ impl<'a> LocalMutation<'a> {
             LocalMutation::TaskCreate { .. }
                 | LocalMutation::NoteSave { .. }
                 | LocalMutation::ReminderAdd { .. }
+                | LocalMutation::CalendarAdd { .. }
         )
+    }
+
+    /// Hand-built pre_state for a mutation whose reversible artifact is NOT a snapshot of
+    /// `table()`'s row — today, only `CalendarDeleteOccurrence`, whose forward write
+    /// inserts into `calendar_exceptions`, a table entirely separate from
+    /// `LocalTable::Calendar`'s `calendar_events`. `snapshot_row` reads the wrong table
+    /// for this case (it would read the untouched event row), so this bypasses it with an
+    /// explicit `{event_id, occurrence_start}` record — exactly what
+    /// `local_compensator::LocalOpKind::DeleteOccurrence` needs to build the inverse
+    /// `DELETE FROM calendar_exceptions` later. `None` means "use the generic
+    /// `snapshot_row`" (every other variant, behavior unchanged).
+    fn explicit_pre_state(&self) -> Option<Value> {
+        match self {
+            LocalMutation::CalendarDeleteOccurrence {
+                event_id,
+                occurrence_start,
+            } => Some(json!({ "event_id": event_id, "occurrence_start": occurrence_start })),
+            _ => None,
+        }
+    }
+
+    /// The identity string `idempotency_key` (`"{tool_name}:{identity}"`) is built from.
+    /// Defaults to `row_id()` for every plain one-row-one-target mutation (unchanged
+    /// behavior). Overridden ONLY for `CalendarDeleteOccurrence`: its `row_id()` returns
+    /// the EVENT id (needed for `read_updated_at`'s live DB lookup), but that id is
+    /// SHARED by every occurrence of the same recurring series — using it bare would
+    /// collide `action_journal`'s global `UNIQUE(idempotency_key)` the moment a SECOND,
+    /// DIFFERENT occurrence of the same event is deleted (they are NOT retries of the
+    /// same logical op). Folding `occurrence_start` in makes the key unique per
+    /// occurrence, matching every other mutation's "one target, one key" invariant.
+    fn idempotency_id(&self) -> String {
+        match self {
+            LocalMutation::CalendarDeleteOccurrence {
+                event_id,
+                occurrence_start,
+            } => format!("{event_id}@{occurrence_start}"),
+            _ => self.row_id().to_string(),
+        }
     }
 }
 
@@ -487,6 +645,78 @@ async fn apply_mutation(tx: &mut Transaction<'_, Sqlite>, m: &LocalMutation<'_>)
             .await?
             .rows_affected()
         }
+        LocalMutation::MemoryForget { fact_id } => {
+            // DB-only half of a forget (mirrors `facts::soft_delete`, scoped to this tx).
+            // The HNSW tombstone is applied by the tool layer AFTER commit — see the
+            // variant's doc comment.
+            sqlx::query(
+                "UPDATE kms_facts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(*fact_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        LocalMutation::WorkItemDelete { id } => {
+            sqlx::query(
+                "UPDATE work_items SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(*id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        LocalMutation::CalendarAdd {
+            id,
+            title,
+            description,
+            location,
+            start_at,
+            end_at,
+            all_day,
+            recurrence,
+        } => {
+            sqlx::query(
+                "INSERT INTO calendar_events
+                     (id, title, description, location, start_at, end_at, all_day, recurrence,
+                      created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(*id)
+            .bind(*title)
+            .bind(*description)
+            .bind(*location)
+            .bind(*start_at)
+            .bind(*end_at)
+            .bind(*all_day as i64)
+            .bind(*recurrence)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        LocalMutation::CalendarDeleteSeries { id } => {
+            sqlx::query(
+                "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(*id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        // The exception INSERT is the entire forward mutation — no `calendar_events` row
+        // is touched (see `LocalMutation::explicit_pre_state`'s doc comment).
+        LocalMutation::CalendarDeleteOccurrence {
+            event_id,
+            occurrence_start,
+        } => calendar::insert_exception_tx(tx, event_id, occurrence_start).await?,
     };
     Ok(affected)
 }
@@ -532,7 +762,28 @@ pub async fn local_journaled_write(
     let id = mutation.row_id().to_string();
     let mut tx = db.pool().begin().await?;
 
-    let pre_state = if mutation.is_create() {
+    let pre_state = if let Some(explicit) = mutation.explicit_pre_state() {
+        // A mutation with an explicit pre_state has no generic "row exists" pre-check
+        // (see the `else` branch below) — but its forward write can still be a genuine
+        // no-op duplicate (e.g. the SAME occurrence deleted twice). That MUST be caught
+        // here, before `journal::insert_tx` below: unlike every other mutation, this
+        // one's `idempotency_key` is stable across repeat attempts (it has no
+        // discriminator besides the exception's own identity), so a duplicate reaching
+        // `insert_tx` would hit `action_journal`'s UNIQUE constraint directly instead of
+        // the graceful "already done" every other no-op mutation gets via
+        // `apply_mutation`'s post-insert `rows_affected() == 0` check.
+        if let LocalMutation::CalendarDeleteOccurrence {
+            event_id,
+            occurrence_start,
+        } = &mutation
+        {
+            if calendar::exception_exists_tx(&mut tx, event_id, occurrence_start).await? {
+                tx.rollback().await.ok();
+                return Ok(None);
+            }
+        }
+        Some(explicit)
+    } else if mutation.is_create() {
         None
     } else {
         match snapshot_row(&mut tx, table, &id).await? {
@@ -559,7 +810,7 @@ pub async fn local_journaled_write(
             // "final"/"compensatable" vocabulary, but the column is still populated for
             // consistency with the schema's NOT NULL constraint.
             compensability: "compensatable",
-            idempotency_key: &format!("{tool_name}:{id}"),
+            idempotency_key: &format!("{tool_name}:{}", mutation.idempotency_id()),
             correlation_ref: &id,
             request_params,
             pre_state: pre_state_str.as_deref(),

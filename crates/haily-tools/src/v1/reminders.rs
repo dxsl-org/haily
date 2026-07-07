@@ -25,10 +25,15 @@ impl Tool for ReminderAddTool {
             "type": "object",
             "properties": {
                 "title":      { "type": "string", "description": "Nội dung nhắc nhở" },
-                "fire_at":    { "type": "string", "description": "RFC3339 thời điểm fire" },
+                "fire_at":    {
+                    "type": "string",
+                    "description": "RFC3339 thời điểm fire, hoặc cụm từ tự nhiên VN/EN \
+                        (vd: 'mỗi thứ 2', 'hàng ngày 7h', '8h sáng mai', 'tomorrow 8am')"
+                },
                 "recurrence": {
                     "type": "string",
-                    "description": "Lặp lại: 'daily' | 'weekly' | cron expression",
+                    "description": "Lặp lại (chỉ dùng khi fire_at là RFC3339): \
+                        'daily' | 'weekly' | 'weekly:<mon..sun>' | 'monthly:<1..31>' | 'every:<N>d'",
                     "nullable": true
                 }
             },
@@ -43,10 +48,40 @@ impl Tool for ReminderAddTool {
         let title = args["title"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("title required"))?;
-        let fire_at = args["fire_at"]
+        let fire_at_input = args["fire_at"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("fire_at required"))?;
-        let recurrence = args["recurrence"].as_str();
+        let recurrence_input = args["recurrence"].as_str();
+
+        // `fire_at` accepts either an explicit RFC3339 instant (recurrence taken from the
+        // caller's own `recurrence` arg, validated against the SAME grammar the daemon
+        // enforces) OR a natural-language VN/EN phrase (recurrence, if any, derived by the
+        // parser itself — the arg is ignored in that branch, since the phrase IS the rule).
+        let (fire_at, recurrence): (String, Option<String>) =
+            match chrono::DateTime::parse_from_rfc3339(fire_at_input) {
+                Ok(_) => {
+                    if let Some(r) = recurrence_input {
+                        if haily_db::recurrence::RecurrenceRule::parse(r).is_none() {
+                            return Err(anyhow::anyhow!(
+                                "recurrence rule not supported: '{r}' (supported: daily, \
+                                 weekly, weekly:<mon..sun>, monthly:<1..31>, every:<N>d)"
+                            ));
+                        }
+                    }
+                    (fire_at_input.to_string(), recurrence_input.map(str::to_string))
+                }
+                Err(_) => match crate::schedule::parse_schedule(fire_at_input, chrono::Local::now()) {
+                    Some((derived_fire_at, derived_rule)) => (derived_fire_at, derived_rule),
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "could not understand fire_at '{fire_at_input}' — supply an \
+                             RFC3339 timestamp or a recognized phrase (e.g. 'daily 7h', \
+                             'every Monday', 'tomorrow 8am')"
+                        ));
+                    }
+                },
+            };
+
         let session_id = ctx.session_id.to_string();
 
         // The id is minted here (not by `reminders::insert`) because the journal outbox row
@@ -58,8 +93,8 @@ impl Tool for ReminderAddTool {
             LocalMutation::ReminderAdd {
                 id: &id,
                 title,
-                fire_at,
-                recurrence,
+                fire_at: &fire_at,
+                recurrence: recurrence.as_deref(),
                 session_id: &session_id,
             },
             &session_id,
