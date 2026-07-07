@@ -18,6 +18,11 @@ use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc
 /// is implausibly stale — a defense-in-depth cap, not an expected code path.
 const MAX_COALESCE_STEPS: u32 = 10_000;
 
+/// Cap on how many in-window occurrences `occurrences_in_window` will collect for a single
+/// event expansion — 366 comfortably covers a full year of a daily event, far more than any
+/// realistic `upcoming` query window, while bounding worst-case memory/CPU per event.
+const MAX_OCCURRENCES_PER_EVENT: usize = 366;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecurrenceRule {
     Daily,
@@ -116,6 +121,53 @@ impl RecurrenceRule {
             }
         }
         Ok(candidate.to_rfc3339())
+    }
+
+    /// Enumerate every occurrence of this rule, seeded from `base` (the event's stored
+    /// `start_at`), that falls within `[window_from, window_to]` inclusive — the expansion
+    /// primitive `haily-db::queries::calendar::upcoming` uses (phase 13a) so a recurring
+    /// calendar event surfaces on every in-window occurrence instead of only its stored
+    /// `start_at`. Reuses `step` (the same period-advance `next_after` relies on) rather than
+    /// forking any recurrence math.
+    ///
+    /// Two bounds keep this safe against a long-lived event combined with a huge caller
+    /// window: fast-forwarding from `base` to `window_from` is capped at
+    /// `MAX_COALESCE_STEPS` (mirrors `next_after`'s own backlog-coalescing bound), and the
+    /// number of occurrences collected inside the window is capped at
+    /// `MAX_OCCURRENCES_PER_EVENT` — a defense-in-depth guard against a pathological rule or
+    /// window exhausting memory (Security Considerations, phase 13a).
+    pub fn occurrences_in_window(
+        &self,
+        base: DateTime<FixedOffset>,
+        window_from: DateTime<FixedOffset>,
+        window_to: DateTime<FixedOffset>,
+    ) -> Vec<DateTime<FixedOffset>> {
+        if window_from > window_to || base > window_to {
+            return Vec::new();
+        }
+
+        let mut candidate = base;
+        let mut coalesce_steps = 0u32;
+        while candidate < window_from {
+            candidate = match self.step(candidate) {
+                Some(c) => c,
+                None => return Vec::new(),
+            };
+            coalesce_steps += 1;
+            if coalesce_steps > MAX_COALESCE_STEPS {
+                return Vec::new();
+            }
+        }
+
+        let mut occurrences = Vec::new();
+        while candidate <= window_to && occurrences.len() < MAX_OCCURRENCES_PER_EVENT {
+            occurrences.push(candidate);
+            candidate = match self.step(candidate) {
+                Some(c) => c,
+                None => break,
+            };
+        }
+        occurrences
     }
 }
 
@@ -279,5 +331,62 @@ mod tests {
     fn free_function_returns_none_for_an_unparseable_stored_rule() {
         let result = next_after("garbage-rule", "2026-01-01T00:00:00+00:00", Utc::now()).unwrap();
         assert!(result.is_none());
+    }
+
+    fn fixed(s: &str) -> DateTime<FixedOffset> {
+        DateTime::parse_from_rfc3339(s).unwrap()
+    }
+
+    #[test]
+    fn occurrences_in_window_yields_one_per_period_across_the_range() {
+        // Weekly-on-Monday event that started 3 weeks before the query window; the window
+        // spans 4 Mondays — every one of them must surface.
+        let rule = RecurrenceRule::WeeklyOn(Weekday::Mon);
+        let base = fixed("2025-12-15T08:00:00+00:00"); // a Monday
+        let from = fixed("2026-01-05T00:00:00+00:00");
+        let to = fixed("2026-01-27T23:59:59+00:00");
+        let occurrences = rule.occurrences_in_window(base, from, to);
+        let rendered: Vec<String> = occurrences.iter().map(|d| d.to_rfc3339()).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "2026-01-05T08:00:00+00:00",
+                "2026-01-12T08:00:00+00:00",
+                "2026-01-19T08:00:00+00:00",
+                "2026-01-26T08:00:00+00:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn occurrences_in_window_includes_base_when_base_is_inside_the_window() {
+        let rule = RecurrenceRule::Daily;
+        let base = fixed("2026-02-01T09:00:00+00:00");
+        let from = fixed("2026-02-01T00:00:00+00:00");
+        let to = fixed("2026-02-03T23:59:59+00:00");
+        let occurrences = rule.occurrences_in_window(base, from, to);
+        assert_eq!(occurrences.len(), 3);
+        assert_eq!(occurrences[0], base);
+    }
+
+    #[test]
+    fn occurrences_in_window_is_empty_when_base_is_after_the_window() {
+        let rule = RecurrenceRule::Daily;
+        let base = fixed("2026-05-01T09:00:00+00:00");
+        let from = fixed("2026-02-01T00:00:00+00:00");
+        let to = fixed("2026-02-03T23:59:59+00:00");
+        assert!(rule.occurrences_in_window(base, from, to).is_empty());
+    }
+
+    #[test]
+    fn occurrences_in_window_is_bounded_by_the_per_event_cap() {
+        // A daily rule over a ~2-year window would otherwise yield ~730 occurrences; the cap
+        // must bound the result regardless of how wide the caller's window is.
+        let rule = RecurrenceRule::Daily;
+        let base = fixed("2024-01-01T08:00:00+00:00");
+        let from = fixed("2024-01-01T00:00:00+00:00");
+        let to = fixed("2026-01-01T00:00:00+00:00");
+        let occurrences = rule.occurrences_in_window(base, from, to);
+        assert_eq!(occurrences.len(), MAX_OCCURRENCES_PER_EVENT);
     }
 }
