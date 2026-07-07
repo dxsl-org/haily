@@ -61,6 +61,19 @@ pub async fn active(db: &DbHandle) -> Result<Vec<Task>> {
     .await?)
 }
 
+/// All non-deleted tasks (any status, including `done`/`cancelled`) that carry a
+/// `calendar_event_id` link. `active()` alone can't answer "does this event have a prep
+/// task at all" — it excludes done tasks, so a completed prep task would look identical
+/// to "no prep task ever existed". Used by the cross-domain nudge detectors
+/// (`haily-proactive::cross_domain`) to tell those two cases apart.
+pub async fn linked_to_calendar(db: &DbHandle) -> Result<Vec<Task>> {
+    Ok(sqlx::query_as::<_, Task>(
+        "SELECT * FROM tasks WHERE calendar_event_id IS NOT NULL AND deleted_at IS NULL",
+    )
+    .fetch_all(db.pool())
+    .await?)
+}
+
 pub async fn update_status(db: &DbHandle, id: &str, status: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let completed_at = if status == "done" {

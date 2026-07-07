@@ -7,6 +7,7 @@ pub mod journal;
 pub mod local_snapshot;
 pub mod meta;
 pub mod notes;
+pub mod nudge_ledger;
 pub mod reminders;
 pub mod sessions;
 pub mod skills;
