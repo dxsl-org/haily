@@ -64,15 +64,36 @@ pub async fn get_fact(db: &DbHandle, id: &str) -> Result<Option<Fact>> {
     .await?)
 }
 
-/// FTS5 BM25 search. Returns most relevant facts first.
-pub async fn search_fts(db: &DbHandle, query: &str, limit: i64) -> Result<Vec<Fact>> {
-    Ok(sqlx::query_as::<_, Fact>(
-        "SELECT f.* FROM kms_facts f
+/// A fact plus the raw SQLite `bm25()` score that produced its FTS5 match.
+///
+/// The score is carried out separately from `Fact` (rather than added as a field on
+/// `Fact` itself) because it is meaningless outside an FTS query result — `Fact` is
+/// also returned by `get_fact`/`list_top`/etc. where no bm25 score exists. `#[sqlx(
+/// flatten)]` maps the `f.*` columns onto `Fact` while `bm25_score` binds to the
+/// query's extra `AS bm25_score` column, in one `query_as` call.
+#[derive(Debug, Clone, FromRow)]
+pub struct FtsHit {
+    #[sqlx(flatten)]
+    pub fact: Fact,
+    /// SQLite FTS5 `bm25()` value. MORE NEGATIVE means a BETTER match — this is the
+    /// opposite of "higher is better" scores elsewhere in the codebase, so callers
+    /// must not treat this like `SearchResult::score`. See `haily-kms/src/search.rs`
+    /// (`BM25_CUTOFF`) for the consumer that applies an absolute cutoff on this value.
+    pub bm25_score: f64,
+}
+
+/// FTS5 BM25 search. Returns most relevant facts first, each paired with the actual
+/// `bm25()` value (not just its rank position) so callers can apply an absolute
+/// relevance cutoff instead of a rank-position proxy — a lone weak match ranked #0
+/// is NOT the same as a strong match, and only the real score can tell them apart.
+pub async fn search_fts(db: &DbHandle, query: &str, limit: i64) -> Result<Vec<FtsHit>> {
+    Ok(sqlx::query_as::<_, FtsHit>(
+        "SELECT f.*, bm25(facts_fts) AS bm25_score FROM kms_facts f
          JOIN facts_fts ON f.rowid = facts_fts.rowid
          WHERE facts_fts MATCH ?
            AND f.deleted_at IS NULL
            AND f.archived_at IS NULL
-         ORDER BY rank LIMIT ?",
+         ORDER BY bm25_score LIMIT ?",
     )
     .bind(query)
     .bind(limit)
@@ -174,6 +195,68 @@ pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     .await?
     .rows_affected();
     Ok(rows > 0)
+}
+
+/// Fetch a fact's raw `updated_at`, REGARDLESS of `deleted_at`/`archived_at` — unlike
+/// `get_fact`'s live-row filter, which would hide a just-soft-deleted row. Used to
+/// capture the C10 undo-guard's baseline version for a `memory_forget` (the generic
+/// local-tool journal path already covers this via `local_snapshot::read_updated_at`
+/// combined with `LocalTable::KmsFacts`; this is for `haily-kms`'s own
+/// `KmsHandle::restore_fact` tests, which drive the restore directly, without going
+/// through the journal).
+pub async fn get_updated_at(db: &DbHandle, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT updated_at FROM kms_facts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await?;
+    Ok(row.map(|(v,)| v))
+}
+
+/// C10-guarded undo of `soft_delete`: clears `deleted_at` only if `updated_at` still
+/// matches `expected_updated_at` — a record changed under us since the forward write
+/// (e.g. a second forget, or any other concurrent touch) is detected by
+/// `rows_affected()==0`, never a separate SELECT-then-UPDATE (TOCTOU). Returns `false`
+/// on that race (caller must refuse, not retry blind); `true` once the DB half of the
+/// restore has landed. The ANN-index half (`KmsHandle::restore_fact`) runs AFTER this
+/// call returns `true` — see that function's doc for the resulting crash-ordering.
+pub async fn clear_deleted_at(db: &DbHandle, id: &str, expected_updated_at: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE kms_facts SET deleted_at = NULL, updated_at = ?
+         WHERE id = ? AND updated_at = ? AND deleted_at IS NOT NULL",
+    )
+    .bind(&now)
+    .bind(id)
+    .bind(expected_updated_at)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
+/// Fact ids whose `deleted_at` was CLEARED (a `memory_forget` undo) strictly after
+/// `since` (RFC3339), restricted to facts that existed BEFORE that boundary
+/// (`created_at <= since`) — the C2 restore-vs-rebuild race fix.
+///
+/// `embeddings_created_since` cannot see these: an undo never changes `created_at`,
+/// only `updated_at`. Without this delta, a `memory_forget` undone while a background
+/// HNSW rebuild is in flight (`KmsHandle::index_remove`'s tombstone-ratio trigger)
+/// would restore the OUTGOING (soon-to-be-discarded) index only — the fresh index's
+/// own DB scan (`embeddings_for_hnsw`, captured before the restore's commit) already
+/// excludes it, and the swap would silently drop the restored fact from ANN search.
+/// Folding this delta in as an INSERT (mirroring `embeddings_created_since`'s shape)
+/// at swap time closes that gap.
+pub async fn ids_undeleted_since(db: &DbHandle, since: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let rows = sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT id, embedding FROM kms_facts
+         WHERE embedding IS NOT NULL AND deleted_at IS NULL AND archived_at IS NULL
+           AND updated_at > ? AND created_at <= ?",
+    )
+    .bind(since)
+    .bind(since)
+    .fetch_all(db.pool())
+    .await?;
+    Ok(rows)
 }
 
 /// EMA update: confidence = 0.8 * old + 0.2 * new_signal.

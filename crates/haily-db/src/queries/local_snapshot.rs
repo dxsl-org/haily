@@ -21,14 +21,22 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use sqlx::{Row, Sqlite, Transaction};
 
-/// The three local tool tables this mechanism covers. A closed, compile-time set —
-/// deliberately excludes memory (HNSW-index coupling) and calendar (recurrence undo
-/// unresolved); see the phase's Risk Notes.
+/// The local tool tables this mechanism covers. A closed, compile-time set —
+/// deliberately excludes calendar (recurrence undo unresolved); see the phase's Risk
+/// Notes. `KmsFacts` (Phase 12 — memory-undo via KmsHandle compensator) is a PARTIAL
+/// member of this set: it is only ever snapshotted here (to capture pre_state / detect
+/// a missing target the same way the other three do) and its forward soft-delete runs
+/// through the ordinary tx-scoped `apply_mutation` below — but its UNDO never goes
+/// through the generic `clear_deleted_at`/`restore_row` in this module. A `memory_forget`
+/// undo must ALSO mutate the in-memory HNSW index, which cannot participate in a
+/// `sqlx::Transaction`, so `journal_undo::local_compensator::local_attempt_undo`
+/// special-cases `LocalTable::KmsFacts` and calls `KmsHandle::restore_fact` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalTable {
     Tasks,
     Notes,
     Reminders,
+    KmsFacts,
 }
 
 impl LocalTable {
@@ -37,12 +45,15 @@ impl LocalTable {
             LocalTable::Tasks => "tasks",
             LocalTable::Notes => "notes",
             LocalTable::Reminders => "reminders",
+            LocalTable::KmsFacts => "kms_facts",
         }
     }
 
     /// Whitelisted columns eligible for `snapshot_row`/`restore_row`. Deliberately excludes
-    /// `notes.embedding` (regenerable BLOB, never part of a pre-image) and `created_at`
-    /// (immutable, never restored).
+    /// `notes.embedding`/`kms_facts.embedding` (regenerable BLOBs, never part of a
+    /// pre-image — Phase 12's invariant: a `memory_forget` undo must NEVER re-embed, only
+    /// read the still-present BLOB back off the live row) and `created_at` (immutable,
+    /// never restored).
     fn whitelisted_columns(self) -> &'static [&'static str] {
         match self {
             LocalTable::Tasks => &[
@@ -74,6 +85,7 @@ impl LocalTable {
                 "updated_at",
                 "deleted_at",
             ],
+            LocalTable::KmsFacts => &["id", "deleted_at", "updated_at"],
         }
     }
 }
@@ -121,6 +133,13 @@ pub enum LocalMutation<'a> {
     ReminderDelete {
         id: &'a str,
     },
+    /// Phase 12: forget = soft-delete `kms_facts` (mirrors `TaskDelete`/`NoteDelete`'s
+    /// shape). Deliberately carries NO embedding — the tool layer (`MemoryForgetTool`)
+    /// calls `KmsHandle::index_remove` for the ANN-side tombstone AFTER this commits,
+    /// since the HNSW mutation cannot run inside this `sqlx::Transaction`.
+    MemoryForget {
+        fact_id: &'a str,
+    },
 }
 
 impl<'a> LocalMutation<'a> {
@@ -135,6 +154,7 @@ impl<'a> LocalMutation<'a> {
             LocalMutation::ReminderAdd { .. } | LocalMutation::ReminderDelete { .. } => {
                 LocalTable::Reminders
             }
+            LocalMutation::MemoryForget { .. } => LocalTable::KmsFacts,
         }
     }
 
@@ -151,6 +171,7 @@ impl<'a> LocalMutation<'a> {
             | LocalMutation::NoteDelete { id }
             | LocalMutation::ReminderAdd { id, .. }
             | LocalMutation::ReminderDelete { id } => id,
+            LocalMutation::MemoryForget { fact_id } => fact_id,
         }
     }
 
@@ -483,6 +504,20 @@ async fn apply_mutation(tx: &mut Transaction<'_, Sqlite>, m: &LocalMutation<'_>)
             .bind(&now)
             .bind(&now)
             .bind(*id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        LocalMutation::MemoryForget { fact_id } => {
+            // DB-only half of a forget (mirrors `facts::soft_delete`, scoped to this tx).
+            // The HNSW tombstone is applied by the tool layer AFTER commit — see the
+            // variant's doc comment.
+            sqlx::query(
+                "UPDATE kms_facts SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(*fact_id)
             .execute(&mut **tx)
             .await?
             .rows_affected()

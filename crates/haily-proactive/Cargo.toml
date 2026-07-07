@@ -7,6 +7,7 @@ description = "Proactive daemon — morning brief, alerts, DND, pattern detectio
 [dependencies]
 haily-db    = { workspace = true }
 haily-io    = { workspace = true }
+haily-kms   = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 tracing     = { workspace = true }

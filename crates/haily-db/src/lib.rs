@@ -1,4 +1,5 @@
 pub mod queries;
+pub mod recurrence;
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};

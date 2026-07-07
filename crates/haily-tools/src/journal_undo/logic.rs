@@ -12,6 +12,7 @@ use super::ConnectorResolver;
 use crate::connector::{redact, ConnectorExecutor, ExecOutcome};
 use anyhow::Result;
 use haily_db::{queries::journal, queries::journal::ActionJournalRow, DbHandle};
+use haily_kms::KmsHandle;
 use serde_json::Value;
 
 /// Hard cap on undo attempts (M4/M7). Beyond this the row is `stuck` for manual action.
@@ -130,14 +131,19 @@ pub async fn write_date_unchanged(
 /// version re-check → read-back-before-compensation (skip-if-already-target) → compensate →
 /// OWN read-back → `undone`. Every terminal state is persisted so a USER-initiated retry
 /// resumes from the recorded state.
+///
+/// `kms` (Phase 12) is threaded through to `local_attempt_undo` — a `memory_forget` row is a
+/// LOCAL row (see `is_local_row`), so its undo needs `KmsHandle::restore_fact` for the
+/// ANN-index half of the compensation. The connector path below never touches it.
 pub async fn attempt_undo(
     db: &DbHandle,
+    kms: &KmsHandle,
     resolver: &ConnectorResolver,
     row: &ActionJournalRow,
     session_id: &str,
 ) -> Result<UndoOutcome> {
     if is_local_row(row) {
-        return local_attempt_undo(db, row, session_id).await;
+        return local_attempt_undo(db, kms, row, session_id).await;
     }
     if let Some(reason) = refusal_reason(row) {
         journal::advance_undo_status(db, &row.id, "refused").await?;
@@ -411,6 +417,7 @@ pub struct BatchCounts {
 /// existence-vs-ownership oracle).
 pub async fn batch_undo(
     db: &DbHandle,
+    kms: &KmsHandle,
     resolver: &ConnectorResolver,
     ids: &[String],
     session_id: &str,
@@ -424,7 +431,7 @@ pub async fn batch_undo(
                 continue;
             }
         };
-        match attempt_undo(db, resolver, &row, session_id).await {
+        match attempt_undo(db, kms, resolver, &row, session_id).await {
             Ok(UndoOutcome::Undone) | Ok(UndoOutcome::AlreadyDone) => counts.undone += 1,
             Ok(_) => counts.failed += 1,
             Err(_) => counts.failed += 1,
@@ -451,11 +458,12 @@ pub async fn batch_undo(
 /// logic, just a different way to name the row set.
 pub async fn undo_turn(
     db: &DbHandle,
+    kms: &KmsHandle,
     resolver: &ConnectorResolver,
     turn_id: &str,
     session_id: &str,
 ) -> Result<BatchCounts> {
     let rows = journal::list_by_turn(db, turn_id, session_id).await?;
     let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
-    Ok(batch_undo(db, resolver, &ids, session_id).await)
+    Ok(batch_undo(db, kms, resolver, &ids, session_id).await)
 }

@@ -3,6 +3,7 @@
 //! daemon; both are now unconditional, gated only by `BootstrapOptions`).
 use haily_db::{queries::journal, queries::work_items, DbHandle};
 use haily_io::{AdapterManager, Notification, WorkItemStatus};
+use haily_kms::KmsHandle;
 use haily_proactive::ProactiveDaemon;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,13 +61,19 @@ pub fn spawn_work_item_watcher(
 }
 
 /// Start the proactive daemon (morning brief, reminders, cross-domain alerts).
+///
+/// `kms` is threaded in for the morning brief's synthesis (Phase 3, assistant-depth):
+/// it correlates tasks/calendar/reminders and pulls floored memory context via
+/// `KmsHandle::search_hybrid` — the same recall path `haily-core` uses for turn
+/// context, so the daemon's recall behaves identically (no separate threshold logic).
 pub fn spawn_proactive_daemon(
     db: Arc<DbHandle>,
+    kms: Arc<KmsHandle>,
     am: AdapterManager,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 ) {
-    ProactiveDaemon::new(db, am).start(shutdown, &tasks);
+    ProactiveDaemon::new(db, kms, am).start(shutdown, &tasks);
 }
 
 /// Interval in seconds between action-journal retention purges. Hourly is fine — the

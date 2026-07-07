@@ -84,12 +84,19 @@ impl KmsHandle {
                 let created = facts::embeddings_created_since(db, &manifest.dumped_at)
                     .await
                     .unwrap_or_default();
+                // C2: a `memory_forget` undone between the dump and this load has an
+                // unchanged `created_at`, so `embeddings_created_since` alone would miss
+                // it — see `facts::ids_undeleted_since`'s doc.
+                let undeleted = facts::ids_undeleted_since(db, &manifest.dumped_at)
+                    .await
+                    .unwrap_or_default();
                 let removed = facts::ids_deleted_or_archived_since(db, &manifest.dumped_at)
                     .await
                     .unwrap_or_default();
-                if !created.is_empty() || !removed.is_empty() {
+                if !created.is_empty() || !undeleted.is_empty() || !removed.is_empty() {
                     let created_floats: Vec<(String, Vec<f32>)> = created
                         .into_iter()
+                        .chain(undeleted)
                         .map(|(id, blob)| (id, blob_to_floats(&blob)))
                         .collect();
                     tracing::info!(
@@ -171,11 +178,19 @@ impl KmsHandle {
                         let created = facts::embeddings_created_since(&this.db, &since)
                             .await
                             .unwrap_or_default();
+                        // C2: fold in any `memory_forget` undone during this rebuild's
+                        // window — its `created_at` predates `since`, so it would
+                        // otherwise be silently dropped at the swap below. See
+                        // `facts::ids_undeleted_since`'s doc for the full race.
+                        let undeleted = facts::ids_undeleted_since(&this.db, &since)
+                            .await
+                            .unwrap_or_default();
                         let removed = facts::ids_deleted_or_archived_since(&this.db, &since)
                             .await
                             .unwrap_or_default();
                         let created_floats: Vec<(String, Vec<f32>)> = created
                             .into_iter()
+                            .chain(undeleted)
                             .map(|(id, blob)| (id, blob_to_floats(&blob)))
                             .collect();
                         fresh.apply_delta(&created_floats, &removed);
@@ -318,6 +333,58 @@ impl KmsHandle {
             self.index_remove(id);
         }
         Ok(removed)
+    }
+
+    /// Undo a `memory_forget`: clear `deleted_at` (DB, the source of truth — runs
+    /// FIRST) then restore ANN searchability in the live in-memory index.
+    ///
+    /// C10: guarded by `expected_updated_at` exactly like the local-tool compensator's
+    /// `clear_deleted_at` — a record changed under us since the forward write (a
+    /// second forget, or any other concurrent touch) affects zero DB rows; this
+    /// returns `Ok(false)` and the caller must treat it as a refusal, never retry
+    /// blind. `Ok(true)` once the DB half has landed (the ANN half below cannot fail
+    /// in a way that should un-do the DB clear — a fact merely missing from ANN
+    /// still exists and is findable via FTS/DB lookups).
+    ///
+    /// Crash-ordering: if the process dies between the DB clear (committed) and the
+    /// ANN restore (not yet run), the fact is LIVE in SQLite but still
+    /// tombstoned/absent from the in-memory HNSW graph — benign and self-healing:
+    /// `search::hybrid`'s FTS5 leg and any DB-backed lookup already find it; ANN
+    /// search alone misses it until the next tombstone/age-triggered rebuild
+    /// (`index_remove`) or a process restart (`load_or_rebuild`/`rebuild_from_db`,
+    /// both DB-driven). The reverse ordering (ANN first) would risk the opposite and
+    /// strictly worse failure — an ANN hit for a fact SQLite still shows deleted —
+    /// which every read path would then have to defensively re-filter.
+    ///
+    /// Branches on `HnswIndex::contains` per the un-tombstone-vs-reinsert contract: a
+    /// bare `insert` on a still-present id would `push` a SECOND `id_map` entry for
+    /// the same fact id (no dedup in `HnswIndex::insert`), corrupting the id→index
+    /// mapping. `contains` false means a compaction rebuild already dropped the node
+    /// from the graph — re-insert from the still-present `kms_facts.embedding` BLOB
+    /// (soft-delete never clears it — see `facts::soft_delete`), never re-embedded.
+    ///
+    /// Defensive `un_tombstone` after a re-insert: a background rebuild
+    /// (`index_remove`) unions the OUTGOING index's tombstones into the fresh one
+    /// (`old.tombstoned_ids()`) so a fact forgotten mid-rebuild stays gone — but that
+    /// same union can carry a STALE tombstone for THIS id forward if this restore's
+    /// `un_tombstone` (the `contains` branch, on a DIFFERENT prior index instance)
+    /// raced the carry-forward read. Clearing it again here, unconditionally, after a
+    /// fresh insert is a no-op when no stale entry exists and closes that gap when one
+    /// does — a just-restored fact must never end up hidden by a leftover tombstone.
+    pub async fn restore_fact(&self, id: &str, expected_updated_at: &str) -> Result<bool> {
+        if !facts::clear_deleted_at(&self.db, id, expected_updated_at).await? {
+            return Ok(false);
+        }
+        let snapshot = self.hnsw_snapshot();
+        if snapshot.contains(id) {
+            snapshot.un_tombstone(id);
+        } else if let Some(fact) = facts::get_fact(&self.db, id).await? {
+            if let Some(blob) = fact.embedding {
+                snapshot.insert(id, &blob_to_floats(&blob));
+                snapshot.un_tombstone(id);
+            }
+        }
+        Ok(true)
     }
 
     /// Archive a fact (distinct from soft-delete — see `facts::archive`) and remove

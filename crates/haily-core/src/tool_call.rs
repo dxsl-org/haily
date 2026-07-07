@@ -19,7 +19,14 @@ const MAX_TOOL_CALLS: u32 = 10;
 /// `pub(crate)` (Harness Completion phase 5, H1 fix): `agent::approval_stats` replays
 /// this SAME escalation rule to derive `approval_requested`/`approval_denied` telemetry
 /// without a broker-observation channel — see its doc comment.
-pub(crate) const RETIERED_DELETE_TOOLS: &[&str] = &["task_delete", "note_delete", "reminder_delete"];
+///
+/// `"memory_forget"` (Phase 12: memory-undo via KmsHandle compensator) — a re-tiered
+/// delete tool MUST be listed here in the SAME step it is re-tiered off
+/// `IrreversibleWrite`, or it becomes auto-run AND uncapped (a prompt-injected agent
+/// could wipe unlimited memories silently, with no per-turn ceiling and no escalation
+/// to approval — C1).
+pub(crate) const RETIERED_DELETE_TOOLS: &[&str] =
+    &["task_delete", "note_delete", "reminder_delete", "memory_forget"];
 
 /// Guards against runaway loops: identical consecutive calls and call-count ceiling.
 pub struct LoopGuard {
@@ -1399,6 +1406,73 @@ mod tests {
             ctx.turn_deletes.load(Ordering::Relaxed),
             MAX_AUTO_DELETES_PER_TURN + 1,
             "the cap must keep escalating monotonically for every delete beyond the cap"
+        );
+    }
+
+    /// C1 (Phase 12 — memory-undo via KmsHandle compensator): proof against the REAL
+    /// `MemoryForgetTool`, not the `RetieredDeleteTool` stand-in — the (cap+1)-th
+    /// `memory_forget` in a turn must escalate to approval. Without `"memory_forget"`
+    /// in `RETIERED_DELETE_TOOLS`, a re-tiered `memory_forget` would be auto-run AND
+    /// uncapped, letting a prompt-injected agent wipe unlimited memories silently.
+    #[tokio::test]
+    async fn memory_forget_past_cap_escalates_to_approval_real_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(haily_tools::v1::memory::MemoryForgetTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        let fact_id = ctx
+            .kms
+            .remember("test", "coffee", "is", "yummy", "sess-1", None)
+            .await
+            .unwrap();
+
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    reversible,
+                    ..
+                } = chunk
+                {
+                    assert!(
+                        reversible,
+                        "memory_forget is cap-escalated ReversibleWrite, not genuinely \
+                         IrreversibleWrite on its own merits"
+                    );
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch(
+                "memory_forget",
+                serde_json::json!({"id": fact_id}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
+        )
+        .await
+        .expect("must resolve via the approval deny, not hang")
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            !ok,
+            "past the cap, a memory_forget call must require (and here, be denied) approval"
+        );
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert_eq!(
+            haily_tools::v1::memory::MemoryForgetTool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "risk_tier() must stay constant — the cap is dispatch-layer policy, not a tier mutation"
         );
     }
 

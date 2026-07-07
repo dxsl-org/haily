@@ -2373,6 +2373,7 @@ dependencies = [
  "chrono",
  "haily-db",
  "haily-io",
+ "haily-kms",
  "sqlx",
  "tempfile",
  "tokio",

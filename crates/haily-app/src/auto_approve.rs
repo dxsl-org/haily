@@ -133,9 +133,11 @@ mod tests {
     #[test]
     fn rejects_every_tool_that_can_still_require_approval() {
         // These remain `IrreversibleWrite`-capable (never re-tiered) — always-ask, no
-        // auto-approve bypass permitted for any of them.
+        // auto-approve bypass permitted for any of them. `memory_forget` moved OFF this
+        // list in Phase 12 (memory-undo via KmsHandle compensator) — see
+        // `retiered_delete_tools_are_no_longer_rejected` below.
         let registry = ToolRegistry::build_v1();
-        for name in ["memory_forget", "calendar_delete", "http_request"] {
+        for name in ["calendar_delete", "http_request"] {
             let names = vec![name.to_string()];
             assert!(
                 validate_auto_approve(&names, &registry).is_err(),
@@ -144,15 +146,16 @@ mod tests {
         }
     }
 
-    /// Harness Completion phase 2: `task_delete`/`note_delete`/`reminder_delete` are now
-    /// CONSTANT `ReversibleWrite` (re-tiered, journaled + undoable) — `can_return_irreversible`
+    /// Harness Completion phase 2 (`task_delete`/`note_delete`/`reminder_delete`) and
+    /// Phase 12 (`memory_forget`, memory-undo via KmsHandle compensator) all re-tier to
+    /// CONSTANT `ReversibleWrite` (journaled + undoable) — `can_return_irreversible`
     /// correctly reports `false` for them, so `validate_auto_approve` no longer rejects
     /// naming them (doing so is a harmless no-op: they never gate on approval at all now,
     /// re-tiering already removed the prompt these tools used to be gated behind).
     #[test]
     fn retiered_delete_tools_are_no_longer_rejected() {
         let registry = ToolRegistry::build_v1();
-        for name in ["task_delete", "reminder_delete", "note_delete"] {
+        for name in ["task_delete", "reminder_delete", "note_delete", "memory_forget"] {
             let names = vec![name.to_string()];
             let result = validate_auto_approve(&names, &registry);
             assert!(

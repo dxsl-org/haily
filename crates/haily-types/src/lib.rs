@@ -39,7 +39,7 @@ pub enum ResponseChunk {
         /// cap escalated it for this call (Harness Completion phase 2's M2 policy) —
         /// i.e. the action IS journaled/undoable, this is not a genuinely final write.
         /// `false` for a tool that is actually `IrreversibleWrite`/`Blocked` on its own
-        /// merits (e.g. `memory_forget`, `calendar_delete`). Display-only — lets a UI
+        /// merits (e.g. `calendar_delete`, `worktree_apply`). Display-only — lets a UI
         /// distinguish "can't be undone" from "cap reached, please confirm" without
         /// re-deriving tier logic client-side. `#[serde(default)]` keeps this ADDITIVE.
         #[serde(default)]
