@@ -238,6 +238,23 @@ impl KmsHandle {
         self.hnsw_snapshot().search(query, k)
     }
 
+    /// Whether `id` is currently ANN-*indexed and live*: present in the in-memory graph's
+    /// id map AND not tombstoned. This is the exact, deterministic contract `restore_fact`
+    /// and `remember` fulfil (graph membership + tombstone state) and the precise inverse of
+    /// what `index_remove` establishes.
+    ///
+    /// It deliberately does NOT run an approximate ANN query: HNSW recall is not a hard
+    /// guarantee — a greedy layered search over a small or tightly-clustered graph can return
+    /// fewer than `k` neighbours and miss even an exact (distance-0) match, and the graph
+    /// topology itself varies run-to-run because `parallel_insert_slice` builds it under rayon.
+    /// Callers needing end-to-end recall of a restored fact use `search_hybrid`, whose FTS5
+    /// leg is exact; this method answers the narrower, fully-deterministic question "did the
+    /// index re-admit this id and clear its tombstone".
+    pub fn is_ann_indexed(&self, id: &str) -> bool {
+        let snapshot = self.hnsw_snapshot();
+        snapshot.contains(id) && !snapshot.is_tombstoned(id)
+    }
+
     /// Hybrid search: FTS5 BM25 always; HNSW ANN when embeddings feature is active.
     /// Returns a ranked list of fact texts relevant to `query`.
     pub async fn search_hybrid(

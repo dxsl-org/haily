@@ -717,23 +717,18 @@ mod tests {
         let row = journal::get_by_id(&db, &row.id).await.unwrap().unwrap();
         assert!(is_local_row(&row), "memory_forget must route through the local path");
         assert!(
-            kms.search_ann_by_vector(&fake_embedding(1), 10)
-                .await
-                .iter()
-                .all(|(id, _)| id != &fact_id),
-            "forgotten fact must not surface in ANN search before undo"
+            !kms.is_ann_indexed(&fact_id),
+            "forgotten fact must be un-indexed from ANN before undo"
         );
 
         let outcome = local_attempt_undo(&db, &kms, &row, "sess-1").await.unwrap();
         assert_eq!(outcome, UndoOutcome::Undone);
 
-        assert!(
-            kms.search_ann_by_vector(&fake_embedding(1), 10)
-                .await
-                .iter()
-                .any(|(id, _)| id == &fact_id),
-            "undo must restore ANN search visibility"
-        );
+        // Deterministic index-membership contract of the undo (re-admit + un-tombstone). An
+        // approximate `search_ann_by_vector` assertion here is flaky under load — HNSW recall
+        // over this tiny, near-duplicate, rayon-built graph is not guaranteed. End-to-end
+        // recall is asserted below via `search_hybrid`, whose FTS5 leg is exact.
+        assert!(kms.is_ann_indexed(&fact_id), "undo must restore ANN index membership");
         let hybrid = kms.search_hybrid("coffee yummy", 10).await.unwrap();
         assert!(
             hybrid.iter().any(|r| r.id == fact_id),

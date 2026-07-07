@@ -759,24 +759,17 @@ mod tests {
         .expect("target exists");
         kms.index_remove(&fact_id);
 
-        assert!(
-            kms.search_ann_by_vector(&fake_embedding(3), 10)
-                .await
-                .iter()
-                .all(|(id, _)| id != &fact_id),
-            "forgotten fact must not surface before undo"
-        );
+        assert!(!kms.is_ann_indexed(&fact_id), "forgotten fact must be un-indexed before undo");
 
         let counts =
             batch_undo(&db, &kms, &empty_resolver(), std::slice::from_ref(&row.id), "sess-1").await;
         assert_eq!(counts.undone, 1, "batch undo of a memory_forget must succeed");
 
+        // Deterministic index-membership contract (see the turn-undo test for why an
+        // approximate `search_ann_by_vector` assertion here is flaky under load).
         assert!(
-            kms.search_ann_by_vector(&fake_embedding(3), 10)
-                .await
-                .iter()
-                .any(|(id, _)| id == &fact_id),
-            "BATCH undo of a memory_forget must re-insert the vector into ANN search"
+            kms.is_ann_indexed(&fact_id),
+            "BATCH undo of a memory_forget must re-index the vector into ANN"
         );
     }
 
@@ -848,15 +841,18 @@ mod tests {
         .expect("target exists");
         kms.index_remove(&fact_id);
 
+        assert!(!kms.is_ann_indexed(&fact_id), "forgotten fact must be un-indexed before undo");
+
         let counts = undo_turn(&db, &kms, &empty_resolver(), turn_id, "sess-1").await.unwrap();
         assert_eq!(counts.undone, 2, "both the task write and the memory_forget must reverse");
 
+        // Assert the DETERMINISTIC contract undo owns — the vector is re-admitted to the ANN
+        // index and its tombstone cleared — not an approximate `search_ann_by_vector` ranking,
+        // whose recall over this tiny, near-duplicate, rayon-built graph is not guaranteed and
+        // flaked under load (returned 7–8 of 10 nodes, missing even the exact match).
         assert!(
-            kms.search_ann_by_vector(&fake_embedding(4), 10)
-                .await
-                .iter()
-                .any(|(id, _)| id == &fact_id),
-            "TURN-group undo of a memory_forget must re-insert the vector into ANN search"
+            kms.is_ann_indexed(&fact_id),
+            "TURN-group undo of a memory_forget must re-index the vector into ANN"
         );
     }
 
