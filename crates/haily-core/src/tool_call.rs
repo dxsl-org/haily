@@ -20,13 +20,19 @@ const MAX_TOOL_CALLS: u32 = 10;
 /// this SAME escalation rule to derive `approval_requested`/`approval_denied` telemetry
 /// without a broker-observation channel — see its doc comment.
 ///
-/// `"memory_forget"` (Phase 12: memory-undo via KmsHandle compensator) — a re-tiered
-/// delete tool MUST be listed here in the SAME step it is re-tiered off
-/// `IrreversibleWrite`, or it becomes auto-run AND uncapped (a prompt-injected agent
-/// could wipe unlimited memories silently, with no per-turn ceiling and no escalation
-/// to approval — C1).
-pub(crate) const RETIERED_DELETE_TOOLS: &[&str] =
-    &["task_delete", "note_delete", "reminder_delete", "memory_forget"];
+/// `"memory_forget"` (Phase 12: memory-undo via KmsHandle compensator) and
+/// `"work_item_delete"` (Phase 11, assistant-depth: work_items closes its harness
+/// gap) — a re-tiered delete tool MUST be listed here in the SAME step it is
+/// re-tiered off `IrreversibleWrite`, or it becomes auto-run AND uncapped (a
+/// prompt-injected agent could wipe unlimited rows silently, with no per-turn
+/// ceiling and no escalation to approval — C1).
+pub(crate) const RETIERED_DELETE_TOOLS: &[&str] = &[
+    "task_delete",
+    "note_delete",
+    "reminder_delete",
+    "memory_forget",
+    "work_item_delete",
+];
 
 /// Guards against runaway loops: identical consecutive calls and call-count ceiling.
 pub struct LoopGuard {
@@ -1471,6 +1477,80 @@ mod tests {
         assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
         assert_eq!(
             haily_tools::v1::memory::MemoryForgetTool.risk_tier(&serde_json::json!({})),
+            RiskTier::ReversibleWrite,
+            "risk_tier() must stay constant — the cap is dispatch-layer policy, not a tier mutation"
+        );
+    }
+
+    /// C1 (Phase 11, assistant-depth: work_items closes its harness gap): proof
+    /// against the REAL `WorkItemDeleteTool`, not a stand-in — the (cap+1)-th
+    /// `work_item_delete` in a turn must escalate to approval. Without
+    /// `"work_item_delete"` in `RETIERED_DELETE_TOOLS`, a re-tiered
+    /// `work_item_delete` would be auto-run AND uncapped.
+    #[tokio::test]
+    async fn work_item_delete_past_cap_escalates_to_approval_real_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(haily_tools::v1::work_items::WorkItemDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) =
+            test_ctx_with_deletes(broker.clone(), MAX_AUTO_DELETES_PER_TURN).await;
+
+        let session_id_for_row = ctx.session_id.to_string();
+        let item = haily_db::queries::sessions::create_session(
+            &ctx.db,
+            &session_id_for_row,
+            "test-adapter",
+            None,
+        )
+        .await
+        .unwrap();
+        let work_item = haily_db::queries::work_items::create(&ctx.db, &item.id, "some work")
+            .await
+            .unwrap();
+
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    reversible,
+                    ..
+                } = chunk
+                {
+                    assert!(
+                        reversible,
+                        "work_item_delete is cap-escalated ReversibleWrite, not \
+                         genuinely IrreversibleWrite on its own merits"
+                    );
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch(
+                "work_item_delete",
+                serde_json::json!({"id": work_item.id}),
+                &registry,
+                &ctx,
+                &kill_off(),
+            ),
+        )
+        .await
+        .expect("must resolve via the approval deny, not hang")
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(
+            !ok,
+            "past the cap, a work_item_delete call must require (and here, be denied) approval"
+        );
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+        assert_eq!(
+            haily_tools::v1::work_items::WorkItemDeleteTool.risk_tier(&serde_json::json!({})),
             RiskTier::ReversibleWrite,
             "risk_tier() must stay constant — the cap is dispatch-layer policy, not a tier mutation"
         );

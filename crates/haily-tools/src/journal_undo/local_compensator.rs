@@ -1,18 +1,20 @@
 //! C1 dispatch split: undo/reconcile for the local v1 tool families (tasks, notes,
-//! reminders, and — Phase 12 — memory) — a self-contained path that never touches a
-//! `ConnectorExecutor`.
+//! reminders, — Phase 12 — memory, and — Phase 11 (assistant-depth) — work_items) —
+//! a self-contained path that never touches a `ConnectorExecutor`.
 //!
 //! `is_local_row` MUST be checked BEFORE `refusal_reason` in `attempt_undo` and before the
 //! executor read-back in `reconcile_incomplete`: the connector refusal set REFUSES any row
 //! with `compensation_plan.is_none()`, which every local row legitimately has (local rows
 //! carry no external compensation plan — they are restored from `pre_state` directly).
 //!
-//! `LOCAL_TOOL_TABLES` is a CLOSED compile-time allowlist covering tasks/notes/reminders
-//! plus `memory_forget` (Phase 12: memory-undo via KmsHandle compensator) — calendar
-//! (recurrence undo unresolved) is deliberately excluded and stays on its current tier/path.
-//! `memory_forget`'s undo is NOT purely generic like the other four tools: it ALSO mutates
+//! `LOCAL_TOOL_TABLES` is a CLOSED compile-time allowlist covering tasks/notes/reminders,
+//! `memory_forget` (Phase 12: memory-undo via KmsHandle compensator), and `work_item_delete`
+//! (Phase 11, assistant-depth: work_items closes its harness gap) — calendar (recurrence
+//! undo unresolved) is deliberately excluded and stays on its current tier/path.
+//! `memory_forget`'s undo is NOT purely generic like the other tools: it ALSO mutates
 //! the in-memory HNSW index, which cannot participate in a `sqlx::Transaction` — see the
-//! `LocalTable::KmsFacts` branch in `local_attempt_undo` below.
+//! `LocalTable::KmsFacts` branch in `local_attempt_undo` below. `work_item_delete` IS
+//! purely generic (pure relational table, no vector/index coupling).
 use anyhow::Result;
 use haily_db::queries::journal::{self, ActionJournalRow};
 use haily_db::queries::local_snapshot::{self, LocalTable};
@@ -35,6 +37,9 @@ const LOCAL_TOOL_TABLES: &[(&str, LocalTable)] = &[
     ("reminder_add", LocalTable::Reminders),
     ("reminder_delete", LocalTable::Reminders),
     ("memory_forget", LocalTable::KmsFacts),
+    // Phase 11 (assistant-depth): the only tool-driven work_items mutation — see
+    // `LocalMutation::WorkItemDelete`'s doc comment for why create/update are absent.
+    ("work_item_delete", LocalTable::WorkItems),
 ];
 
 /// The kind of forward mutation a local tool performed — decides HOW to invert it.
@@ -52,9 +57,8 @@ fn op_kind(tool_name: &str) -> Option<LocalOpKind> {
     match tool_name {
         "task_create" | "note_save" | "reminder_add" => Some(LocalOpKind::Create),
         "task_complete" | "note_update" => Some(LocalOpKind::Update),
-        "task_delete" | "note_delete" | "reminder_delete" | "memory_forget" => {
-            Some(LocalOpKind::Delete)
-        }
+        "task_delete" | "note_delete" | "reminder_delete" | "memory_forget"
+        | "work_item_delete" => Some(LocalOpKind::Delete),
         _ => None,
     }
 }

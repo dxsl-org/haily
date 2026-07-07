@@ -37,6 +37,11 @@ pub enum LocalTable {
     Notes,
     Reminders,
     KmsFacts,
+    /// Phase 11 (assistant-depth): work_items is a plain relational table like
+    /// tasks/notes/reminders — no vector/index side-channel, so it is a FULL member
+    /// of the generic snapshot compensator (unlike `KmsFacts`, which only partially
+    /// participates — see that variant's doc comment).
+    WorkItems,
 }
 
 impl LocalTable {
@@ -46,6 +51,7 @@ impl LocalTable {
             LocalTable::Notes => "notes",
             LocalTable::Reminders => "reminders",
             LocalTable::KmsFacts => "kms_facts",
+            LocalTable::WorkItems => "work_items",
         }
     }
 
@@ -86,6 +92,23 @@ impl LocalTable {
                 "deleted_at",
             ],
             LocalTable::KmsFacts => &["id", "deleted_at", "updated_at"],
+            // `progress` (INTEGER) is deliberately excluded — every whitelisted column
+            // here is read/written as TEXT (see `row_to_json`'s doc comment); adding an
+            // INTEGER column would silently decode to `Null` in a snapshot (harmless
+            // today since Delete is the only op, but a landmine for a future Update).
+            LocalTable::WorkItems => &[
+                "id",
+                "session_id",
+                "title",
+                "status",
+                "phase",
+                "checkpoint",
+                "started_at",
+                "completed_at",
+                "error",
+                "updated_at",
+                "deleted_at",
+            ],
         }
     }
 }
@@ -140,6 +163,13 @@ pub enum LocalMutation<'a> {
     MemoryForget {
         fact_id: &'a str,
     },
+    /// Phase 11: the sole tool-driven destructive mutation on work_items — internal
+    /// lifecycle transitions (create/start/checkpoint/complete/fail/mark_interrupted)
+    /// run directly from `agent.rs`, never through a `Tool`, so they carry no journal
+    /// coverage (see the phase's Risk Notes). Only a user-invoked delete needs undo.
+    WorkItemDelete {
+        id: &'a str,
+    },
 }
 
 impl<'a> LocalMutation<'a> {
@@ -155,6 +185,7 @@ impl<'a> LocalMutation<'a> {
                 LocalTable::Reminders
             }
             LocalMutation::MemoryForget { .. } => LocalTable::KmsFacts,
+            LocalMutation::WorkItemDelete { .. } => LocalTable::WorkItems,
         }
     }
 
@@ -172,6 +203,7 @@ impl<'a> LocalMutation<'a> {
             | LocalMutation::ReminderAdd { id, .. }
             | LocalMutation::ReminderDelete { id } => id,
             LocalMutation::MemoryForget { fact_id } => fact_id,
+            LocalMutation::WorkItemDelete { id } => id,
         }
     }
 
@@ -518,6 +550,17 @@ async fn apply_mutation(tx: &mut Transaction<'_, Sqlite>, m: &LocalMutation<'_>)
             .bind(&now)
             .bind(&now)
             .bind(*fact_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+        }
+        LocalMutation::WorkItemDelete { id } => {
+            sqlx::query(
+                "UPDATE work_items SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(*id)
             .execute(&mut **tx)
             .await?
             .rows_affected()

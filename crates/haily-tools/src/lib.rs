@@ -103,15 +103,18 @@ pub enum RiskTier {
     /// undoable. Covers every plain local create/update (calendar_add, note_save,
     /// note_update, memory_remember, reminder_add, task_create, task_complete,
     /// work_item_resume) AND, as of the Harness Completion phase (re-tier +
-    /// turn_id group undo) plus Phase 12 (KmsHandle-aware compensator), the FOUR
-    /// local soft-delete tools whose journal/undo coverage now matches: `task_delete`,
-    /// `note_delete`, `reminder_delete`, `memory_forget`. `memory_forget`'s undo is a
-    /// DISTINCT KMS-aware compensator (`KmsHandle::restore_fact`), not the generic
-    /// `restore_row`, because it must ALSO re-insert/un-tombstone the fact's vector in
-    /// the live HNSW index — see `journal_undo::local_compensator`'s `LocalTable::KmsFacts`
-    /// branch. Their safety net is no longer the approval prompt but: (1) the journal +
-    /// undo path, (2) a per-turn destructive-op cap enforced in DISPATCH, not here
-    /// (`MAX_AUTO_DELETES_PER_TURN` — see its doc; `haily-core::tool_call::
+    /// turn_id group undo), Phase 12 (KmsHandle-aware compensator), and Phase 11
+    /// assistant-depth (work_items closes its harness gap), the FIVE local
+    /// soft-delete tools whose journal/undo coverage now matches: `task_delete`,
+    /// `note_delete`, `reminder_delete`, `memory_forget`, `work_item_delete`.
+    /// `memory_forget`'s undo is a DISTINCT KMS-aware compensator
+    /// (`KmsHandle::restore_fact`), not the generic `restore_row`, because it must
+    /// ALSO re-insert/un-tombstone the fact's vector in the live HNSW index — see
+    /// `journal_undo::local_compensator`'s `LocalTable::KmsFacts` branch. The other
+    /// four (including `work_item_delete`) undo via the fully generic snapshot
+    /// compensator. Their safety net is no longer the approval prompt but: (1) the
+    /// journal + undo path, (2) a per-turn destructive-op cap enforced in DISPATCH,
+    /// not here (`MAX_AUTO_DELETES_PER_TURN` — see its doc; `haily-core::tool_call::
     /// RETIERED_DELETE_TOOLS` MUST list every tool in this covered set — C1), and (3)
     /// the kill switch (C8), which still blocks every `ReversibleWrite` exactly as it
     /// blocks `IrreversibleWrite`. A tool must NEVER vary this return by args (see the
@@ -184,6 +187,7 @@ impl ToolRegistry {
             Arc::new(FeedbackReactTool) as Arc<dyn Tool>,
             Arc::new(WorkItemListTool) as Arc<dyn Tool>,
             Arc::new(WorkItemResumeTool) as Arc<dyn Tool>,
+            Arc::new(WorkItemDeleteTool) as Arc<dyn Tool>,
             Arc::new(WorktreeApplyTool) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
