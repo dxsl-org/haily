@@ -14,6 +14,16 @@ use haily_llm::LlmConfig;
 #[cfg(feature = "llama")]
 use haily_llm::PromptFormat;
 
+/// A stored preference string mapped to `Some` only when non-empty — an empty tier
+/// override must read as "no override" (`None`), not as a model literally named `""`.
+fn non_empty(v: String) -> Option<String> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// Load LLM routing config from KMS preferences, falling back to env vars then defaults.
 ///
 /// Never fails — a missing or malformed preference simply leaves the corresponding
@@ -33,6 +43,23 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
 
     pref!("llm.cloud_base_url", cfg.cloud_base_url);
     pref!("llm.cloud_model", cfg.cloud_model);
+
+    // Per-tier cloud model-name overrides (Phase 3 tier foundation). Each is stored as a
+    // plain model-name string under `llm.tier_model.<tier>`; an absent key leaves the
+    // tier at `None`, which `complete_tiered` treats as "use the default model" — so
+    // routing is IDENTICAL to today until an operator sets at least one of these.
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.fast").await {
+        cfg.tier_models.fast = non_empty(v);
+    }
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.medium").await {
+        cfg.tier_models.medium = non_empty(v);
+    }
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.thinking").await {
+        cfg.tier_models.thinking = non_empty(v);
+    }
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.ultra").await {
+        cfg.tier_models.ultra = non_empty(v);
+    }
 
     // Multi-key: stored as JSON array under `llm.cloud_api_keys`.
     // Backward compat: fall back to the old single-key `llm.cloud_api_key`.

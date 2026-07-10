@@ -22,6 +22,7 @@ fn tier_str(tier: Option<haily_llm::Tier>) -> Option<&'static str> {
         Some(haily_llm::Tier::Fast) => Some("fast"),
         Some(haily_llm::Tier::Medium) => Some("medium"),
         Some(haily_llm::Tier::Thinking) => Some("thinking"),
+        Some(haily_llm::Tier::Ultra) => Some("ultra"),
         None => None,
     }
 }
