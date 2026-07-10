@@ -14,7 +14,7 @@ mod detectors;
 #[cfg(test)]
 mod tests;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use detectors::{detect_event_no_prep, detect_meeting_conditions, detect_task_conditions};
 use haily_db::{
     queries::{
@@ -56,7 +56,15 @@ pub async fn alert_loop(db: Arc<DbHandle>, am: AdapterManager, shutdown: Cancell
 /// function's own visibility — see `tests.rs`'s module doc comment for the full
 /// rationale for testing in-crate instead.
 pub(crate) async fn run_tick(db: &DbHandle, am: &AdapterManager) {
-    let now = Utc::now();
+    run_tick_at(db, am, Utc::now()).await;
+}
+
+/// Clock-injectable core of [`run_tick`]. Tests pass a fixed `now` so day-boundary
+/// conditions (e.g. an event "later today", filtered by same-UTC-date prefix) are
+/// deterministic regardless of the real wall-clock time the suite runs at — a `now` in the
+/// last minutes of a UTC day would otherwise push a `now + hours` fixture into tomorrow and
+/// silently drop the "today" nudge (a real flake this split removes).
+pub(crate) async fn run_tick_at(db: &DbHandle, am: &AdapterManager, now: DateTime<Utc>) {
     let today = now.format("%Y-%m-%d").to_string();
     let now_rfc3339 = now.to_rfc3339();
     let imminent_end = (now + Duration::minutes(MEETING_PREP_MINS)).to_rfc3339();
