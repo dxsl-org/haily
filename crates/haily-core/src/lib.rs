@@ -573,7 +573,7 @@ mod wiring_tests {
     //! silently drops unknown tool names, so a typo in any `allowed_tools` entry
     //! would strip a capability with zero runtime signal — these tests turn that
     //! into a compile-then-test failure instead.
-    use crate::domains::{CONNECTOR_OP_WHITELIST, DOMAINS};
+    use crate::domains::{CONNECTOR_OP_WHITELIST, DOMAINS, SCOUT_CODING_TOOLS};
     use crate::specialists::SPECIALISTS;
     use haily_tools::ToolRegistry;
     use std::sync::atomic::AtomicBool;
@@ -639,6 +639,16 @@ mod wiring_tests {
             sub.get("odoo_contact_create").is_some(),
             "connector op must resolve in the business domain's sub_registry (C2)"
         );
+    }
+
+    #[test]
+    fn scout_coding_tools_resolve() {
+        // The read-only coding subset (P5 scout stage) must resolve in build_v1 so wiring it
+        // to a future scout sub_registry cannot silently drop a capability.
+        let base = ToolRegistry::build_v1();
+        for t in SCOUT_CODING_TOOLS {
+            assert!(base.get(t).is_some(), "scout coding tool {t} missing from build_v1");
+        }
     }
 
     #[test]

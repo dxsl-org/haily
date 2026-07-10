@@ -815,6 +815,7 @@ mod tests {
             undone_at: None,
             retention_expires_at: "2026-08-02T00:00:00Z".into(),
             manifest_hash: None,
+            workspace_id: None,
         };
         assert!(
             !is_local_row(&row),

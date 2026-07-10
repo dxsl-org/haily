@@ -33,7 +33,8 @@ pub const SPECIALISTS: &[SpecialistConfig] = &[
 Nhận một yêu cầu kỹ thuật và trả về kế hoạch triển khai: phases rõ ràng, dependencies, rủi ro, \
 success criteria cho từng phase. Format: danh sách có đánh số, ngắn gọn. \
 Không implement — chỉ plan.",
-        allowed_tools: &["note_save", "note_search", "memory_search"],
+        // Planner reads the codebase (scout subset) to ground its plan; no mutation/exec.
+        allowed_tools: &["note_save", "note_search", "memory_search", "fs_read", "fs_list", "fs_grep"],
         parent_domain: "delegate_to_developer",
         model_tier: None,
     },
@@ -44,7 +45,11 @@ Không implement — chỉ plan.",
 Tìm bugs, security vulnerabilities, N+1 queries, race conditions, unhandled errors, và anti-patterns. \
 Cụ thể: chỉ rõ vấn đề, giải thích tại sao, đề xuất fix. \
 Không chỉ liệt kê style issues — tập trung vào correctness và safety.",
-        allowed_tools: &["note_search", "memory_search", "web_search"],
+        // Reviewer reads code + diffs; strictly read-only (no mutation/exec).
+        allowed_tools: &[
+            "note_search", "memory_search", "web_search",
+            "fs_read", "fs_list", "fs_grep", "git_status", "git_diff",
+        ],
         parent_domain: "delegate_to_developer",
         model_tier: None,
     },
@@ -55,7 +60,11 @@ Không chỉ liệt kê style issues — tập trung vào correctness và safety
 Phân tích triệu chứng → trace execution path → tìm nguyên nhân gốc rễ. \
 Phân biệt rõ symptom vs cause. Đề xuất fix cụ thể và verify steps. \
 Không đoán — phân tích từng bước logic.",
-        allowed_tools: &["note_search", "memory_search", "web_search", "url_fetch"],
+        // Debugger reads code and RUNS to reproduce (shell_exec), but does not edit.
+        allowed_tools: &[
+            "note_search", "memory_search", "web_search", "url_fetch",
+            "fs_read", "fs_list", "fs_grep", "shell_exec", "git_status", "git_diff",
+        ],
         parent_domain: "delegate_to_developer",
         model_tier: None,
     },
@@ -66,7 +75,11 @@ Không đoán — phân tích từng bước logic.",
 Thiết kế test plan: unit tests, integration tests, edge cases, error scenarios. \
 Xác định critical paths cần coverage cao nhất. Đề xuất test data và mock strategy. \
 Output: danh sách test cases có priority.",
-        allowed_tools: &["note_save", "note_search", "memory_search"],
+        // Tester reads code, writes/edits test files, and runs them.
+        allowed_tools: &[
+            "note_save", "note_search", "memory_search",
+            "fs_read", "fs_list", "fs_grep", "fs_write", "fs_edit", "shell_exec",
+        ],
         parent_domain: "delegate_to_developer",
         model_tier: None,
     },

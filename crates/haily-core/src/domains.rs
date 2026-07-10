@@ -46,6 +46,16 @@ pub const CONNECTOR_OP_WHITELIST: &[&str] = &[
     "odoo_contact_search_read",
 ];
 
+/// The read-only coding subset (Sub-Agent + Skill Architecture phase 1): the whitelist a
+/// future scout stage (P5) gets — pure reads over a workspace, no mutation/exec. Kept as its
+/// own const (distinct from the developer domain's full surface) so the scout stage can be
+/// wired to exactly this set, and so `wiring_tests` proves every name resolves in `build_v1`.
+///
+/// Test-only for now (mirrors `CONNECTOR_OP_WHITELIST`): P5 promotes it to a runtime scout
+/// `sub_registry` whitelist. Until then only the wiring test consumes it.
+#[cfg(test)]
+pub const SCOUT_CODING_TOOLS: &[&str] = &["fs_read", "fs_list", "fs_grep"];
+
 pub const DOMAINS: &[DomainConfig] = &[
     DomainConfig {
         tool_name: "delegate_to_developer",
@@ -59,6 +69,12 @@ Không làm những việc ngoài phạm vi kỹ thuật phần mềm.",
             "note_save", "note_search", "note_update",
             "task_create", "task_list", "task_complete",
             "memory_remember", "memory_search",
+            // Coding tool surface (Sub-Agent + Skill Architecture phase 1) — the developer
+            // domain gets the full file/search/shell/git surface + domain-agnostic code_exec.
+            "fs_read", "fs_list", "fs_grep",
+            "fs_write", "fs_edit", "fs_move", "fs_delete",
+            "shell_exec", "code_exec",
+            "git_status", "git_diff", "git_commit",
         ],
         model_tier: None,
     },
@@ -72,6 +88,8 @@ Luôn trích dẫn nguồn. Phân biệt rõ fact vs opinion. Không bịa đặ
             "web_search", "url_fetch",
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search", "memory_list",
+            // Domain-agnostic sandboxed execution for data scripts (harness-first).
+            "code_exec",
         ],
         model_tier: None,
     },
@@ -85,6 +103,8 @@ Luôn nhắc nhở rủi ro khi tư vấn đầu tư. Không đưa ra lời khuy
             "web_search",
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search",
+            // Domain-agnostic sandboxed execution for financial calculations.
+            "code_exec",
         ],
         model_tier: None,
     },

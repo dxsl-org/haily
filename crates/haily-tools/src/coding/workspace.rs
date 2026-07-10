@@ -1,0 +1,337 @@
+//! `CodingWorkspace` — a dedicated git worktree of a target repo, the single authoritative
+//! compensator for every in-workspace file change.
+//!
+//! Undo of any coding change is a worktree reset: `git checkout -- .` (revert tracked) +
+//! `git clean -ffdx` (remove untracked AND gitignored artifacts). The `-x` and `-ff` flags
+//! are LOAD-BEARING (P0 spike finding U1): a bare `git clean -fd` leaves gitignored
+//! `target/`/`node_modules/` behind, so the workspace would not be truly reverted. Safe
+//! because the worktree is ephemeral. Journal rows are audit/display only — never the
+//! rollback source of truth (red-team FMA-C2: two compensators over the same bytes is a bug).
+//!
+//! git isolation: workspace commits write objects to an isolated store sibling to the
+//! worktree (`GIT_OBJECT_DIRECTORY`), never the real repo's shared object DB, so discarding
+//! the worktree leaves no reachable objects (or reflog churn) in the user's repo.
+
+use anyhow::{bail, Context, Result};
+use haily_db::queries::coding_workspaces::{self, CodingWorkspaceRow};
+use haily_db::DbHandle;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tokio::process::Command;
+
+/// Suffix of the isolated per-workspace object store, a sibling dir of the worktree so it
+/// is not itself swept by the worktree's own `git clean -ffdx`.
+const OBJ_DIR_SUFFIX: &str = ".git-objects";
+
+pub struct CodingWorkspace {
+    pub row: CodingWorkspaceRow,
+}
+
+impl CodingWorkspace {
+    /// Open a fresh workspace: cut a new git worktree (+ ephemeral branch) of `repo_path`
+    /// under `worktrees_root`, and persist the lifecycle row.
+    ///
+    /// **Fails loud if `repo_path` is not a git repository** (red-team AD-C3: a non-git
+    /// target cannot get a workspace — a documented precondition, not a silent no-op).
+    ///
+    /// # Errors
+    /// Returns an error if the target is not a git repo, `git worktree add` fails, or the
+    /// row insert fails.
+    pub async fn open(
+        db: &DbHandle,
+        session_id: &str,
+        repo_path: &Path,
+        worktrees_root: &Path,
+        work_item_id: Option<&str>,
+    ) -> Result<Self> {
+        ensure_git_repo(repo_path).await?;
+
+        let id = coding_workspaces::new_id();
+        let branch = format!("haily/ws-{}", &id[..8.min(id.len())]);
+        let worktree_path = worktrees_root.join(&id);
+        tokio::fs::create_dir_all(worktrees_root)
+            .await
+            .context("creating worktrees root")?;
+
+        let wt_str = worktree_path
+            .to_str()
+            .context("worktree path is not valid UTF-8")?;
+        let repo_str = repo_path
+            .to_str()
+            .context("repo path is not valid UTF-8")?;
+
+        let out = git(repo_path, &["worktree", "add", "-b", &branch, wt_str, "HEAD"], &[]).await?;
+        if !out.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let row = coding_workspaces::create(
+            db,
+            &id,
+            session_id,
+            repo_str,
+            &branch,
+            wt_str,
+            work_item_id,
+        )
+        .await?;
+        Ok(Self { row })
+    }
+
+    /// The canonicalizable worktree root.
+    pub fn worktree_root(&self) -> &Path {
+        Path::new(&self.row.worktree_path)
+    }
+
+    /// The isolated object-store dir used for workspace commits (sibling of the worktree).
+    pub fn object_dir(&self) -> PathBuf {
+        PathBuf::from(object_dir_for(&self.row.worktree_path))
+    }
+
+    /// Revert ALL in-workspace changes (tracked reverted, untracked+ignored removed). Leaves
+    /// the worktree registered so a later op can reuse it. This is the compensator invoked to
+    /// roll a workspace back to its entry state.
+    ///
+    /// # Errors
+    /// Returns an error if either git step fails.
+    pub async fn compensate(&self) -> Result<()> {
+        let root = self.worktree_root();
+        let co = git(root, &["checkout", "--", "."], &[]).await?;
+        if !co.status.success() {
+            bail!(
+                "git checkout -- . failed: {}",
+                String::from_utf8_lossy(&co.stderr)
+            );
+        }
+        let clean = git(root, &["clean", "-ffdx"], &[]).await?;
+        if !clean.status.success() {
+            bail!(
+                "git clean -ffdx failed: {}",
+                String::from_utf8_lossy(&clean.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    /// Full teardown: revert, remove the worktree + its isolated object store, delete the
+    /// ephemeral branch, and soft-delete the row. Best-effort past the row delete so a
+    /// half-torn-down workspace still ends `deleted_at`-marked.
+    ///
+    /// # Errors
+    /// Returns an error only if the row soft-delete fails; git teardown failures are logged.
+    pub async fn discard(&self, db: &DbHandle) -> Result<()> {
+        if let Err(e) = self.compensate().await {
+            tracing::warn!(workspace = %self.row.id, "compensate during discard failed: {e}");
+        }
+        let repo = Path::new(&self.row.repo_path);
+        let _ = git(
+            repo,
+            &["worktree", "remove", "--force", &self.row.worktree_path],
+            &[],
+        )
+        .await;
+        let _ = git(repo, &["branch", "-D", &self.row.branch], &[]).await;
+        let _ = tokio::fs::remove_dir_all(self.object_dir()).await;
+        coding_workspaces::soft_delete(db, &self.row.id).await?;
+        Ok(())
+    }
+}
+
+/// The isolated per-workspace object-store path for a given worktree path (sibling dir, so it
+/// escapes the worktree's own `git clean -ffdx`). Shared by `CodingWorkspace::object_dir` and
+/// `git_commit`'s `GIT_OBJECT_DIRECTORY` so both agree on the location.
+pub fn object_dir_for(worktree_path: &str) -> String {
+    format!("{worktree_path}{OBJ_DIR_SUFFIX}")
+}
+
+/// Fail loud unless `repo_path` is inside a git work tree.
+async fn ensure_git_repo(repo_path: &Path) -> Result<()> {
+    if !repo_path.is_dir() {
+        bail!("target repo path does not exist or is not a directory: {}", repo_path.display());
+    }
+    let out = git(repo_path, &["rev-parse", "--is-inside-work-tree"], &[]).await?;
+    let ok = out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == "true";
+    if !ok {
+        bail!(
+            "target is not a git repository (required for a coding workspace): {}",
+            repo_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A process-unique EMPTY directory used as `core.hooksPath` for every host git invocation.
+/// A coding workspace's target repo is user-selected and may carry a pre-existing (local,
+/// untracked) hook; without this, `git worktree add` (post-checkout), `git commit`
+/// (pre-commit/commit-msg/post-commit), etc. would fire that hook ON THE HOST — outside the
+/// P0 sandbox, with the inherited parent env — which is exactly the RCE class the sandbox
+/// exists to contain. Created once, never populated, so it holds no hook files.
+fn empty_hooks_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("haily-nohooks-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    })
+    .as_path()
+}
+
+/// Run `git -C <dir> <args>` with optional extra env pairs, capturing output. Uses argv
+/// (never a shell string) so there is no interpolation surface. Every invocation pins
+/// `core.hooksPath` at an empty dir so a hook in the (untrusted) target repo cannot fire on
+/// the host — see [`empty_hooks_dir`].
+pub(crate) async fn git(
+    dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    // Forward slashes: git accepts them in config values on Windows and avoids backslash-escape
+    // ambiguity in the `-c` value.
+    let hooks = empty_hooks_dir().display().to_string().replace('\\', "/");
+    cmd.arg("-C")
+        .arg(dir)
+        .arg("-c")
+        .arg(format!("core.hooksPath={hooks}"))
+        .args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().await.context("spawning git")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@haily.test"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            let a: Vec<&str> = args;
+            let out = git(p, &a, &[]).await.unwrap();
+            assert!(out.status.success(), "git {a:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        tokio::fs::write(p.join("README.md"), "hello\n").await.unwrap();
+        let add = git(p, &["add", "."], &[]).await.unwrap();
+        assert!(add.status.success());
+        let commit = git(p, &["commit", "-m", "init"], &[]).await.unwrap();
+        assert!(commit.status.success(), "{}", String::from_utf8_lossy(&commit.stderr));
+        dir
+    }
+
+    async fn db() -> (tempfile::TempDir, std::sync::Arc<DbHandle>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(DbHandle::init(&dir.path().join("t.db")).await.unwrap());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        haily_db::queries::sessions::create_session(&db, &session_id, "coding", None)
+            .await
+            .unwrap();
+        (dir, db, session_id)
+    }
+
+    #[tokio::test]
+    async fn open_non_git_target_fails_loud() {
+        let (dbdir, db, sess) = db().await;
+        let not_git = tempfile::tempdir().unwrap();
+        let wt_root = tempfile::tempdir().unwrap();
+        let r = CodingWorkspace::open(&db, &sess, not_git.path(), wt_root.path(), None).await;
+        assert!(r.is_err(), "a non-git target must fail loud");
+        assert!(format!("{:#}", r.err().unwrap()).contains("not a git repository"));
+        drop(dbdir);
+    }
+
+    #[tokio::test]
+    async fn open_creates_worktree_and_row() {
+        let repo = init_repo().await;
+        let (_dbdir, db, sess) = db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+        let ws = CodingWorkspace::open(&db, &sess, repo.path(), wt_root.path(), None)
+            .await
+            .expect("open");
+        assert!(ws.worktree_root().is_dir(), "worktree dir created");
+        assert!(ws.worktree_root().join("README.md").is_file(), "checked out HEAD");
+        let row = coding_workspaces::get(&db, &ws.row.id).await.unwrap();
+        assert!(row.is_some(), "row persisted");
+    }
+
+    #[tokio::test]
+    async fn compensate_removes_untracked_and_gitignored_and_reverts_tracked() {
+        let repo = init_repo().await;
+        let (_dbdir, db, sess) = db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+        let ws = CodingWorkspace::open(&db, &sess, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
+        let root = ws.worktree_root().to_path_buf();
+
+        // Mutate tracked, add untracked, add a gitignored artifact dir.
+        tokio::fs::write(root.join("README.md"), "TAMPERED\n").await.unwrap();
+        tokio::fs::write(root.join("scratch.txt"), "junk\n").await.unwrap();
+        tokio::fs::write(root.join(".gitignore"), "target/\n").await.unwrap();
+        tokio::fs::create_dir_all(root.join("target")).await.unwrap();
+        tokio::fs::write(root.join("target").join("build.bin"), "artifact").await.unwrap();
+
+        ws.compensate().await.expect("compensate");
+
+        // Tracked reverted, untracked gone, gitignored dir gone (the -x/-ff proof, U1).
+        // Normalize line endings — git may check out CRLF on Windows (autocrlf).
+        let readme = tokio::fs::read_to_string(root.join("README.md")).await.unwrap();
+        assert_eq!(readme.replace("\r\n", "\n"), "hello\n");
+        assert!(!root.join("scratch.txt").exists(), "untracked file must be removed");
+        assert!(!root.join("target").exists(), "gitignored target/ must be removed (-x)");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_git_neutralizes_repo_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        // A pre-commit hook that would BLOCK any commit if it fired.
+        let repo = init_repo().await;
+        let hooks = repo.path().join(".git").join("hooks");
+        tokio::fs::create_dir_all(&hooks).await.unwrap();
+        let pre = hooks.join("pre-commit");
+        tokio::fs::write(&pre, "#!/bin/sh\nexit 1\n").await.unwrap();
+        let mut perm = std::fs::metadata(&pre).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&pre, perm).unwrap();
+
+        tokio::fs::write(repo.path().join("f.txt"), "x").await.unwrap();
+        let add = git(repo.path(), &["add", "-A"], &[]).await.unwrap();
+        assert!(add.status.success());
+        let commit = git(
+            repo.path(),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "x"],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(
+            commit.status.success(),
+            "host git must neutralize the repo's pre-commit hook (it would exit 1): {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_soft_deletes_row_and_removes_worktree() {
+        let repo = init_repo().await;
+        let (_dbdir, db, sess) = db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+        let ws = CodingWorkspace::open(&db, &sess, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
+        let wt = ws.worktree_root().to_path_buf();
+        ws.discard(&db).await.expect("discard");
+        assert!(!wt.exists(), "worktree dir removed");
+        assert!(coding_workspaces::get(&db, &ws.row.id).await.unwrap().is_none());
+    }
+}

@@ -20,6 +20,12 @@ chrono     = { workspace = true }
 async-trait = "0.1"
 reqwest    = { workspace = true, features = ["rustls-tls"] }
 url        = "2"
+# Coding tool surface (Sub-Agent + Skill Architecture phase 1): bundled content search
+# (fs_grep, no external ripgrep) + glob→regex for fs_list.
+regex      = "1"
+# Used in production by the coding surface: ephemeral scratch roots for `code_exec`, empty
+# hooks dir for `git_safe_args`.
+tempfile   = "3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -11,6 +11,33 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+
+/// Cancellation-aware wrapper over [`spawn_capture`] (Sub-Agent + Skill Architecture phase 1,
+/// decision 3): races the run against `cancel.cancelled()` alongside the timeout. When the
+/// caller's kill switch fires `cancel`, the `spawn_capture` future is dropped, and its child's
+/// `kill_on_drop(true)` guarantees the in-flight process (e.g. a running `cargo test`) is
+/// killed immediately — not merely blocked at the next dispatch. Returns
+/// [`SandboxError::Timeout`] on a cancel (the honest "did not complete" outcome the caller
+/// surfaces to the model).
+///
+/// The non-cancellable [`spawn_capture`] is retained unchanged for the sandbox backends and
+/// their existing tests.
+pub async fn spawn_capture_cancellable(
+    program: &str,
+    args: &[String],
+    work_root: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    backend: SandboxKind,
+    cancel: &CancellationToken,
+) -> Result<ExecOutput, SandboxError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SandboxError::Timeout(Duration::ZERO)),
+        res = spawn_capture(program, args, work_root, env, timeout, backend) => res,
+    }
+}
 
 /// Spawn `program` with `args` in `work_root`, with EXACTLY `env` (parent env cleared first),
 /// capturing stdout/stderr (capped) under a wall-clock `timeout`. `backend` is stamped onto
@@ -166,6 +193,45 @@ mod tests {
         let (empty, t) = read_capped(None::<&[u8]>).await;
         assert!(empty.is_empty());
         assert!(!t);
+    }
+
+    #[tokio::test]
+    async fn cancellation_kills_in_flight_child_immediately() {
+        // Decision 3: the kill switch's cancel token must stop an in-flight command, not just
+        // the next dispatch. Start a long sleeper, fire cancel, and assert it returns promptly
+        // (well under the sleeper's own duration) — proving the child was dropped/killed.
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let (prog, args) = (
+            "cmd",
+            vec!["/C".to_string(), "ping -n 30 -w 1000 127.0.0.1 >nul".to_string()],
+        );
+        #[cfg(not(windows))]
+        let (prog, args) = ("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+
+        let cancel = CancellationToken::new();
+        let cancel_c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_c.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let r = spawn_capture_cancellable(
+            prog,
+            &args,
+            dir.path(),
+            &scratch_env(dir.path()),
+            Duration::from_secs(60),
+            SandboxKind::Null,
+            &cancel,
+        )
+        .await;
+        assert!(matches!(r, Err(SandboxError::Timeout(_))), "cancel must end the run");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel must stop the in-flight child promptly, not wait out the 60s timeout"
+        );
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@
 //! its slot — but it is deliberately NOT compiled in this gate phase (adding wasmtime before
 //! `code_exec` ships in P1 is premature weight). See the Phase 0 spike report.
 
+pub mod code_exec;
 pub mod config;
 pub mod manager;
 pub mod native;
@@ -42,6 +43,9 @@ pub use config::{
 };
 pub use manager::{Manager, ManagerStats};
 pub use null::NullSandbox;
+/// Cancellation-aware spawn (Sub-Agent + Skill Architecture phase 1) — used by the coding
+/// `shell_exec`/`code_exec` non-enforcing path to honor the kill switch mid-run.
+pub(crate) use spawn::spawn_capture_cancellable;
 pub use sandbox::{
     detect_redirection_triggers, RedirectionTrigger, Sandbox, SandboxKind,
 };

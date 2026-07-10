@@ -1,4 +1,5 @@
 pub mod calendar;
+pub mod coding_workspaces;
 pub mod connectors;
 pub mod episodic;
 pub mod facts;

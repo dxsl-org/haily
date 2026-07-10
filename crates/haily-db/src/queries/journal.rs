@@ -55,6 +55,11 @@ pub struct ActionJournalRow {
     /// time — a mismatch means the manifest moved/changed since this write and the
     /// compensation must refuse rather than target a base_url/schema the write never touched.
     pub manifest_hash: Option<String>,
+    /// The `coding_workspaces.id` a coding-tool write executed inside (migration 0025).
+    /// `None` for every non-coding row (local personal tools, connector writes) and any
+    /// row written before that migration. Audit/grouping only — the worktree, not this
+    /// column, is the authoritative compensator for a coding change.
+    pub workspace_id: Option<String>,
 }
 
 /// Fields required to record a write. Grouped so `insert` stays within a sane arity and
@@ -84,8 +89,15 @@ pub struct NewAction<'a> {
 
 /// Shared insert body for [`insert`]/[`insert_tx`] — generic over any sqlx `Executor` so the
 /// pool and transaction-scoped callers share one copy of the SQL/bind-list instead of two
-/// hand-kept-in-sync copies.
-async fn insert_via<'e, E>(exec: E, a: NewAction<'_>) -> Result<ActionJournalRow>
+/// hand-kept-in-sync copies. `workspace_id` is threaded as a separate parameter rather than a
+/// `NewAction` field so the coding-tool audit path (the only writer that sets it) can record
+/// it without forcing `workspace_id: None` onto every existing connector/local `NewAction`
+/// literal in the workspace.
+async fn insert_via<'e, E>(
+    exec: E,
+    a: NewAction<'_>,
+    workspace_id: Option<&str>,
+) -> Result<ActionJournalRow>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -98,8 +110,8 @@ where
              (id, session_id, tool_name, tool_tier, compensability, idempotency_key,
               correlation_ref, request_params, pre_state, pre_state_version,
               readback_status, compensation_plan, undo_status, undo_attempts,
-              created_at, retention_expires_at, turn_id, manifest_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?, ?)
+              created_at, retention_expires_at, turn_id, manifest_hash, workspace_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -117,6 +129,7 @@ where
     .bind(&retention_expires_at)
     .bind(a.turn_id)
     .bind(a.manifest_hash)
+    .bind(workspace_id)
     .fetch_one(exec)
     .await?)
 }
@@ -128,7 +141,39 @@ where
 /// Returns an error on a UNIQUE conflict on `idempotency_key` (a duplicate submit of the
 /// same logical op) or any DB failure.
 pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow> {
-    insert_via(db.pool(), a).await
+    insert_via(db.pool(), a, None).await
+}
+
+/// Coding-tool audit insert (Sub-Agent + Skill Architecture phase 1): identical to [`insert`]
+/// but stamps `workspace_id` so the row can be grouped by its owning `CodingWorkspace`. This
+/// is an AUDIT row — the worktree, not this row, is the authoritative compensator for the
+/// file change (a coding undo is a `git checkout -- . && git clean -ffdx`, never a DB
+/// restore), so no `compensation_plan`/`pre_state` snapshot of file bytes is stored.
+///
+/// # Errors
+/// Returns an error on a UNIQUE conflict on `idempotency_key` or any DB failure.
+pub async fn insert_coding_audit(
+    db: &DbHandle,
+    a: NewAction<'_>,
+    workspace_id: &str,
+) -> Result<ActionJournalRow> {
+    insert_via(db.pool(), a, Some(workspace_id)).await
+}
+
+/// All coding-tool audit rows for one workspace, newest first (JournalBrowser grouping).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_by_workspace(
+    db: &DbHandle,
+    workspace_id: &str,
+) -> Result<Vec<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE workspace_id = ? ORDER BY created_at DESC",
+    )
+    .bind(workspace_id)
+    .fetch_all(db.pool())
+    .await?)
 }
 
 /// Transaction-scoped variant of [`insert`] — the LOCAL-tool write path (phase 1) needs the
@@ -143,7 +188,7 @@ pub async fn insert_tx(
     tx: &mut Transaction<'_, Sqlite>,
     a: NewAction<'_>,
 ) -> Result<ActionJournalRow> {
-    insert_via(&mut **tx, a).await
+    insert_via(&mut **tx, a, None).await
 }
 
 /// Shared update body for [`set_readback`]/[`set_readback_tx`] — one copy of the SQL for
@@ -441,6 +486,7 @@ mod tests {
             undone_at: None,
             retention_expires_at: "2026-08-02T00:00:00Z".into(),
             manifest_hash: None,
+            workspace_id: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["sessionId"], "s1");

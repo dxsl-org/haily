@@ -1,3 +1,4 @@
+pub mod coding;
 pub mod connector;
 pub mod exec;
 pub mod journal_undo;
@@ -162,6 +163,7 @@ impl ToolRegistry {
     /// Register all V1 tools.
     pub fn build_v1() -> Self {
         let mut reg = Self::new();
+        use coding::*;
         use v1::{
             calendar::*, memory::*, notes::*, reminders::*, tasks::*, web::*, work_items::*,
             worktree_tool::*,
@@ -193,6 +195,20 @@ impl ToolRegistry {
             Arc::new(WorkItemResumeTool) as Arc<dyn Tool>,
             Arc::new(WorkItemDeleteTool) as Arc<dyn Tool>,
             Arc::new(WorktreeApplyTool) as Arc<dyn Tool>,
+            // Coding tool surface (Sub-Agent + Skill Architecture phase 1) — registered here,
+            // whitelisted only for the developer domain + coding specialists via sub_registry.
+            Arc::new(FsReadTool) as Arc<dyn Tool>,
+            Arc::new(FsListTool) as Arc<dyn Tool>,
+            Arc::new(FsGrepTool) as Arc<dyn Tool>,
+            Arc::new(FsWriteTool) as Arc<dyn Tool>,
+            Arc::new(FsEditTool) as Arc<dyn Tool>,
+            Arc::new(FsMoveTool) as Arc<dyn Tool>,
+            Arc::new(FsDeleteTool) as Arc<dyn Tool>,
+            Arc::new(ShellExecTool) as Arc<dyn Tool>,
+            Arc::new(GitStatusTool) as Arc<dyn Tool>,
+            Arc::new(GitDiffTool) as Arc<dyn Tool>,
+            Arc::new(GitCommitTool) as Arc<dyn Tool>,
+            Arc::new(crate::exec::code_exec::CodeExecTool) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }
