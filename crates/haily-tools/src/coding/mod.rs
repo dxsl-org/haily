@@ -16,6 +16,7 @@ pub mod lint_on_edit;
 pub mod path_guard;
 pub mod shell_exec;
 pub mod shell_policy;
+pub mod stack_detect;
 pub mod workspace;
 
 pub use fs_edit::{FsEditTool, FsWriteTool};

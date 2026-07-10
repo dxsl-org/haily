@@ -95,6 +95,10 @@ impl Orchestrator {
             "work_item_list",   // check active/interrupted tasks
             "work_item_resume", // resume a task
             "feedback_react",   // apply in-line user feedback
+            // Authored-skill lazy-load (phase 2) — universal, like Claude Code's Read/Skill.
+            "skill_search",
+            "skill_list_sections",
+            "skill_fetch",
         ];
         // Timeout bounding every external connector call (phase 4). Conservative — an
         // interactive connector op should complete well within this; a hang is treated as
@@ -206,7 +210,16 @@ impl Orchestrator {
                 .iter()
                 .filter(|s| s.parent_domain == domain.tool_name)
             {
-                let l2_reg = Arc::new(base_v1.sub_registry(spec.allowed_tools));
+                // Phase 2: every specialist gets the universal skill lazy-load trio on
+                // top of its narrow whitelist — injected here (not copied into 14
+                // literals) since several specialists share identical tool lists.
+                let mut l2_inner = base_v1.sub_registry(spec.allowed_tools);
+                for name in domains::SKILL_TOOLS {
+                    if let Some(t) = base_v1.get(name) {
+                        l2_inner.register(Arc::clone(t));
+                    }
+                }
+                let l2_reg = Arc::new(l2_inner);
                 l1_reg.register(Arc::new(delegate::DelegateTool {
                     tool_name: spec.tool_name,
                     description: spec.description,
@@ -674,6 +687,27 @@ mod wiring_tests {
                 s.tool_name,
                 s.parent_domain
             );
+        }
+    }
+
+    #[test]
+    fn skill_tools_resolve_and_reach_every_domain() {
+        // Phase 2: the universal skill lazy-load trio must exist in build_v1 and appear
+        // in every domain's whitelisted sub_registry (domains list them explicitly).
+        use crate::domains::SKILL_TOOLS;
+        let base = ToolRegistry::build_v1();
+        for t in SKILL_TOOLS {
+            assert!(base.get(t).is_some(), "skill tool {t} missing from build_v1");
+        }
+        for d in DOMAINS {
+            let sub = base.sub_registry(d.allowed_tools);
+            for t in SKILL_TOOLS {
+                assert!(
+                    sub.get(t).is_some(),
+                    "domain {} sub_registry is missing skill tool {t}",
+                    d.tool_name
+                );
+            }
         }
     }
 

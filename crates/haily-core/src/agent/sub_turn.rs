@@ -40,6 +40,41 @@ const TRIVIAL_TASK_CHAR_THRESHOLD: usize = 200;
 /// duplicating its soul-block-specific formatting.
 const SUB_TURN_MAX_FACTS: usize = 5;
 
+/// Renders `items` (each `(heading, body)`) into a `## {title}` block that fits within
+/// `*remaining` tokens, dropping trailing (lowest-priority) items first, then DECREMENTS
+/// `*remaining` by the rendered cost. Returns `""` when nothing is left to render or
+/// nothing fits.
+///
+/// This is the budget-priority mechanism for the sub-turn's optional sections: calling
+/// it for playbooks BEFORE standards BEFORE facts makes facts the first to be squeezed
+/// under pressure and playbooks the last — the phase-02 trim order
+/// (current-turn > system core > playbooks > standards > facts). The current-turn user
+/// message and the system core are separate, always-pinned messages and are never
+/// touched here.
+fn fit_titled_block(title: &str, items: &[(String, String)], remaining: &mut usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut kept = items.len();
+    loop {
+        if kept == 0 {
+            return String::new();
+        }
+        let body = items[..kept]
+            .iter()
+            .map(|(h, b)| format!("### {h}\n{b}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let block = format!("## {title}\n{body}");
+        let cost = budget::estimate(&block);
+        if cost <= *remaining {
+            *remaining -= cost;
+            return format!("\n\n{block}");
+        }
+        kept -= 1;
+    }
+}
+
 /// Renders `facts` as a compact `## Relevant Memory` block, dropping facts from the
 /// end (lowest-ranked first, since KMS returns them ranked) until the block's own
 /// estimated cost fits within `budget_tokens`. Returns `None` if `facts` is empty —
@@ -173,11 +208,43 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     };
 
     let tool_block = context::tool_reference_block(&tools);
-    let memory_block = build_memory_block(&relevant_facts, llm.context_window() as usize / 8)
+
+    // Phase 2: authored playbooks (top-k Jaccard-matched to task+domain) + stack-matched
+    // standards. Bodies are tag-stripped at this choke point — an authored file must not
+    // smuggle a live `<tool_call>` into the sub-agent prompt (same rule as facts /
+    // tool-results). References stay UNLOADED (progressive disclosure); only the body of
+    // each matched skill is injected.
+    let playbooks: Vec<(String, String)> = kms
+        .authored_playbooks_for(&task, Some(domain_name), 2)
+        // Strip the NAME too (P2 review MED2) — it becomes a `### {name}` heading in the prompt.
+        .into_iter()
+        .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
+        .collect();
+    // Standards only for the coding (developer) domain — a finance sub-turn must never
+    // receive rust standards. Stack is detected from the CWD here (the standalone
+    // fallback); P4's pipeline engine will detect against a real workspace root.
+    let standards: Vec<(String, String)> = if domain_name == "developer" {
+        let names = haily_tools::coding::stack_detect::detect_standard_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        kms.authored_standards_for(&refs)
+            .into_iter()
+            .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Budget the optional sections in priority order: playbooks first (last to be
+    // squeezed), then standards, then facts (first to be squeezed) — the system core
+    // (system_prompt + tool_block) and the current-turn task message are never trimmed.
+    let mut optional_budget = llm.context_window() as usize / 4;
+    let playbook_block = fit_titled_block("Playbooks", &playbooks, &mut optional_budget);
+    let standards_block = fit_titled_block("Standards", &standards, &mut optional_budget);
+    let memory_block = build_memory_block(&relevant_facts, optional_budget)
         .map(|b| format!("\n\n{b}"))
         .unwrap_or_default();
     let full_prompt = format!(
-        "{system_prompt}\n\n## Tool Calling\nKhi cần dùng tool, output ĐÚNG format này:\n<tool_call>{{\"tool\":\"name\",\"args\":{{...}}}}</tool_call>\n\nSau khi nhận tool result, tiếp tục trả lời bình thường.\n\n## Available Tools\n{tool_block}{memory_block}"
+        "{system_prompt}\n\n## Tool Calling\nKhi cần dùng tool, output ĐÚNG format này:\n<tool_call>{{\"tool\":\"name\",\"args\":{{...}}}}</tool_call>\n\nSau khi nhận tool result, tiếp tục trả lời bình thường.\n\n## Available Tools\n{tool_block}{playbook_block}{standards_block}{memory_block}"
     );
 
     let delegate_overhead_ms = turn_start.elapsed().as_millis() as i64;
@@ -560,6 +627,147 @@ mod sub_turn_tests {
             !response.contains("## Relevant Memory"),
             "trivial task must skip the KMS search and omit the memory section entirely, got: {response}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — authored playbook + standards injection into the sub-turn prompt.
+    // ------------------------------------------------------------------
+
+    /// Copy the shipped `assets/kit-pack` into `<data>/kit-pack` so `KmsHandle::init`
+    /// loads it. Returns false when the shipped pack is unavailable in this checkout.
+    fn copy_kit_pack(data_dir: &std::path::Path) -> bool {
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/kit-pack");
+        if !src.join("manifest.json").is_file() {
+            return false;
+        }
+        fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for e in std::fs::read_dir(src).unwrap() {
+                let e = e.unwrap();
+                let p = e.path();
+                let t = dst.join(e.file_name());
+                if p.is_dir() {
+                    copy_dir(&p, &t);
+                } else {
+                    std::fs::copy(&p, &t).unwrap();
+                }
+            }
+        }
+        copy_dir(&src, &data_dir.join("kit-pack"));
+        true
+    }
+
+    async fn kms_with_kit_pack(dir: &std::path::Path) -> (Arc<DbHandle>, Arc<KmsHandle>) {
+        let db = Arc::new(DbHandle::init(&dir.join("haily.db")).await.expect("db"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir).await.expect("kms"));
+        (db, kms)
+    }
+
+    fn dev_req(
+        task: String,
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        llm: Arc<LlmRouter>,
+    ) -> SubTurnRequest {
+        let mut req = base_req(task, db, kms, llm);
+        req.domain_name = "developer";
+        req
+    }
+
+    #[tokio::test]
+    async fn developer_sub_turn_injects_matched_playbook_without_reference_bodies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if !copy_kit_pack(dir.path()) {
+            return; // shipped pack unavailable
+        }
+        let (db, kms) = kms_with_kit_pack(dir.path()).await;
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        // A task that Jaccard-matches the 'cook' stage prompt (build/implement/code).
+        let req = dev_req(
+            "implement and build this code change end to end".to_string(),
+            db,
+            kms,
+            llm,
+        );
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+
+        assert!(
+            prompt.contains("## Playbooks"),
+            "developer sub-turn must inject a ## Playbooks section, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Cook Stage"),
+            "the matched cook playbook BODY must be present"
+        );
+        // NO-LOAD-ALL: the cook reference chunk (tdd-workflow) must NOT be injected.
+        assert!(
+            !prompt.contains("TDD Workflow (reference)"),
+            "reference-chunk body must stay unloaded until skill_fetch pulls it"
+        );
+    }
+
+    #[tokio::test]
+    async fn developer_sub_turn_injects_rust_standards_in_a_rust_workspace() {
+        // The test runs with CWD inside a Rust crate (has Cargo.toml) → stack detection
+        // finds Rust → the lang-rust standard is injected into ## Standards.
+        let dir = tempfile::tempdir().expect("tempdir");
+        if !copy_kit_pack(dir.path()) {
+            return;
+        }
+        let (db, kms) = kms_with_kit_pack(dir.path()).await;
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let req = dev_req("write some code".to_string(), db, kms, llm);
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+
+        assert!(prompt.contains("## Standards"), "expected a ## Standards section, got: {prompt}");
+        assert!(prompt.contains("Rust Standards"), "expected the lang-rust standard body");
+    }
+
+    #[tokio::test]
+    async fn finance_sub_turn_never_receives_coding_playbooks_or_standards() {
+        // Domain filtering: a finance sub-turn must get neither the developer playbooks
+        // nor the (developer-only) standards.
+        let dir = tempfile::tempdir().expect("tempdir");
+        if !copy_kit_pack(dir.path()) {
+            return;
+        }
+        let (db, kms) = kms_with_kit_pack(dir.path()).await;
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        // Same coding-flavored task, but the sub-turn's domain is finance.
+        let mut req = base_req(
+            "implement and build this code change".to_string(),
+            db,
+            kms,
+            llm,
+        );
+        req.domain_name = "finance";
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+
+        assert!(
+            !prompt.contains("Cook Stage") && !prompt.contains("## Standards"),
+            "finance sub-turn must not receive coding playbooks/standards, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn fit_titled_block_squeezes_lowest_priority_items_first_then_stops() {
+        // Two items, budget only fits one → the first (highest-priority) survives, the
+        // second is dropped; budget is decremented by the rendered cost.
+        let items = vec![
+            ("a".to_string(), "x".repeat(20)),
+            ("b".to_string(), "y".repeat(20)),
+        ];
+        let mut remaining = budget::estimate("## T\n### a\n") + 8; // room for ~one item
+        let block = fit_titled_block("T", &items, &mut remaining);
+        assert!(block.contains("### a"), "highest-priority item must survive");
+        assert!(!block.contains("### b"), "lowest-priority item must be dropped under pressure");
     }
 
     #[tokio::test]

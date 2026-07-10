@@ -23,6 +23,10 @@ uuid       = { workspace = true }
 chrono     = { workspace = true }
 async-trait = "0.1"
 hnsw_rs    = "0.3"
+# Kit-pack integrity: per-file sha256 verification of the authored-skill pack (phase-02).
+sha2       = "0.10"
+# Precise, case/whitespace-tolerant tool-tag stripper for injected authored/fact content.
+regex      = "1"
 fastembed  = { version = "4", optional = true }
 
 [dev-dependencies]

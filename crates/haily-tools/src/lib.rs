@@ -4,6 +4,7 @@ pub mod exec;
 pub mod journal_undo;
 pub mod schedule;
 pub mod security;
+pub mod skill_fetch;
 pub mod v1;
 
 use anyhow::Result;
@@ -209,6 +210,11 @@ impl ToolRegistry {
             Arc::new(GitDiffTool) as Arc<dyn Tool>,
             Arc::new(GitCommitTool) as Arc<dyn Tool>,
             Arc::new(crate::exec::code_exec::CodeExecTool) as Arc<dyn Tool>,
+            // Authored-skill discovery + lazy-load (Sub-Agent + Skill Architecture phase 2)
+            // — universal Read-tier tools, whitelisted for L0 + every domain + specialist.
+            Arc::new(skill_fetch::SkillSearchTool) as Arc<dyn Tool>,
+            Arc::new(skill_fetch::SkillListSectionsTool) as Arc<dyn Tool>,
+            Arc::new(skill_fetch::SkillFetchTool) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }
@@ -409,6 +415,10 @@ mod tests {
             "work_item_list",
             "work_item_resume",
             "feedback_react",
+            // Phase 2 skill lazy-load tools — also L0 quick tools.
+            "skill_search",
+            "skill_list_sections",
+            "skill_fetch",
         ] {
             assert!(base.get(name).is_some(), "missing quick tool: {name}");
         }

@@ -56,6 +56,17 @@ pub const CONNECTOR_OP_WHITELIST: &[&str] = &[
 #[cfg(test)]
 pub const SCOUT_CODING_TOOLS: &[&str] = &["fs_read", "fs_list", "fs_grep"];
 
+/// The universal authored-skill lazy-load trio (Sub-Agent + Skill Architecture phase 2)
+/// — the runtime-mediated discovery+fetch tools that must be reachable at EVERY level
+/// (L0, every domain, every specialist), exactly like Claude Code's always-available
+/// Read/Skill. Listed explicitly in each `DomainConfig::allowed_tools` above for
+/// whitelist visibility (the no-impl warning + `all_domain_whitelists_resolve` cover
+/// them there); injected into every L2 specialist sub-registry in `Orchestrator::init`
+/// rather than copied into all 14 `SpecialistConfig::allowed_tools` literals — several
+/// specialists share byte-identical tool lists, so per-specialist copies would be
+/// duplicative and drift-prone (phase-02 Deviation D8).
+pub const SKILL_TOOLS: &[&str] = &["skill_search", "skill_list_sections", "skill_fetch"];
+
 pub const DOMAINS: &[DomainConfig] = &[
     DomainConfig {
         tool_name: "delegate_to_developer",
@@ -75,6 +86,8 @@ Không làm những việc ngoài phạm vi kỹ thuật phần mềm.",
             "fs_write", "fs_edit", "fs_move", "fs_delete",
             "shell_exec", "code_exec",
             "git_status", "git_diff", "git_commit",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },
@@ -90,6 +103,8 @@ Luôn trích dẫn nguồn. Phân biệt rõ fact vs opinion. Không bịa đặ
             "memory_remember", "memory_search", "memory_list",
             // Domain-agnostic sandboxed execution for data scripts (harness-first).
             "code_exec",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },
@@ -105,6 +120,8 @@ Luôn nhắc nhở rủi ro khi tư vấn đầu tư. Không đưa ra lời khuy
             "memory_remember", "memory_search",
             // Domain-agnostic sandboxed execution for financial calculations.
             "code_exec",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },
@@ -119,6 +136,8 @@ Nhiệm vụ: hỗ trợ sức khỏe, lên kế hoạch du lịch, theo dõi h�
             "reminder_add", "reminder_list",
             "note_save", "note_search", "note_update",
             "memory_remember", "memory_search",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },
@@ -133,6 +152,8 @@ Giữ giọng văn nhất quán theo yêu cầu của người dùng. Sáng tạ
             "note_save", "note_search", "note_update",
             "task_create", "task_list",
             "memory_remember", "memory_search",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },
@@ -150,6 +171,8 @@ Chuyên nghiệp, súc tích, đúng deadline. Ưu tiên action items rõ ràng.
             // Connector ops (C2) — inert until a manifest declares them, live once one
             // does. Kept in sync with `CONNECTOR_OP_WHITELIST`.
             "odoo_contact_create", "odoo_contact_write", "odoo_contact_search_read",
+            // Authored-skill lazy-load (phase 2) — universal.
+            "skill_search", "skill_list_sections", "skill_fetch",
         ],
         model_tier: None,
     },

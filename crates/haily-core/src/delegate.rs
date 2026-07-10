@@ -157,6 +157,13 @@ impl Tool for DelegateTool {
             pause_tx,
         ));
 
+        // Phase 2: `full_task` and `domain_name` are exactly what `run_sub_turn` uses to
+        // select `## Playbooks` (Jaccard over the task, filtered to this domain) and
+        // `## Standards`. No new field is needed — the task string already flows here, and
+        // `domain_name` is server-derived (never LLM-forged). Delegation invariants stay
+        // intact: `run_sub_turn`'s `LoopGuard` still terminates on a tripped guard (never
+        // feeds the error back), and every authored playbook/standard body is
+        // tag-stripped before it enters the sub-agent prompt.
         let sub_turn = crate::agent::run_sub_turn(crate::agent::SubTurnRequest {
             task: full_task,
             system_prompt: self.system_prompt,
