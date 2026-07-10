@@ -1,0 +1,12 @@
+{
+  "name": "spike-ts-add-feature",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsc -p . && node dist/index.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

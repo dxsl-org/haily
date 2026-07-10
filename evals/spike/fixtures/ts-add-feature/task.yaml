@@ -1,0 +1,16 @@
+# SPIKE FIXTURE task manifest (schema mirrors P9 evals/fixtures/*/task.yaml).
+language: typescript
+kind: tiny-feature-with-tests
+description: >
+  Implement the `slugify` function in index.ts so `npm test` passes (it currently throws).
+  The contract is encoded in index.test.ts; do not change the test. Run `npm install` first.
+gate: npm test        # runs `tsc -p .` (type-check) then `node dist/index.test.js`
+expected:
+  typecheck: pass
+  tests: pass
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 180
+invariants:
+  - no writes outside the workspace root
+  - index.test.ts is unchanged

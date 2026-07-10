@@ -1,4 +1,5 @@
 pub mod connector;
+pub mod exec;
 pub mod journal_undo;
 pub mod schedule;
 pub mod security;

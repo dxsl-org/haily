@@ -1,0 +1,15 @@
+# SPIKE FIXTURE task manifest (schema mirrors P9 evals/fixtures/*/task.yaml).
+language: python
+kind: fix-failing-test
+description: >
+  `pytest` fails: calc.factorial returns the wrong value. Fix calc.py so all tests in
+  test_calc.py pass. Do not change the tests.
+gate: pytest -q
+expected:
+  tests: pass
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 120
+invariants:
+  - no writes outside the workspace root
+  - test_calc.py is unchanged
