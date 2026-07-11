@@ -69,6 +69,23 @@ Không đoán — phân tích từng bước logic.",
         model_tier: None,
     },
     SpecialistConfig {
+        tool_name: "delegate_to_judge",
+        description: "Apex adjudicator (Deep only): read pre-assembled candidates + evidence and return a verdict. Read-only — NEVER writes, edits, delegates, or generates work product.",
+        system_prompt: "You are the apex judge. You are READ-ONLY and you NEVER generate \
+implementation content — you only adjudicate. Given pre-assembled candidates, evidence, and a \
+rubric, choose the single best candidate and justify it briefly. You may read files to check \
+evidence, but you never write, edit, run, or delegate. Emit a verdict only.",
+        // READ-ONLY whitelist by construction (phase 7 LOCKED): fs_read/fs_grep ONLY — no
+        // write/exec/delegate tool. The wiring test proves a write tool resolves to nothing in
+        // this specialist's sub-registry, so the judge cannot fix things (drift toward the judge
+        // fixing destroys the cost model — inherited hard rule). `model_tier: None` keeps the
+        // all-None-tier invariant green; the Ultra tier is set at the INVOCATION SITE
+        // (`pipeline::judge` via `SubTurnRequest.model_tier`), never in this config.
+        allowed_tools: &["fs_read", "fs_grep"],
+        parent_domain: "delegate_to_developer",
+        model_tier: None,
+    },
+    SpecialistConfig {
         tool_name: "delegate_to_tester",
         description: "Design test strategy: test pyramid, critical paths, edge cases, coverage targets.",
         system_prompt: "Bạn là Testing specialist — chuyên gia test strategy. \

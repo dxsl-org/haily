@@ -10,8 +10,8 @@ use haily_db::{
     DbHandle,
 };
 use haily_io::{
-    Adapter, ApprovalResolver, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver,
-    GuiWorkItemsReceiver, Request, WorkItemStatus,
+    Adapter, ApprovalResolver, DepthMode, GuiProactiveReceiver, GuiRequestSender,
+    GuiResponseReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
 use haily_kms::KmsHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,12 +49,38 @@ struct AppState {
     app: Mutex<Option<AppHandle>>,
 }
 
+/// Preference key holding the GUI depth toggle's current mode (phase 7). Read per
+/// message so a toggle change takes effect on the next message with no restart; a VN/EN
+/// depth phrase in the message itself still overrides this per-turn (server-side, in
+/// `run_turn`).
+const DEPTH_PREF_KEY: &str = "ui.depth_mode";
+
 #[tauri::command]
 async fn send_message(message: String, state: State<'_, AppState>) -> Result<String, String> {
     let session_id = Uuid::new_v4();
-    let req = Request { session_id, adapter_id: "gui".to_string(), message, user_ref: None };
+    // The toggle's persisted mode seeds this turn; unset/unknown → Normal. A phrase in
+    // `message` may still override it server-side (never the other way around).
+    let depth = meta::get_preference(&state.db, DEPTH_PREF_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| DepthMode::from_label(&v))
+        .unwrap_or_default();
+    let req = Request { session_id, adapter_id: "gui".to_string(), message, user_ref: None, depth };
     state.gui_req_tx.send(req).await.map_err(|e| e.to_string())?;
     Ok(session_id.to_string())
+}
+
+/// Persist the GUI depth toggle (phase 7). Stores a normalized label; an unknown value
+/// falls back to `normal` (never `deep` — Deep is only ever set by an exact match, so a
+/// malformed value can't silently escalate the 3–5× cost path). Takes effect on the next
+/// message (see `send_message`); Deep is never auto-selected by the harness.
+#[tauri::command]
+async fn set_depth(mode: String, state: State<'_, AppState>) -> Result<(), String> {
+    let normalized = DepthMode::from_label(&mode).as_label();
+    meta::upsert_preference(&state.db, DEPTH_PREF_KEY, normalized, "gui")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Resolve a pending tool approval raised for `session_id`. `session_id` is the
@@ -310,6 +336,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             send_message,
+            set_depth,
             approve_tool,
             cancel_turn,
             get_preferences,

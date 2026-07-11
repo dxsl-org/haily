@@ -15,7 +15,12 @@ pub use haily_kms::feedback::{apply_feedback_signal, FeedbackSignal};
 /// Messages at or under this word count are short enough that ANY matched pattern is
 /// assumed to BE the message's whole intent (e.g. "tốt lắm", "sai rồi") rather than an
 /// incidental word inside a longer, unrelated sentence.
-const SHORT_MESSAGE_WORD_LIMIT: usize = 6;
+///
+/// `pub(crate)` so the phase-7 depth phrase-mapper (`crate::depth`) reuses the EXACT
+/// same precision rule instead of copying it — a depth phrase incidentally present in a
+/// long pasted/tool-shaped body must not fire, for the same reason a feedback phrase must
+/// not (DEP-minor: a copied guard risks security-contract drift between the two).
+pub(crate) const SHORT_MESSAGE_WORD_LIMIT: usize = 6;
 
 const POS_PATTERNS: &[&str] = &[
     "👍",
@@ -47,14 +52,21 @@ const NEG_PATTERNS: &[&str] = &[
 /// Vietnamese and English feedback phrases in practice are space-separated tokens,
 /// and the exact count only needs to distinguish "short" from "not short," not be
 /// linguistically precise.
-fn word_count(msg: &str) -> usize {
+///
+/// `pub(crate)` — shared with `crate::depth` (see [`SHORT_MESSAGE_WORD_LIMIT`]).
+pub(crate) fn word_count(msg: &str) -> usize {
     msg.split_whitespace().count()
 }
 
 /// A pattern signal is precise enough to fire when the message is short OR the
 /// pattern sits at the very start — both computed against the same lowercased,
 /// trimmed string the caller already produced, so byte offsets stay consistent.
-fn is_anchored(lower_trimmed: &str, pattern: &str, short: bool) -> bool {
+///
+/// `pub(crate)` — this IS the reusable source-guard primitive the phase-7 depth
+/// phrase-mapper consumes (do NOT copy it into `depth.rs`): "fire only when the whole
+/// short message IS the signal, or the signal leads the message" is exactly what stops a
+/// phrase buried in a longer pasted/tool body from being read as intent.
+pub(crate) fn is_anchored(lower_trimmed: &str, pattern: &str, short: bool) -> bool {
     short || lower_trimmed.starts_with(pattern)
 }
 

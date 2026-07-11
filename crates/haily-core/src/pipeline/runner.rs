@@ -31,7 +31,7 @@ use haily_tools::exec::{
     build_child_env, ExecRequest, Manager, SandboxConfig, SandboxError, ScopeKey, MAX_OUTPUT_BYTES,
 };
 use haily_tools::ToolRegistry;
-use haily_types::{ApprovalGate, ResponseChunk, RunEvent};
+use haily_types::{ApprovalGate, DepthMode, ResponseChunk, RunEvent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -236,6 +236,45 @@ impl PipelineRunner {
 
     async fn emit(&self, ev: RunEvent) {
         let _ = self.events.send(ev).await;
+    }
+
+    /// Build a [`JudgeContext`] sharing this runner's harness handles, for the Deep judge
+    /// panel / refuter votes the pipeline wrappers invoke (phase 7). The `llm` is read-cloned
+    /// from the SAME `RwLock` a stage uses, so a reload is observed at the call boundary. A
+    /// fresh `turn_deletes` counter is used — judge sub-turns are read-only and never re-tier
+    /// a delete, so they need no share of a run's destructive-op cap.
+    pub(crate) fn judge_context(&self, session_id: Uuid) -> crate::pipeline::judge::JudgeContext {
+        let llm = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
+        crate::pipeline::judge::JudgeContext {
+            db: Arc::clone(&self.db),
+            kms: Arc::clone(&self.kms),
+            llm,
+            broker: Arc::clone(&self.broker),
+            kill: Arc::clone(&self.kill),
+            cancel: self.cancel.clone(),
+            user_tx: self.user_tx.clone(),
+            session_id,
+            turn_deletes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Emit the phase-7 parity hint (TEXT-ONLY advisory) at pipeline start: when the session
+    /// model tier is below `Thinking` and the run is NOT already `Deep`, send ONE line
+    /// suggesting Deep + its cost. Never blocks, never escalates, never changes egress —
+    /// a no-op for a `Deep` run or a Thinking/Ultra session.
+    pub(crate) async fn emit_parity_hint(&self, depth: DepthMode) {
+        if depth == DepthMode::Deep {
+            return;
+        }
+        let session_tier = self
+            .llm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot()
+            .session_tier(&[]);
+        if let Some(hint) = crate::depth::parity_hint(session_tier) {
+            let _ = self.user_tx.send(ResponseChunk::Text(hint)).await;
+        }
     }
 
     /// Map an in-flight error (a gate execution error mid-stage) to a terminal `RunStatus`:
@@ -633,6 +672,9 @@ impl PipelineRunner {
             // A stage may force a generation shape (P5 Design → forced `emit_plan_draft`
             // JSON). llama-only; the cloud path ignores it.
             grammar: stage.grammar.clone(),
+            // A pipeline stage's depth is expressed by its per-mode stage GRAPH, not by a
+            // sub-turn prompt variant — keep the stage sub-turn itself at Normal.
+            depth_mode: haily_types::DepthMode::Normal,
         };
 
         let result = run_with_pausable_timeout(

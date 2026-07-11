@@ -16,6 +16,56 @@ pub struct Request {
     pub adapter_id: String,
     pub message: String,
     pub user_ref: Option<String>,
+    /// Judgment-depth requested for this turn (Sub-Agent + Skill Architecture phase 7).
+    /// Set from a GUI toggle OR a VN/EN depth phrase detected in `message` (never from
+    /// tool/pasted content) — `Deep` buys multi-stream judgment (judge panel, refuter
+    /// votes, apex judge) at explicit 3–5× cost. `#[serde(default)]` keeps this ADDITIVE:
+    /// a payload minted before the field existed deserializes to `DepthMode::Normal`, so
+    /// no adapter is forced to set it and the wire envelope stays backward-compatible.
+    #[serde(default)]
+    pub depth: DepthMode,
+}
+
+/// Per-request judgment depth. `Deep` is NEVER auto-selected — it is set only by an
+/// explicit user action (GUI toggle or a genuine user-message phrase); the harness never
+/// escalates to it on its own (phase 7 LOCKED decision). Defined HERE in the leaf
+/// `haily-types` crate — like [`RunEvent`] — so [`Request`] can carry it typed without
+/// `haily-types` depending on `haily-core` (where the phrase mapper + judge machinery
+/// live). `haily-core::depth` re-exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DepthMode {
+    /// Trim stages: skip parallel scout + red-team (plan) and refuter votes (build).
+    Quick,
+    /// The default balanced pipeline.
+    #[default]
+    Normal,
+    /// Add the judge panel (plan Design), refuter votes (build review), and apex-judge
+    /// adjudication at explicit 3–5× cost.
+    Deep,
+}
+
+impl DepthMode {
+    /// Lenient parse of a wire/label string (a GUI toggle value or the phrase-mapper's
+    /// output). An unrecognized value falls back to [`DepthMode::Normal`] — NEVER
+    /// [`DepthMode::Deep`], so a typo can never silently escalate cost (phase 7: Deep is
+    /// only ever reached by an exact, explicit match).
+    pub fn from_label(s: &str) -> DepthMode {
+        match s.trim().to_lowercase().as_str() {
+            "quick" => DepthMode::Quick,
+            "deep" => DepthMode::Deep,
+            _ => DepthMode::Normal,
+        }
+    }
+
+    /// The canonical lowercase label (matches the serde wire form).
+    pub fn as_label(self) -> &'static str {
+        match self {
+            DepthMode::Quick => "quick",
+            DepthMode::Normal => "normal",
+            DepthMode::Deep => "deep",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +308,41 @@ pub trait ApprovalGate: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_mode_defaults_to_normal_and_is_lowercase_on_the_wire() {
+        assert_eq!(DepthMode::default(), DepthMode::Normal);
+        assert_eq!(serde_json::to_string(&DepthMode::Deep).unwrap(), "\"deep\"");
+        assert_eq!(serde_json::to_string(&DepthMode::Quick).unwrap(), "\"quick\"");
+        assert_eq!(
+            serde_json::from_str::<DepthMode>("\"deep\"").unwrap(),
+            DepthMode::Deep
+        );
+    }
+
+    /// ADDITIVE guarantee: a `Request` payload minted before `depth` existed (no `depth`
+    /// key) must still deserialize, defaulting to `Normal` — never error.
+    #[test]
+    fn request_without_depth_deserializes_to_normal() {
+        let legacy = r#"{"session_id":"00000000-0000-0000-0000-000000000000","adapter_id":"cli","message":"hi","user_ref":null}"#;
+        let req: Request = serde_json::from_str(legacy).expect("legacy Request must deserialize");
+        assert_eq!(req.depth, DepthMode::Normal, "absent depth must default to Normal");
+    }
+
+    #[test]
+    fn request_with_deep_depth_roundtrips() {
+        let req = Request {
+            session_id: Uuid::nil(),
+            adapter_id: "gui".into(),
+            message: "làm kỹ vào".into(),
+            user_ref: None,
+            depth: DepthMode::Deep,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"depth\":\"deep\""));
+        let round: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round.depth, DepthMode::Deep);
+    }
 
     #[test]
     fn response_chunk_serde_roundtrip_preserves_tag_and_content() {

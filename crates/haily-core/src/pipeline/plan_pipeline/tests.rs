@@ -11,7 +11,7 @@ use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::coding::workspace::CodingWorkspace;
 use haily_tools::ToolRegistry;
-use haily_types::{ApprovalResolver, ResponseChunk, RunEvent};
+use haily_types::{ApprovalResolver, DepthMode, ResponseChunk, RunEvent};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,7 +27,7 @@ const TASK: &str = "add a rate limiter to the API";
 
 #[test]
 fn scout_stage_is_read_only_and_all_stages_are_leaves() {
-    let p = build_plan_pipeline(TASK, SLUG, None);
+    let p = build_plan_pipeline(TASK, SLUG, None, DepthMode::Normal);
     assert_eq!(p.runs.len(), 4, "first pass is scout→design→write→approval");
     let scout = &p.runs[0];
     assert_eq!(scout.name, "scout");
@@ -47,7 +47,7 @@ fn scout_stage_is_read_only_and_all_stages_are_leaves() {
 #[test]
 fn reject_path_re_runs_design_with_feedback_and_drops_scout() {
     let feedback = "split phase 2 into two smaller phases";
-    let p = build_plan_pipeline(TASK, SLUG, Some(feedback));
+    let p = build_plan_pipeline(TASK, SLUG, Some(feedback), DepthMode::Normal);
     assert_eq!(p.runs.len(), 3, "reject path is design→write→approval (scout dropped)");
     assert_eq!(p.runs[0].name, "design");
     assert!(
@@ -59,7 +59,7 @@ fn reject_path_re_runs_design_with_feedback_and_drops_scout() {
 
 #[test]
 fn design_stage_carries_a_forced_grammar() {
-    let p = build_plan_pipeline(TASK, SLUG, None);
+    let p = build_plan_pipeline(TASK, SLUG, None, DepthMode::Normal);
     let design = p.runs.iter().find(|s| s.name == "design").unwrap();
     assert!(design.grammar.is_some(), "the design stage must force the emit_plan_draft grammar");
     assert!(design.grammar.as_deref().unwrap().contains("emit_plan_draft"));
@@ -270,6 +270,7 @@ async fn scripted_plan_run_writes_artifacts_and_blocks_on_approval() {
         attempts_budget: 6,
         workspace: &fx.workspace,
         revise_feedback: None,
+        depth: DepthMode::Normal,
     };
     let report = run_plan(&runner, &fx.db, spec).await.expect("run");
     let _ = responder.await;
@@ -329,7 +330,7 @@ async fn malformed_draft_retries_once_then_pauses() {
     );
 
     let spec = RunSpec {
-        pipeline: build_plan_pipeline(TASK, SLUG, None),
+        pipeline: build_plan_pipeline(TASK, SLUG, None, DepthMode::Normal),
         session_id: fx.session_id,
         work_item_id: None,
         system_prompt: "test",
@@ -404,6 +405,7 @@ async fn declined_plan_reruns_design_once_and_then_completes() {
         attempts_budget: 6,
         workspace: &fx.workspace,
         revise_feedback: Some("add a phase for load testing".to_string()),
+        depth: DepthMode::Normal,
     };
     let report = run_plan(&runner, &fx.db, spec).await.expect("run");
     let _ = responder.await;
@@ -455,6 +457,7 @@ async fn declined_plan_without_feedback_stays_paused() {
         attempts_budget: 6,
         workspace: &fx.workspace,
         revise_feedback: None,
+        depth: DepthMode::Normal,
     };
     let report = run_plan(&runner, &fx.db, spec).await.expect("run");
     let _ = responder.await;

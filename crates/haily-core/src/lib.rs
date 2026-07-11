@@ -2,6 +2,7 @@ mod agent;
 pub mod approval;
 mod budget;
 mod context;
+pub mod depth;
 mod delegate;
 mod domains;
 pub mod feedback_parser;
@@ -721,6 +722,37 @@ mod wiring_tests {
                 );
             }
         }
+    }
+
+    /// Phase 7 (apex judge, LOCKED): the `judge` specialist's whitelist is READ-ONLY by
+    /// construction. Its sub-registry must resolve `fs_read`/`fs_grep` and must resolve NO
+    /// write/exec/delegate tool — a judge that cannot write cannot drift into "fixing things",
+    /// which is the inherited hard rule the cost model depends on. `sub_registry` drops any
+    /// name not in the whitelist, so an attempted write tool resolving to `None` IS the proof.
+    #[test]
+    fn judge_specialist_whitelist_is_read_only() {
+        let base = ToolRegistry::build_v1();
+        let judge = SPECIALISTS
+            .iter()
+            .find(|s| s.tool_name == "delegate_to_judge")
+            .expect("judge specialist exists");
+        let sub = base.sub_registry(judge.allowed_tools);
+        for read_tool in ["fs_read", "fs_grep"] {
+            assert!(sub.get(read_tool).is_some(), "judge must resolve read tool {read_tool}");
+        }
+        for write_tool in [
+            "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec", "code_exec", "git_commit",
+        ] {
+            assert!(
+                sub.get(write_tool).is_none(),
+                "judge is read-only — a write/exec tool ({write_tool}) must resolve to nothing"
+            );
+        }
+        // Read-only also means it whitelists no delegation tool (never spawns work).
+        assert!(
+            !judge.allowed_tools.iter().any(|t| t.starts_with("delegate_to")),
+            "judge must not be able to delegate"
+        );
     }
 
     #[test]

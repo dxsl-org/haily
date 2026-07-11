@@ -82,6 +82,18 @@ export async function sendMessage(message: string): Promise<string> {
   return invoke('send_message', { message });
 }
 
+/** Judgment depth for a turn. `deep` buys multi-stream judgment at ~3–5× cost. */
+export type DepthMode = 'quick' | 'normal' | 'deep';
+
+/**
+ * Persist the depth toggle. Takes effect on the next message; the backend never
+ * auto-escalates to `deep` — it is only ever set by this explicit action or a genuine
+ * user-message phrase. An unknown value is normalized to `normal` server-side.
+ */
+export async function setDepth(mode: DepthMode): Promise<void> {
+  return invoke('set_depth', { mode });
+}
+
 /**
  * Cancel the in-flight turn for `sessionId`. Fires that turn's cancellation token on
  * the backend; the dispatch loop still emits its normal terminal chunk (`Complete` or

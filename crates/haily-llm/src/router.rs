@@ -445,6 +445,19 @@ impl LlmRouter {
         self.primary.provider_name()
     }
 
+    /// Whether the `Ultra` tier can reach a genuinely cloud-backed model. `Ultra` is
+    /// cloud-effective-only (see [`Tier`]): a local-only backend maps `Thinking`+`Ultra`
+    /// to the one loaded GGUF, so an `Ultra` request there silently collapses to the
+    /// session model. The phase-7 apex-judge/synthesis calls consult this to decide
+    /// whether to warn + fall back to the session tier instead of pretending they
+    /// escalated. `true` when a dedicated Ultra override client exists, the primary is the
+    /// cloud backend, or a cloud fallback is configured; `false` for a local-only setup.
+    pub fn ultra_reachable(&self) -> bool {
+        self.tier_clients.contains_key(&Tier::Ultra)
+            || self.primary.provider_name() == "cloud"
+            || self.fallback.is_some()
+    }
+
     /// Context window (tokens) of the currently-active backend, for `haily-core`'s
     /// token budgeter. Reflects `primary`, not `fallback` — a request that spills
     /// over to the cloud fallback mid-flight is rare enough (and the fallback's

@@ -171,6 +171,12 @@ pub struct SubTurnRequest {
     /// parse-and-repair remains the primary path off-llama (the grammar is a llama-only
     /// optimization, never a correctness dependency).
     pub grammar: Option<String>,
+    /// Judgment depth inherited from the calling turn (phase 7). Threaded server-side from
+    /// the L0 turn's effective depth down through delegation, so a delegated researcher/
+    /// writer sub-turn can pick up a per-depth playbook variant
+    /// ([`crate::depth::research_depth_addendum`]) — prompt-level only. `Normal` for every
+    /// pipeline stage and ordinary path; the LLM can never forge it.
+    pub depth_mode: haily_types::DepthMode,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -205,6 +211,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         max_tool_calls,
         run_id,
         grammar,
+        depth_mode,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -264,8 +271,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let memory_block = build_memory_block(&relevant_facts, optional_budget)
         .map(|b| format!("\n\n{b}"))
         .unwrap_or_default();
+    // Phase 7: a per-depth playbook variant for the NON-coding domains (researcher/writer)
+    // — prompt-level only. `Deep` fans out multi-angle then synthesizes; `Quick` answers
+    // directly. Static text, so no budget accounting needed. The coding pipeline gets real
+    // per-mode stage graphs instead (see `pipeline::{plan_pipeline,build_pipeline}`).
+    let depth_block = crate::depth::research_depth_addendum(domain_name, depth_mode).unwrap_or("");
     let full_prompt = format!(
-        "{system_prompt}\n\n## Tool Calling\nKhi cần dùng tool, output ĐÚNG format này:\n<tool_call>{{\"tool\":\"name\",\"args\":{{...}}}}</tool_call>\n\nSau khi nhận tool result, tiếp tục trả lời bình thường.\n\n## Available Tools\n{tool_block}{playbook_block}{standards_block}{memory_block}"
+        "{system_prompt}{depth_block}\n\n## Tool Calling\nKhi cần dùng tool, output ĐÚNG format này:\n<tool_call>{{\"tool\":\"name\",\"args\":{{...}}}}</tool_call>\n\nSau khi nhận tool result, tiếp tục trả lời bình thường.\n\n## Available Tools\n{tool_block}{playbook_block}{standards_block}{memory_block}"
     );
 
     let delegate_overhead_ms = turn_start.elapsed().as_millis() as i64;
@@ -317,6 +329,8 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         // `Some` only for a pipeline stage sub-turn — stamps this stage's journal rows with
         // the run so they group under one `undo_run` (phase 4b).
         run_id,
+        // Propagate the calling turn's depth to any deeper delegation this sub-turn spawns.
+        depth_mode,
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -595,6 +609,7 @@ mod sub_turn_tests {
             max_tool_calls: None,
             run_id: None,
             grammar: None,
+            depth_mode: haily_types::DepthMode::Normal,
         }
     }
 
@@ -1032,6 +1047,7 @@ mod outcome_tests {
             max_tool_calls: None,
             run_id: None,
             grammar: None,
+            depth_mode: haily_types::DepthMode::Normal,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1068,6 +1084,7 @@ mod outcome_tests {
             max_tool_calls: None,
             run_id: None,
             grammar: None,
+            depth_mode: haily_types::DepthMode::Normal,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1145,6 +1162,7 @@ mod outcome_tests {
             max_tool_calls: None,
             run_id: None,
             grammar: None,
+            depth_mode: haily_types::DepthMode::Normal,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 

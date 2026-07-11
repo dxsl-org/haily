@@ -187,6 +187,7 @@ mod tests {
             turn_deletes: Arc::new(AtomicUsize::new(0)),
             last_journal_id: Arc::new(Mutex::new(None)),
             run_id: None,
+            depth_mode: haily_types::DepthMode::Normal,
         };
         (ctx, kms)
     }

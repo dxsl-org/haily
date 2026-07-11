@@ -295,6 +295,7 @@ fn spec_for<'a>(fx: &'a Fixture, phases: Vec<PhaseInput>) -> BuildRunSpec<'a> {
         workspace: &fx.workspace,
         compile: VerifierCmd::new("git", &["--version"]),
         test: VerifierCmd::new("git", &["--version"]),
+        depth: haily_types::DepthMode::Normal,
     }
 }
 

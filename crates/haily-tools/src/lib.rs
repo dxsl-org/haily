@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_types::ApprovalGate;
+use haily_types::{ApprovalGate, DepthMode};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -94,6 +94,13 @@ pub struct ToolContext {
     /// server-side and never sourced from LLM/tool text — a compromised sub-agent cannot
     /// forge or alter another run's grouping.
     pub run_id: Option<String>,
+    /// Judgment depth for this turn (Sub-Agent + Skill Architecture phase 7). Threaded
+    /// SERVER-SIDE from the L0 turn's effective depth (a GUI toggle or a genuine
+    /// user-message phrase) down through every delegation, so a delegated sub-agent inherits
+    /// the user's chosen depth and the LLM can never self-escalate to `Deep` by forging it.
+    /// `DepthMode::Normal` for every ordinary path (the default); only `run_turn` sets a
+    /// non-default value and only from a user-sourced signal.
+    pub depth_mode: DepthMode,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so

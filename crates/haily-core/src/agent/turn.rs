@@ -83,6 +83,15 @@ pub async fn run_turn(
         let _ = feedback_parser::apply_feedback_signal(&signal, &db, &session_id, false).await;
     }
 
+    // Phase 7 depth: a VN/EN depth phrase in the GENUINE user message (`req.message` — the
+    // SAME source-guarded input feedback detection uses above, never tool/pasted content)
+    // OVERRIDES the request's toggle-set depth for this turn; absent a phrase the toggle
+    // value stands. The harness NEVER escalates to Deep on its own — this is either an
+    // explicit toggle or an explicit phrase. Threaded onto `ToolContext.depth_mode` below so
+    // every delegation inherits it (a researcher/writer sub-agent picks up its depth
+    // playbook variant); the LLM can never forge it.
+    let effective_depth = crate::depth::effective_depth(req.depth, &req.message);
+
     sessions::insert_message(&db, &session_id, "user", &req.message, None).await?;
     info!(session = session_id, "processing user message");
 
@@ -118,6 +127,7 @@ pub async fn run_turn(
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         // An L0 chat turn is not a pipeline run — only the P4b runner sets this.
         run_id: None,
+        depth_mode: effective_depth,
     };
 
     let mut guard = tool_call::LoopGuard::new();
@@ -547,6 +557,7 @@ mod turn_integration_tests {
             adapter_id: "test-adapter".to_string(),
             message: "please create two tasks".to_string(),
             user_ref: None,
+            depth: Default::default(),
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -706,6 +717,7 @@ mod turn_integration_tests {
             adapter_id: "test-adapter".to_string(),
             message: "delete these six tasks, delegate the rest".to_string(),
             user_ref: None,
+            depth: Default::default(),
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -861,6 +873,7 @@ mod outcome_signal_tests {
             adapter_id: "test-adapter".to_string(),
             message: message.to_string(),
             user_ref: None,
+            depth: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -991,6 +1004,7 @@ mod outcome_signal_tests {
             adapter_id: "test-adapter".to_string(),
             message: message.to_string(),
             user_ref: None,
+            depth: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1440,6 +1454,7 @@ mod outcome_signal_tests {
             adapter_id: "test-adapter".to_string(),
             message: "plan a trip to hanoi for the user".to_string(),
             user_ref: None,
+            depth: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await

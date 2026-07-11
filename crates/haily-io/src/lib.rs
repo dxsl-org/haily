@@ -21,8 +21,8 @@ pub use telegram::TelegramAdapter;
 // without importing this adapter layer. Re-exported here so existing call sites
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
 pub use haily_types::{
-    ApprovalResolver, Notification, ProactiveCard, ProactiveCardKind, Request, RequestSender,
-    ResponseChunk, WorkItemStatus,
+    ApprovalResolver, DepthMode, Notification, ProactiveCard, ProactiveCardKind, Request,
+    RequestSender, ResponseChunk, WorkItemStatus,
 };
 
 use anyhow::Result;

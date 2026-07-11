@@ -672,6 +672,7 @@ mod tests {
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
             run_id: None,
+            depth_mode: haily_types::DepthMode::Normal,
         };
         (ctx, rx, dir)
     }

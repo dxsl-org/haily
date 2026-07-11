@@ -13,6 +13,7 @@ use anyhow::Result;
 use haily_db::queries::pipeline_runs;
 use haily_db::DbHandle;
 use haily_tools::coding::workspace::CodingWorkspace;
+use haily_types::DepthMode;
 use uuid::Uuid;
 
 use super::{
@@ -43,6 +44,11 @@ pub struct BuildRunSpec<'a> {
     pub compile: VerifierCmd,
     /// Test gate command.
     pub test: VerifierCmd,
+    /// Judgment depth (phase 7): `Deep` runs refuter votes on each model-reported Critical
+    /// finding before routing it into the Fix loop (a majority-refuted false positive is
+    /// dropped); `Normal`/`Quick` route every Critical straight to the loop. The
+    /// reward-hacking guard's synthetic Critical is deterministic and NEVER refuted away.
+    pub depth: DepthMode,
 }
 
 impl<'a> BuildRunSpec<'a> {
@@ -79,6 +85,9 @@ pub async fn run_build(
     spec: BuildRunSpec<'_>,
 ) -> Result<RunReport> {
     let mut total_retries: u32 = 0;
+
+    // Phase 7 parity hint (text-only) at pipeline start — never blocks/escalates.
+    runner.emit_parity_hint(spec.depth).await;
 
     for phase in &spec.phases {
         // Exemplars: same-extension recent neighbors, excluding the phase's own target files.
@@ -130,6 +139,23 @@ pub async fn run_build(
                 // conservatively do not ship.
                 None => return Ok(report(rev_report.run_id, RunStatus::Paused, total_retries)),
             };
+            // Deep: run refuter votes on each model-reported Critical. A finding survives on at
+            // least one non-refutation (uncertainty defaults to NOT refuted, so it stands) and
+            // is dropped only when a majority of refuters confidently refute it — cutting the
+            // reviewer's false positives without ever silencing a genuine bug. Applied ONLY to
+            // model-reported findings; the deterministic reward-hacking guard below is never
+            // subject to a vote.
+            if spec.depth == DepthMode::Deep && !criticals.is_empty() {
+                let jc = runner.judge_context(spec.session_id);
+                let mut survivors = Vec::new();
+                for f in criticals {
+                    let evidence = format!("{} {}", f.file, f.failure_scenario);
+                    if crate::pipeline::judge::refuter_votes(&jc, &f.summary, &evidence).await {
+                        survivors.push(f);
+                    }
+                }
+                criticals = survivors;
+            }
             if round > 0 {
                 let fix_delta = diff::diff_since(spec.workspace, round_base.as_deref()).await;
                 if let Some(f) = detect_test_tampering(&fix_delta) {

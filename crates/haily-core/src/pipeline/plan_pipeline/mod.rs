@@ -37,6 +37,7 @@ use uuid::Uuid;
 use crate::pipeline::runner::{PipelineRunner, RunReport, RunSpec};
 use crate::pipeline::{ArtifactKind, Gate, Pipeline, RunStatus, Stage};
 use haily_tools::coding::workspace::CodingWorkspace;
+use haily_types::DepthMode;
 
 /// Per-stage tool-call budgets (kept well below the ~25 coherence ceiling — these stages make
 /// one or two tool calls each).
@@ -56,7 +57,17 @@ const PLAN_DOMAIN: &str = "developer";
 /// - `None` = first pass → full **Scout → Design → Write → Approval**.
 /// - `Some(fb)` = reject path → **Design → Write → Approval** (scout orientation is unchanged),
 ///   with `fb` appended to the Design prompt. Driven at most once by [`run_plan`].
-pub fn build_plan_pipeline(task: &str, slug: &str, design_feedback: Option<&str>) -> Pipeline {
+///
+/// `depth` selects the per-mode stage graph (phase 7): `Quick` TRIMS the scout stage (no
+/// parallel-scout/red-team ceremony — straight to Design→Write→Approval); `Normal`/`Deep`
+/// keep scout. The Deep judge PANEL is not a stage (a fan-out is not linear) — [`run_plan`]
+/// runs it and seeds its grafted synthesis into the Design stage's task.
+pub fn build_plan_pipeline(
+    task: &str,
+    slug: &str,
+    design_feedback: Option<&str>,
+    depth: DepthMode,
+) -> Pipeline {
     let scout = Stage {
         name: "scout".into(),
         tier: Some(Tier::Fast),
@@ -116,9 +127,12 @@ pub fn build_plan_pipeline(task: &str, slug: &str, design_feedback: Option<&str>
         grammar: None,
     };
 
-    let runs = match design_feedback {
-        None => vec![scout, design, write, approval],
-        Some(_) => vec![design, write, approval],
+    // Quick trims scout (no orientation ceremony); the reject path always skips scout too.
+    // Normal/Deep on the first pass keep it.
+    let runs = match (design_feedback, depth) {
+        (Some(_), _) => vec![design, write, approval],
+        (None, DepthMode::Quick) => vec![design, write, approval],
+        (None, _) => vec![scout, design, write, approval],
     };
     Pipeline { runs }
 }
@@ -138,12 +152,30 @@ pub async fn run_plan(
     db: &DbHandle,
     spec: PlanRunSpec<'_>,
 ) -> Result<RunReport> {
-    let first = build_plan_pipeline(&spec.task, &spec.slug, None);
+    // Phase 7 parity hint (text-only) at pipeline start — never blocks/escalates.
+    runner.emit_parity_hint(spec.depth).await;
+
+    // Deep: run the judge panel FIRST (two lens designs + a grafting synthesis), then graft
+    // its synthesis into the Design stage's task so the plan is built ON the panel's output.
+    // The panel is a fan-out, so it lives here in the wrapper, not as a linear runner stage.
+    let design_task = if spec.depth == DepthMode::Deep {
+        let jc = runner.judge_context(spec.session_id);
+        let panel = crate::pipeline::judge::judge_panel(&jc, &spec.task).await;
+        format!(
+            "{}\n\n## Panel synthesis (graft of a risk-first and a simplicity-first design — \
+             build the plan on this single synthesized approach)\n{}",
+            spec.task, panel.design
+        )
+    } else {
+        spec.task.clone()
+    };
+
+    let first = build_plan_pipeline(&design_task, &spec.slug, None, spec.depth);
     let mut report = runner.run(spec.run_spec(first)).await?;
 
     if report.status == RunStatus::Paused {
         if let Some(fb) = spec.revise_feedback.as_deref() {
-            let replan = build_plan_pipeline(&spec.task, &spec.slug, Some(fb));
+            let replan = build_plan_pipeline(&design_task, &spec.slug, Some(fb), spec.depth);
             report = runner.run(spec.run_spec(replan)).await?;
         }
     }
@@ -174,6 +206,9 @@ pub struct PlanRunSpec<'a> {
     /// checkpoint. `Some` triggers exactly one Design→Write→Approval re-run; `None` leaves a
     /// declined plan `Paused`.
     pub revise_feedback: Option<String>,
+    /// Judgment depth (phase 7): `Quick` trims the scout stage, `Deep` runs the judge panel
+    /// before Design and emits no parity hint. `Normal` is the default balanced pipeline.
+    pub depth: DepthMode,
 }
 
 impl<'a> PlanRunSpec<'a> {
