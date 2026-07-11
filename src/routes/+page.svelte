@@ -6,6 +6,7 @@
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
   import WorkItemsPanel from '$lib/components/WorkItemsPanel.svelte';
   import ProactivePanel from '$lib/components/ProactivePanel.svelte';
+  import CockpitView from '$lib/components/CockpitView.svelte';
   import { cancelTurn, sendMessage } from '$lib/tauri';
   import type { ChunkPayload, PendingApproval } from '$lib/tauri';
   import { toolVerb } from '$lib/tool-verbs';
@@ -34,6 +35,11 @@
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
   let settingsOpen = $state(false);
+  // Cockpit (P11b) is the primary run-watching surface — a second top-level view
+  // toggled next to Settings, not a route (this app has no client router). Chat state
+  // (messages, streaming) is untouched while cockpit is shown; switching back reveals it
+  // exactly as left.
+  let view = $state<'chat' | 'cockpit'>('chat');
   let pendingApproval = $state<PendingApproval | null>(null);
   // The session_id of the turn currently streaming, or null when idle. Drives the
   // send/Stop button swap — set when `send_message` returns, cleared when that
@@ -223,6 +229,20 @@
   <header>
     <span class="logo">Haily</span>
     <span class="subtitle">trợ lý ảo</span>
+    <div class="view-toggle" role="tablist" aria-label="Chuyển chế độ xem">
+      <button
+        role="tab"
+        aria-selected={view === 'chat'}
+        class:active={view === 'chat'}
+        onclick={() => (view = 'chat')}
+      >Chat</button>
+      <button
+        role="tab"
+        aria-selected={view === 'cockpit'}
+        class:active={view === 'cockpit'}
+        onclick={() => (view = 'cockpit')}
+      >Cockpit</button>
+    </div>
     <button class="gear" onclick={() => settingsOpen = true} aria-label="Cài đặt" title="Cài đặt">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
@@ -233,62 +253,67 @@
 
   <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
   <ApprovalModal bind:pending={pendingApproval} />
-  <WorkItemsPanel />
-  <ProactivePanel />
 
-  <div class="messages">
-    {#each messages as msg (msg.id)}
-      <div class="bubble {msg.role}" class:pending={msg.pending}>
-        {#if msg.role === 'assistant' && msg.pending && !msg.content}
-          <span class="typing"><span></span><span></span><span></span></span>
-        {:else}
-          <span class="text">{msg.content}</span>
-          {#if msg.pending}
-            <span class="cursor">▋</span>
+  {#if view === 'cockpit'}
+    <CockpitView />
+  {:else}
+    <WorkItemsPanel />
+    <ProactivePanel />
+
+    <div class="messages">
+      {#each messages as msg (msg.id)}
+        <div class="bubble {msg.role}" class:pending={msg.pending}>
+          {#if msg.role === 'assistant' && msg.pending && !msg.content}
+            <span class="typing"><span></span><span></span><span></span></span>
+          {:else}
+            <span class="text">{msg.content}</span>
+            {#if msg.pending}
+              <span class="cursor">▋</span>
+            {/if}
           {/if}
-        {/if}
-        <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
-             gating — undo affordances for this turn's writes only appear once nothing
-             else from this turn can still land. -->
-        {#if !msg.pending && msg.undoable.length > 0}
-          <div class="undo-list">
-            {#each msg.undoable as action (action.journalId)}
-              <button
-                class="undo-inline"
-                onclick={() => requestUndo(action.journalId)}
-                disabled={undoing === action.journalId}
-                title={action.verb}
-              >
-                {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    {/each}
-    <div bind:this={bottomAnchor}></div>
-  </div>
+          <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
+               gating — undo affordances for this turn's writes only appear once nothing
+               else from this turn can still land. -->
+          {#if !msg.pending && msg.undoable.length > 0}
+            <div class="undo-list">
+              {#each msg.undoable as action (action.journalId)}
+                <button
+                  class="undo-inline"
+                  onclick={() => requestUndo(action.journalId)}
+                  disabled={undoing === action.journalId}
+                  title={action.verb}
+                >
+                  {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/each}
+      <div bind:this={bottomAnchor}></div>
+    </div>
 
-  <div class="input-area">
-    <textarea
-      bind:this={textarea}
-      bind:value={input}
-      onkeydown={onKeydown}
-      oninput={autoResize}
-      placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
-      rows="1"
-      disabled={sending || pendingApproval !== null || activeSession !== null}
-    ></textarea>
-    {#if activeSession}
-      <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
-        {stopping ? '…' : '■'}
-      </button>
-    {:else}
-      <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
-        {sending ? '…' : '↑'}
-      </button>
-    {/if}
-  </div>
+    <div class="input-area">
+      <textarea
+        bind:this={textarea}
+        bind:value={input}
+        onkeydown={onKeydown}
+        oninput={autoResize}
+        placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
+        rows="1"
+        disabled={sending || pendingApproval !== null || activeSession !== null}
+      ></textarea>
+      {#if activeSession}
+        <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
+          {stopping ? '…' : '■'}
+        </button>
+      {:else}
+        <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
+          {sending ? '…' : '↑'}
+        </button>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -318,8 +343,31 @@
     flex-shrink: 0;
   }
 
-  .gear {
+  .view-toggle {
     margin-left: auto;
+    display: flex;
+    gap: 2px;
+    border: 1px solid #2e2e4a;
+    border-radius: 8px;
+    padding: 2px;
+  }
+
+  .view-toggle button {
+    padding: 4px 12px;
+    min-height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #6b6b8a;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+  }
+  .view-toggle button.active { background: #2a2a45; color: #c084fc; }
+  .view-toggle button:hover:not(.active) { color: #a09ac0; }
+
+  .gear {
     width: 30px;
     height: 30px;
     border: none;
