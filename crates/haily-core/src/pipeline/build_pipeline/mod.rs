@@ -62,8 +62,16 @@ const SHIP_MAX_TOOL_CALLS: u32 = 4;
 /// Build/Test stage tool surface — path-guarded workspace tools only (P1). Refactor/rename uses
 /// first-class `fs_move`/`fs_delete`, NEVER `shell mv` (FMA-M4). NO delegation (stages are
 /// leaves), NO `worktree_apply` (the ship stage is the sole real-repo write path).
-const BUILD_TOOLS: &[&str] =
-    &["fs_read", "fs_list", "fs_grep", "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec"];
+///
+/// Phase 10 adds the LSP hint layer: `lsp_diagnostics` (Read — a semantic per-edit check
+/// alongside the build gate) and `lsp_rename` (ReversibleWrite — a project-safe cross-file rename
+/// that replaces string edits for refactor-rename tasks, journaled like `fs_edit`). Both no-op
+/// cleanly when no server is installed, so the build stage falls back to the build gate + P1
+/// tree-sitter lint with no behavior change on a server-less host.
+const BUILD_TOOLS: &[&str] = &[
+    "fs_read", "fs_list", "fs_grep", "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec",
+    "lsp_diagnostics", "lsp_rename",
+];
 
 /// Review stage tool surface — READ-ONLY plus the synthetic findings emitter. The reviewer
 /// cannot edit code (proves reviewer ≠ builder by construction), and the Fix loop reuses the
@@ -110,6 +118,18 @@ pub struct PhaseInput {
 /// The single source of truth for scaffold eligibility (prevents allowlist drift).
 pub fn scaffold_eligible(tier: Option<Tier>) -> bool {
     tier != Some(Tier::Ultra)
+}
+
+/// Fold LSP semantic diagnostics into the verify-loop signal as an ADDITIONAL hint (phase 10,
+/// decision #5), deduplicated against the AUTHORITATIVE build-gate output so the model is never
+/// shown the same error twice. Returns only the LSP lines NOT already present in `build_output`.
+///
+/// LSP is a hint layer, never the gate of record: a green LSP with a failing build/test gate is
+/// still a failure. This is the seam the runner consumes to enrich fix feedback once a live server
+/// is present on the host; on a server-less host `lsp_lines` is empty (the tools degrade), so this
+/// is a no-op and the build gate is the sole signal — matching the graceful-degradation default.
+pub fn additional_lsp_signal(build_output: &str, lsp_lines: &[String]) -> Vec<String> {
+    haily_tools::lsp::dedup_against_build_gate(lsp_lines, build_output)
 }
 
 /// The scaffold text for a stage at `tier`, or `None` at Ultra.
@@ -217,7 +237,10 @@ fn build_prompt(phase: &PhaseInput, exemplar_block: &str, feedback: Option<&str>
     let mut s = format!(
         "BUILD stage. Implement THIS phase, matching the workspace's conventions. Handle errors \
          and edge cases; do not leave TODOs. Use fs_write/fs_edit/fs_move/fs_delete for all file \
-         changes (never a shell `mv`/`rm`).\n\n## Phase\n{}{}{}",
+         changes (never a shell `mv`/`rm`). For a symbol RENAME/refactor prefer lsp_rename over \
+         string edits (it rewrites every reference project-wide, no collisions); use \
+         lsp_diagnostics for a fast semantic check after an edit. Both are optional hints — if \
+         they report no server, rely on the compile/test gate.\n\n## Phase\n{}{}{}",
         phase.content.trim(),
         block_or_empty(exemplar_block),
         scaffold,

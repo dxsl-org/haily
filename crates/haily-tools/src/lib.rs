@@ -3,6 +3,7 @@ pub mod coding;
 pub mod connector;
 pub mod exec;
 pub mod journal_undo;
+pub mod lsp;
 pub mod schedule;
 pub mod security;
 pub mod skill_fetch;
@@ -230,6 +231,13 @@ impl ToolRegistry {
             Arc::new(skill_fetch::SkillSearchTool) as Arc<dyn Tool>,
             Arc::new(skill_fetch::SkillListSectionsTool) as Arc<dyn Tool>,
             Arc::new(skill_fetch::SkillFetchTool) as Arc<dyn Tool>,
+            // Language-Server semantic layer (Sub-Agent + Skill Architecture phase 10) —
+            // whitelisted for the developer domain via `domains`. `lsp_diagnostics` = Read (a
+            // hint layer alongside the build gate), `lsp_rename` = ReversibleWrite (journaled
+            // like fs_edit). Both no-op cleanly when no server is on PATH (graceful degradation),
+            // so they register + resolve unconditionally with no cargo feature gate.
+            Arc::new(lsp::LspDiagnosticsTool) as Arc<dyn Tool>,
+            Arc::new(lsp::LspRenameTool) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }

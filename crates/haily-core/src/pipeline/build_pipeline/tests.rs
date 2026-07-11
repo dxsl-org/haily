@@ -79,6 +79,36 @@ fn reviewer_is_a_distinct_read_only_stage_never_the_builder() {
 }
 
 #[test]
+fn build_stage_exposes_the_lsp_hint_tools_and_prompt_routes_rename() {
+    // Phase 10: the build stage can call the semantic hint tools, and the prompt routes a
+    // symbol rename to lsp_rename over string edits. Both degrade cleanly when no server exists.
+    let build = build_phase_pipeline(&phase("cache", Some(Tier::Medium)), "", &cmd(), &cmd(), None);
+    let wl = &build.runs[0].tool_whitelist;
+    assert!(wl.iter().any(|t| t == "lsp_diagnostics"), "build stage exposes lsp_diagnostics");
+    assert!(wl.iter().any(|t| t == "lsp_rename"), "build stage exposes lsp_rename");
+    assert!(
+        build.runs[0].prompt_ref.contains("lsp_rename"),
+        "build prompt must route rename/refactor to lsp_rename"
+    );
+}
+
+#[test]
+fn additional_lsp_signal_dedups_against_the_authoritative_build_gate() {
+    // Decision #5: LSP is an ADDITIONAL hint deduplicated against the build gate — an error the
+    // gate already reported is not shown twice; an LSP-only finding survives.
+    let lsp = vec![
+        "  [error] 3:4 mismatched types: expected u32, found String".to_string(),
+        "  [warning] 9:1 unused import: std::io".to_string(),
+    ];
+    let build_output = "error[E0308]: mismatched types: expected u32, found String\n --> src/a.rs:3:4";
+    let extra = additional_lsp_signal(build_output, &lsp);
+    assert_eq!(extra.len(), 1, "the duplicate type error must be elided");
+    assert!(extra[0].contains("unused import"), "the LSP-only warning survives");
+    // Server-less host: no diagnostics collected → no-op, build gate is the sole signal.
+    assert!(additional_lsp_signal(build_output, &[]).is_empty());
+}
+
+#[test]
 fn scaffold_is_present_below_ultra_and_absent_at_ultra() {
     let below = build_phase_pipeline(&phase("c", Some(Tier::Thinking)), "", &cmd(), &cmd(), None);
     assert!(below.runs[0].prompt_ref.contains("Reasoning scaffold"), "scaffold at thinking tier");

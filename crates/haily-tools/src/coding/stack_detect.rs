@@ -15,15 +15,36 @@ pub enum Stack {
     Rust,
     TypeScript,
     Python,
+    Go,
+    Java,
 }
 
 impl Stack {
-    /// The authored standard's `name` (frontmatter) this stack maps to.
+    /// The authored standard's `name` (frontmatter) this stack maps to. `Go`/`Java` return a
+    /// name even though no `lang-go`/`lang-java` standard ships yet — `detect_standard_names` is
+    /// best-effort, so an absent standard file is simply not injected (never an error). They were
+    /// added for the phase-10 LSP language→server mapping ([`super::super::lsp`]), not for
+    /// standards injection.
     pub fn standard_name(&self) -> &'static str {
         match self {
             Stack::Rust => "lang-rust",
             Stack::TypeScript => "lang-typescript",
             Stack::Python => "lang-python",
+            Stack::Go => "lang-go",
+            Stack::Java => "lang-java",
+        }
+    }
+
+    /// Stable lowercase key identifying this stack's language to the LSP server registry
+    /// ([`super::super::lsp::registry`]). Distinct from [`Self::standard_name`] so the LSP
+    /// mapping never couples to the standards-injection naming.
+    pub fn lsp_language(&self) -> &'static str {
+        match self {
+            Stack::Rust => "rust",
+            Stack::TypeScript => "typescript",
+            Stack::Python => "python",
+            Stack::Go => "go",
+            Stack::Java => "java",
         }
     }
 }
@@ -44,6 +65,15 @@ pub fn detect_stacks(dir: &Path) -> Vec<Stack> {
         || dir.join("requirements.txt").is_file()
     {
         out.push(Stack::Python);
+    }
+    if dir.join("go.mod").is_file() {
+        out.push(Stack::Go);
+    }
+    if dir.join("pom.xml").is_file()
+        || dir.join("build.gradle").is_file()
+        || dir.join("build.gradle.kts").is_file()
+    {
+        out.push(Stack::Java);
     }
     out
 }
@@ -105,5 +135,23 @@ mod tests {
     fn empty_dir_detects_nothing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(detect_standard_names_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn detects_go_from_go_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("go.mod"), "module x\n").unwrap();
+        assert_eq!(detect_stacks(dir.path()), vec![Stack::Go]);
+        assert_eq!(Stack::Go.lsp_language(), "go");
+    }
+
+    #[test]
+    fn detects_java_from_pom_or_gradle() {
+        for marker in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join(marker), "").unwrap();
+            assert_eq!(detect_stacks(dir.path()), vec![Stack::Java], "marker {marker}");
+        }
+        assert_eq!(Stack::Java.lsp_language(), "java");
     }
 }

@@ -36,13 +36,16 @@ pub enum VerifierLang {
 }
 
 impl VerifierLang {
-    /// Map a P2-detected [`Stack`] to its verifier dialect. `Stack` has no `Go` variant, so Go
-    /// is only ever reached via [`VerifierLang::detect`] (go.mod probe), never this.
+    /// Map a P2-detected [`Stack`] to its verifier dialect. `Stack::Go` maps to the Go parser;
+    /// `Stack::Java` has no structured verifier parser yet, so it falls back to `Generic`
+    /// (exit-code + first-N-stderr-lines) — the honest default until a Java dialect is curated.
     pub fn from_stack(stack: Stack) -> VerifierLang {
         match stack {
             Stack::Rust => VerifierLang::Rust,
             Stack::TypeScript => VerifierLang::TypeScript,
             Stack::Python => VerifierLang::Python,
+            Stack::Go => VerifierLang::Go,
+            Stack::Java => VerifierLang::Generic,
         }
     }
 

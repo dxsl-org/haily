@@ -86,6 +86,10 @@ Không làm những việc ngoài phạm vi kỹ thuật phần mềm.",
             "fs_write", "fs_edit", "fs_move", "fs_delete",
             "shell_exec", "code_exec",
             "git_status", "git_diff", "git_commit",
+            // Language-Server semantic layer (phase 10) — semantic diagnostics (Read) + safe
+            // cross-file rename (ReversibleWrite). Developer domain only; no-op when no server
+            // is installed, so they are always safe to list (graceful degradation).
+            "lsp_diagnostics", "lsp_rename",
             // Authored-skill lazy-load (phase 2) — universal.
             "skill_search", "skill_list_sections", "skill_fetch",
         ],

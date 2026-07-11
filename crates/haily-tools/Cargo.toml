@@ -18,7 +18,9 @@ haily-db    = { workspace = true }
 haily-kms   = { workspace = true }
 haily-types = { workspace = true }
 tokio      = { workspace = true }
-tokio-util = { workspace = true }
+# `compat` feature: adapt tokio AsyncRead/Write ↔ futures-io for async-lsp's `run_buffered`
+# (phase 10 LSP transport). `rt` comes from the workspace default (TaskTracker).
+tokio-util = { workspace = true, features = ["compat"] }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
@@ -32,6 +34,17 @@ url        = "2"
 # Coding tool surface (Sub-Agent + Skill Architecture phase 1): bundled content search
 # (fs_grep, no external ripgrep) + glob→regex for fs_list.
 regex      = "1"
+# Language-Server semantic layer (Sub-Agent + Skill Architecture phase 10). `lsp-types` =
+# the pure-serde LSP protocol structs (initialize/diagnostics/rename/WorkspaceEdit) so the
+# protocol is never hand-rolled; `async-lsp` = the JSON-RPC-over-stdio transport framework.
+# Both are pure Rust (no C link) so no tree-sitter/sqlx-class link collision. Feature-INDEPENDENT
+# (not gated): graceful degradation is the default path, so the client + registry + dedup logic
+# compile and test on every build without a live server present.
+# Pinned to 0.95 to MATCH async-lsp 0.2.4's own lsp-types dep — a single resolved version so the
+# `Notification`/`Request` trait bounds on async-lsp's Router/ServerSocket unify with our direct
+# `use lsp_types::...` (two versions would make them distinct, incompatible types).
+lsp-types  = "=0.95.1"
+async-lsp  = { version = "0.2", features = ["tokio"] }
 # Used in production by the coding surface: ephemeral scratch roots for `code_exec`, empty
 # hooks dir for `git_safe_args`.
 tempfile   = "3"
