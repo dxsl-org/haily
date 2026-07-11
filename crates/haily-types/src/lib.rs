@@ -103,6 +103,58 @@ pub enum Notification {
     WorkItemsChanged(Vec<WorkItemStatus>),
 }
 
+/// Typed, ordered observability stream for a pipeline RUN (Sub-Agent + Skill Architecture
+/// phase 4). The runner (phase 4b) is the single source of truth for run state, so it emits
+/// this sequence; defined HERE in the leaf `haily-types` crate so `haily-core` can emit it
+/// without importing `haily-io` (the "core never imports io" invariant).
+///
+/// This is the CONTRACT + type only. The ordered delivery channel and per-channel rendering
+/// (GUI timeline, ACP `session/update`, Telegram pings, TUI progress) are built in P11/P12 —
+/// no delivery is wired here.
+///
+/// Follows the ResponseChunk additive convention: `#[serde(tag="type", content="data")]` with
+/// `#[serde(default)]` on any field that may be absent in an older payload, so the wire
+/// envelope stays backward-compatible as variants gain fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "data")]
+pub enum RunEvent {
+    /// A run began. `work_item_id` is the owning long-running item.
+    RunStarted { run_id: String, work_item_id: String },
+    /// A stage began executing. `tier` is the resolved model tier NAME (e.g. `"thinking"`),
+    /// a display string rather than the `haily-llm::Tier` type — `haily-types` is a leaf and
+    /// must not depend on `haily-llm`. `#[serde(default)]` keeps it additive: a stage with no
+    /// tier override, or a pre-`tier` payload, deserializes to `None`.
+    StageStarted {
+        run_id: String,
+        stage: String,
+        #[serde(default)]
+        tier: Option<String>,
+    },
+    /// A chunk of a stage's streamed output. `seq` is the per-run monotonic sequence number so
+    /// a consumer can order/dedupe chunks; `chunk` is the (tag-stripped) text.
+    StageOutput { run_id: String, seq: u64, chunk: String },
+    /// A gate finished. `gate` is the gate KIND label (`"command"`/`"artifact"`/`"approval"`,
+    /// never a path or command), `pass` is the verdict, `decisive` is the shortest decisive
+    /// output (empty on pass) — already rendered as inert data by the verifier parser.
+    GateResult { run_id: String, gate: String, pass: bool, decisive: String },
+    /// A verifier-grounded retry of the current stage began. `attempt` is the new 0-based count.
+    Retry { run_id: String, attempt: u32 },
+    /// The current stage escalated its model tier. `from`/`to` are tier NAME strings.
+    Escalation { run_id: String, from: String, to: String },
+    /// A diff is available for review. `file` is the changed path (repo-relative).
+    DiffAvailable { run_id: String, file: String },
+    /// A stage's approval gate needs the user. `approval_id` is the broker's approval id.
+    ApprovalNeeded { run_id: String, approval_id: String },
+    /// A plan artifact is ready for review. `plan_path` is the produced plan file.
+    PlanReady { run_id: String, plan_path: String },
+    /// The run paused (retries exhausted, approval wait, or explicit stop). `reason` is a short
+    /// human-facing cause.
+    RunPaused { run_id: String, reason: String },
+    /// The run reached a terminal state. `outcome` is the terminal RunStatus name
+    /// (`"done"`/`"failed"`) or a short outcome label.
+    RunComplete { run_id: String, outcome: String },
+}
+
 /// A single discrete proactive event, shaped for a dedicated display surface (the
 /// GUI's card panel — phase 08) rather than the raw daemon-wide `Notification`
 /// broadcast. Deliberately a SEPARATE type rather than re-wrapping `Notification`
@@ -504,5 +556,52 @@ mod tests {
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_event_uses_tag_content_envelope() {
+        let ev = RunEvent::GateResult {
+            run_id: "r1".to_string(),
+            gate: "command".to_string(),
+            pass: false,
+            decisive: "verifier rust FAILED (exit 101)".to_string(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"type\":\"GateResult\""));
+        assert!(json.contains("\"data\""));
+        let round_tripped: RunEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, ev);
+    }
+
+    /// Additive convention: `StageStarted.tier` is `Option<String>` + `#[serde(default)]`, so a
+    /// payload minted before `tier` existed (no `tier` key) must still deserialize, defaulting
+    /// to `None` — the same guarantee the ResponseChunk `origin`/`reversible` tests assert, so a
+    /// persisted or in-flight old RunEvent does not break after an upgrade adds fields.
+    #[test]
+    fn run_event_stage_started_tier_absent_payload_deserializes() {
+        let legacy = r#"{"type":"StageStarted","data":{"run_id":"r1","stage":"plan"}}"#;
+        let ev: RunEvent =
+            serde_json::from_str(legacy).expect("legacy StageStarted without tier must deserialize");
+        match ev {
+            RunEvent::StageStarted { run_id, stage, tier } => {
+                assert_eq!(run_id, "r1");
+                assert_eq!(stage, "plan");
+                assert_eq!(tier, None, "absent tier must default to None, not error");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_event_stage_started_tier_roundtrips() {
+        let ev = RunEvent::StageStarted {
+            run_id: "r1".to_string(),
+            stage: "implement".to_string(),
+            tier: Some("thinking".to_string()),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"tier\":\"thinking\""));
+        let round_tripped: RunEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, ev);
     }
 }

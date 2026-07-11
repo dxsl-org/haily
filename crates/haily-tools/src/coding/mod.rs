@@ -120,6 +120,9 @@ pub(crate) async fn journal_coding_audit(
             manifest_hash: None,
         },
         workspace_id,
+        // P4b threads the active pipeline run id here for in-pipeline coding writes; an
+        // ad-hoc coding sub-turn outside a run leaves it NULL.
+        None,
     )
     .await?;
     match ctx.last_journal_id.lock() {

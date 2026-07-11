@@ -15,7 +15,7 @@ pub mod reconcile;
 
 pub use local_compensator::{is_local_row, local_attempt_undo};
 pub use logic::{
-    attempt_undo, batch_undo, refusal_reason, undo_turn, BatchCounts, UndoOutcome,
+    attempt_undo, batch_undo, refusal_reason, undo_run, undo_turn, BatchCounts, UndoOutcome,
     MAX_UNDO_ATTEMPTS,
 };
 

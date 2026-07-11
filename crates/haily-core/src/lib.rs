@@ -5,6 +5,7 @@ mod context;
 mod delegate;
 mod domains;
 pub mod feedback_parser;
+pub mod pipeline;
 mod specialists;
 mod tag_matcher;
 mod tool_call;
