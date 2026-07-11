@@ -103,6 +103,12 @@ Luôn trích dẫn nguồn. Phân biệt rõ fact vs opinion. Không bịa đặ
             "memory_remember", "memory_search", "memory_list",
             // Domain-agnostic sandboxed execution for data scripts (harness-first).
             "code_exec",
+            // Stealth browser (Phase 13) — the researcher/web domain gets the interactive browser
+            // surface for JS-heavy / bot-walled sites (NOT the coding developer domain). Inert
+            // until the `browser` cargo feature registers these ops in build_v1 (mirrors the
+            // connector-op inert pattern); `sub_registry` skips them otherwise. Mutations
+            // (browser_interact click/fill, browser_session import/clear) stay approval-gated.
+            "browser_navigate", "browser_interact", "browser_session",
             // Authored-skill lazy-load (phase 2) — universal.
             "skill_search", "skill_list_sections", "skill_fetch",
         ],

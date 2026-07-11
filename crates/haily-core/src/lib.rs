@@ -649,6 +649,14 @@ mod wiring_tests {
         let base = base_v1_with_connectors();
         for d in DOMAINS {
             for t in d.allowed_tools {
+                // Browser tools (Phase 13) are registered only under the `browser` cargo feature
+                // (default OFF); like connector ops before a manifest exists, their whitelist
+                // names are inert-but-listed and `sub_registry` skips them when unregistered. In
+                // the default test build they will not resolve, so skip them here — a dedicated
+                // `#[cfg(feature = "browser")]` test in haily-tools asserts they register.
+                if haily_tools::browser::BROWSER_TOOL_NAMES.contains(t) {
+                    continue;
+                }
                 assert!(
                     base.get(t).is_some(),
                     "domain {} references unknown tool {t}",

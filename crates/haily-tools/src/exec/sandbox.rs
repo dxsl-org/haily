@@ -1,9 +1,13 @@
 //! The `Sandbox` trait, backend identity, and config-redirection defense.
 
-use super::config::{ExecOutput, ExecRequest, SandboxConfig};
+use super::config::{
+    build_child_env, ExecOutput, ExecRequest, NetworkPolicy, SandboxAccess, SandboxConfig,
+    SandboxMode,
+};
 use super::SandboxError;
 use async_trait::async_trait;
 use std::path::Path;
+use std::time::Duration;
 
 /// Which concrete backend produced an [`ExecOutput`] — recorded so the spike telemetry and
 /// the per-attempt egress log can attribute a run to its actual isolation level (a "local"
@@ -75,6 +79,38 @@ pub fn git_safe_args(empty_hooks_dir: &Path) -> Vec<String> {
         "-c".into(),
         format!("core.hooksPath={}", empty_hooks_dir.display()),
     ]
+}
+
+/// The loopback address the P13 browser's CDP endpoint MUST bind to. The remote-debugging port
+/// is a full remote-control channel over the browser; exposing it off-host would let anything on
+/// the network drive the user's logged-in sessions. Callers pass this to
+/// [`crate::browser::stealth::build_launch_flags`] as `--remote-debugging-address`.
+pub const BROWSER_CDP_BIND_ADDR: &str = "127.0.0.1";
+
+/// Build the **network-allowed** sandbox profile for the P13 stealth browser (the one exec
+/// surface that MUST reach the web — DISTINCT from code-exec's [`NetworkPolicy::Off`] profile).
+///
+/// The profile is: network `On`; filesystem confined to the browser profile dir
+/// ([`SandboxAccess::ReadWrite`] over that dir only — see [`build_browser_env`], which forces
+/// `HOME`/`TMP` there so the browser cannot read the real home); credential env scrubbed via the
+/// same allowlist as code-exec; and loopback-only CDP ([`BROWSER_CDP_BIND_ADDR`], pinned in the
+/// launch flags). `timeout` bounds a single browser operation.
+pub fn browser_sandbox_config(timeout: Duration) -> SandboxConfig {
+    SandboxConfig {
+        mode: SandboxMode::All,
+        access: SandboxAccess::ReadWrite,
+        network: NetworkPolicy::On,
+        timeout,
+        pid_limit: Some(512),
+    }
+}
+
+/// Build the browser child's environment: the SAME credential-scrubbing allowlist as code-exec
+/// ([`build_child_env`]), with `HOME`/`TMP`/`TEMP` forced to `profile_dir` so the browser writes
+/// only inside its confined profile dir and no parent-process credential (`GH_TOKEN`, `AWS_*`,
+/// cloud LLM keys, …) reaches it.
+pub fn build_browser_env(profile_dir: &Path) -> Vec<(String, String)> {
+    build_child_env(profile_dir, &[])
 }
 
 /// Scan `work_root` (TOP-LEVEL ONLY) for redirection vectors. Best-effort: an unreadable dir
@@ -164,5 +200,51 @@ mod tests {
         )
         .unwrap();
         assert!(detect_redirection_triggers(dir.path()).contains(&RedirectionTrigger::ProcMacro));
+    }
+
+    // ---- P13 network-allowed browser profile -----------------------------------
+
+    #[test]
+    fn browser_profile_allows_network_unlike_code_exec() {
+        let cfg = browser_sandbox_config(Duration::from_secs(60));
+        // The browser MUST reach the web — the one profile with network On...
+        assert_eq!(cfg.network, NetworkPolicy::On);
+        // ...whereas the default (code-exec/build) profile is network Off.
+        assert_eq!(SandboxConfig::default().network, NetworkPolicy::Off);
+        assert_eq!(cfg.timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn browser_env_scrubs_credentials_and_confines_home() {
+        // Simulate a parent process holding secrets, then prove the browser child sees none of
+        // them and has HOME/TMP forced into its confined profile dir. Canary set is local (the
+        // config.rs one is module-private) but covers the same credential classes.
+        const CANARIES: &[&str] = &[
+            "GH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+        ];
+        for c in CANARIES {
+            std::env::set_var(c, "SECRET");
+        }
+        let profile = Path::new("/scratch/haily-browser");
+        let env = build_browser_env(profile);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        for c in CANARIES {
+            assert!(!keys.contains(c), "credential var {c:?} leaked into the browser env");
+        }
+        let home = env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.clone());
+        assert_eq!(home.as_deref(), Some("/scratch/haily-browser"),
+            "browser HOME must be confined to the profile dir");
+        for c in CANARIES {
+            std::env::remove_var(c);
+        }
+    }
+
+    #[test]
+    fn browser_cdp_binds_loopback_only() {
+        assert_eq!(BROWSER_CDP_BIND_ADDR, "127.0.0.1");
     }
 }

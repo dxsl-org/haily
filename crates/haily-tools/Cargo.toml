@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 description = "Tool implementations — all tools the agent can call in V1"
 
+[features]
+# Live stealth browser CDP driver (Phase 13). Default OFF, mirroring haily-llm's `llama`
+# feature: the DEFAULT workspace build/test/clippy stays green and CI needs no Chromium. The
+# feature-independent stealth JS asset, fetch_strategy escalation + keyword tables, human-behavior
+# math, network-allowed sandbox profile, RiskTier gating, and the CloakBrowser seam detection are
+# ALWAYS compiled + tested; only the chromiumoxide-backed driver (browser/manager.rs, browser/
+# tools.rs) is gated here.
+browser = ["dep:chromiumoxide", "dep:rand", "dep:futures", "dep:base64"]
+
 [dependencies]
 haily-db    = { workspace = true }
 haily-kms   = { workspace = true }
@@ -26,6 +35,14 @@ regex      = "1"
 # Used in production by the coding surface: ephemeral scratch roots for `code_exec`, empty
 # hooks dir for `git_safe_args`.
 tempfile   = "3"
+# Phase 13 stealth browser (LIVE CDP driver only — all optional, pulled in by the `browser`
+# feature; the default build never compiles them). chromiumoxide = async CDP driver;
+# rand = runtime human-behavior/CDP jitter; futures = polling the CDP handler stream;
+# base64 = screenshot/PDF data-URI encoding.
+chromiumoxide = { version = "0.9", optional = true }
+rand    = { version = "0.8", optional = true }
+futures = { workspace = true, optional = true }
+base64  = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

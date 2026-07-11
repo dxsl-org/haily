@@ -47,7 +47,8 @@ pub use null::NullSandbox;
 /// `shell_exec`/`code_exec` non-enforcing path to honor the kill switch mid-run.
 pub(crate) use spawn::spawn_capture_cancellable;
 pub use sandbox::{
-    detect_redirection_triggers, RedirectionTrigger, Sandbox, SandboxKind,
+    build_browser_env, browser_sandbox_config, detect_redirection_triggers, RedirectionTrigger,
+    Sandbox, SandboxKind, BROWSER_CDP_BIND_ADDR,
 };
 
 use std::path::PathBuf;

@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod coding;
 pub mod connector;
 pub mod exec;
@@ -241,6 +242,18 @@ impl ToolRegistry {
         reg.register(Arc::new(journal_undo::JournalUndoTool {
             resolver: journal_undo::ConnectorResolver::new(),
         }));
+        // Stealth browser tools (Phase 13) — registered ONLY under the `browser` cargo feature
+        // (default OFF, so `cargo test --workspace` needs no Chromium). Whitelisted for the
+        // researcher/web domains via `sub_registry`, never the coding developer domain. When the
+        // feature is off these names simply do not resolve — exactly the connector-op inert
+        // pattern — and `sub_registry` skips them. `browser_navigate` = Read; `browser_interact`
+        // mutations + `browser_session` import/clear = IrreversibleWrite → ApprovalGate.
+        #[cfg(feature = "browser")]
+        {
+            reg.register(Arc::new(browser::BrowserNavigateTool));
+            reg.register(Arc::new(browser::BrowserInteractTool::new()));
+            reg.register(Arc::new(browser::BrowserSessionTool));
+        }
         reg
     }
 
