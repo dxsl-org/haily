@@ -630,6 +630,9 @@ impl PipelineRunner {
             turn_deletes: Arc::clone(turn_deletes),
             max_tool_calls: Some(stage.max_tool_calls),
             run_id: Some(run_id.to_string()),
+            // A stage may force a generation shape (P5 Design → forced `emit_plan_draft`
+            // JSON). llama-only; the cloud path ignores it.
+            grammar: stage.grammar.clone(),
         };
 
         let result = run_with_pausable_timeout(

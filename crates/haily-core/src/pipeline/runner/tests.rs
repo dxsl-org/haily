@@ -185,6 +185,7 @@ fn stage(name: &str, whitelist: &[&str], gate: Gate, max_retries: u32) -> Stage 
         max_tool_calls: 5,
         gate,
         max_retries,
+        grammar: None,
     }
 }
 

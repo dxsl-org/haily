@@ -14,11 +14,15 @@
 //! agent-loop-touching half and is intentionally NOT in this PR.
 
 pub mod gate;
+pub mod plan_pipeline;
 pub mod runner;
 pub mod stage;
 pub mod verifier_output;
 
 pub use gate::{ArtifactKind, Gate};
+pub use plan_pipeline::{
+    build_plan_pipeline, run_plan, EmitPlanDraftTool, PlanDraft, PlanRunSpec, RenderPlanTool,
+};
 pub use runner::{decide, PipelineRunner, RunReport, RunSpec, StageDecision};
 pub use stage::{Pipeline, RunStatus, Stage, StageOutcome, DEFAULT_MAX_TOOL_CALLS};
 pub use verifier_output::{parse_decisive, VerifierLang};

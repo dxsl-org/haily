@@ -197,6 +197,9 @@ impl Tool for DelegateTool {
             // which calls `run_sub_turn` directly (never via this tool), sets these.
             max_tool_calls: None,
             run_id: None,
+            // A delegated sub-turn never forces a generation grammar — only a pipeline stage
+            // (the runner) does. Keep it unconstrained here (P5 additive default).
+            grammar: None,
         });
 
         let result = run_with_pausable_timeout(

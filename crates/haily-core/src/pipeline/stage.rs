@@ -41,6 +41,12 @@ pub struct Stage {
     /// back into the SAME stage; after `max_retries` the runner escalates (P3) then pauses.
     /// The authoritative pipeline-GLOBAL bound is `pipeline_runs.attempts_remaining`, not this.
     pub max_retries: u32,
+    /// Optional GBNF grammar forcing this stage's generation shape (Plan Pipeline, P5). `Some`
+    /// only for a stage that constrains its output to a specific tool-call JSON (the Design
+    /// stage's `emit_plan_draft`); `None` leaves generation unconstrained. llama-only — the
+    /// cloud path ignores it, so parse-and-repair stays the primary path off-llama. The runner
+    /// copies this onto the stage sub-turn's `SubTurnRequest`.
+    pub grammar: Option<String>,
 }
 
 /// Default per-stage tool-call budget (red-team AD-C2/FMA-M1: below the ~25–30 coherence
@@ -149,6 +155,7 @@ mod tests {
             max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
             gate: Gate::Approval { prompt: "ok?".into() },
             max_retries: 1,
+            grammar: None,
         }
     }
 

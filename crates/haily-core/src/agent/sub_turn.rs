@@ -163,6 +163,14 @@ pub struct SubTurnRequest {
     /// sub-turn as a stage — threaded onto the sub-turn's `ToolContext` so every journal row a
     /// stage writes groups under one `undo_run`. `None` for an ordinary delegated sub-turn.
     pub run_id: Option<String>,
+    /// Optional GBNF grammar constraining this sub-turn's generation (Plan Pipeline, P5).
+    /// `Some` only when a pipeline STAGE forces a shape (e.g. the Design stage forcing an
+    /// `emit_plan_draft` tool-call JSON via [`haily_llm::gbnf::tool_call_grammar`]); `None`
+    /// for every chat turn and delegated sub-turn (today's behavior). Consumed ONLY by the
+    /// in-process llama backend's sampler — the cloud path ignores it entirely, so
+    /// parse-and-repair remains the primary path off-llama (the grammar is a llama-only
+    /// optimization, never a correctness dependency).
+    pub grammar: Option<String>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -196,6 +204,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         turn_deletes,
         max_tool_calls,
         run_id,
+        grammar,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -321,7 +330,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let final_response = loop {
         msgs = token_budget.refit(&msgs, pinned_tail_len);
 
-        let llm_req = CompletionRequest::simple(msgs.clone());
+        let mut llm_req = CompletionRequest::simple(msgs.clone());
+        // A pipeline stage may force a generation shape (P5 Design stage → forced
+        // `emit_plan_draft` JSON). llama-only: the cloud path ignores `grammar`, so this is
+        // additive and never changes the off-llama path.
+        if let Some(g) = &grammar {
+            llm_req = llm_req.with_grammar(g.clone());
+        }
         let response = llm.complete_tiered(model_tier, llm_req).await?;
 
         if let Some((tool_name, args)) = tool_call::parse_tool_call(&response) {
@@ -579,6 +594,7 @@ mod sub_turn_tests {
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
             run_id: None,
+            grammar: None,
         }
     }
 
@@ -1015,6 +1031,7 @@ mod outcome_tests {
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
             run_id: None,
+            grammar: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1050,6 +1067,7 @@ mod outcome_tests {
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
             run_id: None,
+            grammar: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1126,6 +1144,7 @@ mod outcome_tests {
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
             run_id: None,
+            grammar: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
