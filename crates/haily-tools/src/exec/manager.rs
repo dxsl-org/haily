@@ -7,7 +7,7 @@
 
 use super::config::{SandboxConfig, ScopeKey};
 use super::null::NullSandbox;
-use super::sandbox::Sandbox;
+use super::sandbox::{Sandbox, SandboxKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,6 +81,14 @@ impl Manager {
     }
 
     /// Pick the strongest available backend for this host, failing safe to `NullSandbox`.
+    /// Which sandbox backend this host would select right now, WITHOUT pooling one (phase
+    /// 11a — the workspace panel's sandbox-status readout, incl. the `NullSandbox`
+    /// first-exec-approval warning). A `Null` result is the signal that execution is not
+    /// enforcing and requires per-work-root approval, exactly as `select_backend` documents.
+    pub fn probe_sandbox_kind() -> SandboxKind {
+        Self::select_backend().kind()
+    }
+
     /// Windows → the managed WSL2 distro if provisioned (`HAILY_WSL_DISTRO`), else Null.
     /// macOS/Linux → Null in the gate phase (native `exec` lands with those platforms' CI).
     fn select_backend() -> Arc<dyn Sandbox> {

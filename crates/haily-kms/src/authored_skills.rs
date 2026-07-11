@@ -67,6 +67,20 @@ impl SkillKind {
     }
 }
 
+/// Index-level view of one authored skill for the cockpit skills browser (phase 11a) —
+/// the frontmatter fields only, never the body or reference chunks (progressive
+/// disclosure). Authored skills are trusted, sha256-pinned kit-pack content, so they have
+/// no EMA confidence/use-count lifecycle the way synthesized skills do; the browser shows
+/// them as "authored" with those columns empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredSkillInfo {
+    pub name: String,
+    pub description: String,
+    pub when_to_use: String,
+    /// The `SkillKind` as a stable string (`stage-prompt`/`playbook`/`standard`).
+    pub kind: String,
+}
+
 /// One on-demand reference chunk (progressive-disclosure level 3). Its `body` is loaded
 /// only when `fetch_section` pulls it — never injected alongside the skill body.
 #[derive(Debug, Clone)]
@@ -299,6 +313,24 @@ impl AuthoredRegistry {
             .map(|s| (s.name.clone(), s.body.clone()))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Every authored skill's index-level view (phase 11a), name-sorted for a stable
+    /// browser ordering. Frontmatter only — no bodies/references (progressive disclosure).
+    pub fn list_all(&self) -> Vec<AuthoredSkillInfo> {
+        let snap = self.snap();
+        let mut out: Vec<AuthoredSkillInfo> = snap
+            .by_name
+            .values()
+            .map(|s| AuthoredSkillInfo {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                when_to_use: s.when_to_use.clone(),
+                kind: s.kind.as_str().to_string(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 

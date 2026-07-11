@@ -211,6 +211,62 @@ impl CodingWorkspace {
         Ok(())
     }
 
+    /// Whether the worktree has any uncommitted change (tracked-modified, staged, or
+    /// untracked), via `git status --porcelain` (phase 11a — the workspace panel's "dirty"
+    /// dot). Uses the isolated object env so it agrees with `commit_stage`/`compensate`.
+    ///
+    /// # Errors
+    /// Returns an error if resolving the isolated git env or the `git status` call fails.
+    pub async fn is_dirty(&self) -> Result<bool> {
+        let root = self.worktree_root();
+        let (obj_dir, alt_dir) = self.isolated_git_env().await?;
+        let env = [
+            ("GIT_OBJECT_DIRECTORY", obj_dir.as_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt_dir.as_str()),
+        ];
+        let out = git(root, &["status", "--porcelain"], &env).await?;
+        if !out.status.success() {
+            bail!(
+                "git status --porcelain failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    }
+
+    /// The worktree's current unified diff against HEAD (phase 11a — the cockpit
+    /// DiffViewer's read side; the ACCEPT side routes through the existing `worktree_apply`
+    /// approval, not this). Capped at `max_bytes` so a huge generated diff cannot flood the
+    /// IPC channel — a truncated diff is marked with a trailing notice; deep per-file
+    /// viewing/virtualization is the frontend's job. The caller MUST treat the result as
+    /// inert, untrusted content (it is repo/tool-derived) and render it as data only.
+    ///
+    /// # Errors
+    /// Returns an error if resolving the isolated git env or the `git diff` call fails.
+    pub async fn unified_diff(&self, max_bytes: usize) -> Result<String> {
+        let root = self.worktree_root();
+        let (obj_dir, alt_dir) = self.isolated_git_env().await?;
+        let env = [
+            ("GIT_OBJECT_DIRECTORY", obj_dir.as_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt_dir.as_str()),
+        ];
+        // Include untracked files so a newly-created file shows up in the review diff.
+        let out = git(root, &["--no-pager", "diff", "HEAD", "--"], &env).await?;
+        if !out.status.success() {
+            bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let diff = String::from_utf8_lossy(&out.stdout);
+        if diff.len() <= max_bytes {
+            return Ok(diff.into_owned());
+        }
+        // Truncate on a char boundary to avoid splitting a multibyte sequence.
+        let mut end = max_bytes;
+        while end > 0 && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(format!("{}\n… [diff truncated at {max_bytes} bytes]\n", &diff[..end]))
+    }
+
     /// Full teardown: revert, remove the worktree + its isolated object store, delete the
     /// ephemeral branch, and soft-delete the row. Best-effort past the row delete so a
     /// half-torn-down workspace still ends `deleted_at`-marked.

@@ -204,6 +204,13 @@ impl KmsHandle {
         self.authored.search(query, k)
     }
 
+    /// Every authored (kit-pack) skill's index-level view for the cockpit skills browser
+    /// (phase 11a) — frontmatter only, name-sorted. Synthesized skills are read separately
+    /// from `kms_skills` (they have the EMA/decay lifecycle authored skills do not).
+    pub fn authored_skills_list(&self) -> Vec<authored_skills::AuthoredSkillInfo> {
+        self.authored.list_all()
+    }
+
     /// Attempt to load a valid dump; on any failure (including "no dump yet"), fall
     /// back to a full rebuild from `facts::embeddings_for_hnsw`. On a successful
     /// load, reconciles the delta between the dump timestamp and now (facts created

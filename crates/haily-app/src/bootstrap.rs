@@ -275,6 +275,13 @@ impl AppHandle {
         Arc::clone(&self.turns)
     }
 
+    /// Snapshot of every in-flight tool approval across all channels (phase 11a) for the
+    /// unified approvals queue. Delegates to the orchestrator's broker; each entry's
+    /// `session_id` is the auth boundary a UI must respect when offering to resolve it.
+    pub fn pending_approvals(&self) -> Vec<haily_core::PendingApproval> {
+        self.orchestrator.pending_approvals()
+    }
+
     /// Number of tasks currently registered on the root `TaskTracker` — dispatch loop,
     /// watcher, daemon loops, self-improvement workers, plus one per in-flight turn.
     /// Exposed for startup diagnostics and tests; not meaningful as a health signal on

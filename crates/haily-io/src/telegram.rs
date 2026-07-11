@@ -1,12 +1,13 @@
-use crate::{Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk};
+use crate::{slash, Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, RunEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use teloxide::{
     payloads::SendMessageSetters,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{BotCommand, BotCommandScope, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
 };
 use uuid::Uuid;
 
@@ -46,6 +47,11 @@ pub struct TelegramAdapter {
     /// Injected by `haily-app::bootstrap` after the orchestrator exists (see
     /// `Adapter::set_approval_resolver`).
     resolver: Arc<Mutex<Option<Arc<dyn ApprovalResolver>>>>,
+    /// `safety.disable_writes` kill switch (phase 3, C8), injected at bootstrap via
+    /// `set_kill_switch` — the SAME `Arc<AtomicBool>` the orchestrator gates on. Powers the
+    /// remote `/kill` and `/writes on|off` slash commands. `None` until injected; a command
+    /// arriving before then reports "not wired" rather than panicking.
+    kill: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl TelegramAdapter {
@@ -61,7 +67,157 @@ impl TelegramAdapter {
             session_to_chat: Arc::new(DashMap::new()),
             text_buffer: Arc::new(DashMap::new()),
             resolver: Arc::new(Mutex::new(None)),
+            kill: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+/// What the message handler should do with an incoming line. Decided purely by
+/// [`classify_slash`] so the routing (local control command vs. forward-to-orchestrator
+/// vs. unknown-command hint) is unit-testable without a live `Bot`.
+#[derive(Debug, PartialEq, Eq)]
+enum SlashOutcome {
+    /// Not a slash command — forward the original text to the orchestrator verbatim.
+    ForwardOriginal,
+    /// Reply with the `/help` discovery text (handled locally, never forwarded).
+    Help,
+    /// Remote kill switch: disable all writes now.
+    Kill,
+    /// `/writes on|off|status` — toggle/report the kill switch. Carries the bare arg.
+    Writes(String),
+    /// A registered command that maps to a skill/intent: forward this (possibly rewritten)
+    /// text to the orchestrator so the LLM handles it.
+    Forward(String),
+    /// An unregistered `/cmd` — answer with a hint, never silently swallow. Carries the name.
+    Unknown(String),
+}
+
+/// Classify a raw message line into a [`SlashOutcome`]. `@botname` is stripped and the
+/// command name lowercased by [`slash::parse`]. A non-slash line forwards verbatim.
+fn classify_slash(line: &str) -> SlashOutcome {
+    let Some((name, args)) = slash::parse(line) else {
+        return SlashOutcome::ForwardOriginal;
+    };
+    match name.as_str() {
+        "help" | "start" => SlashOutcome::Help, // /start (Telegram onboarding) → discovery too
+        "kill" => SlashOutcome::Kill,
+        "writes" => SlashOutcome::Writes(args),
+        // `/undo <id>` rewrites to the same precise instruction the CLI/GUI send, so the
+        // LLM's `journal_undo` tool + approval gate handle it identically across channels.
+        "undo" => {
+            let id = args.trim();
+            if id.is_empty() {
+                SlashOutcome::Forward("Undo the last action.".to_string())
+            } else {
+                SlashOutcome::Forward(format!("Undo the action with journal id \"{id}\"."))
+            }
+        }
+        // Any other REGISTERED command fronts a skill/intent — forward the whole line as
+        // text so the orchestrator/LLM interprets it (no per-command backend on Telegram).
+        other if slash::is_registered(other) => SlashOutcome::Forward(line.trim().to_string()),
+        // Unregistered → hint, not a silent swallow.
+        other => SlashOutcome::Unknown(other.to_string()),
+    }
+}
+
+/// Apply a `/writes on|off|status` command to `kill` and return the line to echo. Mirrors
+/// the CLI's `handle_writes_command` semantics: `off` disables writes (switch ON), `on`
+/// enables (switch OFF).
+fn apply_writes_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>, arg: &str) -> String {
+    let handle = match kill.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    };
+    let Some(handle) = handle else {
+        return "⚠️ kill switch not wired yet".to_string();
+    };
+    match arg.trim() {
+        "off" => {
+            handle.store(true, Ordering::Release);
+            "🔴 Writes DISABLED — new writes are blocked (in-flight writes are not stopped)".to_string()
+        }
+        "on" => {
+            handle.store(false, Ordering::Release);
+            "🟢 Writes ENABLED — new writes allowed".to_string()
+        }
+        "" | "status" => {
+            let disabled = handle.load(Ordering::Acquire);
+            format!("Writes currently {}", if disabled { "DISABLED" } else { "ENABLED" })
+        }
+        _ => "usage: /writes on | off | status".to_string(),
+    }
+}
+
+/// Set the kill switch ON (disable writes) and return the confirmation line. `/kill` is the
+/// blunt emergency form of `/writes off`.
+fn apply_kill_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>) -> String {
+    let handle = match kill.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    };
+    match handle {
+        Some(h) => {
+            h.store(true, Ordering::Release);
+            "🔴 KILL — all writes disabled. Send /writes on to re-enable.".to_string()
+        }
+        None => "⚠️ kill switch not wired yet".to_string(),
+    }
+}
+
+/// Forward a message to the orchestrator as a normal `telegram` chat request. Shared by
+/// the plain-text path and the slash-command forward path so both build an identical
+/// `Request`.
+async fn forward_text(
+    tx: &Arc<RequestSender>,
+    session_id: Uuid,
+    user_ref: Option<String>,
+    message: String,
+) {
+    let req = Request {
+        session_id,
+        adapter_id: "telegram".to_string(),
+        message,
+        user_ref,
+        depth: Default::default(),
+        origin: Default::default(),
+    };
+    if tx.send(req).await.is_err() {
+        tracing::warn!("telegram: orchestrator channel closed");
+    }
+}
+
+/// Render one ordered `RunEvent` as a concise Telegram status ping, or `None` for a
+/// high-frequency event (streamed `StageOutput` chunks) that would spam the chat — the
+/// GUI timeline is the place to watch those line-by-line; Telegram is remote control, so
+/// it surfaces only the milestone transitions. Content-bearing fields are already
+/// tag-stripped at the delivery chokepoint; this only picks WHICH events to show.
+fn render_run_event_ping(event: &RunEvent) -> Option<String> {
+    match event {
+        RunEvent::RunStarted { run_id, .. } => Some(format!("▶️ Run <code>{}</code> started", escape_html(run_id))),
+        RunEvent::StageStarted { stage, tier, .. } => {
+            let t = tier.as_deref().map(|t| format!(" [{}]", escape_html(t))).unwrap_or_default();
+            Some(format!("⚙️ Stage <b>{}</b>{}", escape_html(stage), t))
+        }
+        RunEvent::GateResult { gate, pass, decisive, .. } => {
+            let icon = if *pass { "✅" } else { "❌" };
+            let tail = if *pass || decisive.is_empty() {
+                String::new()
+            } else {
+                format!("\n<code>{}</code>", escape_html(decisive))
+            };
+            Some(format!("{icon} Gate <b>{}</b>{}", escape_html(gate), tail))
+        }
+        RunEvent::Retry { attempt, .. } => Some(format!("🔁 Retry (attempt {attempt})")),
+        RunEvent::Escalation { from, to, .. } => {
+            Some(format!("⬆️ Escalated {} → {}", escape_html(from), escape_html(to)))
+        }
+        RunEvent::DiffAvailable { file, .. } => Some(format!("📄 Diff ready: <code>{}</code>", escape_html(file))),
+        RunEvent::ApprovalNeeded { .. } => Some("⏳ Approval needed — check your GUI/CLI to decide".to_string()),
+        RunEvent::PlanReady { plan_path, .. } => Some(format!("📝 Plan ready: <code>{}</code>", escape_html(plan_path))),
+        RunEvent::RunPaused { reason, .. } => Some(format!("⏸ Run paused: {}", escape_html(reason))),
+        RunEvent::RunComplete { outcome, .. } => Some(format!("🏁 Run complete: {}", escape_html(outcome))),
+        // Per-chunk streamed output would flood a chat — intentionally not pinged.
+        RunEvent::StageOutput { .. } => None,
     }
 }
 
@@ -168,18 +324,38 @@ impl Adapter for TelegramAdapter {
         let chat_to_session = Arc::clone(&self.chat_to_session);
         let session_to_chat = Arc::clone(&self.session_to_chat);
         let resolver = Arc::clone(&self.resolver);
+        let kill = Arc::clone(&self.kill);
         let tx = Arc::new(tx);
+
+        // Register the curated single-word slash menu automatically (user directive
+        // 2026-07-08): synced from the canonical registry, scoped to private chats, no
+        // manual BotFather config. Best-effort — a network failure here only costs the
+        // menu affordance; every command still arrives as text regardless. Multi-word
+        // commands are intentionally absent (not Telegram-legal — see `slash`).
+        let menu: Vec<BotCommand> = slash::telegram_menu()
+            .into_iter()
+            .map(|(name, desc)| BotCommand::new(name, desc))
+            .collect();
+        if let Err(e) = bot
+            .set_my_commands(menu)
+            .scope(BotCommandScope::AllPrivateChats)
+            .await
+        {
+            tracing::warn!("telegram: set_my_commands failed (menu unavailable, commands still work as text): {e:#}");
+        }
 
         tokio::spawn(async move {
             let message_handler = Update::filter_message().endpoint({
                 let tx = Arc::clone(&tx);
                 let c2s = Arc::clone(&chat_to_session);
                 let s2c = Arc::clone(&session_to_chat);
+                let kill = Arc::clone(&kill);
 
-                move |msg: Message| {
+                move |bot: Bot, msg: Message| {
                     let tx = Arc::clone(&tx);
                     let c2s = Arc::clone(&c2s);
                     let s2c = Arc::clone(&s2c);
+                    let kill = Arc::clone(&kill);
                     async move {
                         let Some(text) = msg.text() else {
                             return respond(());
@@ -193,17 +369,32 @@ impl Adapter for TelegramAdapter {
                         let session_id = *c2s.entry(chat_id).or_insert_with(Uuid::new_v4);
                         s2c.insert(session_id, chat_id);
 
-                        let req = Request {
-                            session_id,
-                            adapter_id: "telegram".to_string(),
-                            message: text.to_string(),
-                            user_ref,
-                            depth: Default::default(),
-                            origin: Default::default(),
+                        // Local control commands (help/kill/writes) are answered in-band and
+                        // never forwarded to the orchestrator; an unregistered `/cmd` gets a
+                        // hint; everything else forwards as chat text (verbatim, or the
+                        // `/undo` rewrite). See `classify_slash`.
+                        let reply: Option<String> = match classify_slash(text) {
+                            SlashOutcome::ForwardOriginal => {
+                                forward_text(&tx, session_id, user_ref, text.to_string()).await;
+                                None
+                            }
+                            SlashOutcome::Forward(msg) => {
+                                forward_text(&tx, session_id, user_ref, msg).await;
+                                None
+                            }
+                            SlashOutcome::Help => Some(slash::help_text()),
+                            SlashOutcome::Kill => Some(apply_kill_command(&kill)),
+                            SlashOutcome::Writes(arg) => Some(apply_writes_command(&kill, &arg)),
+                            SlashOutcome::Unknown(name) => Some(slash::unknown_hint(&name)),
                         };
-
-                        if tx.send(req).await.is_err() {
-                            tracing::warn!("telegram: orchestrator channel closed");
+                        if let Some(reply) = reply {
+                            if let Err(e) = bot
+                                .send_message(ChatId(chat_id), escape_html(&reply))
+                                .parse_mode(ParseMode::Html)
+                                .await
+                            {
+                                tracing::warn!("telegram: command reply failed: {e:#}");
+                            }
                         }
 
                         respond(())
@@ -386,9 +577,31 @@ impl Adapter for TelegramAdapter {
         Ok(())
     }
 
+    /// Render an ordered `RunEvent` as a concise status ping (phase 11a). Telegram is
+    /// remote control, not the primary cockpit, so only milestone transitions are pinged
+    /// (`render_run_event_ping` returns `None` for per-chunk `StageOutput`, which would
+    /// flood the chat). Content is already tag-stripped at the delivery chokepoint.
+    async fn deliver_run_event(&self, session_id: Uuid, event: RunEvent) -> Result<()> {
+        let Some(text) = render_run_event_ping(&event) else {
+            return Ok(());
+        };
+        if let Some(chat_id) = self.session_to_chat.get(&session_id) {
+            self.bot
+                .send_message(ChatId(*chat_id), text)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+        Ok(())
+    }
+
     fn set_approval_resolver(&self, resolver: Arc<dyn ApprovalResolver>) {
         let mut guard = self.resolver.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(resolver);
+    }
+
+    fn set_kill_switch(&self, kill: Arc<AtomicBool>) {
+        let mut guard = self.kill.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(kill);
     }
 
     fn id(&self) -> &str {
@@ -560,6 +773,87 @@ mod tests {
         let result = adapter.notify(Notification::WorkItemsChanged(vec![])).await;
 
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 11a — slash-command routing + remote kill + RunEvent pings.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_slash_routes_control_commands_locally() {
+        assert_eq!(classify_slash("/help"), SlashOutcome::Help);
+        assert_eq!(classify_slash("/start"), SlashOutcome::Help, "/start onboarding → discovery");
+        assert_eq!(classify_slash("/kill"), SlashOutcome::Kill);
+        assert_eq!(classify_slash("/kill@haily_bot"), SlashOutcome::Kill, "@botname stripped");
+        assert_eq!(classify_slash("/writes off"), SlashOutcome::Writes("off".into()));
+    }
+
+    #[test]
+    fn classify_slash_rewrites_undo_and_forwards_registered_skills() {
+        assert_eq!(
+            classify_slash("/undo abc-123"),
+            SlashOutcome::Forward("Undo the action with journal id \"abc-123\".".into())
+        );
+        // A registered skill-fronting command forwards the whole line as text.
+        assert_eq!(classify_slash("/plan add auth"), SlashOutcome::Forward("/plan add auth".into()));
+        // Plain chat forwards verbatim (not a slash command).
+        assert_eq!(classify_slash("hello there"), SlashOutcome::ForwardOriginal);
+    }
+
+    #[test]
+    fn classify_slash_flags_unknown_command_never_silent() {
+        assert_eq!(classify_slash("/frobnicate now"), SlashOutcome::Unknown("frobnicate".into()));
+    }
+
+    #[test]
+    fn apply_kill_and_writes_toggle_the_switch() {
+        let kill: Arc<Mutex<Option<Arc<AtomicBool>>>> =
+            Arc::new(Mutex::new(Some(Arc::new(AtomicBool::new(false)))));
+
+        let msg = apply_kill_command(&kill);
+        assert!(msg.contains("KILL"));
+        // The shared bool must now read "writes disabled" (true).
+        let handle = kill.lock().unwrap().clone().unwrap();
+        assert!(handle.load(Ordering::Acquire), "/kill must set the switch ON");
+
+        let on = apply_writes_command(&kill, "on");
+        assert!(on.contains("ENABLED"));
+        assert!(!handle.load(Ordering::Acquire), "/writes on must clear the switch");
+    }
+
+    #[test]
+    fn apply_writes_reports_not_wired_when_unset() {
+        let kill: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+        assert!(apply_writes_command(&kill, "status").contains("not wired"));
+        assert!(apply_kill_command(&kill).contains("not wired"));
+    }
+
+    #[test]
+    fn run_event_ping_shows_milestones_and_skips_stage_output() {
+        // Per-chunk output would flood the chat — must not ping.
+        assert!(render_run_event_ping(&RunEvent::StageOutput {
+            run_id: "r".into(),
+            seq: 0,
+            chunk: "x".into(),
+        })
+        .is_none());
+
+        let gate = render_run_event_ping(&RunEvent::GateResult {
+            run_id: "r".into(),
+            gate: "command".into(),
+            pass: false,
+            decisive: "compile error".into(),
+        })
+        .expect("gate result must ping");
+        assert!(gate.contains("Gate"));
+        assert!(gate.contains("compile error"));
+
+        assert!(render_run_event_ping(&RunEvent::RunComplete {
+            run_id: "r".into(),
+            outcome: "done".into(),
+        })
+        .unwrap()
+        .contains("complete"));
     }
 
     /// Phase 8: the telegram adapter must handle the new `DistillationProposal` notification

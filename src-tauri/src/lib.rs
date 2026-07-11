@@ -4,14 +4,17 @@
 mod models;
 
 use haily_app::connector_config::{self, ConnectorSummary};
-use haily_app::{AppHandle, BootstrapOptions, CredentialStore, TurnRegistry};
+use haily_app::{
+    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, TurnRegistry,
+    WorkspaceView,
+};
 use haily_db::{
     queries::{journal, meta},
     DbHandle,
 };
 use haily_io::{
     Adapter, ApprovalResolver, DepthMode, GuiProactiveReceiver, GuiRequestSender,
-    GuiResponseReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
+    GuiResponseReceiver, GuiRunEventReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
 use haily_kms::KmsHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -250,6 +253,73 @@ async fn acknowledge_connector_version(
         .map_err(|e| e.to_string())
 }
 
+/// Skills browser (phase 11a): authored kit-pack + synthesized skills, each with its
+/// persisted enable/pin state. Read-only; pure delegation to the app layer.
+#[tauri::command]
+async fn list_skills(state: State<'_, AppState>) -> Result<Vec<SkillView>, String> {
+    haily_app::list_skills(&state.db, &state.kms).await.map_err(|e| e.to_string())
+}
+
+/// Enable/disable a skill (phase 11a). Persists the admin state; see the app layer's
+/// `cockpit` module doc for the deferred-enforcement contract (mirrors `set_connector_status`).
+#[tauri::command]
+async fn set_skill_enabled(name: String, enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    haily_app::set_skill_enabled(&state.db, &name, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Pin/unpin a skill (phase 11a). Persists the admin state; enforcement is deferred (see
+/// `list_skills`).
+#[tauri::command]
+async fn pin_skill(name: String, pinned: bool, state: State<'_, AppState>) -> Result<(), String> {
+    haily_app::pin_skill(&state.db, &name, pinned).await.map_err(|e| e.to_string())
+}
+
+/// Active coding workspaces (phase 11a): branch, dirty status, and the host sandbox
+/// posture (incl. the non-enforcing `NullSandbox` warning flag). Read-only.
+#[tauri::command]
+async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceView>, String> {
+    haily_app::list_workspaces(&state.db).await.map_err(|e| e.to_string())
+}
+
+/// Discard a coding workspace (phase 11a) — revert the worktree, remove it, delete the
+/// branch, soft-delete the row. SESSION-SCOPED: `session_id` (from the `WorkspaceView` the
+/// frontend is acting on) is the boundary — a foreign id returns `false`, never discarding
+/// another session's workspace. Returns `false` (not an error) if no active workspace matched.
+#[tauri::command]
+async fn discard_workspace(
+    id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    haily_app::discard_workspace(&state.db, &id, &session_id).await.map_err(|e| e.to_string())
+}
+
+/// The unified diff of a workspace's worktree against HEAD, for the DiffViewer's read side
+/// (phase 11a). SESSION-SCOPED like `discard_workspace`. The ACCEPT side is NOT here —
+/// accepting a run's changes routes through the existing `worktree_apply` tool approval
+/// (`approve_tool`), view + accept only, no editor. Returns `null` if the id is
+/// unknown/foreign; the diff text is untrusted repo content the frontend renders as data.
+#[tauri::command]
+async fn workspace_diff(
+    id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    haily_app::workspace_diff(&state.db, &id, &session_id).await.map_err(|e| e.to_string())
+}
+
+/// The unified approvals queue's PENDING set (phase 11a): every in-flight tool approval
+/// across all channels. Reconcile source only — the descriptive tool payload lives in the
+/// `ToolApprovalRequest` chunk the frontend already received; each entry's `session_id` is
+/// the auth boundary for resolving it via `approve_tool`. HISTORY is read separately via
+/// `list_journal`. Locks `app` for the read (mirrors `reload_llm`) — infrequent, panel-driven.
+#[tauri::command]
+async fn list_approvals(state: State<'_, AppState>) -> Result<Vec<PendingApproval>, String> {
+    let guard = state.app.lock().await;
+    let app = guard.as_ref().ok_or("app is shutting down")?;
+    Ok(app.pending_approvals())
+}
+
 /// Forward `GuiAdapter` response chunks to the frontend as `haily-chunk` events.
 fn spawn_chunk_bridge(ah: TauriAppHandle, mut rx: GuiResponseReceiver) {
     tauri::async_runtime::spawn(async move {
@@ -294,6 +364,21 @@ fn spawn_proactive_cards_bridge(ah: TauriAppHandle, mut rx: GuiProactiveReceiver
     });
 }
 
+/// Forward ordered pipeline `RunEvent`s to the frontend as `haily-run-events` events
+/// (phase 11a). UNLIKE the work-item/proactive bridges above, `rx` is a bounded, ordered
+/// `mpsc` (NOT a latest-wins `watch`): a coding run's event log must be delivered in full
+/// and in order, so this drains every event rather than coalescing to the latest. Each
+/// event was already tag-stripped at `AdapterManager::deliver_run_event`, so it is inert
+/// data the frontend renders as-is. Ends when the `GuiAdapter` (sender) drops at teardown.
+fn spawn_run_events_bridge(ah: TauriAppHandle, mut rx: GuiRunEventReceiver) {
+    tauri::async_runtime::spawn(async move {
+        while let Some((session_id, event)) = rx.recv().await {
+            let payload = serde_json::json!({ "session_id": session_id.to_string(), "event": event });
+            let _ = ah.emit("haily-run-events", payload);
+        }
+    });
+}
+
 /// Best-effort shutdown on exit. A hard kill (taskkill /F, power loss) skips this
 /// entirely — SQLite WAL crash-safety is the real correctness backstop, not this path.
 fn handle_exit_requested(app_handle: &TauriAppHandle) {
@@ -314,8 +399,14 @@ pub fn run() {
         .setup(|app| {
             let data_dir = haily_app::default_data_dir();
             std::fs::create_dir_all(&data_dir)?;
-            let (gui_adapter, gui_req_tx, gui_resp_rx, gui_work_items_rx, gui_proactive_rx) =
-                haily_io::GuiAdapter::new();
+            let (
+                gui_adapter,
+                gui_req_tx,
+                gui_resp_rx,
+                gui_work_items_rx,
+                gui_proactive_rx,
+                gui_run_events_rx,
+            ) = haily_io::GuiAdapter::new();
             let adapters: Vec<Arc<dyn Adapter>> = vec![Arc::new(gui_adapter)];
             let bootstrap = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default());
             let app_handle = tauri::async_runtime::block_on(bootstrap)
@@ -339,6 +430,7 @@ pub fn run() {
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
             spawn_work_items_bridge(app.handle().clone(), gui_work_items_rx);
             spawn_proactive_cards_bridge(app.handle().clone(), gui_proactive_rx);
+            spawn_run_events_bridge(app.handle().clone(), gui_run_events_rx);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -357,6 +449,13 @@ pub fn run() {
             set_connector_credential,
             set_connector_status,
             acknowledge_connector_version,
+            list_skills,
+            set_skill_enabled,
+            pin_skill,
+            list_workspaces,
+            discard_workspace,
+            workspace_diff,
+            list_approvals,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

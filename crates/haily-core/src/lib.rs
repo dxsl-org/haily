@@ -12,7 +12,7 @@ mod tag_matcher;
 mod tool_call;
 pub mod worktree;
 
-pub use approval::ApprovalBroker;
+pub use approval::{ApprovalBroker, PendingApproval};
 
 use anyhow::Result;
 use haily_db::DbHandle;
@@ -422,6 +422,14 @@ impl Orchestrator {
     /// this Arc is the runtime source of truth, the row is only persistence.
     pub fn kill_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kill)
+    }
+
+    /// Snapshot of every in-flight tool approval across all channels (phase 11a), for the
+    /// unified approvals queue. Reconcile source only — the descriptive tool payload lives
+    /// in the `ToolApprovalRequest` chunk the origin channel received; each entry's
+    /// `session_id` is the auth boundary for resolving it.
+    pub fn pending_approvals(&self) -> Vec<approval::PendingApproval> {
+        self.approval_broker.pending_snapshot()
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).

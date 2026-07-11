@@ -1,6 +1,10 @@
 pub mod cli;
 pub mod gui;
 pub mod manager;
+/// Ordered-`RunEvent` delivery defense — the single tag-strip chokepoint (phase 11a).
+pub mod run_event;
+/// Canonical per-channel slash-command registry (phase 11a).
+pub mod slash;
 /// Internal to this crate — pure card accumulation/eviction logic `gui.rs`'s
 /// `Adapter` impl delegates to (phase 08). Not part of the public API surface.
 mod proactive_cards;
@@ -10,7 +14,8 @@ pub mod telegram;
 
 pub use cli::CliAdapter;
 pub use gui::{
-    GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver,
+    GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiRunEventReceiver,
+    GuiWorkItemsReceiver,
 };
 pub use manager::AdapterManager;
 
@@ -22,7 +27,7 @@ pub use telegram::TelegramAdapter;
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
 pub use haily_types::{
     ApprovalResolver, DepthMode, Notification, ProactiveCard, ProactiveCardKind, Request,
-    RequestSender, ResponseChunk, WorkItemStatus,
+    RequestSender, ResponseChunk, RunEvent, WorkItemStatus,
 };
 
 use anyhow::Result;
@@ -38,6 +43,20 @@ pub trait Adapter: Send + Sync {
 
     /// Deliver an orchestrator response chunk to the session's origin.
     async fn deliver(&self, session_id: Uuid, chunk: ResponseChunk) -> Result<()>;
+
+    /// Deliver one ordered pipeline [`RunEvent`] to the session's origin (phase 11a).
+    ///
+    /// Distinct from [`Self::deliver`] because a coding-pipeline run is a long-lived job
+    /// with its own ORDERED, NON-COALESCING event log — it must never drop or reorder
+    /// events the way the latest-wins work-item/proactive `watch` channels do. The event
+    /// reaches here already tag-stripped ([`crate::AdapterManager::deliver_run_event`] is
+    /// the single sanitize chokepoint), so a render path may treat it as inert data.
+    ///
+    /// Default no-op: a channel with no run-observability surface (or one wired later)
+    /// need not override it — same post-construction contract as the other trait methods.
+    async fn deliver_run_event(&self, _session_id: Uuid, _event: RunEvent) -> Result<()> {
+        Ok(())
+    }
 
     /// Send a proactive notification (morning brief, alert, reminder fired).
     async fn notify(&self, msg: Notification) -> Result<()>;

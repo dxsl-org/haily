@@ -336,3 +336,142 @@ export async function setConnectorStatus(id: string, status: 'active' | 'disable
 export async function acknowledgeConnectorVersion(connectorName: string, version: string): Promise<void> {
   return invoke('acknowledge_connector_version', { connectorName, version });
 }
+
+// ---------------------------------------------------------------------------
+// Phase 11a — Channel Event Backbone (GUI cockpit read/action surface).
+// The Svelte components (RunTimeline, DiffViewer, SkillsBrowser, WorkspacePanel,
+// ApprovalsQueue, ChannelsPanel) that CONSUME these wrappers land in P11b.
+// ---------------------------------------------------------------------------
+
+/** Mirrors `haily_types::RunEvent`'s `#[serde(tag = "type", content = "data")]` envelope
+ * exactly — the ordered, non-coalescing pipeline event stream. A discriminated union for
+ * the same reason as `Chunk`: each variant's `data` shape differs. UNTRUSTED content
+ * (`StageOutput.chunk`, `GateResult.decisive`, `DiffAvailable.file`, `PlanReady.plan_path`)
+ * is already tag-stripped server-side at the delivery chokepoint — render it as inert text,
+ * never as HTML/markup. */
+export type RunEvent =
+  | { type: 'RunStarted'; data: { run_id: string; work_item_id: string } }
+  | { type: 'StageStarted'; data: { run_id: string; stage: string; tier?: string | null } }
+  | { type: 'StageOutput'; data: { run_id: string; seq: number; chunk: string } }
+  | { type: 'GateResult'; data: { run_id: string; gate: string; pass: boolean; decisive: string } }
+  | { type: 'Retry'; data: { run_id: string; attempt: number } }
+  | { type: 'Escalation'; data: { run_id: string; from: string; to: string } }
+  | { type: 'DiffAvailable'; data: { run_id: string; file: string } }
+  | { type: 'ApprovalNeeded'; data: { run_id: string; approval_id: string } }
+  | { type: 'PlanReady'; data: { run_id: string; plan_path: string } }
+  | { type: 'RunPaused'; data: { run_id: string; reason: string } }
+  | { type: 'RunComplete'; data: { run_id: string; outcome: string } };
+
+/** One `haily-run-events` payload: the session the run belongs to plus the event. */
+export interface RunEventPayload {
+  session_id: string;
+  event: RunEvent;
+}
+
+/**
+ * Subscribe to the ordered pipeline `RunEvent` stream. Delivered over a dedicated,
+ * BOUNDED, ordered `mpsc` bridge (`haily-io::gui::GuiRunEventReceiver`) — NOT the
+ * latest-wins `watch` channels the work-item/proactive panels use — so events arrive in
+ * full and in order, never coalesced. A build log depends on this: `onWorkItemsChanged`'s
+ * "reconcile on mount" caveat does NOT apply here; every event is delivered exactly once.
+ */
+export async function onRunEvents(
+  callback: (payload: RunEventPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<RunEventPayload>('haily-run-events', (event) => callback(event.payload));
+}
+
+/** One skill row for the cockpit skills browser. Mirrors `haily_app::cockpit::SkillView`.
+ * `source` is `"authored"` (trusted kit-pack — no confidence/use lifecycle) or
+ * `"synthesized"` (EMA/decay lifecycle; confidence/use_count/last_used_at populated). */
+export interface SkillView {
+  name: string;
+  source: 'authored' | 'synthesized';
+  description: string;
+  kind: string | null;
+  confidence: number | null;
+  use_count: number | null;
+  last_used_at: string | null;
+  enabled: boolean;
+  pinned: boolean;
+}
+
+/** Authored + synthesized skills with their persisted enable/pin state. Read-only. */
+export async function listSkills(): Promise<SkillView[]> {
+  return invoke('list_skills');
+}
+
+/** Enable/disable a skill. Persists the admin state (enforcement is wired in P11b — see the
+ * backend `cockpit` module doc; mirrors the connector-status persist-then-consume pattern). */
+export async function setSkillEnabled(name: string, enabled: boolean): Promise<void> {
+  return invoke('set_skill_enabled', { name, enabled });
+}
+
+/** Pin/unpin a skill. Persists the admin state (enforcement deferred — see `setSkillEnabled`). */
+export async function pinSkill(name: string, pinned: boolean): Promise<void> {
+  return invoke('pin_skill', { name, pinned });
+}
+
+/** One active coding workspace. Mirrors `haily_app::cockpit::WorkspaceView`.
+ * `sandbox_enforcing === false` is the `NullSandbox` warning: execution is NOT isolated and
+ * requires per-work-root first-exec approval — the panel must surface it prominently. */
+export interface WorkspaceView {
+  id: string;
+  session_id: string;
+  repo_path: string;
+  branch: string;
+  worktree_path: string;
+  work_item_id: string | null;
+  created_at: string;
+  dirty: boolean;
+  sandbox_kind: string;
+  sandbox_enforcing: boolean;
+}
+
+/** Active coding workspaces with dirty status and host sandbox posture. Read-only. */
+export async function listWorkspaces(): Promise<WorkspaceView[]> {
+  return invoke('list_workspaces');
+}
+
+/**
+ * Discard a coding workspace (revert worktree, remove it, delete branch, soft-delete row).
+ * `sessionId` MUST be the workspace's own `session_id` (from its `WorkspaceView`) — it is
+ * the auth boundary; a foreign id returns `false` (a no-op), never discarding another
+ * session's workspace. Returns `false` (not a thrown error) if no active workspace matched.
+ */
+export async function discardWorkspace(id: string, sessionId: string): Promise<boolean> {
+  return invoke('discard_workspace', { id, sessionId });
+}
+
+/**
+ * The unified diff of a workspace's worktree against HEAD, for the DiffViewer's read side.
+ * `sessionId` is the same auth boundary as `discardWorkspace`. Returns `null` for an
+ * unknown/foreign id. The text is UNTRUSTED repo content (capped server-side) — render it
+ * as inert data, never as markup. ACCEPTING changes is a separate action that routes
+ * through the existing `worktree_apply` approval via `resolveApproval` — this is view-only.
+ */
+export async function workspaceDiff(id: string, sessionId: string): Promise<string | null> {
+  return invoke('workspace_diff', { id, sessionId });
+}
+
+/** One in-flight approval in the unified queue, as read back from the backend broker.
+ * Mirrors `haily_core::PendingApproval` (snake_case over the wire). Distinct from the
+ * frontend-normalized `PendingApproval` above (which is built from a `ToolApprovalRequest`
+ * chunk and carries the tool/args): this is a RECONCILE snapshot — the tool name/args live
+ * in the chunk the frontend already received (correlate by `approval_id`). `session_id` is
+ * the auth boundary: only that session may resolve it via `resolveApproval`. */
+export interface QueuedApproval {
+  approval_id: string;
+  session_id: string;
+  created_at: string;
+}
+
+/**
+ * The PENDING set of the unified approvals queue — every in-flight approval across all
+ * channels. Use this to reconcile which approvals are still live (prune resolved ones);
+ * the descriptive payload comes from the `ToolApprovalRequestChunk` stream, and history
+ * from `listJournal`. Resolve one via `resolveApproval` (session-auth enforced backend-side).
+ */
+export async function listApprovals(): Promise<QueuedApproval[]> {
+  return invoke('list_approvals');
+}

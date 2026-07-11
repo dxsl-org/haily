@@ -9,12 +9,29 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use haily_types::{ApprovalGate, ApprovalResolver};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
+
+/// A snapshot of one in-flight approval, for the unified cross-channel approvals queue
+/// (Sub-Agent + Skill Architecture phase 11a). Deliberately carries NO tool name/args:
+/// the broker is a pure wait registry and never learned the descriptive payload (that
+/// lives in the `ToolApprovalRequest` chunk the origin channel already received). This
+/// snapshot is a RECONCILE source — which approval ids are still live and who owns them —
+/// so a UI can prune resolved entries and enforce the session-auth boundary, exactly how
+/// the work-item list reconciles the live `watch` snapshots. `session_id` is the auth
+/// boundary: a queued approval can only ever be resolved by its owning session.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub approval_id: Uuid,
+    pub session_id: Uuid,
+    /// RFC3339 registration time — lets a UI age/sort the queue.
+    pub created_at: String,
+}
 
 /// How long a pending approval waits for a decision before defaulting to deny.
 /// Headless/unattended deployments (no human at a GUI/CLI/Telegram) must never hang
@@ -30,7 +47,7 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// what stops a foreign Telegram chat (or a forged GUI/CLI call) from resolving
 /// someone else's pending approval.
 pub struct ApprovalBroker {
-    pending: DashMap<Uuid, (Uuid /* session_id */, oneshot::Sender<bool>)>,
+    pending: DashMap<Uuid, (Uuid /* session_id */, String /* created_at */, oneshot::Sender<bool>)>,
     /// Tool names exempted from the interactive prompt. Populated once at bootstrap
     /// from validated config (`haily_app::validate_auto_approve` rejects any
     /// destructive/exfil tool name before this is ever built) — never mutated after
@@ -61,6 +78,25 @@ impl ApprovalBroker {
     /// bypassing the interactive prompt is a deliberate, auditable trust decision.
     pub fn is_auto_approved(&self, tool_name: &str) -> bool {
         self.auto_approve.contains(tool_name)
+    }
+
+    /// Snapshot of every currently in-flight approval (phase 11a), for the cross-channel
+    /// approvals queue. Order is unspecified (DashMap) — the caller sorts (e.g. by
+    /// `created_at`). A late-resolving entry may vanish between this call and the caller
+    /// reading it; that is benign (the UI reconciles), the same best-effort contract the
+    /// work-item snapshot has.
+    pub fn pending_snapshot(&self) -> Vec<PendingApproval> {
+        self.pending
+            .iter()
+            .map(|e| {
+                let (session_id, created_at, _tx) = e.value();
+                PendingApproval {
+                    approval_id: *e.key(),
+                    session_id: *session_id,
+                    created_at: created_at.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Register a pending approval and wait for a decision.
@@ -99,7 +135,8 @@ impl ApprovalBroker {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(approval_id, (session_id, tx));
+        let created_at = chrono::Utc::now().to_rfc3339();
+        self.pending.insert(approval_id, (session_id, created_at, tx));
 
         let decision = tokio::select! {
             result = rx => result.unwrap_or(false), // sender dropped without resolving → deny
@@ -144,11 +181,11 @@ impl ApprovalResolver for ApprovalBroker {
         // (idempotent — entry is already gone).
         let removed = self
             .pending
-            .remove_if(&approval_id, |_, (bound_session, _)| {
+            .remove_if(&approval_id, |_, (bound_session, _created_at, _)| {
                 *bound_session == session_id
             });
         match removed {
-            Some((_, (_, tx))) => {
+            Some((_, (_, _created_at, tx))) => {
                 // Ignore send failure: the requester side may have already exited via
                 // cancellation/timeout, in which case the decision is moot.
                 let _ = tx.send(approved);
@@ -349,6 +386,46 @@ mod tests {
             .await
             .expect("first request should resolve once approved");
         assert!(first, "the first (untouched) approval resolves normally");
+    }
+
+    #[tokio::test]
+    async fn pending_snapshot_lists_inflight_and_a_foreign_session_cannot_resolve() {
+        // Phase 11a: the cross-channel approvals queue reads `pending_snapshot()`; the
+        // session_id in each entry is the auth boundary — a DIFFERENT session must not be
+        // able to resolve a queued approval it does not own.
+        let broker = ApprovalBroker::new();
+        let approval_id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+
+        let broker_ref = &broker;
+        let request_fut = broker_ref.request(approval_id, owner, &cancel);
+        tokio::pin!(request_fut);
+        tokio::select! {
+            _ = &mut request_fut => panic!("request() must not resolve yet"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        // The queue read shows exactly one in-flight approval, owned by `owner`.
+        let snap = broker_ref.pending_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].approval_id, approval_id);
+        assert_eq!(snap[0].session_id, owner, "snapshot must carry the owning session");
+        assert!(!snap[0].created_at.is_empty());
+
+        // A foreign session cannot resolve it (session auth boundary preserved), and it
+        // therefore stays in the queue.
+        assert!(!broker_ref.resolve(approval_id, intruder, true));
+        assert_eq!(broker_ref.pending_snapshot().len(), 1, "a rejected foreign resolve leaves it queued");
+
+        // The owner can, and the queue then empties.
+        assert!(broker_ref.resolve(approval_id, owner, true));
+        let decision = tokio::time::timeout(Duration::from_secs(2), request_fut)
+            .await
+            .expect("owner resolve unblocks request()");
+        assert!(decision);
+        assert!(broker_ref.pending_snapshot().is_empty(), "resolved approval leaves the queue");
     }
 
     #[tokio::test]
