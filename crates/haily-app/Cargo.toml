@@ -21,6 +21,7 @@ serde       = { workspace = true }
 serde_json  = { workspace = true }
 dashmap     = "6"
 uuid        = { workspace = true }
+chrono      = { workspace = true }
 keyring     = { workspace = true }
 async-trait = "0.1"
 

@@ -156,6 +156,7 @@ impl Adapter for CliAdapter {
                                     message: undo_message,
                                     user_ref: None,
                                     depth: Default::default(),
+                                    origin: Default::default(),
                                 })
                                 .await
                                 .is_err()
@@ -222,6 +223,7 @@ impl Adapter for CliAdapter {
                         message,
                         user_ref: None,
                         depth: Default::default(),
+                        origin: Default::default(),
                     })
                     .await
                     .is_err()

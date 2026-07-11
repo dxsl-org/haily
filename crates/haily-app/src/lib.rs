@@ -7,6 +7,7 @@
 mod auto_approve;
 mod config;
 pub mod connector_config;
+pub mod eval;
 pub mod credential_store;
 mod dispatch;
 mod turns;
@@ -18,6 +19,7 @@ pub use auto_approve::{load_auto_approve, validate_auto_approve};
 pub use bootstrap::{export_database, AppHandle, BootstrapOptions};
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
 pub use credential_store::{CredentialPolicy, CredentialStore};
+pub use eval::run_coding_eval_all;
 pub use turns::TurnRegistry;
 pub use watchers::list_work_items_status;
 

@@ -199,6 +199,7 @@ impl Adapter for TelegramAdapter {
                             message: text.to_string(),
                             user_ref,
                             depth: Default::default(),
+                            origin: Default::default(),
                         };
 
                         if tx.send(req).await.is_err() {

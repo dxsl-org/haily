@@ -558,6 +558,7 @@ mod turn_integration_tests {
             message: "please create two tasks".to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -718,6 +719,7 @@ mod turn_integration_tests {
             message: "delete these six tasks, delegate the rest".to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -874,6 +876,7 @@ mod outcome_signal_tests {
             message: message.to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1005,6 +1008,7 @@ mod outcome_signal_tests {
             message: message.to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1455,6 +1459,7 @@ mod outcome_signal_tests {
             message: "plan a trip to hanoi for the user".to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await

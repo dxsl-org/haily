@@ -1,0 +1,11 @@
+{
+  "name": "ts-add-feature",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "tsc -p . && node dist/index.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

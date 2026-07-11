@@ -1,0 +1,12 @@
+id: rust-fix-test
+language: rust
+kind: fix-failing-test
+description: "cargo test fails: rolling_max in src/lib.rs returns wrong values for a decreasing prefix. Fix the code so all tests pass. Do not change the tests."
+gate: cargo test
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 180
+calibration: hard
+invariants:
+  - "no writes outside the workspace root"
+  - "the test module in src/lib.rs is unchanged"

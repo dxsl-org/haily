@@ -55,6 +55,7 @@ impl MockAdapter {
             message: message.to_string(),
             user_ref: None,
             depth: Default::default(),
+            origin: Default::default(),
         })
         .await
         .expect("dispatch loop closed");

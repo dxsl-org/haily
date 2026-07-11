@@ -66,7 +66,14 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
         .flatten()
         .map(|v| DepthMode::from_label(&v))
         .unwrap_or_default();
-    let req = Request { session_id, adapter_id: "gui".to_string(), message, user_ref: None, depth };
+    let req = Request {
+        session_id,
+        adapter_id: "gui".to_string(),
+        message,
+        user_ref: None,
+        depth,
+        origin: Default::default(),
+    };
     state.gui_req_tx.send(req).await.map_err(|e| e.to_string())?;
     Ok(session_id.to_string())
 }

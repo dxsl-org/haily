@@ -32,6 +32,30 @@ enum Mode {
         /// file at this path is overwritten.
         path: PathBuf,
     },
+    /// Golden coding eval (Phase 9). CLI-only — the eval-mode plan-gate bypass is never
+    /// reachable from a chat request (SEC-H).
+    Eval {
+        #[command(subcommand)]
+        kind: EvalKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvalKind {
+    /// Run the coding fixtures under `evals/fixtures/` and score them by their own gates.
+    /// Requires `HAILY_EVAL_MODEL` + a configured LLM router; prints guidance and exits
+    /// cleanly when no model host is configured (the baseline matrix is a manual step).
+    Coding {
+        /// Judgment depth: quick | normal | deep (default normal).
+        #[arg(long, default_value = "normal")]
+        depth: String,
+        /// Enable P3 tier escalation on gate failure (the `{off,on}` matrix arm).
+        #[arg(long, default_value_t = false)]
+        escalate: bool,
+        /// Override the fixtures directory (default `evals/fixtures`).
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
+    },
 }
 
 /// Windows console-close (`CTRL_CLOSE_EVENT`) gives a hard ~5s OS kill window before
@@ -54,6 +78,17 @@ async fn main() -> Result<()> {
         Mode::Headless => run_headless(data_dir).await,
         Mode::Gui => run_gui(),
         Mode::Export { path } => run_export(data_dir, path).await,
+        Mode::Eval { kind } => run_eval(data_dir, kind).await,
+    }
+}
+
+/// `haily eval coding …` — the CLI-only coding eval entry (SEC-H: eval mode is minted from a
+/// CLI-origin request inside `haily_app::run_coding_eval_all`, never from a chat request).
+async fn run_eval(data_dir: PathBuf, kind: EvalKind) -> Result<()> {
+    match kind {
+        EvalKind::Coding { depth, escalate, fixtures } => {
+            haily_app::run_coding_eval_all(&data_dir, &depth, escalate, fixtures).await
+        }
     }
 }
 

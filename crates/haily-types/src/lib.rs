@@ -24,6 +24,31 @@ pub struct Request {
     /// no adapter is forced to set it and the wire envelope stays backward-compatible.
     #[serde(default)]
     pub depth: DepthMode,
+    /// Transport that produced this request (Sub-Agent + Skill Architecture phase 9, SEC-H).
+    /// Every I/O adapter (GUI, interactive CLI REPL, Telegram) is a [`RequestOrigin::Chat`]
+    /// transport routing a user message through the orchestrator; [`RequestOrigin::Cli`] is
+    /// reserved for a direct CLI SUBCOMMAND invocation (`haily eval …`) and is the ONLY origin
+    /// permitted to enable eval-mode's privileged plan-gate bypass + ship hard-block.
+    ///
+    /// `#[serde(skip)]` (NOT just `default`) is LOAD-BEARING: origin is an in-process transport
+    /// marker that must NEVER cross a serialization boundary — any Request deserialized from a
+    /// wire/GUI/persisted payload always yields the default [`RequestOrigin::Chat`], so a remote
+    /// or chat payload can never inject `Cli`. Only in-process direct construction (the eval CLI
+    /// entrypoint) sets `Cli`; every adapter leaves it `Chat`.
+    #[serde(skip)]
+    pub origin: RequestOrigin,
+}
+
+/// Request transport origin — the SEC-H structural gate for eval mode (phase 9). See
+/// [`Request::origin`]. Defined in the leaf `haily-types` crate so `Request` can carry it typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestOrigin {
+    /// A user message from an I/O adapter (GUI, CLI REPL, Telegram) — the default. Can never
+    /// enable eval mode.
+    #[default]
+    Chat,
+    /// A direct CLI subcommand invocation (`haily eval …`). The ONLY origin eval mode accepts.
+    Cli,
 }
 
 /// Per-request judgment depth. `Deep` is NEVER auto-selected — it is set only by an
@@ -367,6 +392,7 @@ mod tests {
             message: "làm kỹ vào".into(),
             user_ref: None,
             depth: DepthMode::Deep,
+            origin: RequestOrigin::Chat,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("\"depth\":\"deep\""));

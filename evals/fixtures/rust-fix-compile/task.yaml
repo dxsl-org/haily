@@ -1,0 +1,11 @@
+id: rust-fix-compile
+language: rust
+kind: fix-compile-error
+description: "src/lib.rs does not compile: the add function mixes i32 and i64. Fix it so the crate builds and all tests pass. Do not change the test."
+gate: cargo test
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 180
+invariants:
+  - "no writes outside the workspace root"
+  - "the test module in src/lib.rs is unchanged"

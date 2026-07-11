@@ -276,6 +276,22 @@ pub async fn list_interrupted(db: &DbHandle) -> Result<Vec<PipelineRun>> {
     .await?)
 }
 
+/// Count all non-deleted runs for a session, ANY status (queued through done/failed) — the
+/// journal-completeness signal the P9 coding eval scores on (a completed run is `done`, which
+/// [`list_active`] deliberately excludes, so the eval needs an any-status count).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn count_for_session(db: &DbHandle, session_id: &str) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pipeline_runs WHERE session_id = ? AND deleted_at IS NULL",
+    )
+    .bind(session_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(row.0)
+}
+
 /// Soft-delete a run. C10-guarded (`WHERE id = ? AND deleted_at IS NULL`) so a double-delete
 /// is detected via `rows_affected()` rather than a separate SELECT.
 ///

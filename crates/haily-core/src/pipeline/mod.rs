@@ -14,6 +14,7 @@
 //! agent-loop-touching half and is intentionally NOT in this PR.
 
 pub mod build_pipeline;
+pub mod eval_runner;
 pub mod exemplar;
 pub mod gate;
 pub mod judge;
@@ -25,6 +26,10 @@ pub mod verifier_output;
 pub use build_pipeline::{
     build_phase_pipeline, build_review_pipeline, run_build, ship_pipeline, BuildRunSpec,
     EmitFindingsTool, Finding, PhaseInput, Severity, VerifierCmd, EMIT_FINDINGS_TOOL,
+};
+pub use eval_runner::{
+    parse_task_yaml, run_coding_eval, score, EvalDeps, EvalMode, EvalOutcome, ScoreInputs,
+    ScoreResult, TaskManifest,
 };
 pub use gate::{ArtifactKind, Gate};
 pub use judge::{apex_judge, judge_panel, plan_design, refuter_votes, ApexVerdict, DesignResult, JudgeContext};
