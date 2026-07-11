@@ -167,6 +167,30 @@ pub async fn finalize(
     Ok(advanced)
 }
 
+/// Persist synthesized review findings onto a run's pre-allocated nullable `findings` column
+/// (Sub-Agent + Skill Architecture P6). The column exists since P4a (a forward slot), so this
+/// is an in-place UPDATE — no migration. `findings_json` is the caller-serialized findings
+/// array (already validated + tag-stripped upstream); this layer stores it verbatim.
+///
+/// Returns `true` iff an active row was updated (`false` = vanished/soft-deleted — the caller
+/// treats it as a best-effort write, exactly like [`transition`]).
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn set_findings(db: &DbHandle, id: &str, findings_json: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE pipeline_runs SET findings = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(findings_json)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 /// Reset any run left `running` or `queued` by a crash/kill to `interrupted` — the pipeline
 /// analogue of `work_items::reset_stale_running`, run once at boot BEFORE any resume is offered
 /// (FMA-m4: an interrupted run's write stages never auto-resume; the user resumes explicitly).

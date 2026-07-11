@@ -13,12 +13,18 @@
 //! orthogonal orchestration axis rather than a delegation level) lands in phase 4b — it is the
 //! agent-loop-touching half and is intentionally NOT in this PR.
 
+pub mod build_pipeline;
+pub mod exemplar;
 pub mod gate;
 pub mod plan_pipeline;
 pub mod runner;
 pub mod stage;
 pub mod verifier_output;
 
+pub use build_pipeline::{
+    build_phase_pipeline, build_review_pipeline, run_build, ship_pipeline, BuildRunSpec,
+    EmitFindingsTool, Finding, PhaseInput, Severity, VerifierCmd, EMIT_FINDINGS_TOOL,
+};
 pub use gate::{ArtifactKind, Gate};
 pub use plan_pipeline::{
     build_plan_pipeline, run_plan, EmitPlanDraftTool, PlanDraft, PlanRunSpec, RenderPlanTool,

@@ -3,8 +3,10 @@
   "source_commit": "fbe27262aa6a0765bbc0b4aa95536a206c20b8a8",
   "files": {
     "references/cook/tdd-workflow.md": "0f0a512fd6a76ea1e14f0e37c7816e4bbd7c79818bc1e33d93129431066abcbb",
+    "skills/build-implement.md": "12504a3fcadb8d6b245d3741a8545bce6adcfd44bdff2ed714d0e7501ddc4461",
     "skills/cook.md": "7023550f724288eeafca2d9a3edd53be5f7292e05c431420976cb4f0da93cdec",
     "skills/fix.md": "562be2b9d932de9e66d11cc9c64dc3e80f1fe00e4e9b58b0c4b260a90e284dc5",
+    "skills/ship-summary.md": "840054279fc72a6f5a366e47ce2976e19553f9c953ea6234b64592b1bcef8540",
     "skills/plan-design.md": "3546c7be3b98e6c63fe3e5c82a01aca7a4c10ba7ed86bb44aa80b683a202cc5d",
     "skills/plan-scout.md": "ec9753e6e5f5d4da7cd6a6a5d548165c4419ace64f2bd9a6c9c866f1d45b3fe7",
     "skills/plan-write.md": "b854bf5472604738c0c433eb552a9aecbffe3db33d832d8caf9ade028c49befe",
@@ -12,6 +14,7 @@
     "skills/review.md": "a91f4ff0d3a971c6c9ba361ee2cc47c9b731eb6a13dc5260017b4fd7f43ad0d2",
     "skills/scout.md": "54a1f96cd3c7f0c50444918e257ccb79dcc9c869697ab4fcd917c8bab98c9480",
     "skills/test.md": "aeca7eb10efa79c293f59ebc68ed8f79c8ec7d402fe01b3e0cc226c33bd093d5",
+    "skills/verify-review.md": "f20453e6ea2b905dfc52cae38db30f0041aa562b12e1d8dcf88af3bf97546665",
     "standards/lang-python.md": "098faaa4ae7aaadfeb2df700fabc8c8bb9f2ae01e257384b56cca8db6d8627e1",
     "standards/lang-rust.md": "47319f070d07bfaf1de9ed24f7d5e41f5603adfb56012cb81dafbb0f18525621",
     "standards/lang-typescript.md": "5466b6109fe03a0e815dc9827b32809f7d3553c15d2b356582ea3f348e0e87d6"
