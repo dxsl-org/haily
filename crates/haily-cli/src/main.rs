@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use haily_app::{AppHandle, BootstrapOptions};
-use haily_io::{Adapter, CliAdapter};
+use haily_io::{AcpAdapter, Adapter, CliAdapter};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -25,6 +25,11 @@ enum Mode {
     Headless,
     /// Desktop GUI (Tauri) — use `haily gui` or run without a subcommand on desktop
     Gui,
+    /// ACP (Agent Client Protocol) coding channel over stdio (Phase 12). Speaks
+    /// newline-delimited JSON-RPC 2.0 on stdin/stdout so an ACP-capable editor (Zed and
+    /// friends) becomes a code-viewing/reviewing front-end for Haily's coding pipeline.
+    /// stdout is RESERVED for protocol frames — all logs go to stderr.
+    Acp,
     /// Write a consistent standalone copy of the database to the given path (Phase 6,
     /// manual export — same `VACUUM INTO` mechanism the scheduled backup worker uses).
     Export {
@@ -65,8 +70,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to STDERR on every mode. This is load-bearing for the ACP channel (Phase 12):
+    // its stdout is reserved for JSON-RPC frames, so a stray log on stdout would corrupt the
+    // stream. Harmless for the other modes — the CLI REPL writes chat via direct stdout writes,
+    // not tracing, and GUI/headless never depended on logs landing on stdout.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Cli::parse();
@@ -77,6 +87,7 @@ async fn main() -> Result<()> {
         Mode::Cli => run_cli(data_dir).await,
         Mode::Headless => run_headless(data_dir).await,
         Mode::Gui => run_gui(),
+        Mode::Acp => run_acp(data_dir).await,
         Mode::Export { path } => run_export(data_dir, path).await,
         Mode::Eval { kind } => run_eval(data_dir, kind).await,
     }
@@ -116,6 +127,30 @@ async fn run_cli(data_dir: PathBuf) -> Result<()> {
         data_dir.display()
     );
     eprintln!("Type a message and press Enter. Ctrl+D to quit.\n");
+
+    wait_for_shutdown_signal(eof).await;
+    handle.shutdown(SHUTDOWN_TIMEOUT).await;
+    Ok(())
+}
+
+/// `haily acp` — the ACP coding channel over stdio (Phase 12). Wires a single [`AcpAdapter`]
+/// into the standard bootstrap; it plugs into the existing adapter vec, so the approval
+/// resolver, kill switch, and session-transcript provider are injected automatically.
+///
+/// stdout is RESERVED for JSON-RPC frames — every human-facing line here goes to stderr. The
+/// process shuts down when the editor closes stdin (the adapter's EOF token) or on an OS signal.
+async fn run_acp(data_dir: PathBuf) -> Result<()> {
+    let acp = Arc::new(AcpAdapter::new());
+    let eof = acp.eof_token();
+    let adapters: Vec<Arc<dyn Adapter>> = vec![acp];
+    let handle = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default()).await?;
+
+    eprintln!(
+        "Haily — ACP  |  LLM: {}  |  data: {}",
+        handle.orchestrator.llm_provider(),
+        data_dir.display()
+    );
+    eprintln!("ACP stdio server ready. Point an ACP-capable editor (e.g. Zed) at this process.");
 
     wait_for_shutdown_signal(eof).await;
     handle.shutdown(SHUTDOWN_TIMEOUT).await;

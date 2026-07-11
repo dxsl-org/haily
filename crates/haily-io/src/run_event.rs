@@ -51,6 +51,14 @@ pub fn sanitize(event: RunEvent) -> RunEvent {
     }
 }
 
+/// Public entry to the tag-strip fixpoint for other in-crate adapters. The ACP channel
+/// (phase 12) uses it to neutralize untrusted editor-supplied prompt text before forwarding
+/// it to the model — the same defense the `RunEvent` [`sanitize`] chokepoint applies to
+/// tool/repo-derived content, exposed here so the two share one implementation.
+pub fn strip_tool_tags_public(text: &str) -> String {
+    strip_tool_tags(text)
+}
+
 /// Remove every `<...tool_call...>` / `<...tool_result...>` angle-bracket token (any
 /// case, any surrounding whitespace) from `text`, keeping the inner content. Runs to a
 /// fixpoint so a nested/reassembling token (`<tool_<tool_call>call>`) cannot survive.

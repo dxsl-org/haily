@@ -11,6 +11,9 @@
   let loading = $state(true);
   let toggling = $state(false);
   let error = $state('');
+  // P12: ACP editor pairing. Haily runs as the agent BEHIND the editor — the editor spawns
+  // `haily acp` over stdio, so pairing is a one-time editor config, not a GUI-launched action.
+  let showAcp = $state(false);
 
   $effect(() => {
     load();
@@ -86,9 +89,23 @@
 
   <div class="block">
     <span class="switch-title">Editors</span>
-    <button class="acp-btn" disabled title="ACP editor pairing lands in Phase 12">
-      Pair ACP editor (coming in P12)
+    <span class="hint">
+      Follow Haily's code changes as native inline diffs in an ACP-capable editor (e.g. Zed).
+      Haily runs as the agent behind the editor.
+    </span>
+    <button class="acp-btn" onclick={() => (showAcp = !showAcp)}>
+      {showAcp ? 'Hide pairing steps' : 'Pair ACP editor'}
     </button>
+    {#if showAcp}
+      <div class="acp-steps">
+        <p>Add Haily as a custom ACP agent in your editor, pointing it at:</p>
+        <code>haily acp</code>
+        <p class="hint">
+          The editor launches this over stdio; approvals and the plan checkpoint appear as
+          native editor permission prompts, and the kill switch above still applies.
+        </p>
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -122,9 +139,22 @@
     border: 1px solid #2e2e4a;
     border-radius: 8px;
     background: #16162a;
-    color: #6b6b8a;
+    color: #a09ac0;
     font-size: 12px;
-    cursor: not-allowed;
+    cursor: pointer;
+  }
+  .acp-btn:hover { border-color: #4b4b6a; color: #e0dff5; }
+
+  .acp-steps { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #a09ac0; }
+  .acp-steps p { margin: 0; }
+  .acp-steps code {
+    align-self: flex-start;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: #0f0f1e;
+    border: 1px solid #2e2e4a;
+    color: #4ade80;
+    font-size: 12px;
   }
 
   .switch {

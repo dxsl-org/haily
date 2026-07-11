@@ -1,3 +1,6 @@
+/// ACP (Agent Client Protocol) coding channel — a 4th `Adapter` speaking newline-delimited
+/// JSON-RPC 2.0 over stdio (phase 12).
+pub mod acp;
 pub mod cli;
 pub mod gui;
 pub mod manager;
@@ -12,6 +15,7 @@ mod proactive_cards;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 
+pub use acp::AcpAdapter;
 pub use cli::CliAdapter;
 pub use gui::{
     GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiRunEventReceiver,
@@ -27,7 +31,8 @@ pub use telegram::TelegramAdapter;
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
 pub use haily_types::{
     ApprovalResolver, DepthMode, Notification, ProactiveCard, ProactiveCardKind, Request,
-    RequestSender, ResponseChunk, RunEvent, WorkItemStatus,
+    RequestOrigin, RequestSender, ResponseChunk, RunEvent, SessionTranscript, TranscriptEntry,
+    WorkItemStatus,
 };
 
 use anyhow::Result;
@@ -75,6 +80,13 @@ pub trait Adapter: Send + Sync {
     /// surface (e.g. the GUI's Tauri `set_preference`) does not need this. The CLI overrides
     /// it to power its `/writes on|off` command.
     fn set_kill_switch(&self, _kill: Arc<std::sync::atomic::AtomicBool>) {}
+
+    /// Inject a read-only session-transcript provider (phase 12). Same post-construction
+    /// wiring contract as `set_approval_resolver`: `haily-app::bootstrap` calls it once after
+    /// the DB exists, with a `haily-db`-backed implementation. Only the ACP adapter overrides
+    /// it — it replays a session's transcript on `session/load`. Default no-op: a channel with
+    /// no replay surface (GUI, CLI, Telegram) simply never receives one.
+    fn set_session_transcript(&self, _transcript: Arc<dyn haily_types::SessionTranscript>) {}
 
     fn id(&self) -> &str;
 }

@@ -183,9 +183,15 @@ impl AppHandle {
         // before `start_all` begins accepting requests — rather than at construction.
         let resolver = orchestrator.approval_resolver();
         let kill = orchestrator.kill_handle();
+        // Phase 12: the ACP channel replays a session transcript on `session/load` from the
+        // existing `messages` storage. Injected here (post-construction) like the resolver +
+        // kill switch; a channel with no replay surface ignores it via the trait default.
+        let transcript: Arc<dyn haily_types::SessionTranscript> =
+            Arc::new(crate::session_transcript::DbSessionTranscript::new(Arc::clone(&db)));
         for adapter in &adapters {
             adapter.set_approval_resolver(Arc::clone(&resolver));
             adapter.set_kill_switch(Arc::clone(&kill));
+            adapter.set_session_transcript(Arc::clone(&transcript));
         }
 
         let mut builder = AdapterManager::builder();

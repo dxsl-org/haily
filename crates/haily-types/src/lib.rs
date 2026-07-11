@@ -360,6 +360,31 @@ pub trait ApprovalGate: Send + Sync {
     }
 }
 
+/// A single persisted transcript entry for session replay (Sub-Agent + Skill Architecture
+/// phase 12). `role` is `"user"`/`"assistant"` (matching `messages.role`); `content` is the
+/// stored message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub role: String,
+    pub content: String,
+}
+
+/// Read-only view of a session's persisted message history, for the ACP channel's
+/// `session/load` transcript replay (phase 12). Lives in the leaf `haily-types` crate so a
+/// `haily-io` adapter can replay a transcript without depending on `haily-db` (the CLAUDE.md
+/// layering invariant) — the DB-backed implementation is constructed at the app layer and
+/// injected post-construction, exactly like [`ApprovalResolver`]. A channel with no replay
+/// surface never needs it (the [`crate` adapter hook][crate] defaults to no injection, which
+/// yields an empty transcript rather than an error).
+#[async_trait]
+pub trait SessionTranscript: Send + Sync {
+    /// Return the session's messages in chronological order (oldest first), or an empty
+    /// vec for an unknown/empty session. MUST NOT error the caller — replay is best-effort
+    /// UX, never a correctness gate, so an implementation that hits a DB error logs and
+    /// returns what it has (possibly empty).
+    async fn transcript(&self, session_id: &str) -> Vec<TranscriptEntry>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

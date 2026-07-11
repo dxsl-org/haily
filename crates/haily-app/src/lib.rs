@@ -11,6 +11,7 @@ pub mod connector_config;
 pub mod eval;
 pub mod credential_store;
 mod dispatch;
+mod session_transcript;
 mod turns;
 mod watchers;
 
