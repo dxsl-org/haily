@@ -186,6 +186,7 @@ mod tests {
             cancel: CancellationToken::new(),
             turn_deletes: Arc::new(AtomicUsize::new(0)),
             last_journal_id: Arc::new(Mutex::new(None)),
+            run_id: None,
         };
         (ctx, kms)
     }

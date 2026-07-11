@@ -192,6 +192,11 @@ impl Tool for DelegateTool {
             // chain converges on one shared turn_id/counter, however deep it nests.
             turn_id: ctx.turn_id,
             turn_deletes: Arc::clone(&ctx.turn_deletes),
+            // A delegated sub-turn is a chat-scale unit, not a pipeline stage: keep the
+            // global LoopGuard ceiling and no run grouping. Only the P4b pipeline runner,
+            // which calls `run_sub_turn` directly (never via this tool), sets these.
+            max_tool_calls: None,
+            run_id: None,
         });
 
         let result = run_with_pausable_timeout(
@@ -240,7 +245,10 @@ impl Tool for DelegateTool {
 /// Terminates when `sub_rx` closes (the sub-turn dropped its `sub_tx`) or the parent
 /// stream is gone. Must be joined by the caller on every exit path so a leaked task
 /// cannot relay a stale approval into a later turn.
-async fn approval_forwarder(
+///
+/// `pub(crate)` so the P4b pipeline runner reuses the SAME forwarder rather than duplicating
+/// it — a stage's IrreversibleWrite must reach the real user through this exact relay (SEC-H).
+pub(crate) async fn approval_forwarder(
     mut sub_rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
     parent_tx: tokio::sync::mpsc::Sender<ResponseChunk>,
     pause_tx: tokio::sync::mpsc::Sender<()>,
@@ -272,7 +280,10 @@ async fn approval_forwarder(
 /// (the deadline elapsed with no pending approval). `biased` select prefers the
 /// future's completion and the pause pulse over the sleep, so a just-resolved approval
 /// cannot lose a race to a simultaneously-firing stale deadline.
-async fn run_with_pausable_timeout<F>(
+///
+/// `pub(crate)` so the P4b pipeline runner reuses the SAME pausable-clock helper — a stage
+/// blocked on a nested approval must have its compute budget paused exactly as a delegation does.
+pub(crate) async fn run_with_pausable_timeout<F>(
     timeout: Duration,
     fut: F,
     pause_rx: &mut tokio::sync::mpsc::Receiver<()>,
@@ -439,6 +450,7 @@ mod reload_propagation_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
+            run_id: None,
         };
         let args = serde_json::json!({ "task": "short task before reload" });
         let before = delegate

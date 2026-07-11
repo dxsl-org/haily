@@ -91,27 +91,122 @@ impl CodingWorkspace {
         PathBuf::from(object_dir_for(&self.row.worktree_path))
     }
 
-    /// Revert ALL in-workspace changes (tracked reverted, untracked+ignored removed). Leaves
-    /// the worktree registered so a later op can reuse it. This is the compensator invoked to
-    /// roll a workspace back to its entry state.
+    /// Resolve the isolated-object env pair `(GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES)`
+    /// every git op against this workspace uses (P4b review fix). `commit_stage` WRITES new
+    /// commit objects into the isolated dir (never the real repo's store); `compensate` must
+    /// resolve those objects to reset the working tree, so it uses the SAME pair — an empty
+    /// isolated dir (before any commit) is a harmless primary object dir, since every read falls
+    /// through to the alternate (the real repo's objects). Creates the isolated dir if absent.
     ///
     /// # Errors
-    /// Returns an error if either git step fails.
+    /// Returns an error if resolving the repo's git-path objects fails or the isolated dir
+    /// cannot be created.
+    async fn isolated_git_env(&self) -> Result<(String, String)> {
+        let repo = Path::new(&self.row.repo_path);
+        let alt_out = git(repo, &["rev-parse", "--git-path", "objects"], &[]).await?;
+        if !alt_out.status.success() {
+            bail!(
+                "cannot resolve repo objects dir: {}",
+                String::from_utf8_lossy(&alt_out.stderr)
+            );
+        }
+        let alt_rel = String::from_utf8_lossy(&alt_out.stdout).trim().to_string();
+        let alt_abs = repo.join(&alt_rel);
+        let obj_dir = self.object_dir();
+        tokio::fs::create_dir_all(&obj_dir)
+            .await
+            .context("creating isolated object dir")?;
+        let obj_dir_str = obj_dir
+            .to_str()
+            .context("object dir path is not valid UTF-8")?
+            .to_string();
+        let alt_abs_str = alt_abs
+            .to_str()
+            .context("alternate objects path is not valid UTF-8")?
+            .to_string();
+        Ok((obj_dir_str, alt_abs_str))
+    }
+
+    /// Revert ALL in-workspace changes (tracked reverted, untracked+ignored removed) back to
+    /// CURRENT HEAD. Leaves the worktree registered so a later op can reuse it. This is the
+    /// compensator invoked to roll a workspace back to its entry state — "entry" meaning
+    /// whatever HEAD is at call time, which [`Self::commit_stage`] advances at each passed
+    /// pipeline stage boundary (P4b review fix: without a stage-boundary commit, HEAD stays at
+    /// the RUN's entry forever, so a later stage's retry-reset would wipe every earlier PASSED
+    /// stage's output, not just the failing stage's).
+    ///
+    /// # Errors
+    /// Returns an error if resolving the isolated git env or either git step fails.
     pub async fn compensate(&self) -> Result<()> {
         let root = self.worktree_root();
-        let co = git(root, &["checkout", "--", "."], &[]).await?;
+        let (obj_dir, alt_dir) = self.isolated_git_env().await?;
+        let env = [
+            ("GIT_OBJECT_DIRECTORY", obj_dir.as_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt_dir.as_str()),
+        ];
+        let co = git(root, &["checkout", "--", "."], &env).await?;
         if !co.status.success() {
             bail!(
                 "git checkout -- . failed: {}",
                 String::from_utf8_lossy(&co.stderr)
             );
         }
-        let clean = git(root, &["clean", "-ffdx"], &[]).await?;
+        let clean = git(root, &["clean", "-ffdx"], &env).await?;
         if !clean.status.success() {
             bail!(
                 "git clean -ffdx failed: {}",
                 String::from_utf8_lossy(&clean.stderr)
             );
+        }
+        Ok(())
+    }
+
+    /// Commit ALL current worktree changes onto the workspace's own ephemeral branch, in the
+    /// SAME isolated object store `git_commit` (the LLM-facing tool in `git_tools.rs`) uses —
+    /// new commit/tree/blob objects never enter the real repo's shared object DB. Called by the
+    /// pipeline runner (P4b review fix, FMA-M3) after each stage PASSES its gate, so a LATER
+    /// stage's retry-triggered [`Self::compensate`] resets to THIS stage's entry point, not the
+    /// whole run's. A no-op `Ok(())` when there is nothing to commit (a stage that made no file
+    /// changes) — `git commit` would otherwise fail on an empty commit.
+    ///
+    /// # Errors
+    /// Returns an error if resolving the isolated git env, `git add -A`, or `git commit` fails
+    /// for any reason OTHER than "nothing to commit".
+    pub async fn commit_stage(&self, message: &str) -> Result<()> {
+        let root = self.worktree_root();
+        let (obj_dir, alt_dir) = self.isolated_git_env().await?;
+        let env = [
+            ("GIT_OBJECT_DIRECTORY", obj_dir.as_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt_dir.as_str()),
+        ];
+        let add = git(root, &["add", "-A"], &env).await?;
+        if !add.status.success() {
+            bail!("git add failed: {}", String::from_utf8_lossy(&add.stderr));
+        }
+        let commit = git(
+            root,
+            &[
+                "-c",
+                "user.name=Haily",
+                "-c",
+                "user.email=haily@localhost",
+                "commit",
+                "-m",
+                message,
+            ],
+            &env,
+        )
+        .await?;
+        if !commit.status.success() {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&commit.stderr),
+                String::from_utf8_lossy(&commit.stdout)
+            );
+            if combined.contains("nothing to commit") {
+                return Ok(());
+            }
+            bail!("git commit failed: {combined}");
         }
         Ok(())
     }

@@ -42,13 +42,31 @@ pub(crate) const RETIERED_DELETE_TOOLS: &[&str] = &[
 pub struct LoopGuard {
     last: Option<(String, String)>, // (tool_name, args_json)
     count: u32,
+    /// Per-guard ceiling. `new()` uses the global `MAX_TOOL_CALLS` (chat turns);
+    /// `with_limit(n)` overrides it for a wider pipeline-stage budget (phase 4b).
+    limit: u32,
 }
 
 impl LoopGuard {
+    /// Chat-scale guard — the global `MAX_TOOL_CALLS` ceiling (unchanged; memory invariant).
     pub fn new() -> Self {
         Self {
             last: None,
             count: 0,
+            limit: MAX_TOOL_CALLS,
+        }
+    }
+
+    /// Guard with a caller-chosen ceiling (Sub-Agent + Skill Architecture phase 4b) — a
+    /// pipeline stage runs with a wider per-stage budget than the chat default. The
+    /// duplicate-call and terminate-not-feed-back semantics are IDENTICAL to `new()`; only
+    /// the count ceiling differs. The global `MAX_TOOL_CALLS` constant is deliberately NOT
+    /// raised — this is a per-guard override, not a new global.
+    pub fn with_limit(limit: u32) -> Self {
+        Self {
+            last: None,
+            count: 0,
+            limit,
         }
     }
 
@@ -60,8 +78,9 @@ impl LoopGuard {
                 bail!("loop guard: identical call to '{tool}' repeated — stopping");
             }
         }
-        if self.count >= MAX_TOOL_CALLS {
-            bail!("loop guard: reached {MAX_TOOL_CALLS} tool calls in one turn — stopping");
+        if self.count >= self.limit {
+            let limit = self.limit;
+            bail!("loop guard: reached {limit} tool calls in one turn — stopping");
         }
         self.last = Some((tool.to_string(), args_str));
         self.count += 1;
@@ -519,6 +538,37 @@ mod tests {
     }
 
     #[test]
+    fn global_loop_guard_ceiling_is_unchanged() {
+        // Memory invariant: the global chat ceiling stays at 10 — the phase-4b per-stage budget
+        // is a `with_limit` override, NOT a bump of this constant.
+        assert_eq!(MAX_TOOL_CALLS, 10);
+        let mut g = LoopGuard::new();
+        for i in 0..MAX_TOOL_CALLS {
+            assert!(g.check("t", &serde_json::json!({ "i": i })).is_ok(), "call {i} under ceiling");
+        }
+        assert!(
+            g.check("t", &serde_json::json!({ "i": "over" })).is_err(),
+            "the (MAX+1)th call must trip the global ceiling"
+        );
+    }
+
+    #[test]
+    fn with_limit_overrides_the_ceiling_without_touching_the_global() {
+        // A pipeline stage runs with a wider budget; duplicate-detection + terminate semantics
+        // are identical — only the count ceiling differs.
+        let mut g = LoopGuard::with_limit(3);
+        for i in 0..3 {
+            assert!(g.check("t", &serde_json::json!({ "i": i })).is_ok(), "call {i} under limit");
+        }
+        assert!(
+            g.check("t", &serde_json::json!({ "i": 99 })).is_err(),
+            "the 4th call must trip the with_limit(3) ceiling"
+        );
+        // The global constant is untouched by the override.
+        assert_eq!(MAX_TOOL_CALLS, 10);
+    }
+
+    #[test]
     fn loop_guard_bails_on_duplicate_then_ceiling() {
         let mut g = LoopGuard::new();
         let a = serde_json::json!({"q": "x"});
@@ -621,6 +671,7 @@ mod tests {
             cancel,
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
+            run_id: None,
         };
         (ctx, rx, dir)
     }

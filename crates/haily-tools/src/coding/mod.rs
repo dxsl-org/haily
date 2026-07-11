@@ -120,9 +120,10 @@ pub(crate) async fn journal_coding_audit(
             manifest_hash: None,
         },
         workspace_id,
-        // P4b threads the active pipeline run id here for in-pipeline coding writes; an
-        // ad-hoc coding sub-turn outside a run leaves it NULL.
-        None,
+        // P4b: the active pipeline run id for in-pipeline coding writes (set by the runner on
+        // the stage sub-turn's `ToolContext`); an ad-hoc coding sub-turn outside a run has
+        // `run_id == None`, leaving the column NULL.
+        ctx.run_id.as_deref(),
     )
     .await?;
     match ctx.last_journal_id.lock() {

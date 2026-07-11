@@ -87,6 +87,13 @@ pub struct ToolContext {
     /// within one turn, so reset-then-read around a single `execute()` call can never
     /// observe another call's value (see `tool_call.rs`'s no-cross-tool-bleed test).
     pub last_journal_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// Active pipeline run id (Sub-Agent + Skill Architecture phase 4b) — `Some` ONLY for
+    /// a stage sub-turn the pipeline runner drives, so every journal row a stage writes
+    /// (coding-audit + local-tool) is stamped with the run and groups under one `undo_run`.
+    /// `None` for every ordinary chat/delegation turn (the runner is the sole setter). Kept
+    /// server-side and never sourced from LLM/tool text — a compromised sub-agent cannot
+    /// forge or alter another run's grouping.
+    pub run_id: Option<String>,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so

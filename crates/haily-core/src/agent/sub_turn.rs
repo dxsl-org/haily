@@ -154,6 +154,15 @@ pub struct SubTurnRequest {
     /// a sub-agent's re-tiered deletes count toward the ONE cap for the whole turn, not a
     /// fresh one that would let delegation bypass the ceiling. See `ToolContext::turn_deletes`.
     pub turn_deletes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-stage tool-call budget override (Sub-Agent + Skill Architecture phase 4b). `Some(n)`
+    /// caps THIS sub-turn's `LoopGuard` at `n` (a pipeline stage runs with a wider budget than a
+    /// chat turn); `None` keeps the global `MAX_TOOL_CALLS` chat default. LoopGuard semantics are
+    /// unchanged either way — terminate-not-feed-back on a tripped guard, never a new loop.
+    pub max_tool_calls: Option<u32>,
+    /// Active pipeline run id (phase 4b). `Some` ONLY when the pipeline runner drives this
+    /// sub-turn as a stage — threaded onto the sub-turn's `ToolContext` so every journal row a
+    /// stage writes groups under one `undo_run`. `None` for an ordinary delegated sub-turn.
+    pub run_id: Option<String>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -185,6 +194,8 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         kill,
         turn_id,
         turn_deletes,
+        max_tool_calls,
+        run_id,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -263,7 +274,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
 
     // Reuse the same tool loop logic as run_turn, without WorkItem tracking.
     let mut msgs = messages;
-    let mut guard = tool_call::LoopGuard::new();
+    // A pipeline stage overrides the chat-scale ceiling with its per-stage budget (phase 4b);
+    // a delegated sub-turn keeps the global default. Either way the guard still terminates the
+    // loop on trip — it never feeds the guard error back (the memory invariant).
+    let mut guard = match max_tool_calls {
+        Some(limit) => tool_call::LoopGuard::with_limit(limit),
+        None => tool_call::LoopGuard::new(),
+    };
     let mut tool_call_log: Vec<serde_json::Value> = Vec::new();
 
     // Phase 2 seam: the sub-turn no longer mints a throwaway broker/token/sink. It
@@ -288,6 +305,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         // Fresh per-dispatch-call cell for this sub-turn's own tool loop — never
         // shared with the parent's `ToolContext` (M4: no cross-turn bleed).
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
+        // `Some` only for a pipeline stage sub-turn — stamps this stage's journal rows with
+        // the run so they group under one `undo_run` (phase 4b).
+        run_id,
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -557,6 +577,8 @@ mod sub_turn_tests {
             kill: Arc::new(AtomicBool::new(false)),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_tool_calls: None,
+            run_id: None,
         }
     }
 
@@ -991,6 +1013,8 @@ mod outcome_tests {
             kill: Arc::new(AtomicBool::new(false)),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_tool_calls: None,
+            run_id: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1024,6 +1048,8 @@ mod outcome_tests {
             kill: Arc::new(AtomicBool::new(false)),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_tool_calls: None,
+            run_id: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1098,6 +1124,8 @@ mod outcome_tests {
             kill: Arc::new(AtomicBool::new(false)),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_tool_calls: None,
+            run_id: None,
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 

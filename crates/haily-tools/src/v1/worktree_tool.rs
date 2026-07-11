@@ -2,8 +2,33 @@ use crate::{RiskTier, Tool, ToolContext};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::process::Command;
+
+/// Process-wide registry of per-repo advisory apply locks (red-team FMA-C3). Two
+/// `worktree_apply` calls targeting the SAME repo root must serialize — a concurrent apply
+/// could interleave file copies + a `git worktree remove` and corrupt the target. Keyed by the
+/// canonicalized repo root string; the inner `tokio::Mutex` is held for the apply's duration.
+fn repo_apply_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The advisory apply lock for `repo_root`. The SAME `Arc<Mutex<()>>` is returned for the same
+/// (canonicalized) root, so two concurrent applies contend on one mutex; distinct roots get
+/// distinct locks and never block each other. `pub(crate)` so the FMA-C3 regression test can
+/// prove two applies to one root serialize while two roots do not.
+pub(crate) fn repo_apply_lock(repo_root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    // Canonicalize so `foo/` and `foo` map to one lock; fall back to the raw display string when
+    // the path does not yet resolve (never silently key two spellings to two locks otherwise).
+    let key = std::fs::canonicalize(repo_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_root.to_string_lossy().to_string());
+    let mut map = repo_apply_locks().lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(key).or_default())
+}
 
 // ---------------------------------------------------------------------------
 // WorktreeApplyTool
@@ -43,7 +68,7 @@ impl Tool for WorktreeApplyTool {
         RiskTier::IrreversibleWrite
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let worktree_path = args["worktree_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("worktree_path required"))?;
@@ -71,6 +96,43 @@ impl Tool for WorktreeApplyTool {
         // Using current_dir() would be wrong when the process runs from a
         // different directory or when the worktree belongs to a different repo.
         let repo_root = resolve_main_worktree(&wt_path).await?;
+
+        // FMA-C3: hold the per-repo advisory apply lock for the WHOLE apply (copies +
+        // `git worktree remove`). A second concurrent apply to this repo blocks here until
+        // the first completes, so their file copies + worktree teardown can never interleave.
+        let apply_lock = repo_apply_lock(&repo_root);
+        let _apply_guard = apply_lock.lock().await;
+
+        // Pre-apply journal marker (best-effort) so a crash/kill mid-apply is detectable on
+        // boot — the apply is a `final` (worktree-teardown) op, not journal-undoable, so this
+        // is an audit breadcrumb, not a compensation plan. A failed insert must not block the
+        // apply the user asked for.
+        {
+            let idem = uuid::Uuid::new_v4().to_string();
+            let turn = ctx.turn_id.to_string();
+            let request = crate::connector::redact::redact_to_string(
+                json!({ "op": "worktree_apply", "repo": repo_root.display().to_string() }),
+                "coding",
+            );
+            let marker = haily_db::queries::journal::NewAction {
+                session_id: &ctx.session_id.to_string(),
+                tool_name: "worktree_apply",
+                tool_tier: "IrreversibleWrite",
+                compensability: "final",
+                idempotency_key: &idem,
+                correlation_ref: &repo_root.display().to_string(),
+                request_params: &request,
+                pre_state: None,
+                pre_state_version: None,
+                compensation_plan: None,
+                turn_id: Some(&turn),
+                retention_days: crate::LOCAL_RETENTION_DAYS,
+                manifest_hash: None,
+            };
+            if let Err(e) = haily_db::queries::journal::insert(&ctx.db, marker).await {
+                tracing::warn!("worktree_apply pre-apply marker insert failed: {e:#}");
+            }
+        }
 
         // Collect modified tracked files.
         let tracked_output = Command::new("git")
@@ -444,5 +506,40 @@ mod tests {
         let repo = init_git_repo();
         let diff = compute_diff(&repo.path().to_path_buf()).await.unwrap();
         assert!(diff.is_empty());
+    }
+
+    // FMA-C3: two `worktree_apply` calls to the SAME repo root must serialize on one advisory
+    // lock; distinct roots must not block each other.
+    #[tokio::test]
+    async fn second_concurrent_apply_to_same_repo_blocks() {
+        let repo = init_git_repo();
+        let root = repo.path();
+
+        // Same root → SAME lock Arc (they contend).
+        let a = repo_apply_lock(root);
+        let b = repo_apply_lock(root);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the same repo root must map to one shared apply lock"
+        );
+
+        // Hold the lock (first apply in flight); a second acquire must block, not proceed.
+        let _held = a.lock().await;
+        assert!(
+            b.try_lock().is_err(),
+            "a second concurrent apply to the same repo must block while the first holds the lock"
+        );
+
+        // A DIFFERENT repo root gets its own lock and is never blocked by this one.
+        let other = init_git_repo();
+        let c = repo_apply_lock(other.path());
+        assert!(
+            !Arc::ptr_eq(&a, &c),
+            "distinct repo roots must get distinct locks"
+        );
+        assert!(
+            c.try_lock().is_ok(),
+            "an apply to a different repo must not block on another repo's lock"
+        );
     }
 }

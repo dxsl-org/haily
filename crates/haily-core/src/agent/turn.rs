@@ -116,6 +116,8 @@ pub async fn run_turn(
         // Reset at the top of THIS turn's context; `tool_call::dispatch` additionally
         // resets it before every individual tool call within the turn (M4 no-bleed).
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
+        // An L0 chat turn is not a pipeline run — only the P4b runner sets this.
+        run_id: None,
     };
 
     let mut guard = tool_call::LoopGuard::new();

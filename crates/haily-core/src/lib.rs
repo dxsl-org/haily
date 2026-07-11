@@ -296,6 +296,17 @@ impl Orchestrator {
             _ => {}
         }
 
+        // Sub-Agent + Skill Architecture phase 4b — pipeline resume reconcile (FMA-C1/m4): a
+        // pipeline run left `running`/`queued` by a crash/kill is reset to `interrupted` so it
+        // surfaces for EXPLICIT user resume and never auto-resumes a write stage. Mirrors the
+        // work-item reset above; the persisted `attempts_remaining` bound already survived the
+        // restart, so a resumed run cannot exceed its liveness budget.
+        match haily_db::queries::pipeline_runs::reset_stale_running(&db).await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "pipeline runs reset to interrupted"),
+            Err(e) => tracing::warn!("failed to reset stale pipeline runs: {e:#}"),
+            _ => {}
+        }
+
         // Phase 3 reconciliation sweep (C6/C7): classify orphan `pending` journal rows
         // left by a crash/kill mid-write via a read-back GET — NEVER a blind create-retry
         // (M4). A row past its grace window and still `pending` is an orphan; a fresh

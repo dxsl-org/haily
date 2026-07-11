@@ -141,6 +141,52 @@ pub async fn transition_tx(
     transition_via(&mut **tx, id, t).await
 }
 
+/// Commit a run's terminal/pause transition AND its audit-marker journal row in ONE
+/// transaction (red-team FMA-C2). The runner's cancel-proof finalize calls this so a crash or
+/// kill between the two writes is impossible: either the run advanced AND the journal recorded
+/// it, or neither did. `marker` is the run-level audit row (a `pipeline_run` marker with no
+/// `compensation_plan` — the worktree, not this row, is the compensator); it is deliberately
+/// NOT stamped with `run_id`, so `undo_run` never tries to compensate the marker itself.
+///
+/// Returns the transition's `rows_affected > 0` (see [`transition`]) — `false` means the run
+/// row vanished (cancelled/deleted) before finalize, in which case the marker still committed
+/// as an audit trail.
+///
+/// # Errors
+/// Returns an error if beginning the transaction, either write, or the commit fails.
+pub async fn finalize(
+    db: &DbHandle,
+    id: &str,
+    t: RunTransition<'_>,
+    marker: crate::queries::journal::NewAction<'_>,
+) -> Result<bool> {
+    let mut tx = db.pool().begin().await?;
+    crate::queries::journal::insert_tx(&mut tx, marker).await?;
+    let advanced = transition_via(&mut *tx, id, t).await?;
+    tx.commit().await?;
+    Ok(advanced)
+}
+
+/// Reset any run left `running` or `queued` by a crash/kill to `interrupted` — the pipeline
+/// analogue of `work_items::reset_stale_running`, run once at boot BEFORE any resume is offered
+/// (FMA-m4: an interrupted run's write stages never auto-resume; the user resumes explicitly).
+/// A `paused` run is already user-visible and is left as-is. Returns the number reset.
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn reset_stale_running(db: &DbHandle) -> Result<u64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE pipeline_runs SET status = 'interrupted', updated_at = ?
+         WHERE status IN ('running', 'queued') AND deleted_at IS NULL",
+    )
+    .bind(&now)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows)
+}
+
 /// Get a single non-deleted run by id. `None` if no active run with that id exists.
 ///
 /// # Errors
