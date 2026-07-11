@@ -122,6 +122,25 @@ fn approval_stats(
     (requested, denied)
 }
 
+/// Pair a `(prompt, completion)` token usage sample into a well-formed, all-or-nothing telemetry
+/// value (Sub-Agent + Skill Architecture phase 8, FMA-m5 C2 pairing contract).
+///
+/// An attempt's usage is recorded PER ATTEMPT with its resolved backend, never rolled up across
+/// backends: a local backend surfaces no usage (both `None`), a cloud one surfaces both. A MIXED
+/// pair (one `Some`, one `None`) is corrupt — it would let a per-stage rollup average a real
+/// token count against a fabricated zero and poison the GateResult EMA — so this collapses any
+/// mixed pair to `(None, None)`. Only a genuinely complete pair passes through as `Some`/`Some`.
+pub(crate) fn pair_usage(
+    prompt: Option<i64>,
+    completion: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
+    match (prompt, completion) {
+        (Some(p), Some(c)) => (Some(p), Some(c)),
+        // Missing either half → emit None/None explicitly (never a mixed Some/None).
+        _ => (None, None),
+    }
+}
+
 /// Whether `tool_call_log` contains a `feedback_react` call this SAME turn whose
 /// `reaction` is `negative` or `correction` — the m2-review (M2) same-turn
 /// corroborator for `repeat_request`: an explicit user reaction within this turn's
@@ -481,6 +500,16 @@ mod pure_helper_tests {
     fn signals_inability_false_on_a_normal_answer() {
         assert!(!signals_inability("Đây là kết quả bạn cần: 42."));
         assert!(!signals_inability("Here is the answer you asked for."));
+    }
+
+    /// FMA-m5 C2 pairing contract: a MIXED usage pair (one half missing) must collapse to
+    /// None/None, never a Some/None that a rollup could average against a real count.
+    #[test]
+    fn pair_usage_collapses_a_mixed_pair_to_none_none() {
+        assert_eq!(pair_usage(Some(100), Some(50)), (Some(100), Some(50)));
+        assert_eq!(pair_usage(None, None), (None, None));
+        assert_eq!(pair_usage(Some(100), None), (None, None), "prompt-only must not leak through");
+        assert_eq!(pair_usage(None, Some(50)), (None, None), "completion-only must not leak through");
     }
 
     #[test]

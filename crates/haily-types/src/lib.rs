@@ -151,6 +151,23 @@ pub enum Notification {
     },
     /// Broadcast when the set of active work items changes (added, progressed, or removed).
     WorkItemsChanged(Vec<WorkItemStatus>),
+    /// A learning-loop distillation PROPOSAL surfaced for user approval (Sub-Agent + Skill
+    /// Architecture phase 8, DEP-C2). Emitted from `haily-core` when the pipeline's recurrence
+    /// detector finds ≥2 same-class review findings across runs; carries only the rendered,
+    /// already-tag-stripped proposal text — NEVER a silent write to standards. Approval (a
+    /// separate, explicit user action) is what appends it to the out-of-workspace standards
+    /// overlay (SEC-H). Crosses core→io ONLY as this leaf-type variant over the existing mpsc,
+    /// mapped to a [`ProactiveCardKind::DistillationProposal`] card by [`ProactiveCard::from_notification`]
+    /// — `haily-core` never imports `haily-io` (CLAUDE.md layering invariant).
+    DistillationProposal {
+        /// `category:module` class key this proposal addresses — also the dedup/cooldown key
+        /// so a dismissed proposal does not re-fire for the same class within the cooldown.
+        class_key: String,
+        /// The rendered, itemized, tag-stripped proposal text shown to the user.
+        summary: String,
+        /// Number of distilled rules in the proposal.
+        rule_count: u32,
+    },
 }
 
 /// Typed, ordered observability stream for a pipeline RUN (Sub-Agent + Skill Architecture
@@ -230,6 +247,10 @@ pub enum ProactiveCardKind {
     MorningBrief { text: String },
     Alert { title: String, body: String, urgent: bool },
     ReminderFired { reminder_id: Uuid, title: String },
+    /// A learning-loop distillation proposal awaiting user approval (phase 8) — the card
+    /// surface of [`Notification::DistillationProposal`]. Display + approve/dismiss only; the
+    /// approve action (wired at the app/GUI layer) is the sole path that writes the overlay.
+    DistillationProposal { class_key: String, summary: String, rule_count: u32 },
 }
 
 impl ProactiveCard {
@@ -248,6 +269,15 @@ impl ProactiveCard {
             Notification::ReminderFired { reminder_id, title } => ProactiveCardKind::ReminderFired {
                 reminder_id: *reminder_id,
                 title: title.clone(),
+            },
+            Notification::DistillationProposal {
+                class_key,
+                summary,
+                rule_count,
+            } => ProactiveCardKind::DistillationProposal {
+                class_key: class_key.clone(),
+                summary: summary.clone(),
+                rule_count: *rule_count,
             },
             Notification::WorkItemsChanged(_) => return None,
         };
@@ -622,6 +652,47 @@ mod tests {
         assert!(json.contains("\"data\":"));
         let round_tripped: ProactiveCard = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(round_tripped.kind, ProactiveCardKind::Alert { urgent: false, .. }));
+    }
+
+    /// Phase 8 (DEP-C2): a `DistillationProposal` notification maps to a card carrying the
+    /// same class key / summary / rule count — the proposal reaches the GUI card surface
+    /// without `haily-core` importing `haily-io`.
+    #[test]
+    fn proactive_card_from_distillation_proposal() {
+        let card = ProactiveCard::from_notification(&Notification::DistillationProposal {
+            class_key: "critical:crates/haily-core".into(),
+            summary: "1. Always handle the None case".into(),
+            rule_count: 1,
+        })
+        .expect("DistillationProposal must produce a card");
+        match card.kind {
+            ProactiveCardKind::DistillationProposal { class_key, summary, rule_count } => {
+                assert_eq!(class_key, "critical:crates/haily-core");
+                assert_eq!(summary, "1. Always handle the None case");
+                assert_eq!(rule_count, 1);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    /// A `DistillationProposal` notification roundtrips through serde faithfully (additive
+    /// enum variant — old payloads simply never carried it).
+    #[test]
+    fn distillation_proposal_notification_roundtrip() {
+        let notif = Notification::DistillationProposal {
+            class_key: "high:crates/haily-db".into(),
+            summary: "1. Validate at the boundary".into(),
+            rule_count: 2,
+        };
+        let json = serde_json::to_string(&notif).expect("serialize");
+        let round: Notification = serde_json::from_str(&json).expect("deserialize");
+        match round {
+            Notification::DistillationProposal { class_key, rule_count, .. } => {
+                assert_eq!(class_key, "high:crates/haily-db");
+                assert_eq!(rule_count, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

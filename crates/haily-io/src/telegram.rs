@@ -353,6 +353,12 @@ impl Adapter for TelegramAdapter {
             Notification::ReminderFired { title, .. } => {
                 format!("⏰ <b>Reminder</b>: {}", escape_html(&title))
             }
+            Notification::DistillationProposal { summary, rule_count, .. } => {
+                format!(
+                    "🧪 <b>Distillation proposal</b> ({rule_count} rule(s))\n{}",
+                    escape_html(&summary)
+                )
+            }
             // Unreachable in practice (the early-return above handles it), but the
             // match must be total: a future refactor removing that guard must degrade
             // to a dropped notification, never panic the always-on daemon.
@@ -552,6 +558,22 @@ mod tests {
 
         let result = adapter.notify(Notification::WorkItemsChanged(vec![])).await;
 
+        assert!(result.is_ok());
+    }
+
+    /// Phase 8: the telegram adapter must handle the new `DistillationProposal` notification
+    /// variant (exhaustive-match / --features telegram gate). No chats are bound, so no network
+    /// call is made — this asserts the arm exists and does not panic.
+    #[tokio::test]
+    async fn notify_distillation_proposal_is_handled() {
+        let adapter = test_adapter();
+        let result = adapter
+            .notify(Notification::DistillationProposal {
+                class_key: "critical:crates/haily-core".into(),
+                summary: "1. Always handle the None case".into(),
+                rule_count: 1,
+            })
+            .await;
         assert!(result.is_ok());
     }
 }

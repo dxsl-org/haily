@@ -1,4 +1,5 @@
 pub mod authored_skills;
+pub mod distillation;
 pub mod feedback;
 pub mod hnsw;
 pub mod kit_pack;
@@ -37,6 +38,10 @@ pub struct KmsHandle {
     hnsw: RwLock<Arc<HnswIndex>>,
     /// Directory holding the HNSW dump files (`hnsw::dump_dir(data_dir)`).
     dump_dir: PathBuf,
+    /// The app data directory (phase 8). The distillation standards-overlay lives HERE, OUTSIDE
+    /// any coding-workspace `fs_write` root (SEC-H) — so an auto-approved `fs_write` can never
+    /// self-persist a prompt injection into the overlay.
+    data_dir: PathBuf,
     /// Prevents two rebuilds (e.g. a tombstone-ratio trigger firing twice in quick
     /// succession from concurrent `index_remove` calls) from running concurrently.
     rebuild_in_progress: AtomicBool,
@@ -75,6 +80,7 @@ impl KmsHandle {
             db,
             hnsw: RwLock::new(Arc::new(hnsw)),
             dump_dir,
+            data_dir: data_dir.to_path_buf(),
             rebuild_in_progress: AtomicBool::new(false),
             authored,
             #[cfg(feature = "embeddings")]
@@ -145,6 +151,40 @@ impl KmsHandle {
     /// sub-turn `## Standards` injection after stack detection.
     pub fn authored_standards_for(&self, names: &[&str]) -> Vec<(String, String)> {
         self.authored.standards_for(names)
+    }
+
+    /// Path to the distillation standards-overlay file (phase 8). Deliberately under the app
+    /// DATA dir, never a coding-workspace worktree — an auto-approved `fs_write` cannot reach
+    /// it (SEC-H). Its presence is not required; readers fail-open on absence.
+    pub fn standards_overlay_path(&self) -> PathBuf {
+        self.data_dir.join("standards-overlay.md")
+    }
+
+    /// Non-expired, approval-provenanced overlay standards as `(heading, body)` pairs, for the
+    /// sub-turn `## Standards` injection AFTER the kit standards (phase 8). Fail-open (empty on
+    /// any read problem / no overlay yet).
+    pub fn overlay_standards(&self) -> Vec<(String, String)> {
+        let now = chrono::Utc::now().to_rfc3339();
+        distillation::load_overlay_standards(&self.standards_overlay_path(), &now)
+    }
+
+    /// Synthesized skills (confidence ≥ [`skills::SYNTH_SKILL_MIN_CONFIDENCE`]) whose pattern
+    /// matches `task`, as top-`top_n` `(heading, body)` playbook pairs for the sub-turn
+    /// `## Playbooks` pool (phase 8). Source is made visible in each heading. A DB read failure
+    /// yields an empty pool (never an error) — a learning signal must never break a turn.
+    pub async fn synthesized_playbooks_for(&self, task: &str, top_n: usize) -> Vec<(String, String)> {
+        match db_skills::active_skills(&self.db).await {
+            Ok(active) => skills::synthesized_playbooks(
+                &active,
+                task,
+                skills::SYNTH_SKILL_MIN_CONFIDENCE,
+                top_n,
+            ),
+            Err(e) => {
+                tracing::warn!("synthesized_playbooks_for: active_skills read failed: {e:#}");
+                Vec::new()
+            }
+        }
     }
 
     /// Enumerate a skill's fetchable sections (`body` + reference chunk ids). Errors on

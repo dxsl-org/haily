@@ -11,7 +11,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{budget, context, tool_call};
-use super::outcome::{record_outcome_and_update_skill, OutcomeMetricsInput};
+use super::outcome::{pair_usage, record_outcome_and_update_skill, OutcomeMetricsInput};
+
+/// Top-N synthesized skills to consider for the sub-turn playbook pool (phase 8). Kept small so
+/// learned skills augment — never crowd out — the curated authored playbooks ranked above them.
+const SUB_TURN_MAX_SYNTHESIZED_SKILLS: usize = 3;
 
 /// String form of a routing `Tier` for persistence in `kms_task_traces.model_tier` —
 /// `Tier` itself has no `Display`/`as_str` (it is an internal routing enum, not a
@@ -242,22 +246,45 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // smuggle a live `<tool_call>` into the sub-agent prompt (same rule as facts /
     // tool-results). References stay UNLOADED (progressive disclosure); only the body of
     // each matched skill is injected.
-    let playbooks: Vec<(String, String)> = kms
+    let mut playbooks: Vec<(String, String)> = kms
         .authored_playbooks_for(&task, Some(domain_name), 2)
         // Strip the NAME too (P2 review MED2) — it becomes a `### {name}` heading in the prompt.
         .into_iter()
         .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
         .collect();
+    // Phase 8: SYNTHESIZED skills (confidence ≥0.6, pattern-matched, source-labeled) join the
+    // ranked pool AFTER the curated authored playbooks — authored stays higher priority (kept
+    // first, trimmed last), learned skills augment. Sub-0.6 skills never reach here (filtered in
+    // `synthesized_playbooks`). Tag-stripped at this same choke point as every other injection.
+    let synthesized = kms
+        .synthesized_playbooks_for(&task, SUB_TURN_MAX_SYNTHESIZED_SKILLS)
+        .await;
+    playbooks.extend(
+        synthesized
+            .into_iter()
+            .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b))),
+    );
     // Standards only for the coding (developer) domain — a finance sub-turn must never
     // receive rust standards. Stack is detected from the CWD here (the standalone
     // fallback); P4's pipeline engine will detect against a real workspace root.
     let standards: Vec<(String, String)> = if domain_name == "developer" {
         let names = haily_tools::coding::stack_detect::detect_standard_names();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        kms.authored_standards_for(&refs)
+        let mut s: Vec<(String, String)> = kms
+            .authored_standards_for(&refs)
             .into_iter()
             .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
-            .collect()
+            .collect();
+        // Phase 8: the distilled project-standards overlay is injected AFTER the kit standards
+        // (so it augments, never shadows them) and — being last in the list — is trimmed FIRST
+        // under budget pressure (`fit_titled_block` drops trailing items). Only approval-
+        // provenanced, non-expired entries are returned (SEC-H / AD-m3); tag-stripped here too.
+        s.extend(
+            kms.overlay_standards()
+                .into_iter()
+                .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b))),
+        );
+        s
     } else {
         Vec::new()
     };
@@ -408,6 +435,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // delegated sub-turn are attributed to the SAME session, per the existing
     // "learns from delegated work too" convention above).
     let session_id_str = session_id.to_string();
+    // FMA-m5: pair the (prompt, completion) usage into an all-or-nothing value. Both are None
+    // today (complete_tiered surfaces no usage); the pairing guarantees no mixed Some/None ever
+    // reaches the trace regardless of what a future backend returns.
+    let (prompt_tokens, completion_tokens) = pair_usage(None, None);
     record_outcome_and_update_skill(
         &db,
         &session_id_str,
@@ -418,10 +449,13 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         elapsed_ms,
         OutcomeMetricsInput {
             model_tier: tier_str(model_tier),
-            // sub-turn uses complete_tiered (non-streaming); no per-call token count
-            // surfaced here.
-            prompt_tokens: None,
-            completion_tokens: None,
+            // sub-turn uses complete_tiered (non-streaming); no per-call token usage is surfaced
+            // by that path today, so both halves are None. Routed through `pair_usage` anyway so
+            // the all-or-nothing pairing contract (FMA-m5) is enforced at THIS recording boundary
+            // — a future usage-returning backend can pass real values and a mixed pair can never
+            // slip through as Some/None.
+            prompt_tokens,
+            completion_tokens,
             delegate_overhead_ms: Some(delegate_overhead_ms),
             confidence_update_failure_msg: "failed to update skill confidence from sub-turn outcome label",
             // M3 review fix: a delegated sub-turn NEVER owns learning — the parent L0
@@ -862,6 +896,130 @@ mod sub_turn_tests {
         assert!(
             response.contains("payload"),
             "non-tag fact content must survive neutralization"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 8 — synthesized-skill injection + standards-overlay injection.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sub_turn_injects_a_matching_synthesized_skill_above_the_confidence_floor() {
+        let (db, kms, _dir) = test_kms().await;
+        // A fresh synthesized skill starts at confidence 1.0 (≥0.6) and its description matches
+        // the task — it must join the playbook pool with visible provenance.
+        haily_db::queries::skills::insert_skill(
+            &db,
+            "flight-booking",
+            "book a flight ticket for the user",
+            "book flight ticket",
+            "[]",
+        )
+        .await
+        .expect("seed synthesized skill");
+
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+        let req = base_req(
+            "book a flight ticket for the user to hanoi".to_string(),
+            db,
+            kms,
+            llm,
+        );
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+        assert!(
+            prompt.contains("(synthesized skill)"),
+            "a matching ≥0.6 synthesized skill must reach the sub-turn prompt with visible provenance, got: {prompt}"
+        );
+        assert!(prompt.contains("flight-booking"), "the skill name must appear");
+    }
+
+    #[tokio::test]
+    async fn sub_turn_omits_a_synthesized_skill_below_the_confidence_floor() {
+        let (db, kms, _dir) = test_kms().await;
+        let skill = haily_db::queries::skills::insert_skill(
+            &db,
+            "flight-booking",
+            "book a flight ticket for the user",
+            "book flight ticket",
+            "[]",
+        )
+        .await
+        .expect("seed synthesized skill");
+        // Drive confidence below the 0.6 injection floor (EMA reward 0.0, α=0.10: 0.9^5≈0.59).
+        for _ in 0..5 {
+            haily_kms::skills::update_skill_confidence(&db, &skill.id, 0.0)
+                .await
+                .expect("decay confidence");
+        }
+
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+        let req = base_req(
+            "book a flight ticket for the user to hanoi".to_string(),
+            db,
+            kms,
+            llm,
+        );
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+        assert!(
+            !prompt.contains("(synthesized skill)"),
+            "a synthesized skill below the 0.6 confidence floor must NEVER reach the prompt, got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn developer_sub_turn_injects_overlay_standards_after_kit_standards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        if !copy_kit_pack(dir.path()) {
+            return; // shipped pack unavailable
+        }
+        let (db, kms) = kms_with_kit_pack(dir.path()).await;
+        // Approve a distilled overlay entry OUTSIDE the workspace (under the kms data dir).
+        let proposal = haily_kms::distillation::build_proposal(
+            "critical",
+            "crates/haily-core",
+            2,
+            &["always handle the None case returned by find_matching_skill".into()],
+        );
+        haily_kms::distillation::approve_overlay_entries(
+            &kms.standards_overlay_path(),
+            &proposal,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .expect("approve overlay");
+
+        let base_url = spawn_prompt_echo_server().await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+        let req = dev_req("write some rust code".to_string(), db, kms, llm);
+        let prompt = run_sub_turn(req).await.expect("run_sub_turn");
+
+        let kit_pos = prompt.find("Rust Standards").expect("kit rust standard present");
+        let overlay_pos = prompt
+            .find("always handle the None case")
+            .expect("overlay standard present");
+        assert!(
+            overlay_pos > kit_pos,
+            "the distilled overlay standard must be injected AFTER the kit standards (so it is \
+             also trimmed first under budget pressure), got kit@{kit_pos} overlay@{overlay_pos}"
+        );
+    }
+
+    /// SEC-H: the standards overlay lives OUTSIDE any coding-workspace `fs_write` root — so an
+    /// auto-approved `fs_write` scoped to a worktree can never self-persist into it.
+    #[tokio::test]
+    async fn standards_overlay_lives_outside_any_workspace_write_root() {
+        let (_db, kms, dir) = test_kms().await;
+        let overlay = kms.standards_overlay_path();
+        assert!(
+            overlay.starts_with(dir.path()),
+            "overlay must live under the app data dir, got {overlay:?}"
+        );
+        // A coding workspace worktree is cut under a SEPARATE root; the overlay is never under it.
+        let workspace_root = tempfile::tempdir().expect("workspace root");
+        assert!(
+            !overlay.starts_with(workspace_root.path()),
+            "overlay must NOT be reachable from a workspace fs_write root"
         );
     }
 }

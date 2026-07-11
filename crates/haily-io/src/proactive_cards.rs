@@ -8,6 +8,9 @@ use crate::{ProactiveCard, ProactiveCardKind};
 pub(crate) const MAX_ALERT_CARDS: usize = 10;
 /// Max discrete `ReminderFired` cards the GUI panel holds; see `upsert_proactive_card`.
 pub(crate) const MAX_REMINDER_CARDS: usize = 10;
+/// Max discrete `DistillationProposal` cards the GUI panel holds (phase 8) — kept small: a
+/// proposal is a considered, user-approved action, not a high-frequency event.
+pub(crate) const MAX_DISTILLATION_CARDS: usize = 5;
 
 /// Discriminator string for `ProactiveCardKind`, used to group same-kind cards for
 /// the panel's per-kind eviction policy without a full `match` at every call site.
@@ -16,6 +19,7 @@ fn kind_label(kind: &ProactiveCardKind) -> &'static str {
         ProactiveCardKind::MorningBrief { .. } => "morning_brief",
         ProactiveCardKind::Alert { .. } => "alert",
         ProactiveCardKind::ReminderFired { .. } => "reminder_fired",
+        ProactiveCardKind::DistillationProposal { .. } => "distillation_proposal",
     }
 }
 
@@ -27,6 +31,7 @@ fn kind_cap(kind: &ProactiveCardKind) -> usize {
         ProactiveCardKind::MorningBrief { .. } => 1,
         ProactiveCardKind::Alert { .. } => MAX_ALERT_CARDS,
         ProactiveCardKind::ReminderFired { .. } => MAX_REMINDER_CARDS,
+        ProactiveCardKind::DistillationProposal { .. } => MAX_DISTILLATION_CARDS,
     }
 }
 

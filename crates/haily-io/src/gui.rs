@@ -145,6 +145,9 @@ impl Adapter for GuiAdapter {
             Notification::MorningBrief(brief) => format!("[Morning Brief]\n{brief}"),
             Notification::Alert { title, body, .. } => format!("{title}\n{body}"),
             Notification::ReminderFired { title, .. } => format!("⏰ {title}"),
+            Notification::DistillationProposal { summary, .. } => {
+                format!("[Distillation proposal]\n{summary}")
+            }
             // Unreachable in practice (the early-return above handles it), but the
             // match must be total: a future refactor removing that guard must degrade
             // to a dropped notification, never panic the always-on daemon.

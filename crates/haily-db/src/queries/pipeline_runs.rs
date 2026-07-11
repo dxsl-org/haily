@@ -191,6 +191,28 @@ pub async fn set_findings(db: &DbHandle, id: &str, findings_json: &str) -> Resul
     Ok(rows > 0)
 }
 
+/// Persist per-ATTEMPT token accounting onto a run's pre-allocated nullable `per_attempt_tokens`
+/// column (Sub-Agent + Skill Architecture phase 8, FMA-m5). The column exists since P4a (a
+/// forward slot), so this is an in-place UPDATE — no migration. `tokens_json` is the
+/// caller-serialized array of per-attempt records (each with its resolved backend + paired
+/// usage); this layer stores it verbatim. Returns `true` iff an active row was updated.
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn set_per_attempt_tokens(db: &DbHandle, id: &str, tokens_json: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE pipeline_runs SET per_attempt_tokens = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(tokens_json)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 /// Reset any run left `running` or `queued` by a crash/kill to `interrupted` — the pipeline
 /// analogue of `work_items::reset_stale_running`, run once at boot BEFORE any resume is offered
 /// (FMA-m4: an interrupted run's write stages never auto-resume; the user resumes explicitly).

@@ -454,6 +454,34 @@ pub async fn downgrade_trace(
     Ok(())
 }
 
+/// Apply a deterministic GateResult label (Sub-Agent + Skill Architecture phase 8) to a task
+/// trace: set its `outcome` to the gate verdict AND stamp `label_source='gate_result'`,
+/// `label_confidence=0.9`. The WHERE guard `(label_source IS NULL OR label_source !=
+/// 'explicit_feedback')` is the anti-reinforcement precedence invariant (LOCKED decision #4):
+/// a gate result NEVER overwrites an explicit human-feedback label already on the trace, but
+/// freely labels an unlabeled trace or supersedes a weaker heuristic label. Mirrors the
+/// `gate_label_supersedes` predicate in `haily_kms::skills` (kept in lockstep with it).
+///
+/// `outcome` is the caller-mapped `TaskOutcome::as_str()` value (`success`/`failure`) matching
+/// the gate pass/fail. Returns `true` iff a row was actually re-labeled (`false` = row absent
+/// OR an explicit-feedback label protected it).
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn apply_gate_result_label(db: &DbHandle, trace_id: &str, outcome: &str) -> Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE kms_task_traces
+         SET outcome = ?, label_source = 'gate_result', label_confidence = 0.9
+         WHERE id = ? AND (label_source IS NULL OR label_source != 'explicit_feedback')",
+    )
+    .bind(outcome)
+    .bind(trace_id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
+}
+
 /// m4 exact undo predicate: EXISTS a same-`session_id` `action_journal` row with
 /// `undo_status='undone'` AND `undone_at` within `window_minutes` of `created_at`
 /// (the action being recorded — NOT the undo row, since undo mutates the ORIGINAL
@@ -659,4 +687,74 @@ pub async fn delete_traces_older_than(db: &DbHandle, retention_days: i64) -> Res
         .await?
         .rows_affected();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod gate_label_tests {
+    //! Phase 8: `apply_gate_result_label` precedence — a deterministic gate label freely labels
+    //! an unlabeled trace but NEVER overwrites an explicit human-feedback label (LOCKED #4).
+    use super::*;
+    use crate::queries::sessions;
+
+    async fn db_with_session() -> (DbHandle, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        sessions::create_session(&db, &session_id, "test", None).await.unwrap();
+        (db, session_id, dir)
+    }
+
+    fn metrics_with_label(source: Option<&'static str>) -> TraceMetrics<'static> {
+        TraceMetrics {
+            label_source: source,
+            label_confidence: source.map(|_| 0.9),
+            ..TraceMetrics::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_label_applies_to_an_unlabeled_trace() {
+        let (db, sid, _dir) = db_with_session().await;
+        let t = insert_trace(&db, &sid, "build stage", "[]", "success", Some(1), metrics_with_label(None))
+            .await
+            .unwrap();
+        assert_eq!(t.label_source, None, "precondition: trace starts unlabeled");
+
+        let changed = apply_gate_result_label(&db, &t.id, "failure").await.unwrap();
+        assert!(changed, "an unlabeled trace must accept the gate label");
+
+        let after = recent_traces(&db, 5).await.unwrap();
+        let after = after.iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!(after.label_source.as_deref(), Some("gate_result"));
+        assert_eq!(after.label_confidence, Some(0.9));
+        assert_eq!(after.outcome, "failure", "outcome must reflect the gate verdict");
+    }
+
+    #[tokio::test]
+    async fn gate_label_never_overwrites_explicit_feedback() {
+        let (db, sid, _dir) = db_with_session().await;
+        let t = insert_trace(
+            &db,
+            &sid,
+            "build stage",
+            "[]",
+            "failure",
+            Some(1),
+            metrics_with_label(Some("explicit_feedback")),
+        )
+        .await
+        .unwrap();
+
+        let changed = apply_gate_result_label(&db, &t.id, "success").await.unwrap();
+        assert!(!changed, "an explicit_feedback label must protect the trace from a gate relabel");
+
+        let after = recent_traces(&db, 5).await.unwrap();
+        let after = after.iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!(
+            after.label_source.as_deref(),
+            Some("explicit_feedback"),
+            "explicit feedback must survive — a gate result never overwrites it"
+        );
+        assert_eq!(after.outcome, "failure", "outcome must NOT be rewritten when the label is protected");
+    }
 }

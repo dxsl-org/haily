@@ -10,16 +10,19 @@
 //! never mask failure as success). All phases clean → the whole-plan Ship run.
 
 use anyhow::Result;
-use haily_db::queries::pipeline_runs;
+use haily_db::queries::review_findings::{self, NewReviewFinding};
+use haily_db::queries::{meta, pipeline_runs};
 use haily_db::DbHandle;
+use haily_kms::distillation;
 use haily_tools::coding::workspace::CodingWorkspace;
-use haily_types::DepthMode;
+use haily_types::{DepthMode, Notification};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{
     build_phase_pipeline, build_review_pipeline, detect_test_tampering, ship_pipeline, Finding,
-    FindingsDoc, PhaseInput, VerifierCmd, BUILD_DOMAIN, BUILD_SYSTEM_PROMPT, REVIEW_SYSTEM_PROMPT,
-    SHIP_SYSTEM_PROMPT,
+    FindingsDoc, PhaseInput, Severity, VerifierCmd, BUILD_DOMAIN, BUILD_SYSTEM_PROMPT,
+    REVIEW_SYSTEM_PROMPT, SHIP_SYSTEM_PROMPT,
 };
 use crate::pipeline::exemplar;
 use crate::pipeline::runner::{PipelineRunner, RunReport, RunSpec};
@@ -30,6 +33,15 @@ use super::diff;
 /// The bounded Fix-loop budget (P6: "≤2 rounds"). After this many fix rounds still show an
 /// unresolved Critical, the run pauses for the user rather than shipping.
 const MAX_FIX_ROUNDS: u32 = 2;
+
+/// A `(category, module)` class must recur at least this many times ACROSS runs before it
+/// yields a distillation proposal at Ship (phase 8).
+const DISTILLATION_MIN_RECURRENCE: i64 = 2;
+/// Days a proposed class stays on cooldown — a dismissed (or approved) proposal does not
+/// re-fire for the same class within this window (phase 8 anti-nag).
+const DISTILLATION_COOLDOWN_DAYS: i64 = 7;
+/// Max distinct finding summaries itemized into one proposal (keeps the card readable).
+const DISTILLATION_MAX_RULES: i64 = 5;
 
 /// Inputs for [`run_build`], grouped to keep its arity sane (mirrors `PlanRunSpec`).
 pub struct BuildRunSpec<'a> {
@@ -49,6 +61,11 @@ pub struct BuildRunSpec<'a> {
     /// dropped); `Normal`/`Quick` route every Critical straight to the loop. The
     /// reward-hacking guard's synthetic Critical is deterministic and NEVER refuted away.
     pub depth: DepthMode,
+    /// Phase 8 (DEP-C2) — the seam a recurring-findings distillation PROPOSAL is emitted on at
+    /// Ship. `None` disables emission (the proposal is still cooldown-tracked but not surfaced).
+    /// A `haily-types::Notification` mpsc, NOT a direct `haily-io` dependency (haily-core never
+    /// imports haily-io); the app layer bridges this to `AdapterManager::notify_all`.
+    pub distillation_tx: Option<mpsc::Sender<Notification>>,
 }
 
 impl<'a> BuildRunSpec<'a> {
@@ -133,12 +150,17 @@ pub async fn run_build(
             // Collect unresolved Criticals: the reviewer's own + the reward-hacking guard's
             // synthetic one (only on a Fix round — a phase legitimately adding tests in round 0
             // is not tampering; a fix that weakens a test to go green is).
-            let mut criticals: Vec<Finding> = match read_findings(db, &rev_report.run_id).await {
-                Some(findings) => findings.into_iter().filter(|f| f.is_critical()).collect(),
+            let all_findings = match read_findings(db, &rev_report.run_id).await {
+                Some(findings) => findings,
                 // No findings recorded (the reviewer never emitted) — can't confirm clean, so
                 // conservatively do not ship.
                 None => return Ok(report(rev_report.run_id, RunStatus::Paused, total_retries)),
             };
+            // Phase 8: persist every finding to the cross-run history so the Ship recurrence
+            // detector can spot a class that keeps coming back (best-effort — never blocks build).
+            persist_review_findings(db, &rev_report.run_id, &spec, &all_findings).await;
+            let mut criticals: Vec<Finding> =
+                all_findings.into_iter().filter(|f| f.is_critical()).collect();
             // Deep: run refuter votes on each model-reported Critical. A finding survives on at
             // least one non-refutation (uncertainty defaults to NOT refuted, so it stands) and
             // is dropped only when a majority of refuters confidently refute it — cutting the
@@ -174,6 +196,10 @@ pub async fn run_build(
             round += 1;
         }
     }
+
+    // Phase 8: recurrence detector runs at Ship — a class of finding that recurred across runs
+    // becomes a user-approved distillation proposal (proposal-only; never a silent write).
+    emit_distillation_proposals(db, &spec).await;
 
     // Every phase built + reviewed clean → the ONLY write to the real repo.
     let summary = ship_summary(&spec.phases);
@@ -252,6 +278,130 @@ fn ship_summary(phases: &[PhaseInput]) -> String {
 
 fn report(run_id: String, status: RunStatus, retries: u32) -> RunReport {
     RunReport { run_id, status, retries }
+}
+
+/// The `category` half of a class key = the finding's severity string (phase 8: start coarse).
+fn severity_category(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "info",
+    }
+}
+
+/// Persist a review run's findings to the cross-run `review_findings` history (phase 8). Summaries
+/// are tag-stripped before storage (they later render into proposals → prompts). Best-effort: a
+/// write failure is logged, never fatal to the build.
+async fn persist_review_findings(
+    db: &DbHandle,
+    run_id: &str,
+    spec: &BuildRunSpec<'_>,
+    findings: &[Finding],
+) {
+    let session = spec.session_id.to_string();
+    let workspace_id = spec.workspace.row.id.clone();
+    for f in findings {
+        let category = severity_category(f.severity);
+        let module = distillation::module_key(&f.file);
+        let summary = crate::tool_call::strip_tool_tags(&f.summary);
+        let new = NewReviewFinding {
+            run_id,
+            session_id: &session,
+            workspace_id: Some(&workspace_id),
+            category,
+            module: &module,
+            severity: category,
+            file: &f.file,
+            summary: &summary,
+        };
+        if let Err(e) = review_findings::insert_finding(db, new).await {
+            tracing::warn!(run = %run_id, "review-finding history insert failed: {e:#}");
+        }
+    }
+}
+
+/// Preference key namespacing a class's distillation cooldown marker.
+fn cooldown_key(class_key: &str) -> String {
+    format!("distillation.cooldown.{class_key}")
+}
+
+/// Whether `class_key` is still within its post-proposal cooldown window (phase 8 anti-nag):
+/// a class proposed within [`DISTILLATION_COOLDOWN_DAYS`] does not re-fire. Fail-open (treated
+/// as NOT on cooldown) if the marker read fails — surfacing a duplicate proposal is a lesser
+/// harm than silently swallowing a real recurring finding.
+async fn on_cooldown(db: &DbHandle, class_key: &str) -> bool {
+    let Ok(Some(last)) = meta::get_preference(db, &cooldown_key(class_key)).await else {
+        return false;
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(DISTILLATION_COOLDOWN_DAYS)).to_rfc3339();
+    // A marker NEWER than the cutoff means we proposed recently → still on cooldown.
+    last.as_str() > cutoff.as_str()
+}
+
+/// The Ship-time recurrence detector (phase 8): for each `(category, module)` class that recurred
+/// ≥[`DISTILLATION_MIN_RECURRENCE`] times across runs and is not on cooldown, build an itemized
+/// proposal, emit it as a [`Notification::DistillationProposal`] (proposal-only), and set the
+/// cooldown marker. Entirely best-effort — a DB failure never affects the build outcome.
+async fn emit_distillation_proposals(db: &DbHandle, spec: &BuildRunSpec<'_>) {
+    let workspace_id = &spec.workspace.row.id;
+    let classes = match review_findings::recurrent_classes_for_workspace(
+        db,
+        workspace_id,
+        DISTILLATION_MIN_RECURRENCE,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("distillation recurrence query failed: {e:#}");
+            return;
+        }
+    };
+
+    for class in classes {
+        let ck = distillation::class_key(&class.category, &class.module);
+        if on_cooldown(db, &ck).await {
+            continue;
+        }
+        let rows = review_findings::findings_for_class(
+            db,
+            workspace_id,
+            &class.category,
+            &class.module,
+            DISTILLATION_MAX_RULES,
+        )
+        .await
+        .unwrap_or_default();
+        // Summaries are already tag-stripped in `persist_review_findings`; strip again defensively
+        // (a stored row could predate that guarantee) before it renders into a card.
+        let summaries: Vec<String> = rows
+            .iter()
+            .map(|r| crate::tool_call::strip_tool_tags(&r.summary))
+            .collect();
+        let proposal =
+            distillation::build_proposal(&class.category, &class.module, class.count, &summaries);
+        if proposal.rules.is_empty() {
+            continue;
+        }
+        let summary = crate::tool_call::strip_tool_tags(&distillation::render_proposal(&proposal));
+        if let Some(tx) = &spec.distillation_tx {
+            let _ = tx
+                .send(Notification::DistillationProposal {
+                    class_key: ck.clone(),
+                    summary,
+                    rule_count: proposal.rules.len() as u32,
+                })
+                .await;
+        }
+        // Mark cooldown whether or not a sender was wired — a proposal was decided for this class.
+        if let Err(e) =
+            meta::upsert_preference(db, &cooldown_key(&ck), &chrono::Utc::now().to_rfc3339(), "system").await
+        {
+            tracing::warn!("distillation cooldown marker write failed: {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]

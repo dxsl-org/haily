@@ -23,6 +23,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use haily_db::queries::journal::NewAction;
 use haily_db::queries::pipeline_runs::{self, RunTransition};
+use haily_db::queries::skills as db_skills;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::{LlmRouter, Tier};
@@ -238,6 +239,26 @@ impl PipelineRunner {
         let _ = self.events.send(ev).await;
     }
 
+    /// Apply the deterministic GateResult label (phase 8) to the stage's just-recorded task
+    /// trace — the most recent trace for this session, which `run_sub_turn` inserted at the end
+    /// of the stage sub-turn (pipeline stages run sequentially, so "most recent" is this stage's).
+    /// `pass` maps to a `success`/`failure` outcome; the label NEVER overwrites an explicit
+    /// human-feedback label (enforced in `apply_gate_result_label`). Best-effort telemetry — a
+    /// failure here never affects the run outcome.
+    async fn label_stage_trace(&self, session_id: Uuid, pass: bool) {
+        let sid = session_id.to_string();
+        match db_skills::most_recent_trace(&self.db, &sid).await {
+            Ok(Some(trace)) => {
+                let outcome = if pass { "success" } else { "failure" };
+                if let Err(e) = db_skills::apply_gate_result_label(&self.db, &trace.id, outcome).await {
+                    tracing::warn!(run_session = %sid, "gate-result label write failed: {e:#}");
+                }
+            }
+            Ok(None) => tracing::debug!(run_session = %sid, "no trace to label with gate result"),
+            Err(e) => tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}"),
+        }
+    }
+
     /// Build a [`JudgeContext`] sharing this runner's harness handles, for the Deep judge
     /// panel / refuter votes the pipeline wrappers invoke (phase 7). The `llm` is read-cloned
     /// from the SAME `RwLock` a stage uses, so a reload is observed at the call boundary. A
@@ -360,6 +381,10 @@ impl PipelineRunner {
         let turn_deletes = Arc::new(AtomicUsize::new(0));
         let mut attempts_remaining = spec.attempts_budget;
         let mut total_retries: u32 = 0;
+        // Phase 8 (FMA-m5): per-ATTEMPT token accounting (not per-stage) — one record per stage
+        // sub-turn, each carrying its own paired usage + resolved backend. Written to
+        // `pipeline_runs.per_attempt_tokens` before finalize so per-run cost is visible.
+        let mut attempt_tokens: Vec<serde_json::Value> = Vec::new();
 
         let _ = pipeline_runs::transition(
             &self.db,
@@ -425,6 +450,7 @@ impl PipelineRunner {
                 let task = stage_task(&stage.prompt_ref, feedback.as_deref());
                 self.run_stage_subturn(&spec, &run_id, stage, effective_tier, task, &turn_deletes, &mut seq)
                     .await;
+                attempt_tokens.push(attempt_token_record(&stage.name, attempt, effective_tier));
 
                 // FMA-C2 review fix: a gate execution error (verifier timeout, mid-gate
                 // cancel/kill, any non-Spawn sandbox error) is a NORMAL exit path, not a setup
@@ -444,6 +470,15 @@ impl PipelineRunner {
                     }
                 };
                 let cur_hash = state_hash(spec.workspace).await;
+                // Phase 8: label this attempt's task trace with the deterministic gate outcome
+                // (GateResult, conf 0.9). Skips VerifierAbsent (a toolchain-missing error, not a
+                // code pass/fail signal). The label NEVER overwrites an explicit-feedback label
+                // (guard lives in `apply_gate_result_label`).
+                match &verdict {
+                    GateVerdict::Pass => self.label_stage_trace(spec.session_id, true).await,
+                    GateVerdict::Fail(_) => self.label_stage_trace(spec.session_id, false).await,
+                    GateVerdict::VerifierAbsent(_) => {}
+                }
                 match verdict {
                     GateVerdict::VerifierAbsent(msg) => {
                         self.emit(RunEvent::GateResult {
@@ -612,6 +647,14 @@ impl PipelineRunner {
                     break 'run;
                 }
                 StageOutcome::Continue => {}
+            }
+        }
+
+        // Persist per-attempt token accounting (FMA-m5) before finalize — best-effort telemetry.
+        if !attempt_tokens.is_empty() {
+            let json = serde_json::Value::Array(attempt_tokens).to_string();
+            if let Err(e) = pipeline_runs::set_per_attempt_tokens(&self.db, &run_id, &json).await {
+                tracing::warn!(run = %run_id, "per_attempt_tokens write failed: {e:#}");
             }
         }
 
@@ -908,6 +951,22 @@ impl PipelineRunner {
         }
         Ok(())
     }
+}
+
+/// One per-ATTEMPT token record (phase 8, FMA-m5). The record SHAPE is per-attempt with a
+/// resolved-backend slot — never a per-stage rollup that could mix Some/None across backends.
+/// Today `complete_tiered` surfaces no usage, so both halves are `None` (an all-or-nothing pair,
+/// the same invariant `agent::outcome::pair_usage` enforces at the trace-recording boundary) and
+/// `backend` is unresolved; a future usage-returning backend fills these per attempt.
+fn attempt_token_record(stage: &str, attempt: u32, tier: Option<Tier>) -> serde_json::Value {
+    serde_json::json!({
+        "stage": stage,
+        "attempt": attempt,
+        "tier": tier_name(tier),
+        "backend": Option::<String>::None,
+        "prompt_tokens": Option::<i64>::None,
+        "completion_tokens": Option::<i64>::None,
+    })
 }
 
 /// Compose a stage's sub-turn task from its authored prompt reference plus any retry feedback.

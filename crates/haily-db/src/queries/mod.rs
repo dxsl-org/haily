@@ -11,6 +11,7 @@ pub mod notes;
 pub mod nudge_ledger;
 pub mod pipeline_runs;
 pub mod reminders;
+pub mod review_findings;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;

@@ -334,6 +334,9 @@ impl Adapter for CliAdapter {
             Notification::ReminderFired { title, .. } => {
                 format!("\n⏰ Reminder: {title}\n")
             }
+            Notification::DistillationProposal { summary, rule_count, .. } => {
+                format!("\n[Distillation proposal — {rule_count} rule(s)]\n{summary}\n")
+            }
         };
         stdout.write_all(text.as_bytes()).await?;
         stdout.flush().await?;
