@@ -1,14 +1,19 @@
+pub mod browser;
+pub mod coding;
 pub mod connector;
+pub mod exec;
 pub mod journal_undo;
+pub mod lsp;
 pub mod schedule;
 pub mod security;
+pub mod skill_fetch;
 pub mod v1;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_types::ApprovalGate;
+use haily_types::{ApprovalGate, DepthMode};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -84,6 +89,20 @@ pub struct ToolContext {
     /// within one turn, so reset-then-read around a single `execute()` call can never
     /// observe another call's value (see `tool_call.rs`'s no-cross-tool-bleed test).
     pub last_journal_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// Active pipeline run id (Sub-Agent + Skill Architecture phase 4b) — `Some` ONLY for
+    /// a stage sub-turn the pipeline runner drives, so every journal row a stage writes
+    /// (coding-audit + local-tool) is stamped with the run and groups under one `undo_run`.
+    /// `None` for every ordinary chat/delegation turn (the runner is the sole setter). Kept
+    /// server-side and never sourced from LLM/tool text — a compromised sub-agent cannot
+    /// forge or alter another run's grouping.
+    pub run_id: Option<String>,
+    /// Judgment depth for this turn (Sub-Agent + Skill Architecture phase 7). Threaded
+    /// SERVER-SIDE from the L0 turn's effective depth (a GUI toggle or a genuine
+    /// user-message phrase) down through every delegation, so a delegated sub-agent inherits
+    /// the user's chosen depth and the LLM can never self-escalate to `Deep` by forging it.
+    /// `DepthMode::Normal` for every ordinary path (the default); only `run_turn` sets a
+    /// non-default value and only from a user-sourced signal.
+    pub depth_mode: DepthMode,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so
@@ -161,6 +180,7 @@ impl ToolRegistry {
     /// Register all V1 tools.
     pub fn build_v1() -> Self {
         let mut reg = Self::new();
+        use coding::*;
         use v1::{
             calendar::*, memory::*, notes::*, reminders::*, tasks::*, web::*, work_items::*,
             worktree_tool::*,
@@ -192,6 +212,32 @@ impl ToolRegistry {
             Arc::new(WorkItemResumeTool) as Arc<dyn Tool>,
             Arc::new(WorkItemDeleteTool) as Arc<dyn Tool>,
             Arc::new(WorktreeApplyTool) as Arc<dyn Tool>,
+            // Coding tool surface (Sub-Agent + Skill Architecture phase 1) — registered here,
+            // whitelisted only for the developer domain + coding specialists via sub_registry.
+            Arc::new(FsReadTool) as Arc<dyn Tool>,
+            Arc::new(FsListTool) as Arc<dyn Tool>,
+            Arc::new(FsGrepTool) as Arc<dyn Tool>,
+            Arc::new(FsWriteTool) as Arc<dyn Tool>,
+            Arc::new(FsEditTool) as Arc<dyn Tool>,
+            Arc::new(FsMoveTool) as Arc<dyn Tool>,
+            Arc::new(FsDeleteTool) as Arc<dyn Tool>,
+            Arc::new(ShellExecTool) as Arc<dyn Tool>,
+            Arc::new(GitStatusTool) as Arc<dyn Tool>,
+            Arc::new(GitDiffTool) as Arc<dyn Tool>,
+            Arc::new(GitCommitTool) as Arc<dyn Tool>,
+            Arc::new(crate::exec::code_exec::CodeExecTool) as Arc<dyn Tool>,
+            // Authored-skill discovery + lazy-load (Sub-Agent + Skill Architecture phase 2)
+            // — universal Read-tier tools, whitelisted for L0 + every domain + specialist.
+            Arc::new(skill_fetch::SkillSearchTool) as Arc<dyn Tool>,
+            Arc::new(skill_fetch::SkillListSectionsTool) as Arc<dyn Tool>,
+            Arc::new(skill_fetch::SkillFetchTool) as Arc<dyn Tool>,
+            // Language-Server semantic layer (Sub-Agent + Skill Architecture phase 10) —
+            // whitelisted for the developer domain via `domains`. `lsp_diagnostics` = Read (a
+            // hint layer alongside the build gate), `lsp_rename` = ReversibleWrite (journaled
+            // like fs_edit). Both no-op cleanly when no server is on PATH (graceful degradation),
+            // so they register + resolve unconditionally with no cargo feature gate.
+            Arc::new(lsp::LspDiagnosticsTool) as Arc<dyn Tool>,
+            Arc::new(lsp::LspRenameTool) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }
@@ -204,6 +250,18 @@ impl ToolRegistry {
         reg.register(Arc::new(journal_undo::JournalUndoTool {
             resolver: journal_undo::ConnectorResolver::new(),
         }));
+        // Stealth browser tools (Phase 13) — registered ONLY under the `browser` cargo feature
+        // (default OFF, so `cargo test --workspace` needs no Chromium). Whitelisted for the
+        // researcher/web domains via `sub_registry`, never the coding developer domain. When the
+        // feature is off these names simply do not resolve — exactly the connector-op inert
+        // pattern — and `sub_registry` skips them. `browser_navigate` = Read; `browser_interact`
+        // mutations + `browser_session` import/clear = IrreversibleWrite → ApprovalGate.
+        #[cfg(feature = "browser")]
+        {
+            reg.register(Arc::new(browser::BrowserNavigateTool));
+            reg.register(Arc::new(browser::BrowserInteractTool::new()));
+            reg.register(Arc::new(browser::BrowserSessionTool));
+        }
         reg
     }
 
@@ -392,6 +450,10 @@ mod tests {
             "work_item_list",
             "work_item_resume",
             "feedback_react",
+            // Phase 2 skill lazy-load tools — also L0 quick tools.
+            "skill_search",
+            "skill_list_sections",
+            "skill_fetch",
         ] {
             assert!(base.get(name).is_some(), "missing quick tool: {name}");
         }

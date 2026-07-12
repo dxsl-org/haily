@@ -166,6 +166,7 @@ mod tests {
             relevant_facts,
             feedback_directives: vec![],
             active_skills: vec![],
+            skill_routing_table: String::new(),
         }
     }
 

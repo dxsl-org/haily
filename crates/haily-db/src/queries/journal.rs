@@ -55,6 +55,16 @@ pub struct ActionJournalRow {
     /// time — a mismatch means the manifest moved/changed since this write and the
     /// compensation must refuse rather than target a base_url/schema the write never touched.
     pub manifest_hash: Option<String>,
+    /// The `coding_workspaces.id` a coding-tool write executed inside (migration 0025).
+    /// `None` for every non-coding row (local personal tools, connector writes) and any
+    /// row written before that migration. Audit/grouping only — the worktree, not this
+    /// column, is the authoritative compensator for a coding change.
+    pub workspace_id: Option<String>,
+    /// Correlation id shared by every journal row written during ONE pipeline run
+    /// (migration 0026) — lets `list_by_run` collect a run's writes for group undo, mirroring
+    /// `turn_id`. `None` for any non-pipeline row (chat turns, connector writes) and any row
+    /// written before this column existed.
+    pub run_id: Option<String>,
 }
 
 /// Fields required to record a write. Grouped so `insert` stays within a sane arity and
@@ -84,8 +94,16 @@ pub struct NewAction<'a> {
 
 /// Shared insert body for [`insert`]/[`insert_tx`] — generic over any sqlx `Executor` so the
 /// pool and transaction-scoped callers share one copy of the SQL/bind-list instead of two
-/// hand-kept-in-sync copies.
-async fn insert_via<'e, E>(exec: E, a: NewAction<'_>) -> Result<ActionJournalRow>
+/// hand-kept-in-sync copies. `workspace_id` and `run_id` are threaded as separate parameters
+/// rather than `NewAction` fields so the coding-tool / pipeline audit paths (the only writers
+/// that set them) can record them without forcing `workspace_id: None` / `run_id: None` onto
+/// every existing connector/local `NewAction` literal in the workspace.
+async fn insert_via<'e, E>(
+    exec: E,
+    a: NewAction<'_>,
+    workspace_id: Option<&str>,
+    run_id: Option<&str>,
+) -> Result<ActionJournalRow>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -98,8 +116,8 @@ where
              (id, session_id, tool_name, tool_tier, compensability, idempotency_key,
               correlation_ref, request_params, pre_state, pre_state_version,
               readback_status, compensation_plan, undo_status, undo_attempts,
-              created_at, retention_expires_at, turn_id, manifest_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?, ?)
+              created_at, retention_expires_at, turn_id, manifest_hash, workspace_id, run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'not_requested', 0, ?, ?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -117,6 +135,8 @@ where
     .bind(&retention_expires_at)
     .bind(a.turn_id)
     .bind(a.manifest_hash)
+    .bind(workspace_id)
+    .bind(run_id)
     .fetch_one(exec)
     .await?)
 }
@@ -128,7 +148,44 @@ where
 /// Returns an error on a UNIQUE conflict on `idempotency_key` (a duplicate submit of the
 /// same logical op) or any DB failure.
 pub async fn insert(db: &DbHandle, a: NewAction<'_>) -> Result<ActionJournalRow> {
-    insert_via(db.pool(), a).await
+    insert_via(db.pool(), a, None, None).await
+}
+
+/// Coding-tool audit insert (Sub-Agent + Skill Architecture phase 1): identical to [`insert`]
+/// but stamps `workspace_id` so the row can be grouped by its owning `CodingWorkspace`, and
+/// `run_id` (phase 4) so a whole pipeline run's file changes group under one `list_by_run`.
+/// This is an AUDIT row — the worktree, not this row, is the authoritative compensator for the
+/// file change (a coding undo is a `git checkout -- . && git clean -ffdx`, never a DB
+/// restore), so no `compensation_plan`/`pre_state` snapshot of file bytes is stored.
+///
+/// `run_id` is `None` for a coding write outside a pipeline (an ad-hoc coding sub-turn); the
+/// runner (P4b) threads the active run id here for in-pipeline writes.
+///
+/// # Errors
+/// Returns an error on a UNIQUE conflict on `idempotency_key` or any DB failure.
+pub async fn insert_coding_audit(
+    db: &DbHandle,
+    a: NewAction<'_>,
+    workspace_id: &str,
+    run_id: Option<&str>,
+) -> Result<ActionJournalRow> {
+    insert_via(db.pool(), a, Some(workspace_id), run_id).await
+}
+
+/// All coding-tool audit rows for one workspace, newest first (JournalBrowser grouping).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_by_workspace(
+    db: &DbHandle,
+    workspace_id: &str,
+) -> Result<Vec<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE workspace_id = ? ORDER BY created_at DESC",
+    )
+    .bind(workspace_id)
+    .fetch_all(db.pool())
+    .await?)
 }
 
 /// Transaction-scoped variant of [`insert`] — the LOCAL-tool write path (phase 1) needs the
@@ -143,7 +200,7 @@ pub async fn insert_tx(
     tx: &mut Transaction<'_, Sqlite>,
     a: NewAction<'_>,
 ) -> Result<ActionJournalRow> {
-    insert_via(&mut **tx, a).await
+    insert_via(&mut **tx, a, None, None).await
 }
 
 /// Shared update body for [`set_readback`]/[`set_readback_tx`] — one copy of the SQL for
@@ -375,6 +432,31 @@ pub async fn list_by_turn(
     .await?)
 }
 
+/// All rows sharing `run_id`, scoped to `session_id` — the pipeline-run analogue of
+/// [`list_by_turn`] (migration 0026). Identical M1 session-scoping rationale: a `run_id`
+/// collision or forgery from another session yields an empty set, not a leak. Used by
+/// `undo_run` to collect a whole run's journaled writes before delegating to `batch_undo`.
+///
+/// `created_at ASC` ordering matches `list_by_turn`; `batch_undo` is order-insensitive for
+/// the FK-free local tables it covers (see its rationale), so ordering here is for readability
+/// only, not correctness.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_by_run(
+    db: &DbHandle,
+    run_id: &str,
+    session_id: &str,
+) -> Result<Vec<ActionJournalRow>> {
+    Ok(sqlx::query_as::<_, ActionJournalRow>(
+        "SELECT * FROM action_journal WHERE run_id = ? AND session_id = ? ORDER BY created_at ASC",
+    )
+    .bind(run_id)
+    .bind(session_id)
+    .fetch_all(db.pool())
+    .await?)
+}
+
 /// Rows still `pending` read-back past a grace window — orphans the startup
 /// reconciliation sweep must classify (C6). The grace window avoids racing a write that
 /// is legitimately still in flight at boot.
@@ -441,6 +523,8 @@ mod tests {
             undone_at: None,
             retention_expires_at: "2026-08-02T00:00:00Z".into(),
             manifest_hash: None,
+            workspace_id: None,
+            run_id: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["sessionId"], "s1");

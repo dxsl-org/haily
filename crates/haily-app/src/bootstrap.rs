@@ -183,9 +183,15 @@ impl AppHandle {
         // before `start_all` begins accepting requests — rather than at construction.
         let resolver = orchestrator.approval_resolver();
         let kill = orchestrator.kill_handle();
+        // Phase 12: the ACP channel replays a session transcript on `session/load` from the
+        // existing `messages` storage. Injected here (post-construction) like the resolver +
+        // kill switch; a channel with no replay surface ignores it via the trait default.
+        let transcript: Arc<dyn haily_types::SessionTranscript> =
+            Arc::new(crate::session_transcript::DbSessionTranscript::new(Arc::clone(&db)));
         for adapter in &adapters {
             adapter.set_approval_resolver(Arc::clone(&resolver));
             adapter.set_kill_switch(Arc::clone(&kill));
+            adapter.set_session_transcript(Arc::clone(&transcript));
         }
 
         let mut builder = AdapterManager::builder();
@@ -273,6 +279,13 @@ impl AppHandle {
     /// pattern.
     pub fn turn_registry(&self) -> Arc<TurnRegistry> {
         Arc::clone(&self.turns)
+    }
+
+    /// Snapshot of every in-flight tool approval across all channels (phase 11a) for the
+    /// unified approvals queue. Delegates to the orchestrator's broker; each entry's
+    /// `session_id` is the auth boundary a UI must respect when offering to resolve it.
+    pub fn pending_approvals(&self) -> Vec<haily_core::PendingApproval> {
+        self.orchestrator.pending_approvals()
     }
 
     /// Number of tasks currently registered on the root `TaskTracker` — dispatch loop,

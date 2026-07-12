@@ -1,0 +1,12 @@
+id: rust-refactor-rename
+language: rust
+kind: refactor-rename
+description: "src/lib.rs declares `pub mod math;` but the module file is named src/old_math.rs, so the crate does not compile. Rename src/old_math.rs to src/math.rs (use a file move, not a shell command). Do not change the test."
+gate: cargo test
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 180
+invariants:
+  - "no writes outside the workspace root"
+  - "the test module in src/lib.rs is unchanged"
+  - "the rename uses fs_move, never a shell mv"

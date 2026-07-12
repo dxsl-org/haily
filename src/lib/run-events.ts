@@ -1,0 +1,120 @@
+// Pure event-folding logic for the cockpit's `RunTimeline` (P11b). Kept out of the
+// component so the reducer is unit-testable and RunJobCard/RunTimeline stay thin.
+// `RunEvent` carries no explicit "run finished" boolean besides `RunComplete.outcome`,
+// which is a free-form string from the runner (P4) — not a typed enum — so status
+// derivation below is a best-effort heuristic, not an authoritative field.
+import type { RunEvent } from './tauri';
+
+export type JobStatus = 'running' | 'paused' | 'complete' | 'failed';
+
+/** One coding run as a long-lived job (not a chat bubble) — the ordered `events` log is
+ * authoritative; the other fields are just a derived headline for the collapsed card. */
+export interface Job {
+  runId: string;
+  sessionId: string;
+  workItemId: string;
+  status: JobStatus;
+  currentStage: string | null;
+  currentTier: string | null;
+  lastAttempt: number | null;
+  events: RunEvent[];
+}
+
+/**
+ * Fold one incoming `RunEvent` into the job map, returning a NEW map (immutable update
+ * for Svelte reactivity — never mutate `jobs` in place). Every event is appended to
+ * `events` in arrival order: the ordered, non-coalescing `haily-run-events` bridge
+ * guarantees nothing is dropped or reordered, so the raw log is the source of truth for
+ * `RunJobCard`'s expanded view; the other fields are only a convenience summary.
+ */
+export function applyRunEvent(jobs: Map<string, Job>, sessionId: string, event: RunEvent): Map<string, Job> {
+  const runId = event.data.run_id;
+  const next = new Map(jobs);
+  const existing = next.get(runId);
+  const job: Job = existing
+    ? { ...existing, events: [...existing.events, event] }
+    : {
+        runId,
+        sessionId,
+        workItemId: event.type === 'RunStarted' ? event.data.work_item_id : '',
+        status: 'running',
+        currentStage: null,
+        currentTier: null,
+        lastAttempt: null,
+        events: [event],
+      };
+
+  if (event.type === 'StageStarted') {
+    job.currentStage = event.data.stage;
+    job.currentTier = event.data.tier ?? job.currentTier;
+    job.status = 'running';
+  } else if (event.type === 'RunPaused') {
+    job.status = 'paused';
+  } else if (event.type === 'Retry') {
+    job.lastAttempt = event.data.attempt;
+    job.status = 'running';
+  } else if (event.type === 'Escalation') {
+    job.currentTier = event.data.to;
+  } else if (event.type === 'RunComplete') {
+    job.status = /fail|error/i.test(event.data.outcome) ? 'failed' : 'complete';
+  }
+
+  next.set(runId, job);
+  return next;
+}
+
+/** Newest-first job order for the timeline list — the most recently active run on top. */
+export function orderedJobs(jobs: Map<string, Job>): Job[] {
+  return [...jobs.values()].reverse();
+}
+
+export interface EventDescriptor {
+  icon: string;
+  text: string;
+  tone: 'info' | 'pass' | 'fail' | 'warn';
+}
+
+/** Render one `RunEvent` as an inert text line for `RunJobCard`. `text` is built from
+ * UNTRUSTED, already tag-stripped repo/tool content (`StageOutput.chunk`, `GateResult.decisive`,
+ * `DiffAvailable.file`, `PlanReady.plan_path`) — callers MUST bind this via `{text}`, never
+ * `{@html}`. */
+export function describeEvent(e: RunEvent): EventDescriptor {
+  switch (e.type) {
+    case 'RunStarted':
+      return { icon: '▶', text: `Run started — work item ${e.data.work_item_id}`, tone: 'info' };
+    case 'StageStarted':
+      return {
+        icon: '▶',
+        text: `Stage: ${e.data.stage}${e.data.tier ? ` (${e.data.tier})` : ''}`,
+        tone: 'info',
+      };
+    case 'StageOutput':
+      return { icon: '·', text: e.data.chunk, tone: 'info' };
+    case 'GateResult':
+      return {
+        icon: e.data.pass ? '✓' : '✗',
+        text: `Gate ${e.data.gate}: ${e.data.pass ? 'passed' : 'failed'} — ${e.data.decisive}`,
+        tone: e.data.pass ? 'pass' : 'fail',
+      };
+    case 'Retry':
+      return { icon: '↻', text: `Retry — attempt ${e.data.attempt}`, tone: 'warn' };
+    case 'Escalation':
+      return { icon: '⇧', text: `Escalated ${e.data.from} → ${e.data.to}`, tone: 'warn' };
+    case 'DiffAvailable':
+      return { icon: '✎', text: `Diff available: ${e.data.file}`, tone: 'info' };
+    case 'ApprovalNeeded':
+      return { icon: '⚠', text: `Approval needed (id …${e.data.approval_id.slice(-8)})`, tone: 'warn' };
+    case 'PlanReady':
+      return { icon: '\u{1F4CB}', text: `Plan ready: ${e.data.plan_path}`, tone: 'info' };
+    case 'RunPaused':
+      return { icon: '⏸', text: `Paused — ${e.data.reason}`, tone: 'warn' };
+    case 'RunComplete': {
+      const failed = /fail|error/i.test(e.data.outcome);
+      return { icon: failed ? '✗' : '✓', text: `Run complete — ${e.data.outcome}`, tone: failed ? 'fail' : 'pass' };
+    }
+    default: {
+      const _exhaustive: never = e;
+      throw new Error(`unhandled RunEvent variant: ${JSON.stringify(_exhaustive)}`);
+    }
+  }
+}

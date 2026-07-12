@@ -1,5 +1,5 @@
 use crate::security;
-use crate::{RiskTier, Tool, ToolContext};
+use crate::{browser, RiskTier, Tool, ToolContext};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -140,37 +140,97 @@ impl Tool for UrlFetchTool {
         RiskTier::Read
     }
 
+    // 3-tier `fetch_strategy` wrapper (Phase 13): plain fetch → on a bot signal, escalate to the
+    // stealth browser (feature-gated) → on a captcha/login wall, return `AWAITING_USER`. Without
+    // the `browser` feature the middle tier is unavailable, so a bot signal goes STRAIGHT to
+    // `AWAITING_USER` (documented). Stays `RiskTier::Read` end-to-end: `browser_navigate` is also
+    // Read, so no approval gate is bypassed by this escalation.
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("url is required"))?;
         let max_chars = args["max_chars"].as_u64().unwrap_or(4000) as usize;
 
-        let resp =
-            security::follow_redirects_with_guard(url, Duration::from_secs(15), |client, url| {
-                client.get(url)
-            })
-            .await?;
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("url_fetch: failed to read response body: {e}"))?;
-
-        let text = if content_type.contains("text/html") {
-            security::html_to_text(&body)
-        } else {
-            body
+        // Tier 1: plain fetch. A transport failure whose message itself carries a bot signal
+        // still escalates; any other transport failure propagates unchanged.
+        let (status, text) = match plain_fetch(url, max_chars).await {
+            Ok(v) => v,
+            Err(e) => {
+                if browser::fetch_strategy::detect_bot_signal(&e.to_string()) {
+                    return escalate_fetch(url, max_chars, _ctx).await;
+                }
+                return Err(e);
+            }
         };
 
-        let trimmed: String = text.chars().take(max_chars).collect();
-        Ok(trimmed)
+        // Prefix the status onto the bot-signal check only for the block codes, so a 403/429/503
+        // challenge with an empty body still trips the signal (parity with the prior Go path that
+        // checked `err.Error()` for the status).
+        let check = if matches!(status, 403 | 429 | 503) {
+            format!("HTTP {status} {text}")
+        } else {
+            text.clone()
+        };
+        match browser::fetch_strategy::after_plain(&check) {
+            browser::fetch_strategy::Escalation::Done => Ok(text),
+            browser::fetch_strategy::Escalation::Browser => escalate_fetch(url, max_chars, _ctx).await,
+            // `after_plain` never returns AwaitingUser — the browser tier decides that.
+            browser::fetch_strategy::Escalation::AwaitingUser => {
+                Ok(browser::fetch_strategy::awaiting_user_json(url, false))
+            }
+        }
     }
+}
+
+/// Tier-1 plain fetch: returns `(http_status, rendered_text)`. HTML bodies are tag-stripped.
+async fn plain_fetch(url: &str, max_chars: usize) -> Result<(u16, String)> {
+    let resp =
+        security::follow_redirects_with_guard(url, Duration::from_secs(15), |client, url| {
+            client.get(url)
+        })
+        .await?;
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| anyhow::anyhow!("url_fetch: failed to read response body: {e}"))?;
+    let text = if content_type.contains("text/html") {
+        security::html_to_text(&body)
+    } else {
+        body
+    };
+    Ok((status, text.chars().take(max_chars).collect()))
+}
+
+/// Tier 2/3: escalate a bot-walled fetch. With the `browser` feature, render via the stealth
+/// browser and, on a captcha/login wall, return `AWAITING_USER` with the browser held open for
+/// the HUMAN to solve (never auto-solved). Without the feature, the browser tier is unavailable,
+/// so return `AWAITING_USER` immediately (the user must open the URL manually).
+#[cfg(feature = "browser")]
+async fn escalate_fetch(url: &str, max_chars: usize, ctx: &ToolContext) -> Result<String> {
+    let nav = browser::BrowserNavigateTool;
+    let rendered = nav
+        .execute(serde_json::json!({ "url": url, "max_chars": max_chars }), ctx)
+        .await?;
+    match browser::fetch_strategy::after_browser(&rendered) {
+        browser::fetch_strategy::Escalation::AwaitingUser => {
+            Ok(browser::fetch_strategy::awaiting_user_json(url, true))
+        }
+        _ => Ok(rendered),
+    }
+}
+
+/// No-`browser`-feature escalation: the stealth-browser tier is unavailable, so a bot signal
+/// resolves straight to `AWAITING_USER` (LOCKED decision 6).
+#[cfg(not(feature = "browser"))]
+async fn escalate_fetch(url: &str, _max_chars: usize, _ctx: &ToolContext) -> Result<String> {
+    Ok(browser::fetch_strategy::awaiting_user_json(url, false))
 }
 
 // ---------------------------------------------------------------------------

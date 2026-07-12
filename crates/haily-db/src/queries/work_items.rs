@@ -18,6 +18,9 @@ pub struct WorkItem {
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
+    /// Workspace-relative path to the plan artifact the Plan Pipeline rendered for this item
+    /// (e.g. `.agents/<slug>/plan.md`); `None` until a plan is linked (migration 0027, P5).
+    pub plan_path: Option<String>,
 }
 
 /// Create a new work item in queued state.
@@ -91,6 +94,32 @@ pub async fn checkpoint(
     .execute(db.pool())
     .await?;
     Ok(())
+}
+
+/// Link a rendered plan artifact to this work item (Plan Pipeline, P5). `plan_path` is a
+/// workspace-relative path (e.g. `.agents/<slug>/plan.md`), the explicit linkage the Build
+/// pipeline (P6) resolves rather than re-deriving the slug.
+///
+/// Returns `true` if an active row was updated, `false` if `id` did not match an active row
+/// (already deleted, or never existed) — mirrors the `rows_affected()` idiom used by
+/// `soft_delete` so a caller can detect a vanished item without a separate SELECT.
+///
+/// # Errors
+/// Returns an error if the DB update fails.
+pub async fn link_plan(db: &DbHandle, id: &str, plan_path: &str) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = sqlx::query(
+        "UPDATE work_items
+         SET plan_path = ?, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(plan_path)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 /// Mark as successfully completed.
@@ -238,4 +267,44 @@ pub async fn reset_stale_running(db: &DbHandle) -> Result<u64> {
     .await?
     .rows_affected();
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queries::sessions;
+
+    async fn db() -> (tempfile::TempDir, DbHandle, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        sessions::create_session(&db, &session_id, "test", None)
+            .await
+            .unwrap();
+        (dir, db, session_id)
+    }
+
+    #[tokio::test]
+    async fn link_plan_sets_path_and_reads_back_on_the_row() {
+        let (_dir, db, session_id) = db().await;
+        let item = create(&db, &session_id, "build the thing").await.unwrap();
+        assert!(item.plan_path.is_none(), "a fresh item has no linked plan");
+
+        let linked = link_plan(&db, &item.id, ".agents/260707-plan/plan.md")
+            .await
+            .unwrap();
+        assert!(linked, "linking an active item must report a row updated");
+
+        let after = get(&db, &item.id).await.unwrap().expect("row");
+        assert_eq!(after.plan_path.as_deref(), Some(".agents/260707-plan/plan.md"));
+    }
+
+    #[tokio::test]
+    async fn link_plan_reports_false_for_a_missing_item() {
+        let (_dir, db, _session_id) = db().await;
+        let linked = link_plan(&db, "does-not-exist", ".agents/x/plan.md")
+            .await
+            .unwrap();
+        assert!(!linked, "linking a non-existent item must report no row updated");
+    }
 }

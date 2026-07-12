@@ -1,5 +1,8 @@
+pub mod authored_skills;
+pub mod distillation;
 pub mod feedback;
 pub mod hnsw;
+pub mod kit_pack;
 pub mod search;
 pub mod skills;
 pub mod system_prompt;
@@ -35,9 +38,16 @@ pub struct KmsHandle {
     hnsw: RwLock<Arc<HnswIndex>>,
     /// Directory holding the HNSW dump files (`hnsw::dump_dir(data_dir)`).
     dump_dir: PathBuf,
+    /// The app data directory (phase 8). The distillation standards-overlay lives HERE, OUTSIDE
+    /// any coding-workspace `fs_write` root (SEC-H) — so an auto-approved `fs_write` can never
+    /// self-persist a prompt injection into the overlay.
+    data_dir: PathBuf,
     /// Prevents two rebuilds (e.g. a tombstone-ratio trigger firing twice in quick
     /// succession from concurrent `index_remove` calls) from running concurrently.
     rebuild_in_progress: AtomicBool,
+    /// In-memory authored-skill registry loaded from the kit-pack (phase-02). Entirely
+    /// separate from the synthesized `kms_skills` lifecycle — file-sourced, read-only.
+    authored: authored_skills::AuthoredRegistry,
     #[cfg(feature = "embeddings")]
     embedder: Arc<Embedder>,
 }
@@ -56,6 +66,10 @@ impl KmsHandle {
         let dump_dir = hnsw::dump_dir(data_dir);
         let hnsw = Self::load_or_rebuild(&db, &dump_dir).await?;
 
+        // Phase-02: load the authored-skill kit-pack (tolerant of absence — a missing or
+        // unverifiable pack logs and yields an empty registry, never fails boot).
+        let authored = Self::load_authored(data_dir);
+
         #[cfg(feature = "embeddings")]
         let embedder = {
             let emb = tokio::task::spawn_blocking(Embedder::init).await??;
@@ -66,10 +80,135 @@ impl KmsHandle {
             db,
             hnsw: RwLock::new(Arc::new(hnsw)),
             dump_dir,
+            data_dir: data_dir.to_path_buf(),
             rebuild_in_progress: AtomicBool::new(false),
+            authored,
             #[cfg(feature = "embeddings")]
             embedder,
         })
+    }
+
+    /// Locate and load the kit-pack into an [`authored_skills::AuthoredRegistry`].
+    ///
+    /// Source precedence: `<data_dir>/kit-pack` (the shipped/packaged location) first,
+    /// else a CWD-relative `assets/kit-pack` (dev/`cargo run` from the repo root). Only
+    /// the kit-pack tier is populated today; the merge supports the full 5-tier order.
+    /// Any absence or load failure yields an empty registry (logged, never fatal).
+    fn load_authored(data_dir: &Path) -> authored_skills::AuthoredRegistry {
+        let Some(dir) = Self::kit_pack_source(data_dir) else {
+            tracing::debug!("no kit-pack found — authored-skill registry is empty");
+            return authored_skills::AuthoredRegistry::new();
+        };
+        match kit_pack::load(&dir) {
+            Ok(skills) => {
+                tracing::info!(count = skills.len(), path = %dir.display(), "kit-pack loaded");
+                // kit-pack is the LOWEST precedence tier (user/project tiers, when they
+                // exist, override it by name).
+                authored_skills::AuthoredRegistry::from_tiers(vec![skills])
+            }
+            Err(e) => {
+                tracing::warn!(path = %dir.display(), "kit-pack load failed — continuing without authored skills: {e:#}");
+                authored_skills::AuthoredRegistry::new()
+            }
+        }
+    }
+
+    /// First existing kit-pack directory (one that contains a `manifest.json`).
+    fn kit_pack_source(data_dir: &Path) -> Option<PathBuf> {
+        let packaged = data_dir.join("kit-pack");
+        if packaged.join("manifest.json").is_file() {
+            return Some(packaged);
+        }
+        let dev = PathBuf::from("assets/kit-pack");
+        if dev.join("manifest.json").is_file() {
+            return Some(dev);
+        }
+        None
+    }
+
+    // ---------------------------------------------------------------------
+    // Authored-skill API (phase-02) — thin wrappers over `self.authored`.
+    // ---------------------------------------------------------------------
+
+    /// Compact L0 routing table (name + when_to_use), for the `## Skills` system-prompt
+    /// section. Empty string when no kit-pack is loaded.
+    pub fn authored_routing_table(&self) -> String {
+        self.authored.routing_table()
+    }
+
+    /// Top-`k` authored playbook `(name, body)` pairs relevant to `task`, domain-filtered.
+    /// References stay unloaded (progressive disclosure).
+    pub fn authored_playbooks_for(
+        &self,
+        task: &str,
+        domain: Option<&str>,
+        k: usize,
+    ) -> Vec<(String, String)> {
+        self.authored.playbooks_for(task, domain, k)
+    }
+
+    /// Standard-kind bodies for the named standards (e.g. `["lang-rust"]`), for the
+    /// sub-turn `## Standards` injection after stack detection.
+    pub fn authored_standards_for(&self, names: &[&str]) -> Vec<(String, String)> {
+        self.authored.standards_for(names)
+    }
+
+    /// Path to the distillation standards-overlay file (phase 8). Deliberately under the app
+    /// DATA dir, never a coding-workspace worktree — an auto-approved `fs_write` cannot reach
+    /// it (SEC-H). Its presence is not required; readers fail-open on absence.
+    pub fn standards_overlay_path(&self) -> PathBuf {
+        self.data_dir.join("standards-overlay.md")
+    }
+
+    /// Non-expired, approval-provenanced overlay standards as `(heading, body)` pairs, for the
+    /// sub-turn `## Standards` injection AFTER the kit standards (phase 8). Fail-open (empty on
+    /// any read problem / no overlay yet).
+    pub fn overlay_standards(&self) -> Vec<(String, String)> {
+        let now = chrono::Utc::now().to_rfc3339();
+        distillation::load_overlay_standards(&self.standards_overlay_path(), &now)
+    }
+
+    /// Synthesized skills (confidence ≥ [`skills::SYNTH_SKILL_MIN_CONFIDENCE`]) whose pattern
+    /// matches `task`, as top-`top_n` `(heading, body)` playbook pairs for the sub-turn
+    /// `## Playbooks` pool (phase 8). Source is made visible in each heading. A DB read failure
+    /// yields an empty pool (never an error) — a learning signal must never break a turn.
+    pub async fn synthesized_playbooks_for(&self, task: &str, top_n: usize) -> Vec<(String, String)> {
+        match db_skills::active_skills(&self.db).await {
+            Ok(active) => skills::synthesized_playbooks(
+                &active,
+                task,
+                skills::SYNTH_SKILL_MIN_CONFIDENCE,
+                top_n,
+            ),
+            Err(e) => {
+                tracing::warn!("synthesized_playbooks_for: active_skills read failed: {e:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Enumerate a skill's fetchable sections (`body` + reference chunk ids). Errors on
+    /// an unknown skill.
+    pub fn list_skill_sections(&self, skill: &str) -> Result<Vec<(String, String)>> {
+        self.authored.list_sections(skill)
+    }
+
+    /// Fetch exactly ONE section of a skill (the runtime-mediated lazy-load). Errors on
+    /// an unknown skill or section — never dumps the whole skill.
+    pub fn fetch_skill_section(&self, skill: &str, section: &str) -> Result<String> {
+        self.authored.fetch_section(skill, section)
+    }
+
+    /// Discovery: authored skills relevant to `query` as `(name, when_to_use)`.
+    pub fn search_skills(&self, query: &str, k: usize) -> Vec<(String, String)> {
+        self.authored.search(query, k)
+    }
+
+    /// Every authored (kit-pack) skill's index-level view for the cockpit skills browser
+    /// (phase 11a) — frontmatter only, name-sorted. Synthesized skills are read separately
+    /// from `kms_skills` (they have the EMA/decay lifecycle authored skills do not).
+    pub fn authored_skills_list(&self) -> Vec<authored_skills::AuthoredSkillInfo> {
+        self.authored.list_all()
     }
 
     /// Attempt to load a valid dump; on any failure (including "no dump yet"), fall
@@ -476,6 +615,9 @@ impl KmsHandle {
             relevant_facts: vec![],
             feedback_directives,
             active_skills,
+            // Phase-02: the authored-skill index (progressive-disclosure level 1) that
+            // the `## Skills` system-prompt section renders. Empty when no kit-pack.
+            skill_routing_table: self.authored_routing_table(),
         })
     }
 
@@ -521,6 +663,9 @@ pub struct LifeContext {
     pub feedback_directives: Vec<String>,
     /// Top active skills to guide the LLM toward learned patterns.
     pub active_skills: Vec<SkillSummary>,
+    /// Phase-02: compact authored-skill routing table (name + when_to_use, one line
+    /// each) rendered as the L0 `## Skills` section. Empty when no kit-pack is loaded.
+    pub skill_routing_table: String,
 }
 
 #[derive(Debug, Clone, Default)]

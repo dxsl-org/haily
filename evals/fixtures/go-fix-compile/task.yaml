@@ -1,0 +1,11 @@
+id: go-fix-compile
+language: go
+kind: fix-compile-error
+description: "mathx.go does not compile: Add returns an int64 where an int is required. Fix it so `go test ./...` builds and passes. Do not change the test."
+gate: go test ./...
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 180
+invariants:
+  - "no writes outside the workspace root"
+  - "mathx_test.go is unchanged"

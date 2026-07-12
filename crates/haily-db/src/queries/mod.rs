@@ -1,6 +1,8 @@
 pub mod calendar;
+pub mod coding_workspaces;
 pub mod connectors;
 pub mod episodic;
+pub mod eval_runs;
 pub mod facts;
 pub mod graph;
 pub mod journal;
@@ -8,7 +10,9 @@ pub mod local_snapshot;
 pub mod meta;
 pub mod notes;
 pub mod nudge_ledger;
+pub mod pipeline_runs;
 pub mod reminders;
+pub mod review_findings;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;

@@ -5,10 +5,13 @@
 //! trait + manager) so it must sit above `haily-core` in the dependency graph;
 //! `haily-core` itself stays io-free per the workspace's layering invariant.
 mod auto_approve;
+pub mod cockpit;
 mod config;
 pub mod connector_config;
+pub mod eval;
 pub mod credential_store;
 mod dispatch;
+mod session_transcript;
 mod turns;
 mod watchers;
 
@@ -16,10 +19,18 @@ pub mod bootstrap;
 
 pub use auto_approve::{load_auto_approve, validate_auto_approve};
 pub use bootstrap::{export_database, AppHandle, BootstrapOptions};
+pub use cockpit::{
+    discard_workspace, list_skills, list_workspaces, pin_skill, set_skill_enabled, workspace_diff,
+    SkillView, WorkspaceView,
+};
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
+/// Re-exported so the mode layer (`src-tauri`) can name the approvals-queue snapshot type
+/// without a direct `haily-core` dependency (phase 11a).
+pub use haily_core::PendingApproval;
 pub use credential_store::{CredentialPolicy, CredentialStore};
+pub use eval::run_coding_eval_all;
 pub use turns::TurnRegistry;
-pub use watchers::list_work_items_status;
+pub use watchers::{list_work_items_status, spawn_run_event_bridge};
 
 /// Default data directory, shared by every mode: `<exe_dir>/data/`.
 ///

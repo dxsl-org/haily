@@ -1,0 +1,12 @@
+id: python-add-feature
+language: python
+kind: feature-with-tests
+description: "Implement merge_intervals in intervals.py so pytest passes (it currently raises NotImplementedError). The contract is encoded in test_intervals.py. Do not change the tests."
+gate: pytest -q
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 120
+calibration: hard
+invariants:
+  - "no writes outside the workspace root"
+  - "test_intervals.py is unchanged"

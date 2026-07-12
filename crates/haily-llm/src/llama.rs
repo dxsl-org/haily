@@ -147,13 +147,22 @@ impl LlmClient for LlamaClient {
         let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
         let temperature = req.temperature;
         let n_ctx = self.n_ctx;
+        let grammar = req.grammar.clone();
 
         let model = Arc::clone(&self.model);
 
         let fmt = self.fmt;
         let (raw, actual_prompt_tokens) = tokio::task::spawn_blocking(move || {
             let backend = backend()?;
-            run_inference(backend, &model, &prompt_text, n_ctx, max_tokens, temperature)
+            run_inference(
+                backend,
+                &model,
+                &prompt_text,
+                n_ctx,
+                max_tokens,
+                temperature,
+                grammar.as_deref(),
+            )
         })
         .await
         .context("spawn_blocking panicked")??;
@@ -195,6 +204,7 @@ impl LlmClient for LlamaClient {
         let prompt_text = self.fmt.format(&req.messages);
         let max_tokens = req.max_tokens.unwrap_or(1024) as i32;
         let temperature = req.temperature;
+        let grammar = req.grammar.clone();
 
         tokio::task::spawn_blocking(move || {
             let stop: &[&str] = match fmt {
@@ -225,6 +235,7 @@ impl LlmClient for LlamaClient {
                     n_ctx,
                     max_tokens,
                     temperature,
+                    grammar.as_deref(),
                     |piece| {
                         if cancel.is_cancelled() {
                             return false;
@@ -342,11 +353,21 @@ fn run_inference(
     n_ctx: u32,
     max_new_tokens: i32,
     temperature: f32,
+    grammar: Option<&str>,
 ) -> Result<(String, usize)> {
     // The non-streaming path never stops early (callback always returns `true` =
     // "keep going"), so the full output always matches what streaming would have
     // emitted piece-by-piece — one decode loop, two ways to consume it.
-    run_inference_streaming(backend, model, prompt, n_ctx, max_new_tokens, temperature, |_piece| true)
+    run_inference_streaming(
+        backend,
+        model,
+        prompt,
+        n_ctx,
+        max_new_tokens,
+        temperature,
+        grammar,
+        |_piece| true,
+    )
 }
 
 /// Same decode loop as `run_inference`, but invokes `on_piece(piece)` for every
@@ -359,6 +380,8 @@ fn run_inference(
 /// Returns `(full_output, prompt_token_count)` regardless of whether generation ran
 /// to completion or stopped early — a caller that stopped early via `on_piece`
 /// returning `false` still gets whatever was generated up to that point.
+#[allow(clippy::too_many_arguments)] // one cohesive decode call; splitting into a params
+// struct would obscure the llama.cpp call shape more than the arg count clarifies it.
 fn run_inference_streaming(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -366,6 +389,7 @@ fn run_inference_streaming(
     n_ctx: u32,
     max_new_tokens: i32,
     temperature: f32,
+    grammar: Option<&str>,
     mut on_piece: impl FnMut(&str) -> bool,
 ) -> Result<(String, usize)> {
     // n_ctx=0 is a misconfiguration (empty context window) — reject it up front with a
@@ -406,20 +430,34 @@ fn run_inference_streaming(
     // transform samplers (top_k/top_p/temp) only reshape logits and never set
     // the selected token, leaving `llama_sampler_sample` to return a garbage
     // token (observed as immediate EOG → empty output).
-    let mut sampler = if temperature <= 0.0 {
-        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    //
+    // GBNF (Phase 3): an optional grammar sampler is prepended so it masks logits to
+    // grammar-legal tokens BEFORE the transform/selecting samplers run. Fallback
+    // contract: if grammar-sampler construction fails (unsupported build, malformed
+    // grammar, null bytes) we log::warn and generate UNCONSTRAINED rather than panic or
+    // fail the call — the forced-JSON contracts must survive GBNF being unavailable.
+    let mut samplers: Vec<LlamaSampler> = Vec::new();
+    if let Some(gbnf) = grammar {
+        match LlamaSampler::grammar(model, gbnf, "root") {
+            Ok(grammar_sampler) => samplers.push(grammar_sampler),
+            Err(e) => tracing::warn!(
+                "GBNF grammar sampler init failed ({e}); falling back to unconstrained generation"
+            ),
+        }
+    }
+    if temperature <= 0.0 {
+        samplers.push(LlamaSampler::greedy());
     } else {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        LlamaSampler::chain_simple([
-            LlamaSampler::top_k(40),
-            LlamaSampler::top_p(0.9, 1),
-            LlamaSampler::temp(temperature),
-            LlamaSampler::dist(seed),
-        ])
-    };
+        samplers.push(LlamaSampler::top_k(40));
+        samplers.push(LlamaSampler::top_p(0.9, 1));
+        samplers.push(LlamaSampler::temp(temperature));
+        samplers.push(LlamaSampler::dist(seed));
+    }
+    let mut sampler = LlamaSampler::chain_simple(samplers);
 
     let mut output = String::new();
     let mut n_cur = tokens.len() as i32;

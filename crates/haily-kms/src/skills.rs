@@ -95,6 +95,13 @@ pub const TOOL_ERROR_RATIO_CONFIDENCE: f64 = 0.6;
 pub const REPEAT_REQUEST_CONFIDENCE: f64 = 0.5;
 /// m4: near-zero until Phase 2's local-undo journaling has matured the signal.
 pub const UNDO_LABEL_CONFIDENCE: f64 = 0.05;
+/// Deterministic pipeline gate outcome (compile/test pass-fail) — Sub-Agent + Skill
+/// Architecture phase 8. A verifier gate is a HARD, reproducible signal, so it is weighted
+/// high (0.9), just under [`EXPLICIT_FEEDBACK_CONFIDENCE`]: it is strictly better evidence
+/// than any phrase heuristic, but a human's explicit reaction always outranks it (LOCKED
+/// decision #4). It NEVER overwrites an existing `explicit_feedback` label on a trace — see
+/// [`gate_label_supersedes`].
+pub const GATE_RESULT_CONFIDENCE: f64 = 0.9;
 /// m4 exact predicate window: an `action_journal` row undone within this many
 /// minutes of the CURRENT action's `created_at` counts as `undo_within_5min`.
 pub const UNDO_WINDOW_MINUTES: i64 = 5;
@@ -111,6 +118,8 @@ pub enum LabelSource {
     ToolErrorRatio,
     RepeatRequest,
     UndoWithinN,
+    /// Deterministic pipeline gate outcome (phase 8) — see [`GATE_RESULT_CONFIDENCE`].
+    GateResult,
     Unknown,
 }
 
@@ -122,9 +131,23 @@ impl LabelSource {
             LabelSource::ToolErrorRatio => "tool_error_ratio",
             LabelSource::RepeatRequest => "repeat_request",
             LabelSource::UndoWithinN => "undo_within_n_min",
+            LabelSource::GateResult => "gate_result",
             LabelSource::Unknown => "unknown",
         }
     }
+}
+
+/// Whether a deterministic [`LabelSource::GateResult`] label (phase 8) may overwrite an
+/// EXISTING trace label whose `label_source` string is `existing_source`.
+///
+/// The single anti-reinforcement precedence rule for the gate signal (LOCKED decision #4): a
+/// gate result is high-confidence but ALWAYS sits UNDER a human's explicit feedback, so it may
+/// replace anything EXCEPT an `explicit_feedback` label. `None` (no prior label) is freely
+/// superseded. Kept as one pure predicate so the DB update guard
+/// ([`haily_db::queries::skills::apply_gate_result_label`]) and this precedence contract can
+/// never drift apart.
+pub fn gate_label_supersedes(existing_source: Option<&str>) -> bool {
+    existing_source != Some(LabelSource::ExplicitFeedback.as_str())
 }
 
 /// A turn's outcome label: provenance + confidence weight. `is_unknown()` is the
@@ -240,6 +263,69 @@ pub fn find_matching_skill<'a>(
         .filter(|(_, sim)| *sim >= CLUSTER_SIMILARITY_THRESHOLD)
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(s, _)| s)
+}
+
+/// Minimum confidence a SYNTHESIZED skill must clear before it may be injected into a
+/// sub-agent's `## Playbooks` pool (Sub-Agent + Skill Architecture phase 8, LOCKED decision:
+/// "synthesized skills with confidence ≥0.6 whose pattern matches the task join the ranked
+/// pool"). A skill below this bar NEVER reaches the prompt — it is still learning and must not
+/// steer a sub-agent yet.
+pub const SYNTH_SKILL_MIN_CONFIDENCE: f64 = 0.6;
+
+/// Select synthesized skills to inject into a sub-turn's `## Playbooks` pool (phase 8).
+///
+/// Filters `active` skills to those at or above [`SYNTH_SKILL_MIN_CONFIDENCE`] whose
+/// `description`/`pattern` matches `task` at the same Jaccard bar clustering uses
+/// (`CLUSTER_SIMILARITY_THRESHOLD`), ranks by (match strength, then confidence), takes the top
+/// `top_n`, and renders each as a `(heading, body)` pair with the source made VISIBLE in the
+/// heading (`"{name} (synthesized skill)"`) so provenance is never hidden from the model.
+/// The body is the skill's description plus its steps. Pure over its inputs so the confidence
+/// gate is unit-testable without a DB.
+pub fn synthesized_playbooks(
+    active: &[db_skills::Skill],
+    task: &str,
+    min_confidence: f64,
+    top_n: usize,
+) -> Vec<(String, String)> {
+    let mut scored: Vec<(f32, f64, &db_skills::Skill)> = active
+        .iter()
+        .filter(|s| s.confidence >= min_confidence)
+        .filter_map(|s| {
+            // Match against description AND pattern; take the stronger of the two so a skill
+            // whose PATTERN captures the task (but whose prose description does not) still qualifies.
+            let sim = jaccard(task, &s.description).max(jaccard(task, &s.pattern));
+            (sim >= CLUSTER_SIMILARITY_THRESHOLD).then_some((sim, s.confidence, s))
+        })
+        .collect();
+    // Descending by match strength, then confidence — a partial_cmp fallback keeps NaN-free
+    // f32/f64 comparisons total.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    scored
+        .into_iter()
+        .take(top_n)
+        .map(|(_, _, s)| {
+            let steps: Vec<String> = serde_json::from_str(&s.steps).unwrap_or_default();
+            let body = if steps.is_empty() {
+                s.description.clone()
+            } else {
+                format!(
+                    "{}\nSteps:\n{}",
+                    s.description,
+                    steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, st)| format!("{}. {st}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            (format!("{} (synthesized skill)", s.name), body)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

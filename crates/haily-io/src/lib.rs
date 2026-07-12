@@ -1,6 +1,13 @@
+/// ACP (Agent Client Protocol) coding channel — a 4th `Adapter` speaking newline-delimited
+/// JSON-RPC 2.0 over stdio (phase 12).
+pub mod acp;
 pub mod cli;
 pub mod gui;
 pub mod manager;
+/// Ordered-`RunEvent` delivery defense — the single tag-strip chokepoint (phase 11a).
+pub mod run_event;
+/// Canonical per-channel slash-command registry (phase 11a).
+pub mod slash;
 /// Internal to this crate — pure card accumulation/eviction logic `gui.rs`'s
 /// `Adapter` impl delegates to (phase 08). Not part of the public API surface.
 mod proactive_cards;
@@ -8,9 +15,11 @@ mod proactive_cards;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 
+pub use acp::AcpAdapter;
 pub use cli::CliAdapter;
 pub use gui::{
-    GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiWorkItemsReceiver,
+    GuiAdapter, GuiProactiveReceiver, GuiRequestSender, GuiResponseReceiver, GuiRunEventReceiver,
+    GuiWorkItemsReceiver,
 };
 pub use manager::AdapterManager;
 
@@ -21,8 +30,9 @@ pub use telegram::TelegramAdapter;
 // without importing this adapter layer. Re-exported here so existing call sites
 // (haily-cli, src-tauri, haily-proactive) need no import changes.
 pub use haily_types::{
-    ApprovalResolver, Notification, ProactiveCard, ProactiveCardKind, Request, RequestSender,
-    ResponseChunk, WorkItemStatus,
+    ApprovalResolver, DepthMode, Notification, ProactiveCard, ProactiveCardKind, Request,
+    RequestOrigin, RequestSender, ResponseChunk, RunEvent, SessionTranscript, TranscriptEntry,
+    WorkItemStatus,
 };
 
 use anyhow::Result;
@@ -38,6 +48,20 @@ pub trait Adapter: Send + Sync {
 
     /// Deliver an orchestrator response chunk to the session's origin.
     async fn deliver(&self, session_id: Uuid, chunk: ResponseChunk) -> Result<()>;
+
+    /// Deliver one ordered pipeline [`RunEvent`] to the session's origin (phase 11a).
+    ///
+    /// Distinct from [`Self::deliver`] because a coding-pipeline run is a long-lived job
+    /// with its own ORDERED, NON-COALESCING event log — it must never drop or reorder
+    /// events the way the latest-wins work-item/proactive `watch` channels do. The event
+    /// reaches here already tag-stripped ([`crate::AdapterManager::deliver_run_event`] is
+    /// the single sanitize chokepoint), so a render path may treat it as inert data.
+    ///
+    /// Default no-op: a channel with no run-observability surface (or one wired later)
+    /// need not override it — same post-construction contract as the other trait methods.
+    async fn deliver_run_event(&self, _session_id: Uuid, _event: RunEvent) -> Result<()> {
+        Ok(())
+    }
 
     /// Send a proactive notification (morning brief, alert, reminder fired).
     async fn notify(&self, msg: Notification) -> Result<()>;
@@ -56,6 +80,13 @@ pub trait Adapter: Send + Sync {
     /// surface (e.g. the GUI's Tauri `set_preference`) does not need this. The CLI overrides
     /// it to power its `/writes on|off` command.
     fn set_kill_switch(&self, _kill: Arc<std::sync::atomic::AtomicBool>) {}
+
+    /// Inject a read-only session-transcript provider (phase 12). Same post-construction
+    /// wiring contract as `set_approval_resolver`: `haily-app::bootstrap` calls it once after
+    /// the DB exists, with a `haily-db`-backed implementation. Only the ACP adapter overrides
+    /// it — it replays a session's transcript on `session/load`. Default no-op: a channel with
+    /// no replay surface (GUI, CLI, Telegram) simply never receives one.
+    fn set_session_transcript(&self, _transcript: Arc<dyn haily_types::SessionTranscript>) {}
 
     fn id(&self) -> &str;
 }

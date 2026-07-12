@@ -467,3 +467,30 @@ pub async fn undo_turn(
     let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
     Ok(batch_undo(db, kms, resolver, &ids, session_id).await)
 }
+
+/// Undo every journal row minted under ONE pipeline run (Sub-Agent + Skill Architecture
+/// phase 4) — the run-scoped analogue of [`undo_turn`].
+///
+/// Exactly the same shape and guarantees as `undo_turn`: `list_by_run` is session-scoped
+/// (inherits the M1 boundary — a `run_id` from another session yields an empty set, never a
+/// leak), and this function adds ZERO new undo logic, delegating to the existing
+/// [`batch_undo`] once the group is collected.
+///
+/// NOTE (compensator layering): for a run's CODING rows this reverses only the DB *audit*
+/// rows via `batch_undo`; the authoritative rollback of the file bytes is the worktree
+/// discard (`git checkout -- . && git clean -ffdx`) owned by the runner (P4b), not this
+/// function. Local personal-tool writes captured under the same run undo normally here.
+///
+/// # Errors
+/// Returns an error if the row lookup fails.
+pub async fn undo_run(
+    db: &DbHandle,
+    kms: &KmsHandle,
+    resolver: &ConnectorResolver,
+    run_id: &str,
+    session_id: &str,
+) -> Result<BatchCounts> {
+    let rows = journal::list_by_run(db, run_id, session_id).await?;
+    let ids: Vec<String> = rows.into_iter().map(|r| r.id).collect();
+    Ok(batch_undo(db, kms, resolver, &ids, session_id).await)
+}

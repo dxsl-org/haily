@@ -2,15 +2,17 @@ mod agent;
 pub mod approval;
 mod budget;
 mod context;
+pub mod depth;
 mod delegate;
 mod domains;
 pub mod feedback_parser;
+pub mod pipeline;
 mod specialists;
 mod tag_matcher;
 mod tool_call;
 pub mod worktree;
 
-pub use approval::ApprovalBroker;
+pub use approval::{ApprovalBroker, PendingApproval};
 
 use anyhow::Result;
 use haily_db::DbHandle;
@@ -95,6 +97,10 @@ impl Orchestrator {
             "work_item_list",   // check active/interrupted tasks
             "work_item_resume", // resume a task
             "feedback_react",   // apply in-line user feedback
+            // Authored-skill lazy-load (phase 2) — universal, like Claude Code's Read/Skill.
+            "skill_search",
+            "skill_list_sections",
+            "skill_fetch",
         ];
         // Timeout bounding every external connector call (phase 4). Conservative — an
         // interactive connector op should complete well within this; a hang is treated as
@@ -206,7 +212,16 @@ impl Orchestrator {
                 .iter()
                 .filter(|s| s.parent_domain == domain.tool_name)
             {
-                let l2_reg = Arc::new(base_v1.sub_registry(spec.allowed_tools));
+                // Phase 2: every specialist gets the universal skill lazy-load trio on
+                // top of its narrow whitelist — injected here (not copied into 14
+                // literals) since several specialists share identical tool lists.
+                let mut l2_inner = base_v1.sub_registry(spec.allowed_tools);
+                for name in domains::SKILL_TOOLS {
+                    if let Some(t) = base_v1.get(name) {
+                        l2_inner.register(Arc::clone(t));
+                    }
+                }
+                let l2_reg = Arc::new(l2_inner);
                 l1_reg.register(Arc::new(delegate::DelegateTool {
                     tool_name: spec.tool_name,
                     description: spec.description,
@@ -279,6 +294,17 @@ impl Orchestrator {
         match haily_db::queries::work_items::reset_stale_running(&db).await {
             Ok(n) if n > 0 => tracing::info!(count = n, "work items reset to interrupted"),
             Err(e) => tracing::warn!("failed to reset stale work items: {e:#}"),
+            _ => {}
+        }
+
+        // Sub-Agent + Skill Architecture phase 4b — pipeline resume reconcile (FMA-C1/m4): a
+        // pipeline run left `running`/`queued` by a crash/kill is reset to `interrupted` so it
+        // surfaces for EXPLICIT user resume and never auto-resumes a write stage. Mirrors the
+        // work-item reset above; the persisted `attempts_remaining` bound already survived the
+        // restart, so a resumed run cannot exceed its liveness budget.
+        match haily_db::queries::pipeline_runs::reset_stale_running(&db).await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "pipeline runs reset to interrupted"),
+            Err(e) => tracing::warn!("failed to reset stale pipeline runs: {e:#}"),
             _ => {}
         }
 
@@ -396,6 +422,14 @@ impl Orchestrator {
     /// this Arc is the runtime source of truth, the row is only persistence.
     pub fn kill_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kill)
+    }
+
+    /// Snapshot of every in-flight tool approval across all channels (phase 11a), for the
+    /// unified approvals queue. Reconcile source only — the descriptive tool payload lives
+    /// in the `ToolApprovalRequest` chunk the origin channel received; each entry's
+    /// `session_id` is the auth boundary for resolving it.
+    pub fn pending_approvals(&self) -> Vec<approval::PendingApproval> {
+        self.approval_broker.pending_snapshot()
     }
 
     /// Spawn background workers for skill synthesis (hourly) and decay (daily).
@@ -573,7 +607,7 @@ mod wiring_tests {
     //! silently drops unknown tool names, so a typo in any `allowed_tools` entry
     //! would strip a capability with zero runtime signal — these tests turn that
     //! into a compile-then-test failure instead.
-    use crate::domains::{CONNECTOR_OP_WHITELIST, DOMAINS};
+    use crate::domains::{CONNECTOR_OP_WHITELIST, DOMAINS, SCOUT_CODING_TOOLS};
     use crate::specialists::SPECIALISTS;
     use haily_tools::ToolRegistry;
     use std::sync::atomic::AtomicBool;
@@ -615,6 +649,14 @@ mod wiring_tests {
         let base = base_v1_with_connectors();
         for d in DOMAINS {
             for t in d.allowed_tools {
+                // Browser tools (Phase 13) are registered only under the `browser` cargo feature
+                // (default OFF); like connector ops before a manifest exists, their whitelist
+                // names are inert-but-listed and `sub_registry` skips them when unregistered. In
+                // the default test build they will not resolve, so skip them here — a dedicated
+                // `#[cfg(feature = "browser")]` test in haily-tools asserts they register.
+                if haily_tools::browser::BROWSER_TOOL_NAMES.contains(t) {
+                    continue;
+                }
                 assert!(
                     base.get(t).is_some(),
                     "domain {} references unknown tool {t}",
@@ -642,6 +684,16 @@ mod wiring_tests {
     }
 
     #[test]
+    fn scout_coding_tools_resolve() {
+        // The read-only coding subset (P5 scout stage) must resolve in build_v1 so wiring it
+        // to a future scout sub_registry cannot silently drop a capability.
+        let base = ToolRegistry::build_v1();
+        for t in SCOUT_CODING_TOOLS {
+            assert!(base.get(t).is_some(), "scout coding tool {t} missing from build_v1");
+        }
+    }
+
+    #[test]
     fn all_specialist_whitelists_resolve() {
         let base = ToolRegistry::build_v1();
         for s in SPECIALISTS {
@@ -665,6 +717,58 @@ mod wiring_tests {
                 s.parent_domain
             );
         }
+    }
+
+    #[test]
+    fn skill_tools_resolve_and_reach_every_domain() {
+        // Phase 2: the universal skill lazy-load trio must exist in build_v1 and appear
+        // in every domain's whitelisted sub_registry (domains list them explicitly).
+        use crate::domains::SKILL_TOOLS;
+        let base = ToolRegistry::build_v1();
+        for t in SKILL_TOOLS {
+            assert!(base.get(t).is_some(), "skill tool {t} missing from build_v1");
+        }
+        for d in DOMAINS {
+            let sub = base.sub_registry(d.allowed_tools);
+            for t in SKILL_TOOLS {
+                assert!(
+                    sub.get(t).is_some(),
+                    "domain {} sub_registry is missing skill tool {t}",
+                    d.tool_name
+                );
+            }
+        }
+    }
+
+    /// Phase 7 (apex judge, LOCKED): the `judge` specialist's whitelist is READ-ONLY by
+    /// construction. Its sub-registry must resolve `fs_read`/`fs_grep` and must resolve NO
+    /// write/exec/delegate tool — a judge that cannot write cannot drift into "fixing things",
+    /// which is the inherited hard rule the cost model depends on. `sub_registry` drops any
+    /// name not in the whitelist, so an attempted write tool resolving to `None` IS the proof.
+    #[test]
+    fn judge_specialist_whitelist_is_read_only() {
+        let base = ToolRegistry::build_v1();
+        let judge = SPECIALISTS
+            .iter()
+            .find(|s| s.tool_name == "delegate_to_judge")
+            .expect("judge specialist exists");
+        let sub = base.sub_registry(judge.allowed_tools);
+        for read_tool in ["fs_read", "fs_grep"] {
+            assert!(sub.get(read_tool).is_some(), "judge must resolve read tool {read_tool}");
+        }
+        for write_tool in [
+            "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec", "code_exec", "git_commit",
+        ] {
+            assert!(
+                sub.get(write_tool).is_none(),
+                "judge is read-only — a write/exec tool ({write_tool}) must resolve to nothing"
+            );
+        }
+        // Read-only also means it whitelists no delegation tool (never spawns work).
+        assert!(
+            !judge.allowed_tools.iter().any(|t| t.starts_with("delegate_to")),
+            "judge must not be able to delegate"
+        );
     }
 
     #[test]

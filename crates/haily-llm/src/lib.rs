@@ -1,5 +1,7 @@
 mod breaker;
 mod cloud;
+pub mod escalation;
+pub mod gbnf;
 mod prompt;
 mod router;
 mod sse;
@@ -10,8 +12,11 @@ mod gpu;
 mod llama;
 
 pub use cloud::CloudClient;
+pub use escalation::{Egress, EscalationPolicy};
 pub use prompt::PromptFormat;
-pub use router::{LlmConfig, LlmRouter, Tier, TierModels};
+pub use router::{
+    resolve_model_tier, LlmConfig, LlmRouter, RouterSnapshot, Tier, TierModels,
+};
 
 #[cfg(feature = "llama")]
 pub use llama::LlamaClient;
@@ -62,11 +67,25 @@ pub struct CompletionRequest {
     /// `CompletionRequest::simple`, which leaves this `None` rather than fabricating a
     /// token that can never fire.
     pub cancel: Option<CancellationToken>,
+    /// Optional GBNF grammar constraining generation (Phase 3). `None` = unconstrained
+    /// (today's behavior). Consumed ONLY by the in-process llama backend's sampler
+    /// (`llama.rs`, `#[cfg(feature = "llama")]`); the cloud path ignores it entirely
+    /// (no cloud SSE dialect this crate speaks accepts a grammar param). When a grammar
+    /// is set but the sampler cannot construct it, the backend falls back to
+    /// unconstrained generation rather than failing — see `llama.rs`.
+    pub grammar: Option<String>,
 }
 
 impl CompletionRequest {
     pub fn simple(messages: Vec<Message>) -> Self {
-        Self { messages, max_tokens: Some(2048), temperature: 0.7, tools: None, cancel: None }
+        Self {
+            messages,
+            max_tokens: Some(2048),
+            temperature: 0.7,
+            tools: None,
+            cancel: None,
+            grammar: None,
+        }
     }
 
     /// Attaches a per-turn cancellation token, consumed by streaming backends to abort
@@ -74,6 +93,13 @@ impl CompletionRequest {
     /// `CompletionRequest::simple(msgs).with_cancel(token)`.
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Attaches a GBNF grammar to constrain generation (llama backend only — see the
+    /// `grammar` field). Chainable: `CompletionRequest::simple(msgs).with_grammar(g)`.
+    pub fn with_grammar(mut self, grammar: String) -> Self {
+        self.grammar = Some(grammar);
         self
     }
 }

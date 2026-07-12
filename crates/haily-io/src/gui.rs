@@ -1,12 +1,19 @@
 use crate::proactive_cards::upsert_proactive_card;
 use crate::{
-    Adapter, Notification, ProactiveCard, Request, RequestSender, ResponseChunk, WorkItemStatus,
+    Adapter, Notification, ProactiveCard, Request, RequestSender, ResponseChunk, RunEvent,
+    WorkItemStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
+
+/// Bound on the ordered per-run-event `mpsc` (see `GuiRunEventReceiver`). Generous
+/// enough to absorb a bursty build log without stalling the runner in practice, but
+/// FINITE so a frontend that stops draining applies backpressure to the runner instead
+/// of letting the queue grow unbounded and OOM the process (phase-11 risk note).
+const RUN_EVENT_CHANNEL_CAP: usize = 1024;
 
 /// Decision (phase 08): the old NIL-session chat bubble for `MorningBrief`/`Alert`/
 /// `ReminderFired` is now redundant with the typed `ProactivePanel` card surface, and
@@ -48,6 +55,14 @@ pub type GuiWorkItemsReceiver = watch::Receiver<Vec<WorkItemStatus>>;
 /// best-effort by design; see the phase's Architecture note.
 pub type GuiProactiveReceiver = watch::Receiver<Vec<ProactiveCard>>;
 
+/// Channel type the Tauri app reads from to receive ordered pipeline `RunEvent`s
+/// (phase 11a). Deliberately a bounded `mpsc`, NOT a `watch` like the work-item/proactive
+/// receivers above: a coding run's event log must be delivered in full and in order — a
+/// latest-wins cell would silently coalesce away every stage/gate line except the most
+/// recent, which is exactly wrong for a build log. Backpressure (a full channel makes
+/// `deliver_run_event` await) is the intended overload behavior, never a dropped event.
+pub type GuiRunEventReceiver = mpsc::Receiver<(Uuid, RunEvent)>;
+
 /// Tauri IPC bridge. No Tauri dependency lives here — communication is via channels.
 ///
 /// Tauri side wiring (Phase 10):
@@ -62,6 +77,9 @@ pub struct GuiAdapter {
     work_items_tx: watch::Sender<Vec<WorkItemStatus>>,
     /// Accumulated, per-kind-capped live forward of proactive events — see `GuiProactiveReceiver`.
     proactive_tx: watch::Sender<Vec<ProactiveCard>>,
+    /// Ordered, bounded forward of pipeline `RunEvent`s — see `GuiRunEventReceiver`. NOT a
+    /// `watch`: run events must never coalesce (each stage/gate line matters).
+    run_events_tx: mpsc::Sender<(Uuid, RunEvent)>,
 }
 
 impl GuiAdapter {
@@ -72,20 +90,23 @@ impl GuiAdapter {
         GuiResponseReceiver,
         GuiWorkItemsReceiver,
         GuiProactiveReceiver,
+        GuiRunEventReceiver,
     ) {
         let (req_tx, req_rx) = mpsc::channel::<Request>(64);
         let (resp_tx, resp_rx) = mpsc::channel::<(Uuid, ResponseChunk)>(256);
         let (work_items_tx, work_items_rx) = watch::channel(Vec::new());
         let (proactive_tx, proactive_rx) = watch::channel(Vec::new());
+        let (run_events_tx, run_events_rx) = mpsc::channel::<(Uuid, RunEvent)>(RUN_EVENT_CHANNEL_CAP);
 
         let adapter = GuiAdapter {
             req_rx: Arc::new(Mutex::new(req_rx)),
             resp_tx,
             work_items_tx,
             proactive_tx,
+            run_events_tx,
         };
 
-        (adapter, req_tx, resp_rx, work_items_rx, proactive_rx)
+        (adapter, req_tx, resp_rx, work_items_rx, proactive_rx, run_events_rx)
     }
 }
 
@@ -112,6 +133,17 @@ impl Adapter for GuiAdapter {
             .send((session_id, chunk))
             .await
             .map_err(|_| anyhow::anyhow!("GUI response channel closed"))?;
+        Ok(())
+    }
+
+    /// Forward one ordered `RunEvent` to the Tauri bridge over the bounded, non-coalescing
+    /// `run_events_tx` mpsc. `await`ing a full channel is the intended backpressure (never a
+    /// drop) — the event arrives already tag-stripped from `AdapterManager::deliver_run_event`.
+    async fn deliver_run_event(&self, session_id: Uuid, event: RunEvent) -> Result<()> {
+        self.run_events_tx
+            .send((session_id, event))
+            .await
+            .map_err(|_| anyhow::anyhow!("GUI run-event channel closed"))?;
         Ok(())
     }
 
@@ -145,6 +177,9 @@ impl Adapter for GuiAdapter {
             Notification::MorningBrief(brief) => format!("[Morning Brief]\n{brief}"),
             Notification::Alert { title, body, .. } => format!("{title}\n{body}"),
             Notification::ReminderFired { title, .. } => format!("⏰ {title}"),
+            Notification::DistillationProposal { summary, .. } => {
+                format!("[Distillation proposal]\n{summary}")
+            }
             // Unreachable in practice (the early-return above handles it), but the
             // match must be total: a future refactor removing that guard must degrade
             // to a dropped notification, never panic the always-on daemon.
@@ -183,7 +218,7 @@ mod tests {
     /// itself (see the comment on that arm) if the guard is ever removed.
     #[tokio::test]
     async fn notify_work_items_changed_does_not_panic() {
-        let (adapter, _req_tx, _resp_rx, _wi_rx, _pc_rx) = GuiAdapter::new();
+        let (adapter, _req_tx, _resp_rx, _wi_rx, _pc_rx, _re_rx) = GuiAdapter::new();
 
         let result = adapter.notify(Notification::WorkItemsChanged(vec![])).await;
 
@@ -196,7 +231,7 @@ mod tests {
     /// note requires (never queue, never block on a full channel).
     #[tokio::test]
     async fn notify_work_items_changed_is_latest_wins() {
-        let (adapter, _req_tx, _resp_rx, mut wi_rx, _pc_rx) = GuiAdapter::new();
+        let (adapter, _req_tx, _resp_rx, mut wi_rx, _pc_rx, _re_rx) = GuiAdapter::new();
         let first = vec![WorkItemStatus {
             title: "first".into(),
             status: "running".into(),
@@ -224,7 +259,7 @@ mod tests {
     /// every kind this phase adds a forwarding path for.
     #[tokio::test]
     async fn notify_discrete_proactive_kinds_do_not_panic() {
-        let (adapter, _req_tx, _resp_rx, _wi_rx, _pc_rx) = GuiAdapter::new();
+        let (adapter, _req_tx, _resp_rx, _wi_rx, _pc_rx, _re_rx) = GuiAdapter::new();
 
         for msg in [
             Notification::MorningBrief("brief".into()),
@@ -240,7 +275,7 @@ mod tests {
     /// `resp_tx` chat bubble (which would double-surface the same event).
     #[tokio::test]
     async fn notify_proactive_forwards_card_and_suppresses_chat_bubble() {
-        let (adapter, _req_tx, mut resp_rx, _wi_rx, mut pc_rx) = GuiAdapter::new();
+        let (adapter, _req_tx, mut resp_rx, _wi_rx, mut pc_rx, _re_rx) = GuiAdapter::new();
 
         adapter
             .notify(Notification::Alert { title: "t".into(), body: "b".into(), urgent: true })
@@ -255,13 +290,41 @@ mod tests {
         assert!(matches!(resp_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
     }
 
+    /// The GUI run-event forward is an ordered, bounded mpsc (NOT the latest-wins `watch`
+    /// the work-item/proactive panels use): a burst of `deliver_run_event` calls must all
+    /// arrive, in order — the anti-coalesce guarantee a build log depends on.
+    #[tokio::test]
+    async fn run_events_forward_in_order_without_coalescing() {
+        let (adapter, _req_tx, _resp_rx, _wi_rx, _pc_rx, mut re_rx) = GuiAdapter::new();
+        let session = Uuid::new_v4();
+
+        for seq in 0..4u64 {
+            adapter
+                .deliver_run_event(
+                    session,
+                    RunEvent::StageOutput { run_id: "r".into(), seq, chunk: format!("l{seq}") },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (_sid, ev) = re_rx.recv().await.expect("no run event may be dropped");
+            if let RunEvent::StageOutput { seq, .. } = ev {
+                seen.push(seq);
+            }
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3], "run events must stay ordered, none coalesced");
+    }
+
     /// A burst of `Alert`s must never evict a still-present `MorningBrief` card — the
     /// two kinds live in separate eviction buckets. This is an end-to-end check
     /// through `notify()`; `crate::proactive_cards`'s own tests cover the pure
     /// eviction/cap logic in isolation.
     #[tokio::test]
     async fn alert_burst_does_not_evict_morning_brief() {
-        let (adapter, _req_tx, _resp_rx, _wi_rx, mut pc_rx) = GuiAdapter::new();
+        let (adapter, _req_tx, _resp_rx, _wi_rx, mut pc_rx, _re_rx) = GuiAdapter::new();
 
         adapter.notify(Notification::MorningBrief("today's plan".into())).await.unwrap();
         for i in 0..(crate::proactive_cards::MAX_ALERT_CARDS + 5) {

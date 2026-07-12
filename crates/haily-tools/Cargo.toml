@@ -4,12 +4,23 @@ version.workspace = true
 edition.workspace = true
 description = "Tool implementations — all tools the agent can call in V1"
 
+[features]
+# Live stealth browser CDP driver (Phase 13). Default OFF, mirroring haily-llm's `llama`
+# feature: the DEFAULT workspace build/test/clippy stays green and CI needs no Chromium. The
+# feature-independent stealth JS asset, fetch_strategy escalation + keyword tables, human-behavior
+# math, network-allowed sandbox profile, RiskTier gating, and the CloakBrowser seam detection are
+# ALWAYS compiled + tested; only the chromiumoxide-backed driver (browser/manager.rs, browser/
+# tools.rs) is gated here.
+browser = ["dep:chromiumoxide", "dep:rand", "dep:futures", "dep:base64"]
+
 [dependencies]
 haily-db    = { workspace = true }
 haily-kms   = { workspace = true }
 haily-types = { workspace = true }
 tokio      = { workspace = true }
-tokio-util = { workspace = true }
+# `compat` feature: adapt tokio AsyncRead/Write ↔ futures-io for async-lsp's `run_buffered`
+# (phase 10 LSP transport). `rt` comes from the workspace default (TaskTracker).
+tokio-util = { workspace = true, features = ["compat"] }
 anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
@@ -20,6 +31,31 @@ chrono     = { workspace = true }
 async-trait = "0.1"
 reqwest    = { workspace = true, features = ["rustls-tls"] }
 url        = "2"
+# Coding tool surface (Sub-Agent + Skill Architecture phase 1): bundled content search
+# (fs_grep, no external ripgrep) + glob→regex for fs_list.
+regex      = "1"
+# Language-Server semantic layer (Sub-Agent + Skill Architecture phase 10). `lsp-types` =
+# the pure-serde LSP protocol structs (initialize/diagnostics/rename/WorkspaceEdit) so the
+# protocol is never hand-rolled; `async-lsp` = the JSON-RPC-over-stdio transport framework.
+# Both are pure Rust (no C link) so no tree-sitter/sqlx-class link collision. Feature-INDEPENDENT
+# (not gated): graceful degradation is the default path, so the client + registry + dedup logic
+# compile and test on every build without a live server present.
+# Pinned to 0.95 to MATCH async-lsp 0.2.4's own lsp-types dep — a single resolved version so the
+# `Notification`/`Request` trait bounds on async-lsp's Router/ServerSocket unify with our direct
+# `use lsp_types::...` (two versions would make them distinct, incompatible types).
+lsp-types  = "=0.95.1"
+async-lsp  = { version = "0.2", features = ["tokio"] }
+# Used in production by the coding surface: ephemeral scratch roots for `code_exec`, empty
+# hooks dir for `git_safe_args`.
+tempfile   = "3"
+# Phase 13 stealth browser (LIVE CDP driver only — all optional, pulled in by the `browser`
+# feature; the default build never compiles them). chromiumoxide = async CDP driver;
+# rand = runtime human-behavior/CDP jitter; futures = polling the CDP handler stream;
+# base64 = screenshot/PDF data-URI encoding.
+chromiumoxide = { version = "0.9", optional = true }
+rand    = { version = "0.8", optional = true }
+futures = { workspace = true, optional = true }
+base64  = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

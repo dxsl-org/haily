@@ -2,10 +2,10 @@
 //! fires exactly once per day (cooldown) and that the cooldown is PERSISTENT (survives
 //! a simulated daemon restart), closing the in-process-`HashSet` regression this phase
 //! replaced.
-use super::super::run_tick;
+use super::super::{run_tick, run_tick_at};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use haily_db::{
     queries::{
         calendar::{self, NewCalendarEvent},
@@ -94,7 +94,10 @@ async fn link(db: &DbHandle, task_id: &str, event_id: &str) {
 async fn each_mvp_condition_fires_once_and_a_same_session_second_tick_is_suppressed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = DbHandle::init(&dir.path().join("cross.db")).await.expect("db init");
-    let now = Utc::now();
+    // Fixed mid-day `now` (not `Utc::now()`): the "later today" condition filters events by
+    // same-UTC-date prefix, so a real clock in the last hours of a UTC day would push the
+    // `now + 3h` fixture into tomorrow and drop one nudge. Noon keeps every offset in-day.
+    let now = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).single().expect("valid instant");
 
     let prep_event = insert_event(&db, "Standup", &(now + Duration::minutes(5)).to_rfc3339()).await;
     let prep_task = insert_task(&db, "Chuẩn bị slide", None).await;
@@ -111,12 +114,12 @@ async fn each_mvp_condition_fires_once_and_a_same_session_second_tick_is_suppres
     link(&db, &blocking_task.id, &blocked_event.id).await;
 
     let (am, notifications) = adapter_manager();
-    run_tick(&db, &am).await;
+    run_tick_at(&db, &am, now).await;
 
     let fired = titles(&notifications);
     assert_eq!(fired.len(), 5, "expected exactly one nudge per condition, got {fired:?}");
 
-    run_tick(&db, &am).await;
+    run_tick_at(&db, &am, now).await;
     assert_eq!(
         titles(&notifications).len(),
         5,

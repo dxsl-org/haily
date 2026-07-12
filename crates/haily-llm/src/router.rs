@@ -52,11 +52,142 @@ use crate::LlamaClient;
 /// auto-routing is deliberately NOT implemented (YAGNI until a task-outcome
 /// quality signal exists) — today a tier only changes which *cloud model name*
 /// a completion uses, never the backend/provider itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// ORDINAL ORDERING (Phase 3): variants are declared low→high (`Fast < Medium <
+/// Thinking < Ultra`) so the derived `PartialOrd`/`Ord` matches the HailyKit
+/// model-map vocabulary 1:1 — an escalation `T→T+1` is just `Tier::next()`, and a
+/// `max_tier` cap is a `<=` comparison. Do NOT reorder these variants: the derive
+/// keys off declaration order, so a reorder silently inverts every tier comparison.
+///
+/// `Ultra` is *cloud-effective-only* (DEP-1): it names one more cloud-model-name
+/// override, never a new backend. ollama-style local backends map `Thinking`+`Ultra`
+/// to the same loaded GGUF, so a local-only escalation to `Ultra` short-circuits to a
+/// no-op — handled by the egress cap in [`crate::escalation`], not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tier {
     Fast,
     Medium,
     Thinking,
+    Ultra,
+}
+
+impl Tier {
+    /// The next-higher tier, or `None` at the ceiling (`Ultra`). Used by
+    /// [`crate::escalation::EscalationPolicy`] to compute a `T→T+1` step; the policy
+    /// applies the `max_tier`/egress cap on top of this raw successor.
+    pub fn next(self) -> Option<Tier> {
+        match self {
+            Tier::Fast => Some(Tier::Medium),
+            Tier::Medium => Some(Tier::Thinking),
+            Tier::Thinking => Some(Tier::Ultra),
+            Tier::Ultra => None,
+        }
+    }
+}
+
+/// Curated `model_name → Tier` map — an OFFLINE-derived subset of the HailyKit
+/// model-map, informed by AutomationBench-AA leaderboard scores (a published proxy
+/// for multi-step multi-tool business-automation quality; Phase 3 spec §External
+/// signal). There is intentionally NO integration code that reads AA at runtime — the
+/// scores inform which tier each model lands in here, nothing more.
+///
+/// Resolution is EXACT-match-first then substring (see [`resolve_model_tier`]) so a
+/// query for `"gpt-5.4"` never fuzzy-hits the `"gpt-5.4-mini"` entry — the substring-bug
+/// fix inherited from the depth-tier plan. An unknown model resolves to `None`
+/// (fail-safe: downstream scaffolds stay ON, tier hints OFF).
+const CURATED_MODEL_TIERS: &[(&str, Tier)] = &[
+    // Fast — small/cheap, single-step reliable.
+    ("gpt-4o-mini", Tier::Fast),
+    ("gpt-5.4-mini", Tier::Fast),
+    ("claude-3-5-haiku", Tier::Fast),
+    ("gemini-1.5-flash", Tier::Fast),
+    // Medium — general-purpose workhorse.
+    ("gpt-4o", Tier::Medium),
+    ("claude-3-5-sonnet", Tier::Medium),
+    ("gemini-1.5-pro", Tier::Medium),
+    // Thinking — strong multi-step reasoning.
+    ("gpt-5.4", Tier::Thinking),
+    ("claude-3-7-sonnet", Tier::Thinking),
+    ("o1", Tier::Thinking),
+    // Ultra — top-tier automation (highest AA band).
+    ("claude-opus-4", Tier::Ultra),
+    ("o1-pro", Tier::Ultra),
+    ("gpt-5.4-pro", Tier::Ultra),
+];
+
+/// Resolve a model name to its routing [`Tier`], preferring caller `overrides` over the
+/// built-in [`CURATED_MODEL_TIERS`], and EXACT match over substring in BOTH.
+///
+/// Two-pass by design (Phase 3 spec step 3): pass 1 requires string equality, so
+/// `"gpt-5.4"` binds to its own `Thinking` entry rather than substring-matching the
+/// longer `"gpt-5.4-mini"` (`Fast`). Only if no exact key exists does pass 2 look for a
+/// curated/override key that is a substring of `model_name` (e.g. a dated deployment id
+/// `"gpt-4o-mini-2024-07-18"` matching `"gpt-4o-mini"`); the LONGEST such key wins so a
+/// more specific entry beats a shorter prefix. **Overrides win over the curated table in
+/// BOTH passes** — pass 2 checks overrides first, so an operator's override is honored even
+/// when a longer curated key would otherwise substring-match. Unknown model → `None` (fail-safe).
+pub fn resolve_model_tier(model_name: &str, overrides: &[(String, Tier)]) -> Option<Tier> {
+    // Pass 1: exact match. Overrides win over the curated table.
+    if let Some((_, t)) = overrides.iter().find(|(k, _)| k == model_name) {
+        return Some(*t);
+    }
+    if let Some((_, t)) = CURATED_MODEL_TIERS.iter().find(|(k, _)| *k == model_name) {
+        return Some(*t);
+    }
+    // Pass 2: substring, OVERRIDES FIRST — any override substring match beats the curated
+    // table (so "overrides win" holds for substrings too, not just exact keys); within each
+    // source the LONGEST matching key wins.
+    longest_substring_match(model_name, overrides.iter().map(|(k, t)| (k.as_str(), *t)))
+        .or_else(|| {
+            longest_substring_match(model_name, CURATED_MODEL_TIERS.iter().map(|(k, t)| (*k, *t)))
+        })
+}
+
+/// The tier of the LONGEST `table` key that is a substring of `model_name` (empty keys
+/// ignored); `None` if none match.
+fn longest_substring_match<'a>(
+    model_name: &str,
+    table: impl Iterator<Item = (&'a str, Tier)>,
+) -> Option<Tier> {
+    let mut best: Option<(usize, Tier)> = None;
+    for (key, tier) in table {
+        if !key.is_empty() && model_name.contains(key) && best.is_none_or(|(len, _)| key.len() > len)
+        {
+            best = Some((key.len(), tier));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// Immutable per-run view of tier→model resolution, captured once at run start.
+///
+/// RED-TEAM FMA-m3 (Phase 3): a live `reload_llm` between escalation attempts would
+/// change tier→model resolution mid-run, corrupting escalation counting and eval
+/// reproducibility. The P4 pipeline runner snapshots this once per run and consults it
+/// for every stage/attempt; a config reload swaps the whole `Arc<LlmRouter>` and thus
+/// only takes effect at the NEXT run boundary. Consumed by P4 — not wired into any live
+/// loop this phase.
+#[derive(Debug, Clone)]
+pub struct RouterSnapshot {
+    default_model: String,
+    tier_models: HashMap<Tier, String>,
+}
+
+impl RouterSnapshot {
+    /// The cloud model name a call at `tier` would use: the tier's configured override
+    /// if present, else the session default model (mirrors `complete_tiered`'s fallback).
+    pub fn model_for_tier(&self, tier: Option<Tier>) -> &str {
+        tier.and_then(|t| self.tier_models.get(&t))
+            .map(String::as_str)
+            .unwrap_or(&self.default_model)
+    }
+
+    /// The session's effective tier, derived from its default model via
+    /// [`resolve_model_tier`]. `None` when the default model is not in the curated
+    /// table or `overrides` (fail-safe — feeds P7's "scaffold when tier < ultra" hint).
+    pub fn session_tier(&self, overrides: &[(String, Tier)]) -> Option<Tier> {
+        resolve_model_tier(&self.default_model, overrides)
+    }
 }
 
 /// Optional cloud model-name override per tier. Every field defaults to `None`,
@@ -67,6 +198,7 @@ pub struct TierModels {
     pub fast: Option<String>,
     pub medium: Option<String>,
     pub thinking: Option<String>,
+    pub ultra: Option<String>,
 }
 
 impl TierModels {
@@ -75,6 +207,7 @@ impl TierModels {
             Tier::Fast => self.fast.as_deref(),
             Tier::Medium => self.medium.as_deref(),
             Tier::Thinking => self.thinking.as_deref(),
+            Tier::Ultra => self.ultra.as_deref(),
         }
     }
 }
@@ -148,6 +281,7 @@ fn build_tier_clients(config: &LlmConfig) -> HashMap<Tier, Arc<dyn LlmClient>> {
         (Tier::Fast, config.tier_models.get(Tier::Fast)),
         (Tier::Medium, config.tier_models.get(Tier::Medium)),
         (Tier::Thinking, config.tier_models.get(Tier::Thinking)),
+        (Tier::Ultra, config.tier_models.get(Tier::Ultra)),
     ] {
         let Some(model) = model else { continue };
         match CloudClient::new(config.cloud_base_url.clone(), config.cloud_api_keys.clone(), model) {
@@ -158,6 +292,20 @@ fn build_tier_clients(config: &LlmConfig) -> HashMap<Tier, Arc<dyn LlmClient>> {
         }
     }
     clients
+}
+
+/// Effective cloud model name for each tier that names an override in `config`.
+/// Captured at `init` into [`LlmRouter`] so [`RouterSnapshot`] can report what each
+/// tier resolves to without holding a live `LlmConfig`. Tiers with no override are
+/// absent (the snapshot falls back to the default model, mirroring `complete_tiered`).
+fn tier_model_names(config: &LlmConfig) -> HashMap<Tier, String> {
+    let mut names = HashMap::new();
+    for tier in [Tier::Fast, Tier::Medium, Tier::Thinking, Tier::Ultra] {
+        if let Some(model) = config.tier_models.get(tier) {
+            names.insert(tier, model.to_string());
+        }
+    }
+    names
 }
 
 /// Routes requests to the best available LLM backend.
@@ -173,6 +321,13 @@ pub struct LlmRouter {
     /// `primary` in that case. Built once at `init`/`reload_llm` time so a
     /// hot-swap picks up new tier overrides exactly like the primary does.
     tier_clients: HashMap<Tier, Arc<dyn LlmClient>>,
+    /// Default (session) model name — `LlmConfig::cloud_model` at init time. Feeds
+    /// [`RouterSnapshot`] only; routing itself never consults it (that goes through
+    /// `primary`/`tier_clients`).
+    default_model: String,
+    /// Effective model name per tier that has an override, captured at init. Feeds
+    /// [`RouterSnapshot::model_for_tier`] — see [`tier_model_names`].
+    tier_model_names: HashMap<Tier, String>,
 }
 
 impl LlmRouter {
@@ -201,6 +356,12 @@ impl LlmRouter {
         // to locally). Built from the same base_url/keys as `cloud`, one extra
         // `CloudClient` per tier that names an override.
         let tier_clients = build_tier_clients(&config);
+        // Snapshot inputs captured up front: the llama branch below moves
+        // `config.llama_n_ctx` into a `spawn_blocking` closure (disjoint capture keeps
+        // the rest of `config` usable), so compute these before that point to keep the
+        // read sites unambiguous across feature flags.
+        let default_model = config.cloud_model.clone();
+        let tier_model_names = tier_model_names(&config);
 
         #[cfg(feature = "llama")]
         {
@@ -227,6 +388,8 @@ impl LlmRouter {
                         primary: Arc::new(client),
                         fallback: cloud,
                         tier_clients,
+                        default_model,
+                        tier_model_names,
                     },
                     Ok(Err(e)) => tracing::warn!("llama.cpp load failed: {e:#}"),
                     Err(e)     => tracing::warn!("llama.cpp spawn failed: {e:#}"),
@@ -236,11 +399,34 @@ impl LlmRouter {
 
         if let Some(cloud_client) = cloud {
             tracing::info!("LLM: cloud API ({})", config.cloud_model);
-            return Self { primary: cloud_client, fallback: None, tier_clients };
+            return Self {
+                primary: cloud_client,
+                fallback: None,
+                tier_clients,
+                default_model,
+                tier_model_names,
+            };
         }
 
         tracing::warn!("No LLM backend configured — open Settings → Model LLM");
-        Self { primary: Arc::new(NoopClient), fallback: None, tier_clients }
+        Self {
+            primary: Arc::new(NoopClient),
+            fallback: None,
+            tier_clients,
+            default_model,
+            tier_model_names,
+        }
+    }
+
+    /// Capture an immutable [`RouterSnapshot`] of this router's tier→model resolution.
+    /// The P4 pipeline runner calls this once per run so a live `reload_llm` (which
+    /// swaps the whole `Arc<LlmRouter>`) cannot change resolution mid-run — see
+    /// [`RouterSnapshot`]'s doc for the reproducibility contract.
+    pub fn snapshot(&self) -> RouterSnapshot {
+        RouterSnapshot {
+            default_model: self.default_model.clone(),
+            tier_models: self.tier_model_names.clone(),
+        }
     }
 
     /// Complete a request against a specific model `tier`. Falls back to `primary`
@@ -257,6 +443,19 @@ impl LlmRouter {
 
     pub fn provider_name(&self) -> &str {
         self.primary.provider_name()
+    }
+
+    /// Whether the `Ultra` tier can reach a genuinely cloud-backed model. `Ultra` is
+    /// cloud-effective-only (see [`Tier`]): a local-only backend maps `Thinking`+`Ultra`
+    /// to the one loaded GGUF, so an `Ultra` request there silently collapses to the
+    /// session model. The phase-7 apex-judge/synthesis calls consult this to decide
+    /// whether to warn + fall back to the session tier instead of pretending they
+    /// escalated. `true` when a dedicated Ultra override client exists, the primary is the
+    /// cloud backend, or a cloud fallback is configured; `false` for a local-only setup.
+    pub fn ultra_reachable(&self) -> bool {
+        self.tier_clients.contains_key(&Tier::Ultra)
+            || self.primary.provider_name() == "cloud"
+            || self.fallback.is_some()
     }
 
     /// Context window (tokens) of the currently-active backend, for `haily-core`'s
@@ -451,6 +650,7 @@ mod tier_tests {
                 fast: Some("fast-model".to_string()),
                 medium: None,
                 thinking: None,
+                ultra: None,
             },
             ..LlmConfig::default()
         }
@@ -503,5 +703,133 @@ mod tier_tests {
         let req = CompletionRequest::simple(vec![Message::user("hi")]);
         let err = router.complete_tiered(Some(Tier::Fast), req).await.expect_err("no backend configured");
         assert!(err.to_string().contains("Chưa cấu hình LLM"));
+    }
+
+    /// CRITICAL regression (Phase 3): with NO tier overrides configured,
+    /// `complete_tiered(None, ..)` and `complete_tiered(Some(any_tier), ..)` must both
+    /// route to the exact same default model as plain `complete(..)` — zero behavior
+    /// change until an operator opts in. The echo server returns the model name used, so
+    /// equal text == same model routed.
+    #[tokio::test]
+    async fn unconfigured_tiers_route_identically_to_default() {
+        let base_url = spawn_model_echo_server().await;
+        // No tier_models at all — the default (unconfigured) shape.
+        #[allow(clippy::needless_update)]
+        let config = LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "default-model".to_string(),
+            ..LlmConfig::default()
+        };
+        let router = LlmRouter::init(config).await;
+
+        let baseline = router
+            .complete(CompletionRequest::simple(vec![Message::user("hi")]))
+            .await
+            .expect("baseline");
+        for tier in [None, Some(Tier::Fast), Some(Tier::Medium), Some(Tier::Thinking), Some(Tier::Ultra)] {
+            let text = router
+                .complete_tiered(tier, CompletionRequest::simple(vec![Message::user("hi")]))
+                .await
+                .expect("tiered");
+            assert_eq!(text, baseline, "unconfigured tier {tier:?} must match default routing");
+        }
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    //! Pure tier-ordering, model→tier resolution, and snapshot tests (no network).
+    use super::*;
+
+    #[test]
+    fn tier_ordinal_ordering_is_fast_lt_medium_lt_thinking_lt_ultra() {
+        assert!(Tier::Fast < Tier::Medium);
+        assert!(Tier::Medium < Tier::Thinking);
+        assert!(Tier::Thinking < Tier::Ultra);
+        // Sanity: the derive keys off declaration order — a reorder would break this.
+        let mut tiers = [Tier::Ultra, Tier::Fast, Tier::Thinking, Tier::Medium];
+        tiers.sort();
+        assert_eq!(tiers, [Tier::Fast, Tier::Medium, Tier::Thinking, Tier::Ultra]);
+    }
+
+    #[test]
+    fn tier_next_steps_up_then_saturates_at_ultra() {
+        assert_eq!(Tier::Fast.next(), Some(Tier::Medium));
+        assert_eq!(Tier::Medium.next(), Some(Tier::Thinking));
+        assert_eq!(Tier::Thinking.next(), Some(Tier::Ultra));
+        assert_eq!(Tier::Ultra.next(), None);
+    }
+
+    #[test]
+    fn resolve_model_tier_exact_match_beats_substring() {
+        // The substring-bug case: `gpt-5.4` must bind to its OWN Thinking entry, never
+        // fuzzy-hit the longer `gpt-5.4-mini` (Fast).
+        assert_eq!(resolve_model_tier("gpt-5.4", &[]), Some(Tier::Thinking));
+        assert_eq!(resolve_model_tier("gpt-5.4-mini", &[]), Some(Tier::Fast));
+    }
+
+    #[test]
+    fn resolve_model_tier_substring_matches_dated_deployment_ids() {
+        // A dated deployment id has no exact entry; the longest curated substring wins.
+        assert_eq!(
+            resolve_model_tier("gpt-4o-mini-2024-07-18", &[]),
+            Some(Tier::Fast),
+            "must prefer the longer `gpt-4o-mini` key over the shorter `gpt-4o`"
+        );
+    }
+
+    #[test]
+    fn resolve_model_tier_unknown_is_none() {
+        assert_eq!(resolve_model_tier("some-unlisted-model-x", &[]), None);
+    }
+
+    #[test]
+    fn resolve_model_tier_user_overrides_win_and_are_exact_first() {
+        let overrides = vec![
+            ("my-local-3b".to_string(), Tier::Fast),
+            ("gpt-4o".to_string(), Tier::Ultra), // re-tier a curated model
+        ];
+        assert_eq!(resolve_model_tier("my-local-3b", &overrides), Some(Tier::Fast));
+        // Override's exact match beats the curated table's own exact `gpt-4o`→Medium.
+        assert_eq!(resolve_model_tier("gpt-4o", &overrides), Some(Tier::Ultra));
+    }
+
+    #[test]
+    fn resolve_model_tier_override_wins_by_substring_over_longer_curated_key() {
+        // Review LOW1: a shorter operator override must beat a longer curated substring key.
+        // `mycorp-gpt-4o-mini` contains both the override `mycorp` (Ultra) and the curated
+        // `gpt-4o-mini` (Fast); the override must win even though its key is shorter.
+        let overrides = vec![("mycorp".to_string(), Tier::Ultra)];
+        assert_eq!(resolve_model_tier("mycorp-gpt-4o-mini", &overrides), Some(Tier::Ultra));
+        // With no override, the curated substring still resolves (fallback intact).
+        assert_eq!(resolve_model_tier("mycorp-gpt-4o-mini", &[]), Some(Tier::Fast));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_default_and_overridden_tier_models() {
+        #[allow(clippy::needless_update)]
+        let config = LlmConfig {
+            cloud_api_keys: vec!["k".to_string()],
+            cloud_base_url: "http://127.0.0.1:1".to_string(),
+            cloud_model: "gpt-4o".to_string(),
+            tier_models: TierModels {
+                fast: Some("gpt-4o-mini".to_string()),
+                medium: None,
+                thinking: None,
+                ultra: Some("claude-opus-4".to_string()),
+            },
+            ..LlmConfig::default()
+        };
+        let router = LlmRouter::init(config).await;
+        let snap = router.snapshot();
+
+        assert_eq!(snap.model_for_tier(None), "gpt-4o", "None → default model");
+        assert_eq!(snap.model_for_tier(Some(Tier::Fast)), "gpt-4o-mini");
+        assert_eq!(snap.model_for_tier(Some(Tier::Ultra)), "claude-opus-4");
+        // A tier with no override falls back to the default model.
+        assert_eq!(snap.model_for_tier(Some(Tier::Medium)), "gpt-4o");
+        // Session tier is derived from the default model (`gpt-4o` → Medium in the table).
+        assert_eq!(snap.session_tier(&[]), Some(Tier::Medium));
     }
 }

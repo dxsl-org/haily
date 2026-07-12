@@ -1,0 +1,3 @@
+# Kit-pack files are sha256-pinned in manifest.json — keep line endings stable (LF)
+# across platforms, or an autocrlf checkout would flip the bytes and fail every hash.
+* text eol=lf

@@ -12,6 +12,9 @@ members = [
     "crates/haily-cli",
     "src-tauri",
 ]
+# Throwaway P0 capability-spike fixtures carry their own `[package]` manifests but are NOT
+# workspace members (they are copied to scratch repos and run standalone against the local model).
+exclude = ["evals"]
 resolver = "2"
 
 [workspace.package]

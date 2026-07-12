@@ -1,0 +1,11 @@
+id: ts-add-feature
+language: typescript
+kind: feature-with-tests
+description: "Implement the slugify function in index.ts so npm test passes (it currently throws). The contract is encoded in index.test.ts. Run npm install first; do not change the test."
+gate: npm test
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 240
+invariants:
+  - "no writes outside the workspace root"
+  - "index.test.ts is unchanged"

@@ -1,0 +1,18 @@
+# SPIKE FIXTURE task manifest (schema mirrors P9 evals/fixtures/*/task.yaml).
+language: rust
+kind: fix-compile-error
+description: >
+  `cargo test` fails to compile: the `add` function in src/lib.rs does not compile.
+  Fix it so the crate builds and all tests pass. Do not change the test.
+gate: cargo test
+# Deterministic pass condition the gate must satisfy (no LLM judge).
+expected:
+  build: pass
+  tests: pass
+max_tool_calls: 25
+max_escalations: 0
+timeout_seconds: 120
+# Invariants the run must not violate.
+invariants:
+  - no writes outside the workspace root
+  - the test module in src/lib.rs is unchanged

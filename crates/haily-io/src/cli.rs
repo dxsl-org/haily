@@ -1,5 +1,6 @@
 use crate::{
-    Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, WorkItemStatus,
+    slash, Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, RunEvent,
+    WorkItemStatus,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -130,6 +131,15 @@ impl Adapter for CliAdapter {
                     continue;
                 }
 
+                // `/help` is the discovery surface (phase 11a) — the canonical slash
+                // registry, rendered identically on every channel. Handled before chat
+                // dispatch so it never reaches the orchestrator as a message.
+                if message == "/help" {
+                    let _ = stdout.write_all(slash::help_text().as_bytes()).await;
+                    stdout.flush().await.ok();
+                    continue;
+                }
+
                 // `/writes on|off` throws or clears the kill switch (C8) live. Handled
                 // before chat dispatch so it never reaches the orchestrator as a message.
                 if let Some(arg) = message.strip_prefix("/writes") {
@@ -155,6 +165,8 @@ impl Adapter for CliAdapter {
                                     adapter_id: "cli".to_string(),
                                     message: undo_message,
                                     user_ref: None,
+                                    depth: Default::default(),
+                                    origin: Default::default(),
                                 })
                                 .await
                                 .is_err()
@@ -220,6 +232,8 @@ impl Adapter for CliAdapter {
                         adapter_id: "cli".to_string(),
                         message,
                         user_ref: None,
+                        depth: Default::default(),
+                        origin: Default::default(),
                     })
                     .await
                     .is_err()
@@ -229,6 +243,18 @@ impl Adapter for CliAdapter {
             }
         });
 
+        Ok(())
+    }
+
+    /// Render an ordered pipeline `RunEvent` to stdout (phase 11a): tool-progress lines,
+    /// a lightweight plan/stage panel, and gate/retry/pause milestones. The modal approval
+    /// path is unchanged — `ApprovalNeeded` here is only an informational ping; the real
+    /// y/n prompt still arrives via `deliver(ToolApprovalRequest)`. Content is already
+    /// tag-stripped at the delivery chokepoint, so it renders as inert text.
+    async fn deliver_run_event(&self, _session_id: Uuid, event: RunEvent) -> Result<()> {
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(render_run_event_line(&event).as_bytes()).await?;
+        stdout.flush().await?;
         Ok(())
     }
 
@@ -332,6 +358,9 @@ impl Adapter for CliAdapter {
             Notification::ReminderFired { title, .. } => {
                 format!("\n⏰ Reminder: {title}\n")
             }
+            Notification::DistillationProposal { summary, rule_count, .. } => {
+                format!("\n[Distillation proposal — {rule_count} rule(s)]\n{summary}\n")
+            }
         };
         stdout.write_all(text.as_bytes()).await?;
         stdout.flush().await?;
@@ -407,6 +436,37 @@ fn parse_undo_command(arg: &str) -> Option<String> {
         return None;
     }
     Some(format!("Undo the action with journal id \"{id}\"."))
+}
+
+/// Render one ordered `RunEvent` as the CLI's stdout line(s) (phase 11a). Pure and
+/// unit-testable. `StageOutput` is the streamed stage content (rendered raw, no framing,
+/// since it is the tool-progress stream itself); every other variant is a bracketed
+/// milestone line. `StageStarted`/`PlanReady` double as the lightweight plan/stage panel.
+fn render_run_event_line(event: &RunEvent) -> String {
+    match event {
+        RunEvent::RunStarted { run_id, .. } => format!("\n▶ [run {run_id}] started\n"),
+        RunEvent::StageStarted { stage, tier, .. } => {
+            let t = tier.as_deref().map(|t| format!(" ({t})")).unwrap_or_default();
+            format!("\n── stage: {stage}{t} ──\n")
+        }
+        // The streamed stage content itself — this IS the tool-progress stream.
+        RunEvent::StageOutput { chunk, .. } => chunk.clone(),
+        RunEvent::GateResult { gate, pass, decisive, .. } => {
+            let mark = if *pass { "✓" } else { "✗" };
+            if *pass || decisive.is_empty() {
+                format!("\n[gate {gate}: {mark}]\n")
+            } else {
+                format!("\n[gate {gate}: {mark}] {decisive}\n")
+            }
+        }
+        RunEvent::Retry { attempt, .. } => format!("\n[retry: attempt {attempt}]\n"),
+        RunEvent::Escalation { from, to, .. } => format!("\n[escalated {from} → {to}]\n"),
+        RunEvent::DiffAvailable { file, .. } => format!("\n[diff ready: {file}]\n"),
+        RunEvent::ApprovalNeeded { .. } => "\n[approval needed — respond at the y/n prompt]\n".to_string(),
+        RunEvent::PlanReady { plan_path, .. } => format!("\n📝 [plan ready: {plan_path}]\n"),
+        RunEvent::RunPaused { reason, .. } => format!("\n⏸ [run paused: {reason}]\n"),
+        RunEvent::RunComplete { outcome, .. } => format!("\n🏁 [run complete: {outcome}]\n"),
+    }
 }
 
 /// Compact status panel rendered above the `You:` prompt when tasks are active.
@@ -573,6 +633,58 @@ mod tests {
         // a pre-phase-3 CLI would have produced.
         assert_eq!(render_tool_result_line("task_delete", true), "[✓ task_delete]\n");
         assert_eq!(render_tool_result_line("task_delete", false), "[✗ task_delete]\n");
+    }
+
+    /// Phase 11a: the CLI renders each `RunEvent` as a distinct stdout form — milestones
+    /// are bracketed lines, while `StageOutput` is the raw streamed content (the
+    /// tool-progress stream itself, no framing).
+    #[test]
+    fn render_run_event_line_formats_each_variant() {
+        assert!(render_run_event_line(&RunEvent::StageStarted {
+            run_id: "r".into(),
+            stage: "build".into(),
+            tier: Some("thinking".into()),
+        })
+        .contains("stage: build (thinking)"));
+
+        // StageOutput is the raw stream — no brackets, returned verbatim.
+        assert_eq!(
+            render_run_event_line(&RunEvent::StageOutput {
+                run_id: "r".into(),
+                seq: 0,
+                chunk: "compiling…".into(),
+            }),
+            "compiling…"
+        );
+
+        let gate = render_run_event_line(&RunEvent::GateResult {
+            run_id: "r".into(),
+            gate: "command".into(),
+            pass: false,
+            decisive: "E0001".into(),
+        });
+        assert!(gate.contains("gate command"));
+        assert!(gate.contains("E0001"));
+
+        assert!(render_run_event_line(&RunEvent::PlanReady {
+            run_id: "r".into(),
+            plan_path: ".agents/x/plan.md".into(),
+        })
+        .contains("plan ready"));
+    }
+
+    /// `deliver_run_event` must not error rendering any variant (it writes to stdout — the
+    /// assertion is that the path is total and panic-free, mirroring the ToolResult test).
+    #[tokio::test]
+    async fn deliver_run_event_renders_without_error() {
+        let cli = CliAdapter::new();
+        for ev in [
+            RunEvent::RunStarted { run_id: "r".into(), work_item_id: "w".into() },
+            RunEvent::StageOutput { run_id: "r".into(), seq: 0, chunk: "x".into() },
+            RunEvent::RunComplete { run_id: "r".into(), outcome: "done".into() },
+        ] {
+            cli.deliver_run_event(Uuid::new_v4(), ev).await.expect("render must not error");
+        }
     }
 
     /// Constructs both a legacy-shaped and an R4-shaped `ToolResult` (reversible +

@@ -16,6 +16,81 @@ pub struct Request {
     pub adapter_id: String,
     pub message: String,
     pub user_ref: Option<String>,
+    /// Judgment-depth requested for this turn (Sub-Agent + Skill Architecture phase 7).
+    /// Set from a GUI toggle OR a VN/EN depth phrase detected in `message` (never from
+    /// tool/pasted content) — `Deep` buys multi-stream judgment (judge panel, refuter
+    /// votes, apex judge) at explicit 3–5× cost. `#[serde(default)]` keeps this ADDITIVE:
+    /// a payload minted before the field existed deserializes to `DepthMode::Normal`, so
+    /// no adapter is forced to set it and the wire envelope stays backward-compatible.
+    #[serde(default)]
+    pub depth: DepthMode,
+    /// Transport that produced this request (Sub-Agent + Skill Architecture phase 9, SEC-H).
+    /// Every I/O adapter (GUI, interactive CLI REPL, Telegram) is a [`RequestOrigin::Chat`]
+    /// transport routing a user message through the orchestrator; [`RequestOrigin::Cli`] is
+    /// reserved for a direct CLI SUBCOMMAND invocation (`haily eval …`) and is the ONLY origin
+    /// permitted to enable eval-mode's privileged plan-gate bypass + ship hard-block.
+    ///
+    /// `#[serde(skip)]` (NOT just `default`) is LOAD-BEARING: origin is an in-process transport
+    /// marker that must NEVER cross a serialization boundary — any Request deserialized from a
+    /// wire/GUI/persisted payload always yields the default [`RequestOrigin::Chat`], so a remote
+    /// or chat payload can never inject `Cli`. Only in-process direct construction (the eval CLI
+    /// entrypoint) sets `Cli`; every adapter leaves it `Chat`.
+    #[serde(skip)]
+    pub origin: RequestOrigin,
+}
+
+/// Request transport origin — the SEC-H structural gate for eval mode (phase 9). See
+/// [`Request::origin`]. Defined in the leaf `haily-types` crate so `Request` can carry it typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestOrigin {
+    /// A user message from an I/O adapter (GUI, CLI REPL, Telegram) — the default. Can never
+    /// enable eval mode.
+    #[default]
+    Chat,
+    /// A direct CLI subcommand invocation (`haily eval …`). The ONLY origin eval mode accepts.
+    Cli,
+}
+
+/// Per-request judgment depth. `Deep` is NEVER auto-selected — it is set only by an
+/// explicit user action (GUI toggle or a genuine user-message phrase); the harness never
+/// escalates to it on its own (phase 7 LOCKED decision). Defined HERE in the leaf
+/// `haily-types` crate — like [`RunEvent`] — so [`Request`] can carry it typed without
+/// `haily-types` depending on `haily-core` (where the phrase mapper + judge machinery
+/// live). `haily-core::depth` re-exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DepthMode {
+    /// Trim stages: skip parallel scout + red-team (plan) and refuter votes (build).
+    Quick,
+    /// The default balanced pipeline.
+    #[default]
+    Normal,
+    /// Add the judge panel (plan Design), refuter votes (build review), and apex-judge
+    /// adjudication at explicit 3–5× cost.
+    Deep,
+}
+
+impl DepthMode {
+    /// Lenient parse of a wire/label string (a GUI toggle value or the phrase-mapper's
+    /// output). An unrecognized value falls back to [`DepthMode::Normal`] — NEVER
+    /// [`DepthMode::Deep`], so a typo can never silently escalate cost (phase 7: Deep is
+    /// only ever reached by an exact, explicit match).
+    pub fn from_label(s: &str) -> DepthMode {
+        match s.trim().to_lowercase().as_str() {
+            "quick" => DepthMode::Quick,
+            "deep" => DepthMode::Deep,
+            _ => DepthMode::Normal,
+        }
+    }
+
+    /// The canonical lowercase label (matches the serde wire form).
+    pub fn as_label(self) -> &'static str {
+        match self {
+            DepthMode::Quick => "quick",
+            DepthMode::Normal => "normal",
+            DepthMode::Deep => "deep",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +176,75 @@ pub enum Notification {
     },
     /// Broadcast when the set of active work items changes (added, progressed, or removed).
     WorkItemsChanged(Vec<WorkItemStatus>),
+    /// A learning-loop distillation PROPOSAL surfaced for user approval (Sub-Agent + Skill
+    /// Architecture phase 8, DEP-C2). Emitted from `haily-core` when the pipeline's recurrence
+    /// detector finds ≥2 same-class review findings across runs; carries only the rendered,
+    /// already-tag-stripped proposal text — NEVER a silent write to standards. Approval (a
+    /// separate, explicit user action) is what appends it to the out-of-workspace standards
+    /// overlay (SEC-H). Crosses core→io ONLY as this leaf-type variant over the existing mpsc,
+    /// mapped to a [`ProactiveCardKind::DistillationProposal`] card by [`ProactiveCard::from_notification`]
+    /// — `haily-core` never imports `haily-io` (CLAUDE.md layering invariant).
+    DistillationProposal {
+        /// `category:module` class key this proposal addresses — also the dedup/cooldown key
+        /// so a dismissed proposal does not re-fire for the same class within the cooldown.
+        class_key: String,
+        /// The rendered, itemized, tag-stripped proposal text shown to the user.
+        summary: String,
+        /// Number of distilled rules in the proposal.
+        rule_count: u32,
+    },
+}
+
+/// Typed, ordered observability stream for a pipeline RUN (Sub-Agent + Skill Architecture
+/// phase 4). The runner (phase 4b) is the single source of truth for run state, so it emits
+/// this sequence; defined HERE in the leaf `haily-types` crate so `haily-core` can emit it
+/// without importing `haily-io` (the "core never imports io" invariant).
+///
+/// This is the CONTRACT + type only. The ordered delivery channel and per-channel rendering
+/// (GUI timeline, ACP `session/update`, Telegram pings, TUI progress) are built in P11/P12 —
+/// no delivery is wired here.
+///
+/// Follows the ResponseChunk additive convention: `#[serde(tag="type", content="data")]` with
+/// `#[serde(default)]` on any field that may be absent in an older payload, so the wire
+/// envelope stays backward-compatible as variants gain fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "data")]
+pub enum RunEvent {
+    /// A run began. `work_item_id` is the owning long-running item.
+    RunStarted { run_id: String, work_item_id: String },
+    /// A stage began executing. `tier` is the resolved model tier NAME (e.g. `"thinking"`),
+    /// a display string rather than the `haily-llm::Tier` type — `haily-types` is a leaf and
+    /// must not depend on `haily-llm`. `#[serde(default)]` keeps it additive: a stage with no
+    /// tier override, or a pre-`tier` payload, deserializes to `None`.
+    StageStarted {
+        run_id: String,
+        stage: String,
+        #[serde(default)]
+        tier: Option<String>,
+    },
+    /// A chunk of a stage's streamed output. `seq` is the per-run monotonic sequence number so
+    /// a consumer can order/dedupe chunks; `chunk` is the (tag-stripped) text.
+    StageOutput { run_id: String, seq: u64, chunk: String },
+    /// A gate finished. `gate` is the gate KIND label (`"command"`/`"artifact"`/`"approval"`,
+    /// never a path or command), `pass` is the verdict, `decisive` is the shortest decisive
+    /// output (empty on pass) — already rendered as inert data by the verifier parser.
+    GateResult { run_id: String, gate: String, pass: bool, decisive: String },
+    /// A verifier-grounded retry of the current stage began. `attempt` is the new 0-based count.
+    Retry { run_id: String, attempt: u32 },
+    /// The current stage escalated its model tier. `from`/`to` are tier NAME strings.
+    Escalation { run_id: String, from: String, to: String },
+    /// A diff is available for review. `file` is the changed path (repo-relative).
+    DiffAvailable { run_id: String, file: String },
+    /// A stage's approval gate needs the user. `approval_id` is the broker's approval id.
+    ApprovalNeeded { run_id: String, approval_id: String },
+    /// A plan artifact is ready for review. `plan_path` is the produced plan file.
+    PlanReady { run_id: String, plan_path: String },
+    /// The run paused (retries exhausted, approval wait, or explicit stop). `reason` is a short
+    /// human-facing cause.
+    RunPaused { run_id: String, reason: String },
+    /// The run reached a terminal state. `outcome` is the terminal RunStatus name
+    /// (`"done"`/`"failed"`) or a short outcome label.
+    RunComplete { run_id: String, outcome: String },
 }
 
 /// A single discrete proactive event, shaped for a dedicated display surface (the
@@ -128,6 +272,10 @@ pub enum ProactiveCardKind {
     MorningBrief { text: String },
     Alert { title: String, body: String, urgent: bool },
     ReminderFired { reminder_id: Uuid, title: String },
+    /// A learning-loop distillation proposal awaiting user approval (phase 8) — the card
+    /// surface of [`Notification::DistillationProposal`]. Display + approve/dismiss only; the
+    /// approve action (wired at the app/GUI layer) is the sole path that writes the overlay.
+    DistillationProposal { class_key: String, summary: String, rule_count: u32 },
 }
 
 impl ProactiveCard {
@@ -146,6 +294,15 @@ impl ProactiveCard {
             Notification::ReminderFired { reminder_id, title } => ProactiveCardKind::ReminderFired {
                 reminder_id: *reminder_id,
                 title: title.clone(),
+            },
+            Notification::DistillationProposal {
+                class_key,
+                summary,
+                rule_count,
+            } => ProactiveCardKind::DistillationProposal {
+                class_key: class_key.clone(),
+                summary: summary.clone(),
+                rule_count: *rule_count,
             },
             Notification::WorkItemsChanged(_) => return None,
         };
@@ -203,9 +360,70 @@ pub trait ApprovalGate: Send + Sync {
     }
 }
 
+/// A single persisted transcript entry for session replay (Sub-Agent + Skill Architecture
+/// phase 12). `role` is `"user"`/`"assistant"` (matching `messages.role`); `content` is the
+/// stored message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub role: String,
+    pub content: String,
+}
+
+/// Read-only view of a session's persisted message history, for the ACP channel's
+/// `session/load` transcript replay (phase 12). Lives in the leaf `haily-types` crate so a
+/// `haily-io` adapter can replay a transcript without depending on `haily-db` (the CLAUDE.md
+/// layering invariant) — the DB-backed implementation is constructed at the app layer and
+/// injected post-construction, exactly like [`ApprovalResolver`]. A channel with no replay
+/// surface never needs it (the [`crate` adapter hook][crate] defaults to no injection, which
+/// yields an empty transcript rather than an error).
+#[async_trait]
+pub trait SessionTranscript: Send + Sync {
+    /// Return the session's messages in chronological order (oldest first), or an empty
+    /// vec for an unknown/empty session. MUST NOT error the caller — replay is best-effort
+    /// UX, never a correctness gate, so an implementation that hits a DB error logs and
+    /// returns what it has (possibly empty).
+    async fn transcript(&self, session_id: &str) -> Vec<TranscriptEntry>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_mode_defaults_to_normal_and_is_lowercase_on_the_wire() {
+        assert_eq!(DepthMode::default(), DepthMode::Normal);
+        assert_eq!(serde_json::to_string(&DepthMode::Deep).unwrap(), "\"deep\"");
+        assert_eq!(serde_json::to_string(&DepthMode::Quick).unwrap(), "\"quick\"");
+        assert_eq!(
+            serde_json::from_str::<DepthMode>("\"deep\"").unwrap(),
+            DepthMode::Deep
+        );
+    }
+
+    /// ADDITIVE guarantee: a `Request` payload minted before `depth` existed (no `depth`
+    /// key) must still deserialize, defaulting to `Normal` — never error.
+    #[test]
+    fn request_without_depth_deserializes_to_normal() {
+        let legacy = r#"{"session_id":"00000000-0000-0000-0000-000000000000","adapter_id":"cli","message":"hi","user_ref":null}"#;
+        let req: Request = serde_json::from_str(legacy).expect("legacy Request must deserialize");
+        assert_eq!(req.depth, DepthMode::Normal, "absent depth must default to Normal");
+    }
+
+    #[test]
+    fn request_with_deep_depth_roundtrips() {
+        let req = Request {
+            session_id: Uuid::nil(),
+            adapter_id: "gui".into(),
+            message: "làm kỹ vào".into(),
+            user_ref: None,
+            depth: DepthMode::Deep,
+            origin: RequestOrigin::Chat,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"depth\":\"deep\""));
+        let round: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round.depth, DepthMode::Deep);
+    }
 
     #[test]
     fn response_chunk_serde_roundtrip_preserves_tag_and_content() {
@@ -487,6 +705,47 @@ mod tests {
         assert!(matches!(round_tripped.kind, ProactiveCardKind::Alert { urgent: false, .. }));
     }
 
+    /// Phase 8 (DEP-C2): a `DistillationProposal` notification maps to a card carrying the
+    /// same class key / summary / rule count — the proposal reaches the GUI card surface
+    /// without `haily-core` importing `haily-io`.
+    #[test]
+    fn proactive_card_from_distillation_proposal() {
+        let card = ProactiveCard::from_notification(&Notification::DistillationProposal {
+            class_key: "critical:crates/haily-core".into(),
+            summary: "1. Always handle the None case".into(),
+            rule_count: 1,
+        })
+        .expect("DistillationProposal must produce a card");
+        match card.kind {
+            ProactiveCardKind::DistillationProposal { class_key, summary, rule_count } => {
+                assert_eq!(class_key, "critical:crates/haily-core");
+                assert_eq!(summary, "1. Always handle the None case");
+                assert_eq!(rule_count, 1);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    /// A `DistillationProposal` notification roundtrips through serde faithfully (additive
+    /// enum variant — old payloads simply never carried it).
+    #[test]
+    fn distillation_proposal_notification_roundtrip() {
+        let notif = Notification::DistillationProposal {
+            class_key: "high:crates/haily-db".into(),
+            summary: "1. Validate at the boundary".into(),
+            rule_count: 2,
+        };
+        let json = serde_json::to_string(&notif).expect("serialize");
+        let round: Notification = serde_json::from_str(&json).expect("deserialize");
+        match round {
+            Notification::DistillationProposal { class_key, rule_count, .. } => {
+                assert_eq!(class_key, "high:crates/haily-db");
+                assert_eq!(rule_count, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn work_items_changed_notification_roundtrip() {
         let notif = Notification::WorkItemsChanged(vec![WorkItemStatus {
@@ -504,5 +763,52 @@ mod tests {
             }
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_event_uses_tag_content_envelope() {
+        let ev = RunEvent::GateResult {
+            run_id: "r1".to_string(),
+            gate: "command".to_string(),
+            pass: false,
+            decisive: "verifier rust FAILED (exit 101)".to_string(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"type\":\"GateResult\""));
+        assert!(json.contains("\"data\""));
+        let round_tripped: RunEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, ev);
+    }
+
+    /// Additive convention: `StageStarted.tier` is `Option<String>` + `#[serde(default)]`, so a
+    /// payload minted before `tier` existed (no `tier` key) must still deserialize, defaulting
+    /// to `None` — the same guarantee the ResponseChunk `origin`/`reversible` tests assert, so a
+    /// persisted or in-flight old RunEvent does not break after an upgrade adds fields.
+    #[test]
+    fn run_event_stage_started_tier_absent_payload_deserializes() {
+        let legacy = r#"{"type":"StageStarted","data":{"run_id":"r1","stage":"plan"}}"#;
+        let ev: RunEvent =
+            serde_json::from_str(legacy).expect("legacy StageStarted without tier must deserialize");
+        match ev {
+            RunEvent::StageStarted { run_id, stage, tier } => {
+                assert_eq!(run_id, "r1");
+                assert_eq!(stage, "plan");
+                assert_eq!(tier, None, "absent tier must default to None, not error");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_event_stage_started_tier_roundtrips() {
+        let ev = RunEvent::StageStarted {
+            run_id: "r1".to_string(),
+            stage: "implement".to_string(),
+            tier: Some("thinking".to_string()),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"tier\":\"thinking\""));
+        let round_tripped: RunEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, ev);
     }
 }

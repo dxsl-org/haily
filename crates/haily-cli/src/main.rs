@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use haily_app::{AppHandle, BootstrapOptions};
-use haily_io::{Adapter, CliAdapter};
+use haily_io::{AcpAdapter, Adapter, CliAdapter};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -25,12 +25,41 @@ enum Mode {
     Headless,
     /// Desktop GUI (Tauri) — use `haily gui` or run without a subcommand on desktop
     Gui,
+    /// ACP (Agent Client Protocol) coding channel over stdio (Phase 12). Speaks
+    /// newline-delimited JSON-RPC 2.0 on stdin/stdout so an ACP-capable editor (Zed and
+    /// friends) becomes a code-viewing/reviewing front-end for Haily's coding pipeline.
+    /// stdout is RESERVED for protocol frames — all logs go to stderr.
+    Acp,
     /// Write a consistent standalone copy of the database to the given path (Phase 6,
     /// manual export — same `VACUUM INTO` mechanism the scheduled backup worker uses).
     Export {
         /// Destination file path. The parent directory must already exist; an existing
         /// file at this path is overwritten.
         path: PathBuf,
+    },
+    /// Golden coding eval (Phase 9). CLI-only — the eval-mode plan-gate bypass is never
+    /// reachable from a chat request (SEC-H).
+    Eval {
+        #[command(subcommand)]
+        kind: EvalKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvalKind {
+    /// Run the coding fixtures under `evals/fixtures/` and score them by their own gates.
+    /// Requires `HAILY_EVAL_MODEL` + a configured LLM router; prints guidance and exits
+    /// cleanly when no model host is configured (the baseline matrix is a manual step).
+    Coding {
+        /// Judgment depth: quick | normal | deep (default normal).
+        #[arg(long, default_value = "normal")]
+        depth: String,
+        /// Enable P3 tier escalation on gate failure (the `{off,on}` matrix arm).
+        #[arg(long, default_value_t = false)]
+        escalate: bool,
+        /// Override the fixtures directory (default `evals/fixtures`).
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
     },
 }
 
@@ -41,8 +70,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to STDERR on every mode. This is load-bearing for the ACP channel (Phase 12):
+    // its stdout is reserved for JSON-RPC frames, so a stray log on stdout would corrupt the
+    // stream. Harmless for the other modes — the CLI REPL writes chat via direct stdout writes,
+    // not tracing, and GUI/headless never depended on logs landing on stdout.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Cli::parse();
@@ -53,7 +87,19 @@ async fn main() -> Result<()> {
         Mode::Cli => run_cli(data_dir).await,
         Mode::Headless => run_headless(data_dir).await,
         Mode::Gui => run_gui(),
+        Mode::Acp => run_acp(data_dir).await,
         Mode::Export { path } => run_export(data_dir, path).await,
+        Mode::Eval { kind } => run_eval(data_dir, kind).await,
+    }
+}
+
+/// `haily eval coding …` — the CLI-only coding eval entry (SEC-H: eval mode is minted from a
+/// CLI-origin request inside `haily_app::run_coding_eval_all`, never from a chat request).
+async fn run_eval(data_dir: PathBuf, kind: EvalKind) -> Result<()> {
+    match kind {
+        EvalKind::Coding { depth, escalate, fixtures } => {
+            haily_app::run_coding_eval_all(&data_dir, &depth, escalate, fixtures).await
+        }
     }
 }
 
@@ -81,6 +127,30 @@ async fn run_cli(data_dir: PathBuf) -> Result<()> {
         data_dir.display()
     );
     eprintln!("Type a message and press Enter. Ctrl+D to quit.\n");
+
+    wait_for_shutdown_signal(eof).await;
+    handle.shutdown(SHUTDOWN_TIMEOUT).await;
+    Ok(())
+}
+
+/// `haily acp` — the ACP coding channel over stdio (Phase 12). Wires a single [`AcpAdapter`]
+/// into the standard bootstrap; it plugs into the existing adapter vec, so the approval
+/// resolver, kill switch, and session-transcript provider are injected automatically.
+///
+/// stdout is RESERVED for JSON-RPC frames — every human-facing line here goes to stderr. The
+/// process shuts down when the editor closes stdin (the adapter's EOF token) or on an OS signal.
+async fn run_acp(data_dir: PathBuf) -> Result<()> {
+    let acp = Arc::new(AcpAdapter::new());
+    let eof = acp.eof_token();
+    let adapters: Vec<Arc<dyn Adapter>> = vec![acp];
+    let handle = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default()).await?;
+
+    eprintln!(
+        "Haily — ACP  |  LLM: {}  |  data: {}",
+        handle.orchestrator.llm_provider(),
+        data_dir.display()
+    );
+    eprintln!("ACP stdio server ready. Point an ACP-capable editor (e.g. Zed) at this process.");
 
     wait_for_shutdown_signal(eof).await;
     handle.shutdown(SHUTDOWN_TIMEOUT).await;
