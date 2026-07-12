@@ -120,6 +120,17 @@ The device token authenticates the WS **upgrade**; it does not re-appear in any 
 auth is entirely `session_id`-scoped, checked against the device identity bound to the connection
 at upgrade time.
 
+**v1 is single-active-device-per-session, not full multi-device (P2a review finding 4):** a
+`session_id` is claimed by whichever device FIRST uses it (first-use-wins, `TOFU`) and stays
+bound to that device for as long as the server process runs — a second device presenting the
+same `session_id` is rejected with `SessionUnknown`, exactly like an unpaired/foreign device
+would be. This is NOT "every paired device can see every session"; it is "one session belongs to
+exactly one device, permanently, until that device is revoked or the server restarts" (revocation
+evicts the claim so the `session_id` becomes claimable again — see `MobileAdapter::disconnect_device`
+in P2a). A future multi-device-per-session model (e.g. a shared household session two phones can
+both see) is out of scope for this plan and would need an explicit design, not an accidental
+side effect of the first-use-wins rule.
+
 ## 4. Pairing sequence (HTTP)
 
 ```mermaid

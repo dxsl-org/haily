@@ -11,6 +11,17 @@ pub mod connector_config;
 pub mod eval;
 pub mod credential_store;
 mod dispatch;
+/// Mobile-server config loader + DB-backed device store (Mobile Thin-Client plan phase 2a).
+/// Gated behind the `mobile-server` feature (which forwards to `haily-io/mobile-server`, see
+/// Cargo.toml) since both files reference `haily_io::mobile::*` types that only exist under
+/// that feature — a default (no-feature) build must not even see this module. Registered here
+/// as a minimal, additive edit purely so the two new source files this phase creates are part
+/// of the crate's module tree — no other logic in this file changes. See the phase's
+/// Deviation Log.
+#[cfg(feature = "mobile-server")]
+pub mod mobile_config;
+#[cfg(feature = "mobile-server")]
+pub mod mobile_device_store;
 mod session_transcript;
 mod turns;
 mod watchers;

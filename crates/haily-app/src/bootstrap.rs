@@ -171,7 +171,8 @@ impl AppHandle {
                 shutdown.child_token(),
                 tasks.clone(),
                 auto_approve,
-                Some(Arc::clone(&credential_store) as Arc<dyn haily_tools::connector::CredentialGetter>),
+                Some(Arc::clone(&credential_store)
+                    as Arc<dyn haily_tools::connector::CredentialGetter>),
             )
             .await?,
         );
@@ -186,8 +187,9 @@ impl AppHandle {
         // Phase 12: the ACP channel replays a session transcript on `session/load` from the
         // existing `messages` storage. Injected here (post-construction) like the resolver +
         // kill switch; a channel with no replay surface ignores it via the trait default.
-        let transcript: Arc<dyn haily_types::SessionTranscript> =
-            Arc::new(crate::session_transcript::DbSessionTranscript::new(Arc::clone(&db)));
+        let transcript: Arc<dyn haily_types::SessionTranscript> = Arc::new(
+            crate::session_transcript::DbSessionTranscript::new(Arc::clone(&db)),
+        );
         for adapter in &adapters {
             adapter.set_approval_resolver(Arc::clone(&resolver));
             adapter.set_kill_switch(Arc::clone(&kill));
@@ -199,6 +201,10 @@ impl AppHandle {
             builder = builder.register(adapter);
         }
         let am = builder.build();
+        // Mobile Thin-Client plan phase 2a review fix (m7): the manager can only be injected
+        // back into adapters AFTER it exists, i.e. after `build()` — one line, mirrors the
+        // resolver/kill/transcript injection loop just above but necessarily separate from it.
+        am.wire_self_reference();
 
         dispatch::spawn_dispatch_loop(
             am.clone(),

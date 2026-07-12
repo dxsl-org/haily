@@ -4,16 +4,20 @@ pub mod acp;
 pub mod cli;
 pub mod gui;
 pub mod manager;
+/// Internal to this crate — pure card accumulation/eviction logic `gui.rs`'s
+/// `Adapter` impl delegates to (phase 08). Not part of the public API surface.
+mod proactive_cards;
 /// Ordered-`RunEvent` delivery defense — the single tag-strip chokepoint (phase 11a).
 pub mod run_event;
 /// Canonical per-channel slash-command registry (phase 11a).
 pub mod slash;
-/// Internal to this crate — pure card accumulation/eviction logic `gui.rs`'s
-/// `Adapter` impl delegates to (phase 08). Not part of the public API surface.
-mod proactive_cards;
 
 #[cfg(feature = "telegram")]
 pub mod telegram;
+
+/// Desktop mobile-server core (Mobile Thin-Client plan phase 2a) — see `mobile::MobileAdapter`.
+#[cfg(feature = "mobile-server")]
+pub mod mobile;
 
 pub use acp::AcpAdapter;
 pub use cli::CliAdapter;
@@ -87,6 +91,15 @@ pub trait Adapter: Send + Sync {
     /// it — it replays a session's transcript on `session/load`. Default no-op: a channel with
     /// no replay surface (GUI, CLI, Telegram) simply never receives one.
     fn set_session_transcript(&self, _transcript: Arc<dyn haily_types::SessionTranscript>) {}
+
+    /// Inject a handle back to the `AdapterManager` that registered this adapter (Mobile
+    /// Thin-Client plan phase 2a review fix, red team m7). Same post-construction wiring
+    /// contract as `set_approval_resolver`: `manager::AdapterManager::wire_self_reference`
+    /// calls this once, right after the manager itself is built (which is necessarily AFTER
+    /// every adapter's construction — the manager doesn't exist yet at that point). Default
+    /// no-op: only an adapter that itself needs to broadcast a `Notification` to every OTHER
+    /// adapter (today: the mobile adapter's kill-switch ENABLE path) needs to override this.
+    fn set_adapter_manager(&self, _manager: crate::manager::AdapterManager) {}
 
     fn id(&self) -> &str;
 }

@@ -79,6 +79,18 @@ jobs:
       # feature on so that path stays green.
       - name: Build (telegram feature)
         run: cargo build -p haily-cli --features telegram
+      # Mobile Thin-Client plan phase 2a: `mobile-server` is likewise feature-gated (axum WS
+      # server, off by default) — build and clippy it explicitly, plus the combo with
+      # `telegram` (red team C2/M15), so a shared enum change (e.g. `Notification`) can't
+      # silently break either adapter's exhaustive match.
+      - name: Clippy (haily-io, mobile-server feature)
+        run: cargo clippy -p haily-io --features mobile-server --all-targets -- -D warnings
+      - name: Build (mobile-server feature)
+        run: cargo build -p haily-cli --features mobile-server
+      - name: Check (mobile-server + telegram combo)
+        run: cargo check -p haily-io --features "mobile-server telegram"
+      - name: Test (haily-io, mobile-server feature)
+        run: cargo test -p haily-io --features mobile-server
       - name: Test
         run: cargo test --workspace
 

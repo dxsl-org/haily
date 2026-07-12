@@ -43,6 +43,12 @@ enum Mode {
         #[command(subcommand)]
         kind: EvalKind,
     },
+    /// Pair a mobile device (Mobile Thin-Client plan phase 2a) — headless fallback, since
+    /// there is no GUI here to render the QR (that's the future P2b "Add Device" screen).
+    /// Mints a short-TTL pairing code, prints it as text + ASCII QR, and runs a one-shot
+    /// mobile server (tailnet + loopback only, per the M2 bind policy) until Ctrl+C.
+    #[cfg(feature = "mobile-server")]
+    Pair,
 }
 
 #[derive(Subcommand)]
@@ -90,6 +96,8 @@ async fn main() -> Result<()> {
         Mode::Acp => run_acp(data_dir).await,
         Mode::Export { path } => run_export(data_dir, path).await,
         Mode::Eval { kind } => run_eval(data_dir, kind).await,
+        #[cfg(feature = "mobile-server")]
+        Mode::Pair => run_pair(data_dir).await,
     }
 }
 
@@ -97,9 +105,11 @@ async fn main() -> Result<()> {
 /// CLI-origin request inside `haily_app::run_coding_eval_all`, never from a chat request).
 async fn run_eval(data_dir: PathBuf, kind: EvalKind) -> Result<()> {
     match kind {
-        EvalKind::Coding { depth, escalate, fixtures } => {
-            haily_app::run_coding_eval_all(&data_dir, &depth, escalate, fixtures).await
-        }
+        EvalKind::Coding {
+            depth,
+            escalate,
+            fixtures,
+        } => haily_app::run_coding_eval_all(&data_dir, &depth, escalate, fixtures).await,
     }
 }
 
@@ -173,6 +183,30 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
          Rebuild with `--features telegram` to enable the Telegram adapter."
     );
 
+    // Mobile Thin-Client plan phase 2a: a SEPARATE `DbHandle` from the one `AppHandle::bootstrap`
+    // opens below — the mobile adapter must be fully constructed (with its config + device
+    // store) BEFORE the adapters `Vec` is handed to `bootstrap`, which is the point the real
+    // orchestrator/KMS DB connection is created. Opening a second pool onto the same
+    // `haily.db` file is the same pattern `export_database` already uses for one-shot work;
+    // WAL mode supports concurrent connections from multiple pools safely.
+    #[cfg(feature = "mobile-server")]
+    {
+        let mobile_db = Arc::new(haily_db::DbHandle::init(&data_dir.join("haily.db")).await?);
+        let mobile_cfg = haily_app::mobile_config::load_mobile_config(&mobile_db).await;
+        if mobile_cfg.enabled {
+            let device_store = Arc::new(haily_app::mobile_device_store::DbMobileDeviceStore::new(
+                Arc::clone(&mobile_db),
+            ));
+            adapters.push(Arc::new(haily_io::mobile::MobileAdapter::new(
+                mobile_cfg,
+                device_store,
+                data_dir.clone(),
+            )));
+        } else {
+            tracing::info!("mobile: server disabled (set the 'mobile.enabled' preference to enable) — not starting");
+        }
+    }
+
     // M5a: Session-0/no-D-Bus headless daemons cannot reliably reach the OS keyring
     // (DPAPI needs the interactive session; Linux secret-service needs a D-Bus session
     // bus) — never attempt it here, go straight to the DB-read path with a persisted
@@ -189,7 +223,10 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
     // connector registration here would be wrong. This is a soft gate: warn loudly so an
     // operator is never left assuming headless connectors work when every auth-requiring
     // call will actually fail closed one at a time.
-    if haily_app::load_odoo_api_key(&handle.credential_store).await.is_none() {
+    if haily_app::load_odoo_api_key(&handle.credential_store)
+        .await
+        .is_none()
+    {
         warn!(
             "headless: no Odoo connector credential resolvable (HAILY_CRED_FILE, \
              HAILY_CRED__CONNECTOR_ODOO_API_KEY, or HAILY_ODOO_API_KEY) — any connector call \
@@ -206,6 +243,72 @@ async fn run_headless(data_dir: PathBuf) -> Result<()> {
     // Headless has no interactive stdin; a never-cancelled token means "OS signals only".
     wait_for_shutdown_signal(CancellationToken::new()).await;
     handle.shutdown(SHUTDOWN_TIMEOUT).await;
+    Ok(())
+}
+
+/// `haily pair` — headless pairing ceremony (Mobile Thin-Client plan phase 2a). There is no
+/// GUI here to render the future "Add Device" dialog (P2b), so this command itself IS the
+/// out-of-band confirm (M4): an operator with terminal access to the trusted desktop
+/// explicitly ran it, which is at least as strong a proof of physical access as tapping
+/// "Approve" on a dialog — see `haily-io::mobile::pairing`'s module doc for the full rationale.
+/// Runs a one-shot mobile server (same bind policy as `haily headless`'s, tailnet + loopback
+/// only unless `mobile.lan_opt_in` is set) until Ctrl+C.
+#[cfg(feature = "mobile-server")]
+async fn run_pair(data_dir: PathBuf) -> Result<()> {
+    let db = Arc::new(haily_db::DbHandle::init(&data_dir.join("haily.db")).await?);
+    let device_store = Arc::new(haily_app::mobile_device_store::DbMobileDeviceStore::new(
+        Arc::clone(&db),
+    ));
+    let mut cfg = haily_app::mobile_config::load_mobile_config(&db).await;
+    cfg.enabled = true; // force on for this one-shot ceremony even if the persisted pref is off
+    let port = cfg.port;
+
+    let adapter = haily_io::mobile::MobileAdapter::new(cfg, device_store, data_dir.clone());
+    let code = adapter.mint_pairing_code(None, true);
+
+    let cert = haily_io::mobile::tls::load_or_generate(&data_dir)?;
+    let interfaces = haily_io::mobile::bind::enumerate_interfaces();
+    let host = haily_io::mobile::bind::select_bind_addrs(&interfaces, false, port)
+        .into_iter()
+        .find(|a| !a.ip().is_loopback())
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::from_std(haily_io::mobile::pairing::PAIRING_CODE_TTL)?)
+    .to_rfc3339();
+    let qr = haily_types::PairingQr {
+        host,
+        port,
+        cert_fingerprint: cert.fingerprint,
+        pairing_code: code.clone(),
+        expires_at,
+    };
+
+    // Review finding 6c: bind BEFORE printing anything the phone would otherwise be told to
+    // scan against a server that never actually came up — most commonly because `haily
+    // headless`/GUI is already running the mobile server on this same port.
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    if !adapter.start_and_await_bind(tx).await {
+        anyhow::bail!(
+            "mobile: failed to bind any address on port {port} — is `haily headless` or the \
+             GUI already running the mobile server? Stop it first, or set a different \
+             'mobile.port' preference for this ceremony."
+        );
+    }
+
+    eprintln!("Pairing code: {code}  (valid 2 minutes)");
+    eprintln!("Payload: {}", serde_json::to_string(&qr)?);
+    if let Ok(ascii_qr) = qrcode::QrCode::new(serde_json::to_string(&qr)?) {
+        eprintln!(
+            "{}",
+            ascii_qr
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .build()
+        );
+    }
+    eprintln!("Waiting for the phone to scan and pair — press Ctrl+C when done.");
+
+    tokio::signal::ctrl_c().await.ok();
     Ok(())
 }
 

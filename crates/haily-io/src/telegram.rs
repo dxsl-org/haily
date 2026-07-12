@@ -560,6 +560,16 @@ impl Adapter for TelegramAdapter {
                 );
                 return Ok(());
             }
+            // m7/M15: the kill switch is intentionally global — a flip from ANY frontend
+            // (mobile enable-only, desktop GUI, another Telegram session) is pinged here too.
+            Notification::KillStateChanged { on } => {
+                let (icon, label) = if on {
+                    ("🔴", "Writes DISABLED")
+                } else {
+                    ("🟢", "Writes ENABLED")
+                };
+                format!("{icon} Kill switch changed — {label} (from another channel)")
+            }
         };
 
         // Broadcast to all known chats

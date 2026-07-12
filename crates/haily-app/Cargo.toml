@@ -34,6 +34,9 @@ llama  = ["haily-llm/llama"]
 cuda   = ["haily-llm/cuda"]
 metal  = ["haily-llm/metal"]
 vulkan = ["haily-llm/vulkan"]
+# Desktop mobile-server config loader + device store (Mobile Thin-Client plan phase 2a) —
+# forwards to `haily-io/mobile-server`, mirroring `haily-cli`'s existing `telegram` passthrough.
+mobile-server = ["haily-io/mobile-server"]
 # Exposes `CredentialStore::force_next_keyring_error` (mock-backend error injection) to
 # EXTERNAL test crates under `tests/`. Never enabled by a production build — only via the
 # self-referencing dev-dependency below, which cargo only activates for this crate's own

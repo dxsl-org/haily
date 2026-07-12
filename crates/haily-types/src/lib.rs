@@ -204,6 +204,15 @@ pub enum Notification {
         /// Number of distilled rules in the proposal.
         rule_count: u32,
     },
+    /// The `safety.disable_writes` kill switch changed state (Mobile Thin-Client plan
+    /// phase 2a, red team m7/M15). The kill switch is intentionally GLOBAL — flipping it
+    /// from ANY frontend (desktop GUI, Telegram, CLI, mobile) must be reflected on every
+    /// OTHER frontend, so every channel's displayed state stays consistent with the one
+    /// shared underlying safety property. Broadcast via `notify_all`, same as every other
+    /// `Notification` variant — no separate watch channel needed.
+    KillStateChanged {
+        on: bool,
+    },
 }
 
 /// Typed, ordered observability stream for a pipeline RUN (Sub-Agent + Skill Architecture
@@ -316,6 +325,10 @@ impl ProactiveCard {
                 rule_count: *rule_count,
             },
             Notification::WorkItemsChanged(_) => return None,
+            // Live safety-state signal, not a discrete/dismissable event card — a frontend
+            // that cares (GUI toggle, mobile hello-ack) reads it directly off this variant
+            // rather than through the card surface, mirroring `WorkItemsChanged`.
+            Notification::KillStateChanged { .. } => return None,
         };
         Some(ProactiveCard {
             id: Uuid::new_v4(),
@@ -757,6 +770,20 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// `KillStateChanged` is additive and has no card representation — mirrors
+    /// `WorkItemsChanged`'s guarantee (a frontend that cares reads it directly).
+    #[test]
+    fn kill_state_changed_roundtrips_and_has_no_card() {
+        let notif = Notification::KillStateChanged { on: true };
+        let json = serde_json::to_string(&notif).expect("serialize");
+        let round: Notification = serde_json::from_str(&json).expect("deserialize");
+        match round {
+            Notification::KillStateChanged { on } => assert!(on),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        assert!(ProactiveCard::from_notification(&notif).is_none());
     }
 
     #[test]

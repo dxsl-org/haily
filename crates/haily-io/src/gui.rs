@@ -189,6 +189,9 @@ impl Adapter for GuiAdapter {
                 );
                 return Ok(());
             }
+            // No card/chat-bubble surface here — the GUI reads live kill state through its
+            // own Tauri preference/kill-Arc path, not through a notification bubble.
+            Notification::KillStateChanged { .. } => return Ok(()),
         };
         // Delivered on a synthetic session so Phase 10 can route it to a notification panel.
         let synthetic_session = Uuid::nil();

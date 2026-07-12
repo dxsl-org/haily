@@ -8,6 +8,16 @@ description = "Unified I/O adapter — GUI, CLI, Telegram all implement Adapter 
 default = []
 # Telegram bot support (requires TELOXIDE_TOKEN env var at runtime)
 telegram = ["dep:teloxide"]
+# Desktop mobile-server core (Mobile Thin-Client plan phase 2a): axum WS server, self-signed
+# TLS for the LAN-opt-in listener, real interface enumeration for the bind-policy pure fn.
+mobile-server = [
+    "dep:axum",
+    "dep:axum-server",
+    "dep:rcgen",
+    "dep:sha2",
+    "dep:if-addrs",
+    "dep:futures",
+]
 
 [dependencies]
 haily-types = { workspace = true }
@@ -22,6 +32,13 @@ uuid        = { workspace = true }
 async-trait = "0.1"
 dashmap     = "6"
 teloxide    = { version = "0.12", features = ["macros"], optional = true }
+# mobile-server feature deps below — see the `mobile-server` feature above.
+axum        = { version = "0.7", features = ["ws"], optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+rcgen       = { version = "0.13", optional = true }
+sha2        = { version = "0.10", optional = true }
+if-addrs    = { version = "0.13", optional = true }
+futures     = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
