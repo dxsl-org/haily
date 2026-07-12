@@ -40,10 +40,9 @@ pub fn extract_weekday(text: &str) -> Option<Weekday> {
 pub fn extract_every_n_days(text: &str) -> Option<u32> {
     let (idx, marker_len) = if let Some(i) = text.find("mỗi ") {
         (i, "mỗi ".len())
-    } else if let Some(i) = text.find("every ") {
-        (i, "every ".len())
     } else {
-        return None;
+        let i = text.find("every ")?;
+        (i, "every ".len())
     };
     let rest = &text[idx + marker_len..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();

@@ -110,6 +110,8 @@ pub fn discover_on_path(program: &str) -> Option<PathBuf> {
 /// Candidate executable suffixes: `""` everywhere, plus the Windows `PATHEXT` set so a bare
 /// `rust-analyzer` resolves `rust-analyzer.exe`/`.cmd`/`.bat`.
 fn executable_extensions() -> Vec<String> {
+    // `mut` is only exercised by the cfg(windows) block below.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut exts = vec![String::new()];
     #[cfg(windows)]
     {
