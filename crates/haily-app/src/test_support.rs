@@ -7,7 +7,9 @@
 //! way to make a turn genuinely slow enough to prove the shutdown drain waits on it.
 use anyhow::Result;
 use async_trait::async_trait;
-use haily_io::{Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk};
+use haily_io::{
+    Adapter, ApprovalResolver, Notification, Request, RequestSender, ResponseChunk, TurnCanceller,
+};
 use haily_llm::LlmConfig;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +26,9 @@ pub struct MockAdapter {
     /// `haily-app::bootstrap` actually injects the resolver into every adapter,
     /// not just the ones with a real interactive approval surface.
     approval_resolver: Mutex<Option<Arc<dyn ApprovalResolver>>>,
+    /// Set by `set_turn_canceller` (Mobile Thin-Client plan phase 3 amendment) — mirrors
+    /// `approval_resolver`'s proof-of-injection role.
+    turn_canceller: Mutex<Option<Arc<dyn TurnCanceller>>>,
 }
 
 impl MockAdapter {
@@ -32,6 +37,7 @@ impl MockAdapter {
             req_tx: Mutex::new(None),
             delivered: Arc::new(Mutex::new(Vec::new())),
             approval_resolver: Mutex::new(None),
+            turn_canceller: Mutex::new(None),
         })
     }
 
@@ -39,6 +45,12 @@ impl MockAdapter {
     /// broker into this adapter before `start()` began accepting requests.
     pub fn has_approval_resolver(&self) -> bool {
         self.approval_resolver.lock().expect("lock").is_some()
+    }
+
+    /// Whether `set_turn_canceller` has been called — proves bootstrap wires the turn
+    /// registry into every adapter, not just the mobile one that actually uses it.
+    pub fn has_turn_canceller(&self) -> bool {
+        self.turn_canceller.lock().expect("lock").is_some()
     }
 
     pub async fn send(&self, message: &str) -> Uuid {
@@ -94,6 +106,10 @@ impl Adapter for MockAdapter {
 
     fn set_approval_resolver(&self, resolver: Arc<dyn ApprovalResolver>) {
         *self.approval_resolver.lock().expect("lock") = Some(resolver);
+    }
+
+    fn set_turn_canceller(&self, canceller: Arc<dyn TurnCanceller>) {
+        *self.turn_canceller.lock().expect("lock") = Some(canceller);
     }
 
     fn id(&self) -> &str {

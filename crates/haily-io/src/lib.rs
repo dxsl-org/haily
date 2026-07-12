@@ -36,7 +36,7 @@ pub use telegram::TelegramAdapter;
 pub use haily_types::{
     ApprovalResolver, DepthMode, Notification, ProactiveCard, ProactiveCardKind, Request,
     RequestOrigin, RequestSender, ResponseChunk, RunEvent, SessionTranscript, TranscriptEntry,
-    WorkItemStatus,
+    TurnCanceller, WorkItemStatus,
 };
 
 use anyhow::Result;
@@ -100,6 +100,14 @@ pub trait Adapter: Send + Sync {
     /// no-op: only an adapter that itself needs to broadcast a `Notification` to every OTHER
     /// adapter (today: the mobile adapter's kill-switch ENABLE path) needs to override this.
     fn set_adapter_manager(&self, _manager: crate::manager::AdapterManager) {}
+
+    /// Inject a turn-cancellation seam (Mobile Thin-Client plan phase 3 amendment — see
+    /// `docs/mobile-protocol.md` §3.2 and the cross-referenced Deviation Log entries in
+    /// phase-01/phase-03). Same post-construction wiring contract as `set_approval_resolver`:
+    /// `haily-app::bootstrap` calls it once after `TurnRegistry` exists. Default no-op: only
+    /// the mobile adapter overrides it (desktop's GUI/CLI already hold `Arc<TurnRegistry>`
+    /// directly through their own `AppState`, bypassing the `Adapter` trait entirely for this).
+    fn set_turn_canceller(&self, _canceller: Arc<dyn haily_types::TurnCanceller>) {}
 
     fn id(&self) -> &str;
 }

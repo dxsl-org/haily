@@ -17,7 +17,7 @@ pub mod writer;
 use crate::manager::AdapterManager;
 use crate::{
     Adapter, ApprovalResolver, Notification, ProactiveCard, RequestSender, ResponseChunk, RunEvent,
-    SessionTranscript,
+    SessionTranscript, TurnCanceller,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -147,6 +147,11 @@ pub struct MobileAdapter {
     /// (this adapter is itself reachable through the manager it holds) is acceptable here: both
     /// live for the whole process lifetime regardless, so nothing is ever freed early either way.
     manager: Arc<Mutex<Option<AdapterManager>>>,
+    /// Turn-cancellation seam (Mobile Thin-Client plan phase 3 amendment) — injected
+    /// post-construction via `set_turn_canceller`, mirroring `resolver`/`kill`/`transcript`.
+    /// `None` until `haily-app::bootstrap` wires it, in which case `ClientFrame::CancelTurn`
+    /// is a harmless no-op (see `server.rs::handle_client_frame`).
+    turn_canceller: Arc<Mutex<Option<Arc<dyn TurnCanceller>>>>,
     /// Directory holding the persisted TLS identity (`tls::load_or_generate`) and where a
     /// future `haily pair` (CLI) would look up the live pairing service — see
     /// `haily-cli/src/main.rs`.
@@ -175,6 +180,7 @@ impl MobileAdapter {
             transcript: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             manager: Arc::new(Mutex::new(None)),
+            turn_canceller: Arc::new(Mutex::new(None)),
             data_dir,
         }
     }
@@ -277,6 +283,13 @@ impl MobileAdapter {
 
     pub(crate) fn manager_handle(&self) -> Option<AdapterManager> {
         self.manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn turn_canceller_handle(&self) -> Option<Arc<dyn TurnCanceller>> {
+        self.turn_canceller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -389,6 +402,16 @@ impl Adapter for MobileAdapter {
     /// adapter via `notify_all`, not just push it to this adapter's own connected devices.
     fn set_adapter_manager(&self, manager: AdapterManager) {
         *self.manager.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// Mobile Thin-Client plan phase 3 amendment: lets `ClientFrame::CancelTurn` reach
+    /// `haily-app::TurnRegistry` without this crate depending on `haily-app` — see the trait
+    /// default's doc comment for the wiring contract.
+    fn set_turn_canceller(&self, canceller: Arc<dyn TurnCanceller>) {
+        *self
+            .turn_canceller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(canceller);
     }
 
     fn id(&self) -> &str {

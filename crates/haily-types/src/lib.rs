@@ -231,7 +231,10 @@ pub enum Notification {
 #[serde(tag = "type", content = "data")]
 pub enum RunEvent {
     /// A run began. `work_item_id` is the owning long-running item.
-    RunStarted { run_id: String, work_item_id: String },
+    RunStarted {
+        run_id: String,
+        work_item_id: String,
+    },
     /// A stage began executing. `tier` is the resolved model tier NAME (e.g. `"thinking"`),
     /// a display string rather than the `haily-llm::Tier` type — `haily-types` is a leaf and
     /// must not depend on `haily-llm`. `#[serde(default)]` keeps it additive: a stage with no
@@ -244,15 +247,28 @@ pub enum RunEvent {
     },
     /// A chunk of a stage's streamed output. `seq` is the per-run monotonic sequence number so
     /// a consumer can order/dedupe chunks; `chunk` is the (tag-stripped) text.
-    StageOutput { run_id: String, seq: u64, chunk: String },
+    StageOutput {
+        run_id: String,
+        seq: u64,
+        chunk: String,
+    },
     /// A gate finished. `gate` is the gate KIND label (`"command"`/`"artifact"`/`"approval"`,
     /// never a path or command), `pass` is the verdict, `decisive` is the shortest decisive
     /// output (empty on pass) — already rendered as inert data by the verifier parser.
-    GateResult { run_id: String, gate: String, pass: bool, decisive: String },
+    GateResult {
+        run_id: String,
+        gate: String,
+        pass: bool,
+        decisive: String,
+    },
     /// A verifier-grounded retry of the current stage began. `attempt` is the new 0-based count.
     Retry { run_id: String, attempt: u32 },
     /// The current stage escalated its model tier. `from`/`to` are tier NAME strings.
-    Escalation { run_id: String, from: String, to: String },
+    Escalation {
+        run_id: String,
+        from: String,
+        to: String,
+    },
     /// A diff is available for review. `file` is the changed path (repo-relative).
     DiffAvailable { run_id: String, file: String },
     /// A stage's approval gate needs the user. `approval_id` is the broker's approval id.
@@ -289,13 +305,26 @@ pub struct ProactiveCard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ProactiveCardKind {
-    MorningBrief { text: String },
-    Alert { title: String, body: String, urgent: bool },
-    ReminderFired { reminder_id: Uuid, title: String },
+    MorningBrief {
+        text: String,
+    },
+    Alert {
+        title: String,
+        body: String,
+        urgent: bool,
+    },
+    ReminderFired {
+        reminder_id: Uuid,
+        title: String,
+    },
     /// A learning-loop distillation proposal awaiting user approval (phase 8) — the card
     /// surface of [`Notification::DistillationProposal`]. Display + approve/dismiss only; the
     /// approve action (wired at the app/GUI layer) is the sole path that writes the overlay.
-    DistillationProposal { class_key: String, summary: String, rule_count: u32 },
+    DistillationProposal {
+        class_key: String,
+        summary: String,
+        rule_count: u32,
+    },
 }
 
 impl ProactiveCard {
@@ -305,16 +334,24 @@ impl ProactiveCard {
     /// must treat `None` as "nothing to forward on this surface", not an error.
     pub fn from_notification(msg: &Notification) -> Option<Self> {
         let kind = match msg {
-            Notification::MorningBrief(text) => ProactiveCardKind::MorningBrief { text: text.clone() },
-            Notification::Alert { title, body, urgent } => ProactiveCardKind::Alert {
+            Notification::MorningBrief(text) => {
+                ProactiveCardKind::MorningBrief { text: text.clone() }
+            }
+            Notification::Alert {
+                title,
+                body,
+                urgent,
+            } => ProactiveCardKind::Alert {
                 title: title.clone(),
                 body: body.clone(),
                 urgent: *urgent,
             },
-            Notification::ReminderFired { reminder_id, title } => ProactiveCardKind::ReminderFired {
-                reminder_id: *reminder_id,
-                title: title.clone(),
-            },
+            Notification::ReminderFired { reminder_id, title } => {
+                ProactiveCardKind::ReminderFired {
+                    reminder_id: *reminder_id,
+                    title: title.clone(),
+                }
+            }
             Notification::DistillationProposal {
                 class_key,
                 summary,
@@ -371,7 +408,12 @@ pub trait ApprovalGate: Send + Sync {
     /// Register a pending approval and wait for a decision. Returns `true` only if
     /// approved before `cancel` fires or the implementation's own timeout elapses —
     /// callers must treat cancellation and timeout identically to an explicit deny.
-    async fn request(&self, approval_id: Uuid, session_id: Uuid, cancel: &CancellationToken) -> bool;
+    async fn request(
+        &self,
+        approval_id: Uuid,
+        session_id: Uuid,
+        cancel: &CancellationToken,
+    ) -> bool;
 
     /// Whether `tool_name` is on the pre-validated auto-approve allowlist and may skip
     /// the interactive prompt. Exposed on the gate (not just the concrete broker) so
@@ -411,6 +453,19 @@ pub trait SessionTranscript: Send + Sync {
     async fn transcript(&self, session_id: &str) -> Vec<TranscriptEntry>;
 }
 
+/// Cancels an in-flight turn by `session_id` (Mobile Thin-Client plan phase 3 amendment,
+/// cross-referenced in phase-01's Deviation Log). Lives here (not `haily-app`) so a
+/// `haily-io` adapter can cancel a turn without depending on `haily-app`'s `TurnRegistry`
+/// concrete type — see CLAUDE.md's layering invariant. Mirrors `ApprovalResolver`/
+/// `SessionTranscript`'s injection contract exactly: `haily-app::TurnRegistry` is the sole
+/// implementer, injected post-construction via `Adapter::set_turn_canceller`.
+pub trait TurnCanceller: Send + Sync {
+    /// Cancel `session_id`'s in-flight turn, if any. Returns `true` if a turn was found and
+    /// cancelled, `false` if none was registered (already finished, unknown, or never
+    /// started) — callers should treat `false` as a harmless no-op, never an error.
+    fn cancel(&self, session_id: Uuid) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +474,10 @@ mod tests {
     fn depth_mode_defaults_to_normal_and_is_lowercase_on_the_wire() {
         assert_eq!(DepthMode::default(), DepthMode::Normal);
         assert_eq!(serde_json::to_string(&DepthMode::Deep).unwrap(), "\"deep\"");
-        assert_eq!(serde_json::to_string(&DepthMode::Quick).unwrap(), "\"quick\"");
+        assert_eq!(
+            serde_json::to_string(&DepthMode::Quick).unwrap(),
+            "\"quick\""
+        );
         assert_eq!(
             serde_json::from_str::<DepthMode>("\"deep\"").unwrap(),
             DepthMode::Deep
@@ -432,7 +490,11 @@ mod tests {
     fn request_without_depth_deserializes_to_normal() {
         let legacy = r#"{"session_id":"00000000-0000-0000-0000-000000000000","adapter_id":"cli","message":"hi","user_ref":null}"#;
         let req: Request = serde_json::from_str(legacy).expect("legacy Request must deserialize");
-        assert_eq!(req.depth, DepthMode::Normal, "absent depth must default to Normal");
+        assert_eq!(
+            req.depth,
+            DepthMode::Normal,
+            "absent depth must default to Normal"
+        );
     }
 
     #[test]
@@ -497,7 +559,10 @@ mod tests {
         match chunk {
             ResponseChunk::ToolApprovalRequest { origin, tool, .. } => {
                 assert_eq!(tool, "exec");
-                assert_eq!(origin, None, "absent origin must default to None, not error");
+                assert_eq!(
+                    origin, None,
+                    "absent origin must default to None, not error"
+                );
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -687,7 +752,11 @@ mod tests {
         })
         .expect("Alert must produce a card");
         match alert.kind {
-            ProactiveCardKind::Alert { title, body, urgent } => {
+            ProactiveCardKind::Alert {
+                title,
+                body,
+                urgent,
+            } => {
                 assert_eq!(title, "t");
                 assert_eq!(body, "b");
                 assert!(urgent);
@@ -728,7 +797,10 @@ mod tests {
         assert!(json.contains("\"type\":\"Alert\""));
         assert!(json.contains("\"data\":"));
         let round_tripped: ProactiveCard = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(round_tripped.kind, ProactiveCardKind::Alert { urgent: false, .. }));
+        assert!(matches!(
+            round_tripped.kind,
+            ProactiveCardKind::Alert { urgent: false, .. }
+        ));
     }
 
     /// Phase 8 (DEP-C2): a `DistillationProposal` notification maps to a card carrying the
@@ -743,7 +815,11 @@ mod tests {
         })
         .expect("DistillationProposal must produce a card");
         match card.kind {
-            ProactiveCardKind::DistillationProposal { class_key, summary, rule_count } => {
+            ProactiveCardKind::DistillationProposal {
+                class_key,
+                summary,
+                rule_count,
+            } => {
                 assert_eq!(class_key, "critical:crates/haily-core");
                 assert_eq!(summary, "1. Always handle the None case");
                 assert_eq!(rule_count, 1);
@@ -764,7 +840,11 @@ mod tests {
         let json = serde_json::to_string(&notif).expect("serialize");
         let round: Notification = serde_json::from_str(&json).expect("deserialize");
         match round {
-            Notification::DistillationProposal { class_key, rule_count, .. } => {
+            Notification::DistillationProposal {
+                class_key,
+                rule_count,
+                ..
+            } => {
                 assert_eq!(class_key, "high:crates/haily-db");
                 assert_eq!(rule_count, 2);
             }
@@ -827,10 +907,14 @@ mod tests {
     #[test]
     fn run_event_stage_started_tier_absent_payload_deserializes() {
         let legacy = r#"{"type":"StageStarted","data":{"run_id":"r1","stage":"plan"}}"#;
-        let ev: RunEvent =
-            serde_json::from_str(legacy).expect("legacy StageStarted without tier must deserialize");
+        let ev: RunEvent = serde_json::from_str(legacy)
+            .expect("legacy StageStarted without tier must deserialize");
         match ev {
-            RunEvent::StageStarted { run_id, stage, tier } => {
+            RunEvent::StageStarted {
+                run_id,
+                stage,
+                tier,
+            } => {
                 assert_eq!(run_id, "r1");
                 assert_eq!(stage, "plan");
                 assert_eq!(tier, None, "absent tier must default to None, not error");

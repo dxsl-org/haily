@@ -190,10 +190,16 @@ impl AppHandle {
         let transcript: Arc<dyn haily_types::SessionTranscript> = Arc::new(
             crate::session_transcript::DbSessionTranscript::new(Arc::clone(&db)),
         );
+        // Mobile Thin-Client plan phase 3 amendment: `turns` (below) already exists at this
+        // point (constructed earlier in this same function), so it's injected in the same
+        // post-construction loop as the other three seams — only `MobileAdapter` overrides the
+        // default no-op (see `haily-io::Adapter::set_turn_canceller`'s doc comment).
+        let turn_canceller = Arc::clone(&turns) as Arc<dyn haily_types::TurnCanceller>;
         for adapter in &adapters {
             adapter.set_approval_resolver(Arc::clone(&resolver));
             adapter.set_kill_switch(Arc::clone(&kill));
             adapter.set_session_transcript(Arc::clone(&transcript));
+            adapter.set_turn_canceller(Arc::clone(&turn_canceller));
         }
 
         let mut builder = AdapterManager::builder();

@@ -107,11 +107,12 @@ desktop for the same underlying event, with no parallel "mobile chunk" type to k
 | `SetKillSwitch` | `session_id, on` | Toggles the kill switch. **ENABLE-ONLY from mobile** — see §8.1. |
 | `FetchProactive` | `session_id` | Requests the current proactive-card list. |
 | `FetchSession` | `session_id` | Requests a `SessionSnapshot` — see §6.3. |
+| `CancelTurn` | `session_id` | Cancels `session_id`'s in-flight turn. **Added in phase 3** (additive, no `PROTOCOL_VERSION` bump — see §9); a server predating this variant already degrades an unrecognized `type` tag to its own decode fallback, so no coordinated rollout was required. |
 | `Ping` | — | Keepalive; server replies `Pong`. |
 | `Unknown` | `type_tag: String` | Forward-compat sentinel (§9), symmetric with `ServerBody::Unknown`. |
 
 **Every session-scoped frame — `UserMessage`, `Approve`, `SetKillSwitch`, `FetchProactive`,
-`FetchSession` — carries `session_id`, not just `Approve`.** The server MUST verify
+`FetchSession`, `CancelTurn` — carries `session_id`, not just `Approve`.** The server MUST verify
 `session_id ∈` the authenticated device's set of sessions on every one of these, not only on
 `Approve`. A device that has been unpaired or a `session_id` that belongs to a different device
 must be rejected the same way regardless of which frame type carried it.
@@ -434,3 +435,12 @@ reconnect.
   encodes findings from (sections C3, C4, M1, M4, M5, M7, M8, M14, M15, m1 are non-negotiable
   invariants here, not implementor discretion).
 - `crates/haily-types/src/mobile/` — the executable half of this contract.
+
+## 14. Changelog
+
+- **Phase 3 review (cross-phase amendment):** added `ClientFrame::CancelTurn { session_id }`
+  (§3.2). Additive per §9's version-negotiation policy — no `PROTOCOL_VERSION` bump. The server
+  resolves it through a new `haily_types::TurnCanceller` seam (`Adapter::set_turn_canceller`,
+  injected by `haily-app::bootstrap` from the existing `TurnRegistry`), session-bound like every
+  other session-scoped frame. Logged in both `phase-01-protocol-spec.md`'s and
+  `phase-03-mobile-shell.md`'s Deviation Log (cross-referenced).

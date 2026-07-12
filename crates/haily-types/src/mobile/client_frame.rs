@@ -52,6 +52,15 @@ pub enum ClientFrame {
     /// Requests a [`super::SessionSnapshot`] — the recovery path when resume-by-seq is no
     /// longer possible (red team M7).
     FetchSession { session_id: Uuid },
+    /// Cancels `session_id`'s in-flight turn (Mobile Thin-Client plan phase 3 amendment — see
+    /// `docs/mobile-protocol.md` §3.2 and phase-01/phase-03's cross-referenced Deviation Log
+    /// entries). Additive per §9's version-negotiation policy: a NEW `ClientFrame` variant is
+    /// NOT an envelope-structure change, so this needed no `PROTOCOL_VERSION` bump — an older
+    /// server that predates this variant already degrades an unrecognized `type` tag to its own
+    /// `Unknown` fallback (C3) rather than erroring. Session-scoped per m1: the server MUST
+    /// verify `session_id` belongs to the authenticated device before honoring it, identical to
+    /// every other session-scoped frame.
+    CancelTurn { session_id: Uuid },
     /// Keepalive; the server replies `ServerBody::Pong`.
     Ping,
     /// Forward-compat sentinel (red team C3), symmetric with `ServerBody::Unknown` — see that
@@ -102,6 +111,9 @@ enum ClientFrameKnown {
     FetchSession {
         session_id: Uuid,
     },
+    CancelTurn {
+        session_id: Uuid,
+    },
     Ping,
 }
 
@@ -146,6 +158,7 @@ impl From<ClientFrameKnown> for ClientFrame {
             ClientFrameKnown::FetchSession { session_id } => {
                 ClientFrame::FetchSession { session_id }
             }
+            ClientFrameKnown::CancelTurn { session_id } => ClientFrame::CancelTurn { session_id },
             ClientFrameKnown::Ping => ClientFrame::Ping,
         }
     }
@@ -267,6 +280,7 @@ mod tests {
             },
             ClientFrame::FetchProactive { session_id: sid },
             ClientFrame::FetchSession { session_id: sid },
+            ClientFrame::CancelTurn { session_id: sid },
         ];
         for frame in frames {
             let json = serde_json::to_string(&frame).expect("serialize");
@@ -275,6 +289,18 @@ mod tests {
                 "missing session_id in {json}"
             );
         }
+    }
+
+    /// Phase 3 amendment (additive, no `PROTOCOL_VERSION` bump per §9) — proves the new variant
+    /// round-trips through the normal encode path and through the shadow-decode probe.
+    #[test]
+    fn cancel_turn_roundtrips() {
+        let sid = Uuid::new_v4();
+        let frame = ClientFrame::CancelTurn { session_id: sid };
+        let json = serde_json::to_string(&frame).expect("serialize");
+        assert!(json.contains("\"CancelTurn\""));
+        let round: ClientFrame = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(round, ClientFrame::CancelTurn { session_id } if session_id == sid));
     }
 
     #[test]

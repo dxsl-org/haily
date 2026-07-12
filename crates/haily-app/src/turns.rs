@@ -65,6 +65,18 @@ impl TurnRegistry {
     }
 }
 
+/// Mobile Thin-Client plan phase 3 amendment (see `docs/mobile-protocol.md` §3.2 and
+/// phase-01/phase-03's cross-referenced Deviation Log entries): lets `haily-io`'s
+/// `MobileAdapter` cancel a turn via `haily_types::TurnCanceller` without this crate's
+/// `TurnRegistry` type leaking into the lower `haily-io` layer. Delegates straight to the
+/// existing inherent `cancel` method — same semantics `src-tauri`'s desktop `cancel_turn`
+/// command already exercises.
+impl haily_types::TurnCanceller for TurnRegistry {
+    fn cancel(&self, session_id: Uuid) -> bool {
+        TurnRegistry::cancel(self, session_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

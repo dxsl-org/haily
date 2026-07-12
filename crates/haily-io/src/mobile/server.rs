@@ -503,6 +503,21 @@ async fn handle_client_frame(
                 depth: DepthMode::default(),
             }));
         }
+        // Mobile Thin-Client plan phase 3 amendment (additive ClientFrame variant, §9 — no
+        // PROTOCOL_VERSION bump). Session-bound like every other session-scoped frame (m1): a
+        // device may only cancel a turn on a session it owns, never a foreign one. A missing
+        // `turn_canceller` (not yet wired, or a build without it) makes this a silent no-op —
+        // mirrors `FetchProactive`/`FetchSession`'s own "no seam yet" fallback, never an error
+        // that would disconnect the socket over a capability gap.
+        ClientFrame::CancelTurn { session_id } => {
+            if !claim_or_verify_session(&state.session_owner, session_id, device_id) {
+                writer.push(ServerBody::Error(MobileError::SessionUnknown));
+                return;
+            }
+            if let Some(canceller) = state.turn_canceller_handle() {
+                canceller.cancel(session_id);
+            }
+        }
     }
 }
 
@@ -725,5 +740,154 @@ mod tests {
                 .await,
             RedeemOutcome::Confirmed
         ));
+    }
+
+    /// Mobile review finding 6d: the kill switch is deliberately NOT scoped to any one
+    /// conversation (§8.5/M15's "intentionally global" invariant), so the mobile UI sends it
+    /// with a nil-UUID session sentinel rather than a real per-turn id (mirrors the desktop
+    /// GUI's own `NIL_UUID` convention for non-session-scoped signals). `claim_or_verify_session`
+    /// treats a nil UUID as an ordinary key — first-use-wins — so this must succeed exactly like
+    /// the random-session-id case, not be special-cased/rejected.
+    #[tokio::test]
+    async fn set_kill_switch_enable_with_nil_session_id_still_flips_and_broadcasts() {
+        let state = test_adapter();
+        state.set_kill_switch(std::sync::Arc::new(AtomicBool::new(false)));
+
+        let notifications = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let recording = std::sync::Arc::new(RecordingAdapter {
+            notifications: notifications.clone(),
+        });
+        let am = AdapterManager::builder().register(recording).build();
+        state.set_adapter_manager(am);
+
+        let device_id = Uuid::new_v4();
+        let writer = DeviceWriter::spawn(1, 10);
+
+        handle_client_frame(
+            &state,
+            device_id,
+            &writer,
+            ClientFrame::SetKillSwitch {
+                session_id: Uuid::nil(),
+                on: true,
+            },
+        )
+        .await;
+
+        assert_eq!(notifications.lock().unwrap().len(), 1);
+        assert!(state.kill_handle().unwrap().load(Ordering::Acquire));
+        assert_eq!(
+            *state.session_owner.get(&Uuid::nil()).unwrap(),
+            device_id,
+            "the nil-UUID sentinel must still be claimed like any other session id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mobile Thin-Client plan phase 3 amendment — ClientFrame::CancelTurn.
+    // -----------------------------------------------------------------------
+
+    /// Records every `session_id` it was asked to cancel — proves the seam was actually
+    /// invoked (or not) without depending on `haily-app::TurnRegistry` from this crate.
+    struct RecordingCanceller {
+        cancelled: std::sync::Arc<StdMutex<Vec<Uuid>>>,
+    }
+
+    impl haily_types::TurnCanceller for RecordingCanceller {
+        fn cancel(&self, session_id: Uuid) -> bool {
+            self.cancelled.lock().unwrap().push(session_id);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_from_the_owning_session_invokes_the_seam() {
+        let state = test_adapter();
+        let cancelled = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        state.set_turn_canceller(std::sync::Arc::new(RecordingCanceller {
+            cancelled: cancelled.clone(),
+        }));
+
+        let device_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let writer = DeviceWriter::spawn(1, 10);
+
+        // Claim the session first (mirrors a prior UserMessage on the same session), then cancel.
+        assert!(claim_or_verify_session(
+            &state.session_owner,
+            session_id,
+            device_id
+        ));
+        handle_client_frame(
+            &state,
+            device_id,
+            &writer,
+            ClientFrame::CancelTurn { session_id },
+        )
+        .await;
+
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            vec![session_id],
+            "the canceller must be invoked with exactly the requested session id"
+        );
+    }
+
+    /// m1: a device may only cancel a turn on a session IT owns — a foreign session_id must be
+    /// rejected with `SessionUnknown`, never silently forwarded to the canceller.
+    #[tokio::test]
+    async fn cancel_turn_from_a_non_owning_device_is_denied() {
+        let state = test_adapter();
+        let cancelled = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        state.set_turn_canceller(std::sync::Arc::new(RecordingCanceller {
+            cancelled: cancelled.clone(),
+        }));
+
+        let owner = Uuid::new_v4();
+        let intruder = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let writer = DeviceWriter::spawn(1, 10);
+
+        assert!(claim_or_verify_session(
+            &state.session_owner,
+            session_id,
+            owner
+        ));
+        handle_client_frame(
+            &state,
+            intruder,
+            &writer,
+            ClientFrame::CancelTurn { session_id },
+        )
+        .await;
+
+        assert!(
+            cancelled.lock().unwrap().is_empty(),
+            "a non-owning device's CancelTurn must never reach the seam"
+        );
+    }
+
+    /// A build/boot state with no canceller wired yet must be a harmless no-op, not a panic —
+    /// mirrors `FetchProactive`/`FetchSession`'s own "no seam yet" fallback.
+    #[tokio::test]
+    async fn cancel_turn_with_no_canceller_wired_is_a_silent_no_op() {
+        let state = test_adapter();
+        let device_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let writer = DeviceWriter::spawn(1, 10);
+
+        assert!(claim_or_verify_session(
+            &state.session_owner,
+            session_id,
+            device_id
+        ));
+        // Must not panic.
+        handle_client_frame(
+            &state,
+            device_id,
+            &writer,
+            ClientFrame::CancelTurn { session_id },
+        )
+        .await;
     }
 }
