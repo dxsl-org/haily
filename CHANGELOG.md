@@ -25,8 +25,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - agent: work item tracking with checkpoints
 - agent: ephemeral worktree sandbox for tasks
 - cli: work item status panel above prompt
-
-### Security
+- tools: sandboxed exec seam with credential scrub
+- tools: coding fs, shell, git, exec tools
+- kms: authored-skill loader with kit pack
+- llm: ultra tier, escalation policy, GBNF grammars
+- core: pipeline engine with staged verifier gates
+- core: pipeline resume with stage-boundary reconcile
+- db: pipeline runs linked to action journal
+- core: plan pipeline with forced-JSON draft
+- core: build pipeline with review fix loop
+- core: depth tiers with apex judge panel
+- kms: learning loop distillation proposals
+- core: golden coding eval harness, CLI-gated
+- io: ordered run event delivery to channels
+- gui: cockpit run timeline and skills browser
+- io: ACP coding channel with permission bridge
+- tools: stealth browser behind feature flag
+- tools: LSP diagnostics and rename, isolation-spawned
+- eval: automation connector eval with mock SaaS
 - kms: unknown outcomes never move confidence
 - kms: archival requires two independent negatives
 - core: feedback downgrade parses only user message
