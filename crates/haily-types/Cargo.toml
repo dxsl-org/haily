@@ -6,6 +6,12 @@ description = "Shared message/DTO types (Request, ResponseChunk, Notification) â
 
 [dependencies]
 serde = { workspace = true }
+# Wire-format value used ONLY for the mobile protocol's forward-compat "Unknown" decode path
+# (mobile.rs) â€” buffering an unrecognized frame body as JSON so an old client tolerates a new
+# server variant instead of hard-failing (see CLAUDE.md Decision C3). Already a transitive dep
+# of every crate that consumes this one; promoting it from dev-only to a real dependency does
+# not add a new library to the workspace's dependency graph.
+serde_json = { workspace = true }
 uuid  = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -15,4 +21,3 @@ async-trait = "0.1"
 chrono = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }

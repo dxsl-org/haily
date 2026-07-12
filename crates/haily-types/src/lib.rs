@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Mobile thin-client wire protocol — envelope, frame catalogue, pairing DTOs (Mobile
+/// Thin-Client plan phase 1). See `docs/mobile-protocol.md` for the full spec these types
+/// implement; that document and this module are the same contract, kept in sync in the same
+/// PR as a rule (a serde change here IS a spec edit there).
+pub mod mobile;
+
+pub use mobile::{
+    ClientFrame, MobileApprovalPolicy, MobileError, PairRequest, PairResponse, PairingQr,
+    ServerBody, ServerFrame, SessionSnapshot, PROTOCOL_VERSION,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub session_id: Uuid,
@@ -362,8 +373,10 @@ pub trait ApprovalGate: Send + Sync {
 
 /// A single persisted transcript entry for session replay (Sub-Agent + Skill Architecture
 /// phase 12). `role` is `"user"`/`"assistant"` (matching `messages.role`); `content` is the
-/// stored message text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// stored message text. `Serialize`/`Deserialize` (added for the mobile thin-client's
+/// `SessionSnapshot` frame, phase 1) is purely additive — no existing caller serializes this
+/// type today, so adding the derive changes no wire shape in production.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub role: String,
     pub content: String,
