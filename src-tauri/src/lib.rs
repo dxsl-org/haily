@@ -26,6 +26,19 @@ use uuid::Uuid;
 /// Best-effort cleanup budget — Tauri's exit path has no guaranteed grace period.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Command-facing state for the mobile pairing/devices panel (Mobile Thin-Client plan phase
+/// 2b), gated behind the `mobile-server` feature so a default GUI build never sees these
+/// fields or the `haily_io::mobile`/`haily-app` mobile-server types. Constructed unconditionally
+/// at setup (regardless of the persisted `mobile.enabled` preference) — the config/devices
+/// panel must work even to turn the server ON for the first time; `MobileAdapter::start`
+/// itself already no-ops when disabled.
+#[cfg(feature = "mobile-server")]
+struct MobileState {
+    adapter: Arc<haily_io::mobile::MobileAdapter>,
+    cfg: haily_io::mobile::MobileServerConfig,
+    data_dir: std::path::PathBuf,
+}
+
 /// Command-facing state. `app` is the shutdown surface — taken (leaving `None`) once
 /// `ExitRequested` fires, so a second exit event can't double-shutdown a moved value.
 struct AppState {
@@ -49,6 +62,8 @@ struct AppState {
     /// `app` at setup, mirroring `approval_resolver`/`turns`/`kill`, so the connector
     /// config UI's credential-set command (Phase 7) doesn't need to lock `app`.
     credential_store: Arc<CredentialStore>,
+    #[cfg(feature = "mobile-server")]
+    mobile: MobileState,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -320,6 +335,79 @@ async fn list_approvals(state: State<'_, AppState>) -> Result<Vec<PendingApprova
     Ok(app.pending_approvals())
 }
 
+// ---------------------------------------------------------------------------
+// Mobile Thin-Client plan phase 2b — pairing QR, OOB confirm-on-pair (M4), devices panel,
+// status banners, cert lifecycle (m5). Pure delegation onto `haily_app::mobile_admin`; no
+// logic beyond glue lives here, mirroring every other command in this file.
+// ---------------------------------------------------------------------------
+
+/// Mint a fresh pairing code and build the QR payload (Mobile Thin-Client phase 2b). Uses the
+/// INTERACTIVE confirm mode — the phone's `POST /pair` blocks until `mobile_confirm_pair`
+/// resolves it (M4); `device_name` is an optional display hint shown on the confirm prompt.
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+async fn mobile_pairing_qr(
+    device_name: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<haily_types::PairingQr, String> {
+    haily_app::pairing_qr(&state.mobile.adapter, &state.mobile.data_dir, &state.mobile.cfg, device_name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Every pairing request still awaiting the desktop's OOB decision (M4). Polled by the GUI
+/// panel while open — see `haily_app::mobile_admin`'s module doc for why this is a poll, not a
+/// push (P2a exposes no event channel for a newly-arrived pairing request).
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+fn mobile_pending_pairs(state: State<'_, AppState>) -> Result<Vec<haily_app::PendingPairView>, String> {
+    Ok(haily_app::pending_pairs(&state.mobile.adapter))
+}
+
+/// Approve or deny a pending pairing request (M4). Returns `false` (not an error) for an
+/// unknown/already-resolved code — the caller should treat that as a no-op.
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+fn mobile_confirm_pair(code: String, approve: bool, state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(haily_app::confirm_pair(&state.mobile.adapter, &code, approve))
+}
+
+/// Every non-revoked paired device, most-recently-paired first.
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+async fn mobile_list_devices(state: State<'_, AppState>) -> Result<Vec<haily_app::DeviceView>, String> {
+    haily_app::list_devices(&state.db).await.map_err(|e| e.to_string())
+}
+
+/// Revoke a paired device — soft-revokes the row AND ends its live connection immediately.
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+async fn mobile_revoke_device(device_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let device_id = Uuid::parse_str(&device_id).map_err(|e| e.to_string())?;
+    haily_app::revoke_device(&state.db, &state.mobile.adapter, device_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Status banners: enabled/running/tailnet-absent/LAN-opt-in (M2/M11, Tailscale prerequisite).
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+async fn mobile_server_status(state: State<'_, AppState>) -> Result<haily_app::MobileStatusView, String> {
+    Ok(haily_app::mobile_status(&state.mobile.cfg).await)
+}
+
+/// Force TLS identity ROTATION, not access revocation (m5) — every paired device row stays
+/// intact; only the LAN-direct pinned fingerprint goes stale, and every currently paired
+/// device's live connection is forced to reconnect. The frontend MUST warn the user first —
+/// this command performs no confirmation of its own (mirrors `export_database`'s contract).
+#[cfg(feature = "mobile-server")]
+#[tauri::command]
+async fn mobile_regenerate_cert(state: State<'_, AppState>) -> Result<String, String> {
+    haily_app::regenerate_cert(&state.db, &state.mobile.adapter, &state.mobile.data_dir)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Forward `GuiAdapter` response chunks to the frontend as `haily-chunk` events.
 fn spawn_chunk_bridge(ah: TauriAppHandle, mut rx: GuiResponseReceiver) {
     tauri::async_runtime::spawn(async move {
@@ -407,7 +495,44 @@ pub fn run() {
                 gui_proactive_rx,
                 gui_run_events_rx,
             ) = haily_io::GuiAdapter::new();
-            let adapters: Vec<Arc<dyn Adapter>> = vec![Arc::new(gui_adapter)];
+
+            #[allow(unused_mut)]
+            let mut adapters: Vec<Arc<dyn Adapter>> = vec![Arc::new(gui_adapter)];
+
+            // Mobile Thin-Client plan phase 2b: constructed unconditionally (regardless of the
+            // persisted `mobile.enabled` preference) so the pairing/devices panel always has
+            // something to read/act on, including turning the server ON for the first time —
+            // `MobileAdapter::start` itself already no-ops when disabled (P2a, M11). A SEPARATE
+            // `DbHandle` from the one `AppHandle::bootstrap` opens below, mirroring
+            // `haily-cli`'s headless/`haily pair` wiring: the adapter must exist BEFORE the
+            // `adapters` vec is handed to `bootstrap`.
+            #[cfg(feature = "mobile-server")]
+            let mobile_state = {
+                let (adapter, cfg) = tauri::async_runtime::block_on(async {
+                    let mobile_db =
+                        Arc::new(DbHandle::init(&data_dir.join("haily.db")).await?);
+                    let cfg = haily_app::mobile_config::load_mobile_config(&mobile_db).await;
+                    let device_store = Arc::new(
+                        haily_app::mobile_device_store::DbMobileDeviceStore::new(Arc::clone(
+                            &mobile_db,
+                        )),
+                    );
+                    let adapter = Arc::new(haily_io::mobile::MobileAdapter::new(
+                        cfg.clone(),
+                        device_store,
+                        data_dir.clone(),
+                    ));
+                    Ok::<_, anyhow::Error>((adapter, cfg))
+                })
+                .map_err(|e: anyhow::Error| Box::new(std::io::Error::other(e.to_string())))?;
+                adapters.push(adapter.clone() as Arc<dyn Adapter>);
+                MobileState {
+                    adapter,
+                    cfg,
+                    data_dir: data_dir.clone(),
+                }
+            };
+
             let bootstrap = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default());
             let app_handle = tauri::async_runtime::block_on(bootstrap)
                 .map_err(|e| Box::new(std::io::Error::other(e.to_string())))?;
@@ -425,6 +550,8 @@ pub fn run() {
                 turns,
                 kill,
                 credential_store,
+                #[cfg(feature = "mobile-server")]
+                mobile: mobile_state,
                 app: Mutex::new(Some(app_handle)),
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
@@ -456,6 +583,20 @@ pub fn run() {
             discard_workspace,
             workspace_diff,
             list_approvals,
+            #[cfg(feature = "mobile-server")]
+            mobile_pairing_qr,
+            #[cfg(feature = "mobile-server")]
+            mobile_pending_pairs,
+            #[cfg(feature = "mobile-server")]
+            mobile_confirm_pair,
+            #[cfg(feature = "mobile-server")]
+            mobile_list_devices,
+            #[cfg(feature = "mobile-server")]
+            mobile_revoke_device,
+            #[cfg(feature = "mobile-server")]
+            mobile_server_status,
+            #[cfg(feature = "mobile-server")]
+            mobile_regenerate_cert,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

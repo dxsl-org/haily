@@ -475,3 +475,92 @@ export interface QueuedApproval {
 export async function listApprovals(): Promise<QueuedApproval[]> {
   return invoke('list_approvals');
 }
+
+// ---------------------------------------------------------------------------
+// Mobile Thin-Client plan phase 2b — pairing QR, OOB confirm-on-pair (M4), devices panel,
+// status banners. Every wrapper below invokes a command registered ONLY behind the Rust
+// `mobile-server` feature (see `src-tauri/Cargo.toml`); a build without that feature simply
+// has no matching command, so these calls reject with a generic "command not found" error —
+// callers must already treat every mobile_* call as fallible (existing try/catch convention),
+// there is no separate "is this feature compiled in" probe.
+// ---------------------------------------------------------------------------
+
+/** Mirrors `haily_types::PairingQr` — the payload encoded into the pairing QR image. */
+export interface PairingQr {
+  host: string;
+  port: number;
+  cert_fingerprint: string;
+  pairing_code: string;
+  expires_at: string;
+}
+
+/** Mint a fresh pairing code and its QR payload. Interactive confirm mode (M4): the phone's
+ * `/pair` request blocks server-side until a matching `confirmPair` call resolves it. */
+export async function mobilePairingQr(deviceName?: string): Promise<PairingQr> {
+  return invoke('mobile_pairing_qr', { deviceName: deviceName ?? null });
+}
+
+/** One pairing request still awaiting the desktop's out-of-band decision (M4). Mirrors
+ * `haily_app::PendingPairView`. */
+export interface PendingPair {
+  code: string;
+  device_name: string;
+}
+
+/**
+ * Every pairing request still awaiting confirmation. POLLED by the caller (there is no push
+ * event for a newly-arrived pairing request — see `haily_app::mobile_admin`'s module doc) —
+ * call this on an interval while the pairing screen is open.
+ */
+export async function mobilePendingPairs(): Promise<PendingPair[]> {
+  return invoke('mobile_pending_pairs');
+}
+
+/** Approve or deny a pending pairing request (M4). Returns `false` (not a thrown error) for an
+ * unknown/already-resolved code — treat that as a no-op. */
+export async function mobileConfirmPair(code: string, approve: boolean): Promise<boolean> {
+  return invoke('mobile_confirm_pair', { code, approve });
+}
+
+/** One paired device row. Mirrors `haily_app::DeviceView`. */
+export interface MobileDevice {
+  device_id: string;
+  device_name: string;
+  created_at: string;
+  last_seen_at: string | null;
+}
+
+/** Every non-revoked paired device, most-recently-paired first. */
+export async function mobileListDevices(): Promise<MobileDevice[]> {
+  return invoke('mobile_list_devices');
+}
+
+/** Revoke a paired device — soft-revokes it AND ends its live connection immediately. */
+export async function mobileRevokeDevice(deviceId: string): Promise<void> {
+  return invoke('mobile_revoke_device', { deviceId });
+}
+
+/** Mirrors `haily_app::MobileStatusView` — the panel's status banners. `running` is a
+ * best-effort loopback liveness probe (see the Rust doc comment for why nothing stronger is
+ * observable without editing the P2a server internals). */
+export interface MobileStatus {
+  enabled: boolean;
+  running: boolean;
+  tailnet_present: boolean;
+  lan_opt_in: boolean;
+  port: number;
+}
+
+/** Status banners: enabled/running/tailnet-absent/LAN-opt-in. */
+export async function mobileServerStatus(): Promise<MobileStatus> {
+  return invoke('mobile_server_status');
+}
+
+/**
+ * Force TLS identity regeneration (m5). The CALLER must warn the user first that every
+ * already-paired device's pinned LAN fingerprint will mismatch until it re-pairs — this
+ * function performs no confirmation of its own. Returns the new fingerprint.
+ */
+export async function mobileRegenerateCert(): Promise<string> {
+  return invoke('mobile_regenerate_cert');
+}

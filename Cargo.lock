@@ -2651,6 +2651,7 @@ dependencies = [
  "haily-db",
  "haily-io",
  "haily-kms",
+ "haily-types",
  "serde",
  "serde_json",
  "tauri",

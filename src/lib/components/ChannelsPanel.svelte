@@ -6,6 +6,7 @@
   // already toggles — one mechanism, surfaced prominently here too since a remote/
   // background run needs it reachable fastest from the cockpit.
   import { getPreferences, setPreference } from '$lib/tauri';
+  import MobilePanel from './MobilePanel.svelte';
 
   let prefs = $state<Record<string, string>>({});
   let loading = $state(true);
@@ -86,6 +87,8 @@
       <span class="hint">Live status isn't wired to the cockpit yet — check Settings for whether it's configured.</span>
     </div>
   </div>
+
+  <MobilePanel />
 
   <div class="block">
     <span class="switch-title">Editors</span>

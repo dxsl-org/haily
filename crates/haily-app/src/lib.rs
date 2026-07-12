@@ -22,6 +22,11 @@ mod dispatch;
 pub mod mobile_config;
 #[cfg(feature = "mobile-server")]
 pub mod mobile_device_store;
+/// Desktop GUI's mobile pairing/devices command backing (Mobile Thin-Client plan phase 2b) —
+/// pure delegation onto P2a's public `haily_io::mobile` API, no new persistence. Same feature
+/// gate as the two modules above, for the same reason (references `haily_io::mobile::*` types).
+#[cfg(feature = "mobile-server")]
+pub mod mobile_admin;
 mod session_transcript;
 mod turns;
 mod watchers;
@@ -35,6 +40,11 @@ pub use cockpit::{
     SkillView, WorkspaceView,
 };
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
+#[cfg(feature = "mobile-server")]
+pub use mobile_admin::{
+    confirm_pair, list_devices, mobile_status, pairing_qr, pending_pairs, regenerate_cert,
+    revoke_device, DeviceView, MobileStatusView, PendingPairView,
+};
 /// Re-exported so the mode layer (`src-tauri`) can name the approvals-queue snapshot type
 /// without a direct `haily-core` dependency (phase 11a).
 pub use haily_core::PendingApproval;
