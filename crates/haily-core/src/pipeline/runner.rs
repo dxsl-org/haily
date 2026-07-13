@@ -164,6 +164,12 @@ pub struct RunReport {
     /// Total retries (incl. escalated retries) across all stages — mirrors the count of
     /// `RunEvent::Retry` emitted.
     pub retries: u32,
+    /// The LAST `GateVerdict::Fail` decisive text seen anywhere in this run (empty if every gate
+    /// passed clean on its first attempt). This is the run's own compile/test-gate signal, kept
+    /// so a caller composing further feedback (the build-pipeline Fix loop's LSP dedup, phase 4
+    /// pipeline-activation) can tell an LSP diagnostic apart from one the gate already reported —
+    /// without re-parsing `RunEvent::GateResult` off the side channel.
+    pub last_gate_output: String,
 }
 
 /// The deterministic pipeline stage machine. Holds the shared harness handles it threads into
@@ -450,6 +456,10 @@ impl PipelineRunner {
         let turn_deletes = Arc::new(AtomicUsize::new(0));
         let mut attempts_remaining = spec.attempts_budget;
         let mut total_retries: u32 = 0;
+        // The most recent gate failure's decisive text across the WHOLE run (overwritten on
+        // every `Fail`, so a later stage's failure supersedes an earlier one) — surfaced on the
+        // report for a caller that needs to compare against it (see `RunReport::last_gate_output`).
+        let mut last_gate_output = String::new();
         // Phase 8 (FMA-m5): per-ATTEMPT token accounting (not per-stage) — one record per stage
         // sub-turn, each carrying its own paired usage + resolved backend. Written to
         // `pipeline_runs.per_attempt_tokens` before finalize so per-run cost is visible.
@@ -679,6 +689,7 @@ impl PipelineRunner {
                     }
                     GateVerdict::Fail(decisive) => {
                         let decisive: String = decisive.chars().take(GATE_DECISIVE_CAP).collect();
+                        last_gate_output = decisive.clone();
                         self.emit(RunEvent::GateResult {
                             run_id: run_id.clone(),
                             gate: stage.gate.kind_label().to_string(),
@@ -822,6 +833,7 @@ impl PipelineRunner {
             run_id,
             status: final_status,
             retries: total_retries,
+            last_gate_output,
         })
     }
 

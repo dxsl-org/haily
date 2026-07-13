@@ -79,8 +79,12 @@ pub struct AppHandle {
     /// the same read/write-fallback policy the startup migration used — never by reaching
     /// into `kms_preferences` directly for a credential.
     pub credential_store: Arc<CredentialStore>,
-    shutdown: CancellationToken,
-    tasks: TaskTracker,
+    /// `pub(crate)` (not private): `launch.rs`'s coding-run entrypoint needs its own child
+    /// token per launch, mirroring `dispatch_loop`'s own `shutdown.child_token()` per turn.
+    pub(crate) shutdown: CancellationToken,
+    /// `pub(crate)`: `launch.rs` registers the run-event/distillation bridges plus the tracked
+    /// launch task on this SAME tracker, so `AppHandle::shutdown`'s drain covers them too.
+    pub(crate) tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
 }
 

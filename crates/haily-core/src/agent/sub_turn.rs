@@ -241,13 +241,19 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
 
     let tool_block = context::tool_reference_block(&tools);
 
+    // Pipeline Activation phase 5: the cockpit-persisted skill enable/pin admin state, read
+    // ONCE here and threaded into BOTH selection calls below — a disabled name is excluded
+    // outright, a pinned name is prioritized ahead of the ranked pool. Fails open to
+    // default-empty gates on any DB read problem (see `skill_gates::load`).
+    let skill_gates = kms.load_skill_gates().await;
+
     // Phase 2: authored playbooks (top-k Jaccard-matched to task+domain) + stack-matched
     // standards. Bodies are tag-stripped at this choke point — an authored file must not
     // smuggle a live `<tool_call>` into the sub-agent prompt (same rule as facts /
     // tool-results). References stay UNLOADED (progressive disclosure); only the body of
     // each matched skill is injected.
     let mut playbooks: Vec<(String, String)> = kms
-        .authored_playbooks_for(&task, Some(domain_name), 2)
+        .authored_playbooks_for(&task, Some(domain_name), 2, &skill_gates)
         // Strip the NAME too (P2 review MED2) — it becomes a `### {name}` heading in the prompt.
         .into_iter()
         .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
@@ -257,7 +263,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // first, trimmed last), learned skills augment. Sub-0.6 skills never reach here (filtered in
     // `synthesized_playbooks`). Tag-stripped at this same choke point as every other injection.
     let synthesized = kms
-        .synthesized_playbooks_for(&task, SUB_TURN_MAX_SYNTHESIZED_SKILLS)
+        .synthesized_playbooks_for(&task, SUB_TURN_MAX_SYNTHESIZED_SKILLS, &skill_gates)
         .await;
     playbooks.extend(
         synthesized

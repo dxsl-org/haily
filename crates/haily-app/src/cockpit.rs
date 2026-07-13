@@ -9,23 +9,21 @@
 //! (`skill.enabled.<name>` / `skill.pinned.<name>`), so ONE mechanism covers both the
 //! in-memory authored kit-pack AND the DB-synthesized skills without a schema migration.
 //! `list_skills` reflects it and the setters write it. ENFORCEMENT — excluding a disabled
-//! skill from injection, prioritizing a pinned one — is deferred to the P11b GUI-wiring PR,
-//! mirroring the established `set_connector_status` precedent in this codebase (an admin
-//! toggle whose persisted state the runtime consumes at a later, documented point), rather
-//! than threading a pref read into the two hot injection paths (sync in-memory authored +
-//! async DB synthesized) in this backbone PR.
+//! skill from injection, prioritizing a pinned one — was deferred here in P11a and is now
+//! LIVE (Pipeline Activation phase 5): `haily-kms::skill_gates::load` reads this same `meta`
+//! state and `haily-core::agent::sub_turn::run_sub_turn` threads it into both hot injection
+//! paths (sync in-memory authored + async DB synthesized). The key-prefix constants below
+//! are re-exported FROM `haily-kms` (not redeclared) so the setters here and that reader can
+//! never silently drift apart.
 
 use anyhow::Result;
 use haily_db::queries::{coding_workspaces, meta, skills as db_skills};
 use haily_db::DbHandle;
+use haily_kms::skill_gates::{SKILL_ENABLED_PREFIX, SKILL_PINNED_PREFIX};
 use haily_kms::KmsHandle;
 use haily_tools::coding::workspace::CodingWorkspace;
 use haily_tools::exec::{Manager, SandboxKind};
 use serde::Serialize;
-
-/// Preference key prefixes for per-skill enable/pin state (see the module doc).
-const SKILL_ENABLED_PREFIX: &str = "skill.enabled.";
-const SKILL_PINNED_PREFIX: &str = "skill.pinned.";
 
 /// Cap on a workspace diff returned to the GUI, so a huge generated diff cannot flood the
 /// IPC channel (the frontend virtualizes/paginates — phase risk note). 512 KiB is ample

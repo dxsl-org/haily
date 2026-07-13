@@ -4,6 +4,7 @@ pub mod feedback;
 pub mod hnsw;
 pub mod kit_pack;
 pub mod search;
+pub mod skill_gates;
 pub mod skills;
 pub mod system_prompt;
 pub mod voice_check;
@@ -137,14 +138,24 @@ impl KmsHandle {
     }
 
     /// Top-`k` authored playbook `(name, body)` pairs relevant to `task`, domain-filtered.
-    /// References stay unloaded (progressive disclosure).
+    /// References stay unloaded (progressive disclosure). `gates` (phase 5) excludes disabled
+    /// names and lets a pinned name bypass the match bar — see `AuthoredRegistry::playbooks_for`.
     pub fn authored_playbooks_for(
         &self,
         task: &str,
         domain: Option<&str>,
         k: usize,
+        gates: &skills::SkillGates,
     ) -> Vec<(String, String)> {
-        self.authored.playbooks_for(task, domain, k)
+        self.authored.playbooks_for(task, domain, k, gates)
+    }
+
+    /// Load the current skill enable/pin admin state (Pipeline Activation phase 5) for one
+    /// injection assembly — see `skill_gates::load` for the key-scheme contract. Exposed as a
+    /// `KmsHandle` method (rather than requiring the caller to import `skill_gates` directly)
+    /// since `KmsHandle` already owns the `db` handle the read needs.
+    pub async fn load_skill_gates(&self) -> skills::SkillGates {
+        skill_gates::load(&self.db).await
     }
 
     /// Standard-kind bodies for the named standards (e.g. `["lang-rust"]`), for the
@@ -172,13 +183,21 @@ impl KmsHandle {
     /// matches `task`, as top-`top_n` `(heading, body)` playbook pairs for the sub-turn
     /// `## Playbooks` pool (phase 8). Source is made visible in each heading. A DB read failure
     /// yields an empty pool (never an error) — a learning signal must never break a turn.
-    pub async fn synthesized_playbooks_for(&self, task: &str, top_n: usize) -> Vec<(String, String)> {
+    /// `gates` (phase 5) excludes disabled names and lets a pinned name bypass the confidence/
+    /// match-bar filter — see `skills::synthesized_playbooks`.
+    pub async fn synthesized_playbooks_for(
+        &self,
+        task: &str,
+        top_n: usize,
+        gates: &skills::SkillGates,
+    ) -> Vec<(String, String)> {
         match db_skills::active_skills(&self.db).await {
             Ok(active) => skills::synthesized_playbooks(
                 &active,
                 task,
                 skills::SYNTH_SKILL_MIN_CONFIDENCE,
                 top_n,
+                gates,
             ),
             Err(e) => {
                 tracing::warn!("synthesized_playbooks_for: active_skills read failed: {e:#}");

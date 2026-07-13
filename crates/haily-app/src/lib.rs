@@ -11,6 +11,7 @@ pub mod connector_config;
 pub mod eval;
 pub mod credential_store;
 mod dispatch;
+mod launch;
 /// Mobile-server config loader + DB-backed device store (Mobile Thin-Client plan phase 2a).
 /// Gated behind the `mobile-server` feature (which forwards to `haily-io/mobile-server`, see
 /// Cargo.toml) since both files reference `haily_io::mobile::*` types that only exist under
@@ -50,8 +51,9 @@ pub use mobile_admin::{
 pub use haily_core::PendingApproval;
 pub use credential_store::{CredentialPolicy, CredentialStore};
 pub use eval::run_coding_eval_all;
+pub use launch::launch_coding_run;
 pub use turns::TurnRegistry;
-pub use watchers::{list_work_items_status, spawn_run_event_bridge};
+pub use watchers::{list_work_items_status, spawn_distillation_bridge, spawn_run_event_bridge};
 
 /// Default data directory, shared by every mode: `<exe_dir>/data/`.
 ///

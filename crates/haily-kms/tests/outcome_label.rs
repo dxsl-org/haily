@@ -3,7 +3,7 @@
 use haily_db::queries::skills as db_skills;
 use haily_kms::skills::{
     derive_label, find_matching_skill, gate_label_supersedes, is_repeat_request,
-    jaccard_similarity, synthesized_playbooks, LabelSource, TaskOutcome,
+    jaccard_similarity, synthesized_playbooks, LabelSource, SkillGates, TaskOutcome,
     EXPLICIT_FEEDBACK_CONFIDENCE, GATE_RESULT_CONFIDENCE, PHRASE_FEEDBACK_CONFIDENCE,
     REPEAT_REQUEST_CONFIDENCE, SYNTH_SKILL_MIN_CONFIDENCE, TOOL_ERROR_RATIO_CONFIDENCE,
     UNDO_LABEL_CONFIDENCE,
@@ -143,6 +143,7 @@ fn synthesized_skill_below_confidence_floor_never_reaches_the_pool() {
         "please book a flight ticket to hanoi",
         SYNTH_SKILL_MIN_CONFIDENCE,
         3,
+        &SkillGates::default(),
     );
     assert!(
         picked.is_empty(),
@@ -159,6 +160,7 @@ fn synthesized_skill_at_or_above_floor_and_matching_is_injected_with_visible_pro
         "please book a flight ticket to hanoi",
         SYNTH_SKILL_MIN_CONFIDENCE,
         3,
+        &SkillGates::default(),
     );
     assert_eq!(picked.len(), 1, "a matching skill at the floor must be injected");
     assert!(
@@ -172,9 +174,78 @@ fn synthesized_skill_at_or_above_floor_and_matching_is_injected_with_visible_pro
 fn synthesized_skill_that_does_not_match_the_task_is_not_injected() {
     let mut high = make_skill("s2", "weather-lookup", "check the weather forecast for a city");
     high.confidence = 0.95;
-    let picked =
-        synthesized_playbooks(&[high], "book a flight ticket to hanoi", SYNTH_SKILL_MIN_CONFIDENCE, 3);
+    let picked = synthesized_playbooks(
+        &[high],
+        "book a flight ticket to hanoi",
+        SYNTH_SKILL_MIN_CONFIDENCE,
+        3,
+        &SkillGates::default(),
+    );
     assert!(picked.is_empty(), "a high-confidence but unrelated skill must not be injected");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline Activation phase 5 — skill enable/pin gate enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disabled_synthesized_skill_is_excluded_even_at_high_confidence() {
+    let mut high = make_skill("s1", "flight-booking", "book a flight ticket for the user");
+    high.confidence = 0.95;
+    let gates = SkillGates::new(std::collections::HashSet::from(["flight-booking".to_string()]), std::collections::HashSet::new());
+    let picked = synthesized_playbooks(
+        &[high],
+        "please book a flight ticket to hanoi",
+        SYNTH_SKILL_MIN_CONFIDENCE,
+        3,
+        &gates,
+    );
+    assert!(picked.is_empty(), "a disabled synthesized skill must never be injected");
+}
+
+#[test]
+fn pinned_synthesized_skill_bypasses_the_confidence_floor_and_match_bar_and_is_ordered_first() {
+    // Below the confidence floor AND does not match the task at all — would normally be
+    // excluded twice over. Pinning it must surface it anyway, ahead of the genuinely
+    // matching skill.
+    let mut unrelated_low_conf = make_skill("s1", "weather-lookup", "check the weather forecast for a city");
+    unrelated_low_conf.confidence = SYNTH_SKILL_MIN_CONFIDENCE - 0.3;
+    let mut matching = make_skill("s2", "flight-booking", "book a flight ticket for the user");
+    matching.confidence = SYNTH_SKILL_MIN_CONFIDENCE;
+
+    let gates = SkillGates::new(std::collections::HashSet::new(), std::collections::HashSet::from(["weather-lookup".to_string()]));
+    let picked = synthesized_playbooks(
+        &[unrelated_low_conf, matching],
+        "please book a flight ticket to hanoi",
+        SYNTH_SKILL_MIN_CONFIDENCE,
+        3,
+        &gates,
+    );
+    assert_eq!(picked.len(), 2);
+    assert!(
+        picked[0].0.starts_with("weather-lookup"),
+        "the pinned skill must be ordered first despite failing both the confidence and match filters: {picked:?}"
+    );
+}
+
+#[test]
+fn pinned_synthesized_skill_stays_bounded_by_top_n() {
+    let mut pinned_skill = make_skill("s1", "weather-lookup", "check the weather forecast for a city");
+    pinned_skill.confidence = SYNTH_SKILL_MIN_CONFIDENCE;
+    let mut matching = make_skill("s2", "flight-booking", "book a flight ticket for the user");
+    matching.confidence = SYNTH_SKILL_MIN_CONFIDENCE;
+
+    let gates = SkillGates::new(std::collections::HashSet::new(), std::collections::HashSet::from(["weather-lookup".to_string()]));
+    // top_n=1: the pinned skill takes the single slot.
+    let picked = synthesized_playbooks(
+        &[pinned_skill, matching],
+        "please book a flight ticket to hanoi",
+        SYNTH_SKILL_MIN_CONFIDENCE,
+        1,
+        &gates,
+    );
+    assert_eq!(picked.len(), 1, "pinned entries stay bounded by top_n: {picked:?}");
+    assert!(picked[0].0.starts_with("weather-lookup"));
 }
 
 // ---------------------------------------------------------------------------

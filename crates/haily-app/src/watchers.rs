@@ -123,6 +123,41 @@ pub fn spawn_run_event_bridge(
     });
 }
 
+/// Drain a run's distillation-proposal stream into every adapter (Sub-Agent + Skill Architecture
+/// phase 8's DEP-C2 emit seam, closed live by the "Pipeline Activation & Wiring" plan, phase 1 —
+/// Seam 3). Mirrors `spawn_run_event_bridge`'s shape exactly: the P6 build pipeline (in
+/// `haily-core`) emits a `Notification::DistillationProposal` to a plain `mpsc` it is handed,
+/// knowing nothing about adapters; this loop is the only place core and io meet, broadcasting
+/// each proposal via `AdapterManager::notify_all` (the GUI cockpit renders it as a
+/// `ProactiveCardKind::DistillationProposal` card). Ends when the run drops its sender or on
+/// shutdown, whichever comes first; registered on `tasks` so shutdown drains it.
+pub fn spawn_distillation_bridge(
+    mut proposals: mpsc::Receiver<Notification>,
+    am: AdapterManager,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
+) {
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("distillation bridge shutting down");
+                    break;
+                }
+                maybe = proposals.recv() => {
+                    let Some(notification) = maybe else {
+                        // Run finished (or never emitted) — its sender dropped.
+                        break;
+                    };
+                    if let Err(e) = am.notify_all(notification).await {
+                        tracing::warn!("distillation notify failed: {e:#}");
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Start the proactive daemon (morning brief, reminders, cross-domain alerts).
 ///
 /// `kms` is threaded in for the morning brief's synthesis (Phase 3, assistant-depth):
@@ -207,6 +242,7 @@ mod tests {
     /// `AdapterManager` route.
     struct RecordingAdapter {
         tx: mpsc::Sender<RunEvent>,
+        notify_tx: mpsc::Sender<Notification>,
     }
 
     #[async_trait]
@@ -221,7 +257,8 @@ mod tests {
             let _ = self.tx.send(event).await;
             Ok(())
         }
-        async fn notify(&self, _msg: Notification) -> Result<()> {
+        async fn notify(&self, msg: Notification) -> Result<()> {
+            let _ = self.notify_tx.send(msg).await;
             Ok(())
         }
         fn id(&self) -> &str {
@@ -234,7 +271,8 @@ mod tests {
     #[tokio::test]
     async fn bridge_forwards_run_events_in_order_and_exits_on_sender_drop() {
         let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
-        let adapter = Arc::new(RecordingAdapter { tx: seen_tx });
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter { tx: seen_tx, notify_tx });
         let am = AdapterManager::builder().register(adapter).build();
         let session = Uuid::new_v4();
         am.bind_session(session, "rec");
@@ -265,5 +303,43 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
             .await
             .expect("bridge task must exit after the runner drops its sender");
+    }
+
+    /// The distillation bridge forwards a proposal to every adapter via `notify_all` and exits
+    /// cleanly when the run drops its sender (mirrors the `RunEvent` bridge's own contract).
+    #[tokio::test]
+    async fn distillation_bridge_forwards_proposals_and_exits_on_sender_drop() {
+        let (seen_tx, _seen_rx) = mpsc::channel::<RunEvent>(1);
+        let (notify_tx, mut notify_rx) = mpsc::channel::<Notification>(16);
+        let adapter = Arc::new(RecordingAdapter { tx: seen_tx, notify_tx });
+        let am = AdapterManager::builder().register(adapter).build();
+
+        let (dist_tx, dist_rx) = mpsc::channel::<Notification>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        spawn_distillation_bridge(dist_rx, am, shutdown, tasks.clone());
+
+        dist_tx
+            .send(Notification::DistillationProposal {
+                class_key: "compile_error:auth".to_string(),
+                summary: "recurring pattern".to_string(),
+                rule_count: 2,
+            })
+            .await
+            .unwrap();
+        drop(dist_tx); // run finished → bridge loop should end
+
+        match notify_rx.recv().await.expect("proposal forwarded") {
+            Notification::DistillationProposal { class_key, rule_count, .. } => {
+                assert_eq!(class_key, "compile_error:auth");
+                assert_eq!(rule_count, 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("distillation bridge task must exit after the run drops its sender");
     }
 }

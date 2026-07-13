@@ -27,6 +27,9 @@ pub struct CodingWorkspaceRow {
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
+    /// Pipeline run this workspace was driven by (Pipeline Activation & Wiring phase 1). `NULL`
+    /// until [`set_run_id`] stamps it post-run, or for a workspace never driven by a run.
+    pub run_id: Option<String>,
 }
 
 /// Persist a new workspace row. `id` is minted by the caller so the on-disk worktree and the
@@ -137,4 +140,23 @@ pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
 /// persisting the row).
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Stamp the pipeline `run_id` a workspace was driven by (Pipeline Activation & Wiring, phase
+/// 1), for the P6 worktree reaper to join a workspace row back to its `pipeline_runs` row.
+/// Called AFTER the run reaches a terminal/paused state (the run mints its own id mid-flight,
+/// so it cannot be known at workspace-open time). Not scoped to `deleted_at IS NULL` — a
+/// concurrent discard racing this stamp is harmless: the run_id is audit metadata on an
+/// already-soft-deleted row either way, so the caller never needs to special-case the race.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn set_run_id(db: &DbHandle, id: &str, run_id: &str) -> Result<()> {
+    sqlx::query("UPDATE coding_workspaces SET run_id = ?, updated_at = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
 }

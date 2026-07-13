@@ -192,7 +192,15 @@ pub async fn run_build(
                 // Unresolved Critical after the bounded Fix loop — pause, never mask as success.
                 return Ok(report(rev_report.run_id, RunStatus::Paused, total_retries));
             }
-            feedback = Some(render_feedback(&criticals));
+            // Phase 10 seam finally wired (pipeline-activation phase 4): fold semantic LSP
+            // diagnostics for the phase's changed files into the Fix-loop feedback, deduplicated
+            // against THIS round's own compile-gate output so the model never sees the same
+            // error twice. Best-effort — a missing/degraded server yields no lines and the round
+            // proceeds on reviewer findings alone.
+            let lsp_lines =
+                lsp_fix_signal(spec.workspace, &phase.target_files, &bt_report.last_gate_output)
+                    .await;
+            feedback = Some(append_lsp_signal(render_feedback(&criticals), &lsp_lines));
             round += 1;
         }
     }
@@ -277,7 +285,43 @@ fn ship_summary(phases: &[PhaseInput]) -> String {
 }
 
 fn report(run_id: String, status: RunStatus, retries: u32) -> RunReport {
-    RunReport { run_id, status, retries }
+    // A synthetic terminal report for an early-exit path (build/test failed, review paused, or
+    // the fix loop is unresolved) — there is no further round to enrich, so the gate-output
+    // signal is irrelevant here (unlike the `RunReport` the runner itself returns).
+    RunReport { run_id, status, retries, last_gate_output: String::new() }
+}
+
+/// Best-effort LSP-only semantic-diagnostic lines for the phase's changed files, deduplicated
+/// against `build_output` (this round's own compile-gate decisive text) so a diagnostic the gate
+/// already reported is never shown to the model twice (phase 4, pipeline-activation, closing the
+/// `dedup_against_build_gate` seam). Scoped to `target_files` — never a whole-repo scan.
+///
+/// Graceful degradation is mandatory: no language server / a spawn or handshake error for a file
+/// yields no lines for it (see `haily_tools::lsp::collect_diagnostic_lines`) — this function can
+/// never fail the Fix loop, only enrich it when a server happens to be available.
+async fn lsp_fix_signal(
+    workspace: &CodingWorkspace,
+    target_files: &[String],
+    build_output: &str,
+) -> Vec<String> {
+    let lines = haily_tools::lsp::collect_diagnostic_lines(&workspace.row, target_files).await;
+    haily_tools::lsp::dedup_against_build_gate(&lines, build_output)
+}
+
+/// Append deduped LSP lines to the reviewer-findings feedback, or return `base` unchanged when
+/// there is nothing to add (no server / no extra diagnostics) — the degradation path is a plain
+/// no-op, never a placeholder header with an empty body.
+fn append_lsp_signal(base: String, lsp_lines: &[String]) -> String {
+    if lsp_lines.is_empty() {
+        return base;
+    }
+    let mut s = base;
+    s.push_str(
+        "\n\nAdditional semantic diagnostics from the language server (not already reported by \
+         the build gate above):\n",
+    );
+    s.push_str(&lsp_lines.join("\n"));
+    s
 }
 
 /// The `category` half of a class key = the finding's severity string (phase 8: start coarse).
@@ -444,7 +488,7 @@ mod tests {
     }
 
     fn rr(status: RunStatus) -> RunReport {
-        RunReport { run_id: "r1".to_string(), status, retries: 0 }
+        RunReport { run_id: "r1".to_string(), status, retries: 0, last_gate_output: String::new() }
     }
 
     #[tokio::test]
@@ -477,5 +521,54 @@ mod tests {
             let out = finalize_ship_report(rr(status), &ws);
             assert_eq!(out.status, status, "an already-honest non-Done outcome must never be rewritten");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 (pipeline-activation): LSP diagnostics folded into the Fix loop.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_lsp_signal_surfaces_lsp_only_lines_and_drops_build_gate_duplicates() {
+        // Simulates this round's compile-gate output and the lines `collect_diagnostic_lines`
+        // would have returned — proves the dedup + merge wiring end to end without a live server.
+        let build_output =
+            "error[E0308]: mismatched types: expected u32, found String\n --> src/a.rs:3:4";
+        let lsp_lines = vec![
+            "  [error] 3:4 mismatched types: expected u32, found String".to_string(), // gate dup
+            "  [warning] 9:1 unused variable: x".to_string(),                         // LSP-only
+        ];
+        let deduped = haily_tools::lsp::dedup_against_build_gate(&lsp_lines, build_output);
+        let base = "The independent review found unresolved CRITICAL issues:\n1. bug".to_string();
+        let feedback = append_lsp_signal(base.clone(), &deduped);
+
+        assert!(
+            feedback.contains("unused variable: x"),
+            "the LSP-only diagnostic must reach the fix feedback"
+        );
+        assert!(
+            !feedback.contains("mismatched types"),
+            "a diagnostic the build gate already reported must be dropped, not duplicated"
+        );
+        assert!(feedback.starts_with(&base), "reviewer findings stay first; LSP lines are additive");
+    }
+
+    #[test]
+    fn append_lsp_signal_is_a_no_op_when_there_is_nothing_to_add() {
+        let base = "The independent review found unresolved CRITICAL issues:\n1. bug".to_string();
+        let feedback = append_lsp_signal(base.clone(), &[]);
+        assert_eq!(feedback, base, "no LSP lines means the fix feedback is left completely unaffected");
+    }
+
+    #[tokio::test]
+    async fn lsp_fix_signal_degrades_cleanly_with_no_server_available() {
+        // An unsupported-language file (no server can ever be mapped to it) proves the
+        // absent-server path through the REAL async collector, without requiring an actual
+        // language server binary on the test host — the round must be unaffected, never fail.
+        let (ws, _dirs) = workspace_fixture().await;
+        let lines = lsp_fix_signal(&ws, &["README.md".to_string()], "irrelevant build output").await;
+        assert!(
+            lines.is_empty(),
+            "no server for the file's language must yield zero lines, never fail the round"
+        );
     }
 }

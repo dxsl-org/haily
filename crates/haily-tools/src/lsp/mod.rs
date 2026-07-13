@@ -99,6 +99,23 @@ fn resolve_for_file(tool: &str, path: &str) -> Resolved {
     Resolved::Ready(spec)
 }
 
+/// Render one diagnostic as the `  [sev] L:C message` line shape both [`render_diagnostics`] and
+/// the build-pipeline Fix-loop collector ([`collect_diagnostic_lines`]) share — kept in ONE place
+/// so `dedup_against_build_gate`'s parsing of this shape (see [`diagnostic_core_message`]) never
+/// drifts from what actually gets rendered.
+fn diagnostic_line(d: &Diagnostic) -> String {
+    let sev = match d.severity {
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "info",
+        Some(DiagnosticSeverity::HINT) => "hint",
+        _ => "note",
+    };
+    let line = d.range.start.line + 1;
+    let col = d.range.start.character + 1;
+    format!("  [{sev}] {line}:{col} {}", d.message.trim())
+}
+
 /// Render collected diagnostics into a concise, tag-stripped, capped model-safe block. Untrusted
 /// (server-derived) text is tag-stripped so a `<tool_call>` token in a diagnostic message cannot
 /// steer the fix loop (P4 contract).
@@ -108,16 +125,8 @@ fn render_diagnostics(diags: &[Diagnostic]) -> String {
     }
     let mut body = format!("lsp_diagnostics: {} diagnostic(s)\n", diags.len());
     for d in diags {
-        let sev = match d.severity {
-            Some(DiagnosticSeverity::ERROR) => "error",
-            Some(DiagnosticSeverity::WARNING) => "warning",
-            Some(DiagnosticSeverity::INFORMATION) => "info",
-            Some(DiagnosticSeverity::HINT) => "hint",
-            _ => "note",
-        };
-        let line = d.range.start.line + 1;
-        let col = d.range.start.character + 1;
-        body.push_str(&format!("  [{sev}] {line}:{col} {}\n", d.message.trim()));
+        body.push_str(&diagnostic_line(d));
+        body.push('\n');
         if body.len() > DIAGNOSTICS_CHAR_CAP {
             body.push_str("  [... additional diagnostics elided ...]\n");
             break;
@@ -291,6 +300,18 @@ async fn collect_diagnostics(
     rel: &str,
     spec: &LspServerSpec,
 ) -> Result<String> {
+    let diags = collect_diagnostic_items(ws, rel, spec).await?;
+    Ok(render_diagnostics(&diags))
+}
+
+/// Open `rel` in the pooled server and return its raw diagnostics after a bounded wait — the
+/// shared plumbing [`collect_diagnostics`] (tool path, renders a block) and
+/// [`collect_diagnostic_lines`] (build-pipeline Fix-loop path, renders per-line) both build on.
+async fn collect_diagnostic_items(
+    ws: &CodingWorkspaceRow,
+    rel: &str,
+    spec: &LspServerSpec,
+) -> Result<Vec<Diagnostic>> {
     let root = canonical_root(Path::new(&ws.worktree_path))?;
     let abs = resolve_in_workspace(&root, rel)?;
     let uri = Url::from_file_path(&abs).map_err(|_| anyhow!("file path is not a valid URL"))?;
@@ -298,7 +319,51 @@ async fn collect_diagnostics(
     let client = manager().get_or_spawn(&ws.id, &root, spec).await?;
     open_document(&client, &uri, spec.language, &text)?;
     tokio::time::sleep(DIAGNOSTIC_WAIT).await;
-    Ok(render_diagnostics(&client.diagnostics_for(&uri)))
+    Ok(client.diagnostics_for(&uri))
+}
+
+/// In-process entrypoint for the build-pipeline Fix loop (phase 4, pipeline-activation): collect
+/// rendered diagnostic LINES for a set of workspace-relative files, without re-parsing the
+/// `lsp_diagnostics` tool's JSON. Each file with at least one diagnostic contributes a `### rel`
+/// header followed by its `  [sev] L:C message` lines (the same shape [`dedup_against_build_gate`]
+/// already parses) so the caller can tell which file each survivor belongs to.
+///
+/// Best-effort and bounded, matching the tool's own degradation contract: a file whose language
+/// has no available server is silently skipped (never an error), and the total rendered size is
+/// capped at [`DIAGNOSTICS_CHAR_CAP`] — a run with many changed files degrades to a truncated
+/// block, never an unbounded prompt or a stalled Fix loop.
+pub async fn collect_diagnostic_lines(ws: &CodingWorkspaceRow, files: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut total_len = 0usize;
+    'files: for rel in files {
+        let spec = match resolve_for_file("lsp_diagnostics", rel) {
+            Resolved::Ready(spec) => spec,
+            Resolved::Degrade(_) => continue, // no server for this file's language — silent skip
+        };
+        let diags = match collect_diagnostic_items(ws, rel, &spec).await {
+            Ok(diags) => diags,
+            Err(e) => {
+                tracing::debug!("lsp diagnostics collection degraded for {rel}: {e:#}");
+                continue;
+            }
+        };
+        if diags.is_empty() {
+            continue;
+        }
+        let header = format!("### {rel}");
+        total_len += header.len();
+        lines.push(header);
+        for d in &diags {
+            let line = diagnostic_line(d);
+            total_len += line.len();
+            lines.push(line);
+            if total_len > DIAGNOSTICS_CHAR_CAP {
+                lines.push("  [... additional diagnostics elided ...]".to_string());
+                break 'files;
+            }
+        }
+    }
+    lines
 }
 
 /// Send `textDocument/didOpen` so the server indexes + diagnoses the file.
@@ -563,6 +628,32 @@ mod tests {
     #[test]
     fn renders_empty_and_nonempty_diagnostics() {
         assert!(render_diagnostics(&[]).contains("no semantic diagnostics"));
+    }
+
+    fn dummy_workspace_row() -> CodingWorkspaceRow {
+        CodingWorkspaceRow {
+            id: "ws-test".to_string(),
+            session_id: "session-test".to_string(),
+            repo_path: "/nonexistent/repo".to_string(),
+            branch: "main".to_string(),
+            worktree_path: "/nonexistent/worktree".to_string(),
+            work_item_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_diagnostic_lines_degrades_cleanly_for_unsupported_files() {
+        // Both extensions resolve to `Degrade` (no language mapping) BEFORE any filesystem access
+        // or server spawn is attempted, so a bogus workspace path is safe here — proves the
+        // build-pipeline Fix-loop collector never touches disk/process on an unsupported file.
+        let ws = dummy_workspace_row();
+        let lines =
+            collect_diagnostic_lines(&ws, &["notes.xyz".to_string(), "README".to_string()]).await;
+        assert!(lines.is_empty(), "an unsupported-language file must yield zero collected lines");
     }
 
     #[test]

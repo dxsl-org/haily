@@ -15,13 +15,17 @@ mod tool_call;
 pub mod worktree;
 
 pub use approval::{ApprovalBroker, PendingApproval};
+/// Pipeline Activation & Wiring (phase 1): the caller-facing launch request type + its Plan/
+/// Build/PlanThenBuild selector, re-exported at the crate root so an app-layer caller (`haily-
+/// app`) never needs a `haily_core::pipeline::launcher` path.
+pub use pipeline::{CodingRunSpec, RunKind};
 
 use anyhow::Result;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;
-use haily_types::{ApprovalResolver, Request, ResponseChunk};
+use haily_types::{ApprovalGate, ApprovalResolver, Notification, Request, ResponseChunk, RunEvent};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -422,6 +426,36 @@ impl Orchestrator {
             routing_enabled: Arc::clone(&self.routing_enabled),
         };
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
+    }
+
+    /// Launch a live coding-pipeline run (Pipeline Activation & Wiring, phase 1) bound to this
+    /// orchestrator's own handles. `LaunchDeps` is built here (never inside `pipeline::launcher`,
+    /// which does not know about `Orchestrator`'s private fields — mirrors `process`'s own
+    /// `TurnRuntime` construction) from the SAME approval broker + kill switch a normal turn
+    /// uses, so every write-tier tool call inside the launched run stays gated identically
+    /// (Security Considerations). `cancel` is the caller's per-run token, mirroring `process`'s
+    /// per-turn token.
+    ///
+    /// # Errors
+    /// Returns an error only for a setup failure (target-repo resolution, workspace open, or a
+    /// runner setup failure) — a paused/failed pipeline run is a normal `RunReport`, not an
+    /// error (see `pipeline::launcher::launch_coding_run`'s contract).
+    pub async fn launch_coding_run(
+        &self,
+        spec: pipeline::CodingRunSpec,
+        user_tx: mpsc::Sender<ResponseChunk>,
+        events_tx: mpsc::Sender<RunEvent>,
+        distillation_tx: Option<mpsc::Sender<Notification>>,
+        cancel: CancellationToken,
+    ) -> Result<pipeline::RunReport> {
+        let deps = pipeline::LaunchDeps {
+            db: Arc::clone(&self.db),
+            kms: Arc::clone(&self.kms),
+            llm: Arc::clone(&self.llm),
+            broker: Arc::clone(&self.approval_broker) as Arc<dyn ApprovalGate>,
+            kill: Arc::clone(&self.kill),
+        };
+        pipeline::launch_coding_run(deps, spec, user_tx, events_tx, distillation_tx, cancel).await
     }
 
     pub fn llm_provider(&self) -> String {
