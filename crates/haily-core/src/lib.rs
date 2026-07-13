@@ -7,8 +7,10 @@ mod delegate;
 mod domains;
 pub mod feedback_parser;
 pub mod pipeline;
+pub mod routing;
 mod specialists;
 mod tag_matcher;
+mod tier_intent;
 mod tool_call;
 pub mod worktree;
 
