@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { reloadLlm } from '$lib/tauri';
 
   let { prefs, save }: {
     prefs: Record<string, string>;
@@ -40,7 +41,7 @@
     try {
       await save('llm.llama_model_path', entry.path);
       await save('llm.llama_prompt_format', entry.format);
-      const provider = await invoke<string>('reload_llm');
+      const provider = await reloadLlm();
       // The router never errors on load — it silently falls back to "unconfigured".
       // Only "llama.cpp" means the GGUF actually loaded.
       if (provider === 'llama.cpp') {
@@ -56,6 +57,59 @@
   }
 
   const p = (key: string, fallback = '') => prefs[key] ?? fallback;
+
+  // ── Cost/quality routing dial (Auto Model Routing R1, phase 7) ──────────────
+
+  let costQuality = $state(7);
+  let costQualitySaving = $state(false);
+  let costQualityError = $state('');
+
+  // `routing_enabled` absent must read as ON — mirrors the backend's own boot-time
+  // seed default (`haily-core`'s `routing_enabled_pref` comment: "absent preference
+  // must default to ON"), so a fresh install shows the toggle already engaged.
+  let routingEnabled = $state(true);
+  let routingSaving = $state(false);
+
+  $effect(() => {
+    const cq = prefs['llm.cost_quality'];
+    if (cq !== undefined) {
+      const n = Number(cq);
+      if (Number.isFinite(n)) costQuality = n;
+    }
+    const re = prefs['llm.routing_enabled'];
+    if (re !== undefined) routingEnabled = re === 'true' || re === '1';
+  });
+
+  // Persists then hot-swaps the router at the next turn boundary (mirrors `applyCloud`).
+  // Mid-drag `input` events only update the label; the actual save/reload fires once on
+  // `change` (drag release) to avoid spamming `reload_llm` on every tick.
+  async function applyCostQuality(value: number) {
+    costQuality = value;
+    costQualityError = '';
+    costQualitySaving = true;
+    try {
+      await save('llm.cost_quality', String(value));
+      await reloadLlm();
+    } catch (e) {
+      costQualityError = String(e);
+    } finally {
+      costQualitySaving = false;
+    }
+  }
+
+  // No `reload_llm` here: `llm.routing_enabled` rides Phase 4's live special-case in
+  // `set_preference` (the SAME `Arc<AtomicBool>` every `TurnRuntime` reads), so the
+  // toggle takes effect on the very next turn with no router swap needed.
+  async function toggleRouting() {
+    const next = !routingEnabled;
+    routingEnabled = next;
+    routingSaving = true;
+    try {
+      await save('llm.routing_enabled', next ? 'true' : 'false');
+    } finally {
+      routingSaving = false;
+    }
+  }
 
   // ── Cloud API multi-key management ──────────────────────────────────────────
 
@@ -89,7 +143,7 @@
     try {
       const filtered = apiKeys.map(k => k.trim()).filter(Boolean);
       await save('llm.cloud_api_keys', JSON.stringify(filtered));
-      const provider = await invoke<string>('reload_llm');
+      const provider = await reloadLlm();
       cloudApplyOk = provider !== 'unconfigured'
         ? `✓ Đã áp dụng — ${filtered.length} key, provider: ${provider}`
         : '⚠️ Không có key hợp lệ — kiểm tra lại API key.';
@@ -100,6 +154,43 @@
     }
   }
 </script>
+
+<div class="section routing-section">
+  <label class="toggle-row">
+    <span>Tự chọn model theo tác vụ</span>
+    <input
+      type="checkbox"
+      checked={routingEnabled}
+      disabled={routingSaving}
+      onchange={toggleRouting}
+    />
+  </label>
+  <span class="hint">
+    Khi bật, Haily tự chọn model theo độ khó từng tác vụ (rẻ ↔ giỏi) thay vì luôn dùng model cấu hình cố định. Có hiệu lực từ tin nhắn sau, không cần khởi động lại.
+  </span>
+
+  <label>Ưu tiên rẻ ↔ giỏi
+    <input
+      type="range"
+      min="0" max="10" step="1"
+      value={costQuality}
+      oninput={e => costQuality = Number(e.currentTarget.value)}
+      onchange={e => applyCostQuality(Number(e.currentTarget.value))}
+    />
+    <div class="slider-labels">
+      <span>Tiết kiệm</span>
+      <span>Cân bằng</span>
+      <span>Chất lượng</span>
+    </div>
+  </label>
+  <span class="hint">Áp dụng từ tin nhắn sau — kéo xong thả tay để lưu.</span>
+
+  {#if costQualitySaving}
+    <div class="status-info">⏳ Đang áp dụng…</div>
+  {:else if costQualityError}
+    <div class="status-error">⚠️ {costQualityError}</div>
+  {/if}
+</div>
 
 <div class="subtabs">
   {#each (['local', 'cloud'] as const) as t}
@@ -239,6 +330,33 @@
   .subtab:hover:not(.active) { color: #a09ac0; }
 
   .section { display: flex; flex-direction: column; gap: 18px; }
+
+  .routing-section {
+    padding-bottom: 18px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid #2e2e4a;
+  }
+  .toggle-row {
+    flex-direction: row !important;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: #e0dff5;
+  }
+  .toggle-row input[type="checkbox"] {
+    width: auto;
+    accent-color: #7c3aed;
+  }
+  input[type="range"] {
+    padding: 0;
+    accent-color: #7c3aed;
+  }
+  .slider-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #6b6b8a;
+  }
 
   label {
     display: flex;

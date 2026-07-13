@@ -154,6 +154,17 @@ export async function setPreference(key: string, value: string): Promise<void> {
   return invoke('set_preference', { key, value });
 }
 
+/**
+ * Re-read LLM preferences and hot-swap the active backend at the next turn boundary.
+ * Returns the active provider name (`'llama.cpp'` / `'cloud'` / `'unconfigured'`) so the
+ * caller can distinguish a real model load from a silent "unconfigured" fallback — the
+ * router never errors on load, only when a message is sent. Mirrors the Rust
+ * `reload_llm` command (`src-tauri/src/lib.rs`).
+ */
+export async function reloadLlm(): Promise<string> {
+  return invoke('reload_llm');
+}
+
 /** One recorded connector write, as read back for the Safety tab's undo surface.
  * Mirrors `haily_db::queries::journal::ActionJournalRow` (camelCase over the wire). */
 export interface JournalEntry {
