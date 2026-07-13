@@ -1,10 +1,9 @@
 //! Tier decision core (Auto Model Routing R1, phase 3): [`select_tier`] picks the
 //! [`haily_llm::Tier`] a turn/pipeline-stage should run on, purely from trusted-origin inputs.
-//!
-//! Called by nobody yet — Phase 4 wires this into `agent::turn` and threads
-//! [`TierDecision::features`] into `routing_decisions` (phase 2's log table). Kept standalone
-//! and fully unit-testable so the decision ladder is provable in isolation before it touches
-//! the hot chat path.
+//! Phase 4 wires this into `agent::turn` — [`select_tier`] feeds `current_tier` at the top of
+//! `run_turn`, and [`open_stream_with_escalation`] is the escalation-aware replacement for the
+//! turn loop's plain `complete_stream` call — and threads [`TierDecision::features`] into
+//! `routing_decisions` (phase 2's log table).
 //!
 //! **Injection invariant (LOCKED):** every input this module reads is either the genuine user
 //! message string or an already-derived trusted counter (`RouteCtx.history_user_msgs` — a
@@ -16,7 +15,9 @@
 
 use crate::depth::DepthMode;
 use crate::tier_intent;
-use haily_llm::Tier;
+use haily_llm::{CompletionRequest, Egress, EscalationPolicy, LlmRouter, StreamChunk, Tier};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Self-calibrate from `routing_decisions` data once it exists (researcher-01: no published
 /// thresholds exist for either constant) — these are deliberate placeholders, not tuned values.
@@ -45,6 +46,16 @@ impl RouteFeatures {
             history_user_msgs: ctx.history_user_msgs,
             depth_label: ctx.depth.as_label(),
         }
+    }
+}
+
+/// Only meaningful as part of [`TierDecision::default`] — a routing-disabled turn never logs
+/// these features (see the `routing_enabled=false ⇒ zero rows` identity contract in
+/// `agent::turn`), so the exact zero values here are never observed, only the fact that
+/// `tier`/`source` resolve to "session default, no decision made."
+impl Default for RouteFeatures {
+    fn default() -> Self {
+        RouteFeatures { msg_words: 0, has_code: false, history_user_msgs: 0, depth_label: "normal" }
     }
 }
 
@@ -88,6 +99,16 @@ pub struct TierDecision {
     pub tier: Option<Tier>,
     pub source: DecisionSource,
     pub features: RouteFeatures,
+}
+
+/// The `routing_enabled=false` value — `agent::turn` uses this instead of calling
+/// [`select_tier`] at all when the kill switch is off, so a disabled turn's tier is always
+/// `None` (identical model selection to a pre-phase-4 turn) and its decision source is
+/// unambiguously "no decision was made" rather than a fabricated heuristic result.
+impl Default for TierDecision {
+    fn default() -> Self {
+        TierDecision { tier: None, source: DecisionSource::Default, features: RouteFeatures::default() }
+    }
 }
 
 /// Wire label for a [`Tier`], matching the `routing_decisions.chosen_tier`/`escalated_to`
@@ -194,6 +215,85 @@ pub fn select_tier(msg: &str, ctx: RouteCtx, cost_quality: u8) -> TierDecision {
     let tier = tier.map(|t| apply_remote_ceiling(t, ctx.remote_origin));
 
     TierDecision { tier, source, features }
+}
+
+/// Mirrors the `deny_remote_deep` remote-origin check (`haily-io::mobile::server`, which sets
+/// `adapter_id: "mobile"` — the ONLY remote-transport literal any adapter uses; GUI/CLI/
+/// Telegram all route through an in-process or already-authenticated local channel). Feeds
+/// `RouteCtx.remote_origin` so the tier ceiling stays in lockstep with the existing depth
+/// ceiling for a remote request.
+pub fn is_remote_adapter(adapter_id: &str) -> bool {
+    adapter_id == "mobile"
+}
+
+/// Parses the optional `llm.escalation.egress` preference override (`localonly` |
+/// `allowcloud`, case-insensitive). `None` for an absent/unrecognized value, meaning the
+/// primary-backend-locality derivation in `agent::turn` applies unmodified.
+pub fn parse_egress_override(value: &str) -> Option<Egress> {
+    match value.to_lowercase().as_str() {
+        "localonly" => Some(Egress::LocalOnly),
+        "allowcloud" => Some(Egress::AllowCloud),
+        _ => None,
+    }
+}
+
+/// Streams `req` at `*current_tier`, escalating exactly once to a higher tier on a
+/// PRE-FIRST-TOKEN failure — the chat "dead-end rescue" (phase 4). Replaces the turn loop's
+/// plain `llm.complete_stream(req)` call.
+///
+/// Contract (LOCKED, red-team):
+/// 1. Cancellation is checked BEFORE any escalation logic — the user's own stop request must
+///    never trigger a costlier retry; it propagates the original error immediately.
+/// 2. Otherwise consults `policy.next_tier`, capped by `egress`/`llm.highest_local_tier()`.
+///    `policy.enabled == false` (e.g. a routing-disabled turn's policy) makes this always
+///    `None` — identical to a single plain `complete_stream` attempt, no rescue.
+/// 3. No-op guard: a `next` tier that resolves to the SAME backend model as the current
+///    attempt (a local-only config collapses `Thinking`/`Ultra` to one loaded GGUF; an
+///    unconfigured tier override falls back to the session default either way) is skipped —
+///    retrying an identical model wastes a request for nothing.
+/// 4. One step max: the escalated retry's own failure propagates as-is, never a second rescue.
+///
+/// On a successful escalated retry, `*current_tier` is updated so every subsequent tool-loop
+/// iteration in THIS turn reuses the rescued tier instead of re-escalating from scratch; a
+/// fresh turn always starts over from its own `select_tier` decision (the tier is never
+/// persisted past the turn it was computed in).
+pub async fn open_stream_with_escalation(
+    llm: &LlmRouter,
+    current_tier: &mut Option<Tier>,
+    req: CompletionRequest,
+    policy: &EscalationPolicy,
+    egress: Egress,
+    cancel: &CancellationToken,
+) -> anyhow::Result<mpsc::Receiver<StreamChunk>> {
+    match llm.complete_stream_tiered(*current_tier, req.clone()).await {
+        Ok(rx) => Ok(rx),
+        Err(e) => {
+            if cancel.is_cancelled() {
+                return Err(e);
+            }
+            let snapshot = llm.snapshot();
+            let highest_local = llm.highest_local_tier();
+            // `None` means "session default" — anchor the ladder at the default model's own
+            // resolved tier so the escalation math has a real ordinal starting point; an
+            // unrecognized default model fails safe to `Fast` (the floor), still buying
+            // exactly one rescue step rather than silently skipping escalation altogether.
+            let effective_current =
+                current_tier.unwrap_or_else(|| snapshot.session_tier(&[]).unwrap_or(Tier::Fast));
+            let Some(next) = policy.next_tier(effective_current, 1, egress, highest_local) else {
+                return Err(e);
+            };
+            if snapshot.model_for_tier(Some(next)) == snapshot.model_for_tier(*current_tier) {
+                return Err(e);
+            }
+            match llm.complete_stream_tiered(Some(next), req).await {
+                Ok(rx) => {
+                    *current_tier = Some(next);
+                    Ok(rx)
+                }
+                Err(e2) => Err(e2),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +472,228 @@ mod tests {
         let c = select_tier("ok fix that", bumped, 5);
         assert_ne!(c.tier, a.tier, "only the trusted history_user_msgs count can change the decision");
         assert_eq!(c.source, DecisionSource::Heuristic);
+    }
+
+    // -- routing_enabled=false plumbing --------------------------------------------------
+
+    #[test]
+    fn tier_decision_default_is_session_default_with_no_tier() {
+        let decision = TierDecision::default();
+        assert_eq!(decision.tier, None);
+        assert_eq!(decision.source, DecisionSource::Default);
+    }
+
+    // -- remote-adapter / egress-override helpers ----------------------------------------
+
+    #[test]
+    fn is_remote_adapter_true_only_for_mobile() {
+        assert!(is_remote_adapter("mobile"));
+        assert!(!is_remote_adapter("gui"));
+        assert!(!is_remote_adapter("telegram"));
+        assert!(!is_remote_adapter("cli"));
+    }
+
+    #[test]
+    fn parse_egress_override_parses_known_values_case_insensitively() {
+        assert_eq!(parse_egress_override("localonly"), Some(Egress::LocalOnly));
+        assert_eq!(parse_egress_override("LocalOnly"), Some(Egress::LocalOnly));
+        assert_eq!(parse_egress_override("allowcloud"), Some(Egress::AllowCloud));
+        assert_eq!(parse_egress_override("ALLOWCLOUD"), Some(Egress::AllowCloud));
+        assert_eq!(parse_egress_override("garbage"), None);
+        assert_eq!(parse_egress_override(""), None);
+    }
+}
+
+#[cfg(test)]
+mod escalation_tests {
+    //! `open_stream_with_escalation` integration tests — a REAL `LlmRouter` (cloud backend)
+    //! against a scripted loopback SSE/TCP mock server, mirroring the exact mock-server
+    //! technique `agent::turn`'s own test modules use (per this file's per-module-helper
+    //! convention, duplicated rather than shared — see `sub_turn.rs`'s doc for that
+    //! precedent). No real network call: bound to `127.0.0.1:0`, OS-assigned port.
+    use super::*;
+    use haily_llm::{LlmConfig, Message};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn cloud_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    fn req() -> CompletionRequest {
+        CompletionRequest::simple(vec![Message::user("hi")])
+    }
+
+    fn enabled_policy() -> EscalationPolicy {
+        EscalationPolicy { failures_before_escalation: 1, max_tier: Tier::Thinking, enabled: true }
+    }
+
+    /// Every connection this server accepts either fails immediately (closes without a
+    /// valid response — a pre-first-token error) or succeeds with `content`, per
+    /// `fail_first_n` calls. Returns `(base_url, call_count)` so a test can assert exactly
+    /// how many connections were actually attempted.
+    fn spawn_server(fail_first_n: usize, content: &'static str) -> (String, Arc<AtomicUsize>) {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_srv = Arc::clone(&call_count);
+        // A synchronous std listener bound before the async server task starts, so the
+        // base_url is available to the caller immediately (no race on first connect).
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let addr = std_listener.local_addr().expect("local_addr");
+        let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let call_count = Arc::clone(&call_count_srv);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_first_n {
+                        // A malformed status line forces an IMMEDIATE synchronous parse
+                        // error in the HTTP client (never a timeout-dependent wait for a
+                        // connection-reset to propagate) — a deterministic, fast way to
+                        // simulate a pre-first-token stream-init failure.
+                        let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": content } }]
+                    })
+                    .to_string();
+                    let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), call_count)
+    }
+
+    #[tokio::test]
+    async fn cancellation_never_escalates_and_propagates_the_original_error() {
+        let (base_url, call_count) = spawn_server(usize::MAX, "unused");
+        let llm = LlmRouter::init(cloud_config(base_url)).await;
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled BEFORE the call
+
+        let mut current_tier = None;
+        let result = open_stream_with_escalation(
+            &llm,
+            &mut current_tier,
+            req(),
+            &enabled_policy(),
+            Egress::AllowCloud,
+            &cancel,
+        )
+        .await;
+
+        assert!(result.is_err(), "a pre-first-token failure on a cancelled turn must propagate");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "cancellation must prevent any escalated retry — exactly one attempt"
+        );
+        assert_eq!(current_tier, None, "tier must be left untouched on a cancelled failure");
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_never_escalates() {
+        let (base_url, call_count) = spawn_server(usize::MAX, "unused");
+        let llm = LlmRouter::init(cloud_config(base_url)).await;
+        let cancel = CancellationToken::new();
+        let disabled = EscalationPolicy { failures_before_escalation: 1, max_tier: Tier::Thinking, enabled: false };
+
+        let mut current_tier = None;
+        let result = open_stream_with_escalation(
+            &llm, &mut current_tier, req(), &disabled, Egress::AllowCloud, &cancel,
+        )
+        .await;
+
+        assert!(result.is_err(), "a disabled policy must behave exactly like plain complete_stream — no rescue");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "disabled policy must never attempt a retry");
+    }
+
+    #[tokio::test]
+    async fn no_op_guard_skips_retry_when_next_tier_resolves_to_the_same_model() {
+        // No `tier_models` override configured — `model_for_tier(Some(next))` and
+        // `model_for_tier(None)` both fall back to the SAME session default model, so the
+        // no-op guard must fire before a second connection is ever attempted.
+        let (base_url, call_count) = spawn_server(usize::MAX, "unused");
+        let llm = LlmRouter::init(cloud_config(base_url)).await;
+        let cancel = CancellationToken::new();
+
+        let mut current_tier = None;
+        let result = open_stream_with_escalation(
+            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "an identical resolved model must never be retried"
+        );
+        assert_eq!(current_tier, None);
+    }
+
+    #[tokio::test]
+    async fn pre_first_token_error_escalates_once_to_a_distinct_tier_model() {
+        // Fails the FIRST connection, succeeds every connection after — proving the
+        // escalated retry actually reaches the server and succeeds.
+        let (base_url, call_count) = spawn_server(1, "Escalated answer.");
+        let mut config = cloud_config(base_url);
+        // A distinct Medium override so `model_for_tier(Some(Medium)) != model_for_tier(None)`
+        // — the no-op guard must NOT fire here.
+        config.tier_models.medium = Some("distinct-medium-model".to_string());
+        let llm = LlmRouter::init(config).await;
+        let cancel = CancellationToken::new();
+
+        let mut current_tier = None;
+        let result = open_stream_with_escalation(
+            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the escalated retry must succeed");
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "exactly one retry attempt");
+        assert_eq!(
+            current_tier,
+            Some(Tier::Medium),
+            "current_tier must be updated to the tier that actually succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_first_attempt_never_touches_the_escalation_path() {
+        let (base_url, call_count) = spawn_server(0, "Plain answer.");
+        let llm = LlmRouter::init(cloud_config(base_url)).await;
+        let cancel = CancellationToken::new();
+
+        let mut current_tier = None;
+        let result = open_stream_with_escalation(
+            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "a clean success must never retry");
+        assert_eq!(current_tier, None, "tier must be untouched when no escalation ever happened");
     }
 }

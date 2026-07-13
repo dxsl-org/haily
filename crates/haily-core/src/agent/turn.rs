@@ -1,19 +1,20 @@
 use anyhow::Result;
 use haily_db::{
-    queries::{sessions, work_items},
+    queries::{routing_decisions, sessions, work_items},
     DbHandle,
 };
 use haily_kms::KmsHandle;
-use haily_llm::{CompletionRequest, LlmClient, LlmRouter, Message, Role};
+use haily_llm::{CompletionRequest, Egress, EscalationPolicy, LlmRouter, Message, Role, Tier};
 use haily_tools::{ToolContext, ToolRegistry};
 use haily_types::{Request, ResponseChunk};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
 
 use crate::approval::ApprovalBroker;
+use crate::routing::{self, TierDecision};
 use crate::{budget, context, feedback_parser, tool_call};
 use super::outcome::{record_outcome_and_update_skill, OutcomeMetricsInput};
 use super::stream::stream_llm_response;
@@ -33,6 +34,11 @@ pub struct TurnRuntime {
     /// Phase 3 kill switch (C8): `safety.disable_writes`, shared from the Orchestrator so
     /// the L0 turn and every sub-turn it spawns observe the same live-toggleable flag.
     pub kill: Arc<AtomicBool>,
+    /// Auto Model Routing R1 (phase 4) kill switch: `llm.routing_enabled`, mirroring `kill`
+    /// exactly — a shared, live-flippable `Arc<AtomicBool>` from the Orchestrator. `false`
+    /// makes this turn behave identically to the pre-phase-4 turn (tier always `None`, zero
+    /// `routing_decisions` rows, no escalation rescue attempted).
+    pub routing_enabled: Arc<AtomicBool>,
 }
 
 /// Full agent turn. Called once per incoming Request.
@@ -54,6 +60,7 @@ pub async fn run_turn(
         llm,
         tools,
         kill,
+        routing_enabled,
     } = runtime;
     let session_id = req.session_id.to_string();
     let turn_start = std::time::Instant::now();
@@ -105,7 +112,64 @@ pub async fn run_turn(
     // every sub-turn `delegate.rs` spawns from it, shares this id/counter so the whole
     // turn's writes group under one `undo_turn` and one M2 destructive-op cap.
     let turn_id = uuid::Uuid::new_v4();
+    let turn_id_str = turn_id.to_string();
     let turn_deletes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Auto Model Routing R1 (phase 4): the tier decision is computed EXACTLY ONCE here —
+    // `current_tier` is reused by every loop iteration below (the anti-flap invariant) and
+    // only ever mutated by `open_stream_with_escalation`'s own rescue step, never
+    // recomputed from `select_tier` again within this turn. `routing_active=false` makes
+    // `decision` the pure `Default` (tier=None, source=default) — identical model
+    // selection to a pre-phase-4 turn, and (checked again at turn end) zero
+    // `routing_decisions` rows.
+    let routing_active = routing_enabled.load(Ordering::Acquire);
+    // Count of PRIOR user messages actually surviving this turn's token-budget fit — a
+    // trusted-origin, privacy-safe COUNT (never assembled history text; see
+    // `routing::RouteCtx`'s injection-invariant doc). `messages` already includes the
+    // CURRENT turn's own user message (`context::build_messages` always appends it and
+    // pins it), so it is excluded via `saturating_sub(1)`.
+    let history_user_msgs = messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .count()
+        .saturating_sub(1);
+    let route_ctx = routing::RouteCtx {
+        depth: effective_depth,
+        history_user_msgs,
+        // Mirrors the existing `deny_remote_deep` remote-origin check (mobile/server.rs,
+        // `adapter_id: "mobile"` is the only remote-transport literal any adapter sets).
+        remote_origin: routing::is_remote_adapter(&req.adapter_id),
+    };
+    let decision = if routing_active {
+        routing::select_tier(&req.message, route_ctx, llm.cost_quality())
+    } else {
+        TierDecision::default()
+    };
+    let mut current_tier = decision.tier;
+    // Chat escalation policy (LOCKED, phase 4 spec): a single dead-end rescue on a
+    // pre-first-token stream failure — strictly better than today's hard-fail. `enabled`
+    // is unconditionally `true` (the rescue is a reliability improvement independent of
+    // the tier-selection toggle); the no-op guard inside `open_stream_with_escalation`
+    // already collapses this to a no-op whenever no tier override is actually configured.
+    let escalation_policy = EscalationPolicy {
+        failures_before_escalation: 1,
+        max_tier: Tier::Thinking,
+        enabled: true,
+    };
+    // Egress derivation (LOCKED): llama primary ⇒ LocalOnly (escalation never silently
+    // leaves the machine the user started local on); cloud primary ⇒ AllowCloud. An
+    // optional `llm.escalation.egress` preference overrides either derivation; read fresh
+    // each turn (not cached at boot) so an operator change takes effect immediately.
+    let egress_override = haily_db::queries::meta::get_preference(&db, "llm.escalation.egress")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| routing::parse_egress_override(&v));
+    let egress = egress_override.unwrap_or(if llm.provider_name() == "llama.cpp" {
+        Egress::LocalOnly
+    } else {
+        Egress::AllowCloud
+    });
 
     let tool_ctx = ToolContext {
         db: db.clone(),
@@ -173,7 +237,16 @@ pub async fn run_turn(
             messages = token_budget.refit(&messages, pinned_tail_len);
 
             let llm_req = CompletionRequest::simple(messages.clone()).with_cancel(cancel.clone());
-            let mut stream = match llm.complete_stream(llm_req).await {
+            let mut stream = match routing::open_stream_with_escalation(
+                &llm,
+                &mut current_tier,
+                llm_req,
+                &escalation_policy,
+                egress,
+                cancel,
+            )
+            .await
+            {
                 Ok(rx) => rx,
                 Err(e) => break 'turn Err(e),
             };
@@ -341,7 +414,12 @@ pub async fn run_turn(
         &final_response,
         elapsed_ms,
         OutcomeMetricsInput {
-            model_tier: None, // L0 turns don't select a Tier today — see `SubTurnRequest::model_tier` doc.
+            // Auto Model Routing R1 (phase 4): the tier actually used for the turn's LAST
+            // LLM call — `current_tier` reflects any escalation that fired, matching the
+            // same "last call's counts" convention `turn_prompt_tokens`/
+            // `turn_completion_tokens` already follow above. `None` (session default,
+            // routing disabled, or no heuristic triggered) persists as NULL.
+            model_tier: current_tier.map(routing::tier_label),
             prompt_tokens: turn_prompt_tokens,
             completion_tokens: turn_completion_tokens,
             delegate_overhead_ms: None, // L0 turns have no delegate-spawn overhead of their own.
@@ -351,9 +429,37 @@ pub async fn run_turn(
             owns_learning: true,
             approval_gate: &tool_ctx.approval_gate,
             final_turn_deletes: turn_deletes.load(std::sync::atomic::Ordering::Relaxed),
+            turn_id: turn_id_str.as_str(),
         },
     )
     .await;
+
+    // Auto Model Routing R1 (phase 4): best-effort routing-decision telemetry, co-located
+    // with the trace write above — best-effort (`let _ =`, never `?`) and written ONLY
+    // when routing is enabled, so `routing_enabled=false` produces ZERO rows (the identity
+    // guarantee `turn_integration_tests`/golden harness rely on). A crashed turn writes
+    // nothing (see migration 0031's write contract) — this call sits after every fallible
+    // `?` in this function has already resolved, so it only ever runs on a completed turn.
+    if routing_active {
+        let escalated_to = if current_tier != decision.tier { current_tier } else { None };
+        let new_row = routing_decisions::NewRoutingDecision {
+            turn_id: turn_id_str.as_str(),
+            run_id: None, // an L0 chat turn is not a pipeline run
+            context_kind: "chat",
+            stage_kind: None,
+            chosen_tier: decision.tier.map(routing::tier_label),
+            escalated_to: escalated_to.map(routing::tier_label),
+            decision_source: decision.source.as_label(),
+            cost_quality: i64::from(llm.cost_quality()),
+            feature_msg_words: decision.features.msg_words as i64,
+            feature_has_code: decision.features.has_code,
+            feature_history_user_msgs: decision.features.history_user_msgs as i64,
+            feature_depth: decision.features.depth_label,
+            escalation_trigger: escalated_to.map(|_| "stream_init_error"),
+            prior_failures: i64::from(escalated_to.is_some()),
+        };
+        let _ = routing_decisions::insert(&db, new_row).await;
+    }
 
     // Only send `final_response` here if it was never streamed live during the loop
     // (the loop-guard's fallback message) — the common plain-text-answer path already
@@ -544,6 +650,7 @@ mod turn_integration_tests {
             llm,
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(true)),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -692,6 +799,7 @@ mod turn_integration_tests {
             llm: l0_llm,
             tools: Arc::new(l0_registry),
             kill,
+            routing_enabled: Arc::new(AtomicBool::new(true)),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -849,12 +957,26 @@ mod outcome_signal_tests {
         format!("http://{addr}")
     }
 
-    async fn run_plain_turn(
+    pub(super) async fn run_plain_turn(
         db: Arc<DbHandle>,
         kms: Arc<KmsHandle>,
         session_id: uuid::Uuid,
         message: &str,
         answer: &'static str,
+    ) {
+        run_plain_turn_with_routing(db, kms, session_id, message, answer, true).await;
+    }
+
+    /// Auto Model Routing R1 phase 4: same drive as `run_plain_turn`, but with the
+    /// `routing_enabled` seed under caller control — used by the identity/blast-radius
+    /// tests that must prove behavior with the kill switch OFF vs its default ON state.
+    pub(super) async fn run_plain_turn_with_routing(
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        session_id: uuid::Uuid,
+        message: &str,
+        answer: &'static str,
+        routing_enabled: bool,
     ) {
         let base_url = spawn_plain_answer_sse_server(answer).await;
         let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
@@ -864,6 +986,7 @@ mod outcome_signal_tests {
             llm,
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(routing_enabled)),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -884,7 +1007,7 @@ mod outcome_signal_tests {
         drain.await.expect("drain task");
     }
 
-    async fn latest_trace(db: &DbHandle, session_id: uuid::Uuid) -> db_skills::TaskTrace {
+    pub(super) async fn latest_trace(db: &DbHandle, session_id: uuid::Uuid) -> db_skills::TaskTrace {
         db_skills::most_recent_trace(db, &session_id.to_string())
             .await
             .expect("most_recent_trace")
@@ -996,6 +1119,7 @@ mod outcome_signal_tests {
             llm,
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(true)),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1447,6 +1571,7 @@ mod outcome_signal_tests {
             llm: l0_llm,
             tools: Arc::new(l0_registry),
             kill,
+            routing_enabled: Arc::new(AtomicBool::new(true)),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1504,5 +1629,99 @@ mod outcome_signal_tests {
              it further via a second application on top of the first",
             after.confidence
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_toggle_tests {
+    //! Auto Model Routing R1 phase 4 — the two blast-radius criteria the plan's Success
+    //! Criteria table marks CRITICAL: `routing_enabled=false` must reproduce legacy
+    //! behavior byte-for-byte AT THIS HARNESS'S GRANULARITY (visible text, tool
+    //! dispatch, DB rows, TaskOutcome — the collector tracks no chunk sequence, so this
+    //! does not overclaim byte-identical streaming; see the phase file's Assumptions),
+    //! and zero `routing_decisions` rows; `routing_enabled=true` with a plain message
+    //! that trips no heuristic must select the SAME tier (`None`) and add exactly one
+    //! telemetry row.
+    use super::outcome_signal_tests::{run_plain_turn, run_plain_turn_with_routing};
+    use haily_db::{queries::routing_decisions, DbHandle};
+    use haily_kms::KmsHandle;
+    use std::sync::Arc;
+
+    async fn test_db_kms() -> (Arc<DbHandle>, Arc<KmsHandle>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("haily.db");
+        let db = Arc::new(DbHandle::init(&db_path).await.expect("db init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
+        (db, kms, dir)
+    }
+
+    /// CRITICAL: `routing_enabled=false` ⇒ identical outcome to a plain turn (text/DB/
+    /// TaskOutcome parity at this harness's granularity) AND zero `routing_decisions`
+    /// rows — the routing layer must be a complete no-op when the kill switch is off.
+    #[tokio::test]
+    async fn routing_disabled_matches_legacy_behavior_and_writes_zero_decision_rows() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        run_plain_turn_with_routing(
+            db.clone(),
+            kms,
+            session_id,
+            "what's the capital of vietnam",
+            "Hanoi is the capital of Vietnam.",
+            false,
+        )
+        .await;
+
+        // Text/DB/TaskOutcome parity: the same assistant/user message pair and outcome a
+        // routing-enabled plain turn produces (see `a_plain_successful_turn_with_no_signal_is_labeled_unknown`).
+        let trace = super::outcome_signal_tests::latest_trace(&db, session_id).await;
+        assert_eq!(trace.outcome, "success");
+        assert!(trace.label_source.is_none());
+
+        let messages = haily_db::queries::sessions::recent_messages(&db, &session_id.to_string(), 10)
+            .await
+            .expect("recent_messages");
+        assert!(
+            messages.iter().any(|m| m.role == "assistant" && m.content == "Hanoi is the capital of Vietnam."),
+            "assistant response must persist exactly as scripted, got: {messages:?}"
+        );
+
+        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        assert!(
+            rows.is_empty(),
+            "routing_enabled=false must write ZERO routing_decisions rows, got: {rows:?}"
+        );
+    }
+
+    /// CRITICAL: `routing_enabled=true` (the shipping default) with a plain message that
+    /// trips no heuristic (short, no code fence, no history) must select `tier=None` —
+    /// the SAME model selection as a pre-phase-4 turn — with a blast radius of exactly
+    /// one `routing_decisions` row (telemetry only; no behavior change).
+    #[tokio::test]
+    async fn routing_enabled_default_on_with_no_heuristic_trigger_has_blast_radius_of_one_row() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        run_plain_turn(db.clone(), kms, session_id, "hi there", "Hello! How can I help?").await;
+
+        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        assert_eq!(
+            rows.len(),
+            1,
+            "blast radius must be exactly one telemetry row, got: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].chosen_tier, None,
+            "a short plain message with no history/heuristic trigger must select tier=None \
+             (identical model selection to a pre-phase-4 turn), got: {:?}",
+            rows[0].chosen_tier
+        );
+        assert_eq!(rows[0].decision_source, "default");
+        assert!(rows[0].escalated_to.is_none());
     }
 }

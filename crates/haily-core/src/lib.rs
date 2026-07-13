@@ -45,6 +45,13 @@ pub struct Orchestrator {
     /// is observed at any depth, and exposed via `kill_handle()` so the app layer can flip
     /// it live from `set_preference`/CLI without an orchestrator round-trip.
     kill: Arc<AtomicBool>,
+    /// Auto Model Routing R1 (phase 4) kill switch: `llm.routing_enabled`. Mirrors `kill`
+    /// exactly — seeded once from the persisted preference (default ON), the runtime
+    /// source of truth from here on, and exposed via `routing_enabled_handle()` so the app
+    /// layer can flip it live from `set_preference` without an orchestrator round-trip.
+    /// `false` collapses every turn's tier decision to `None` (identical model selection
+    /// to a pre-phase-4 turn) and skips the `routing_decisions` telemetry write entirely.
+    routing_enabled: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
@@ -124,6 +131,19 @@ impl Orchestrator {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
         let kill = Arc::new(AtomicBool::new(disable_writes));
+
+        // Auto Model Routing R1 (phase 4) kill switch: mirrors `disable_writes` above
+        // exactly — seeded from the persisted `llm.routing_enabled` preference, default
+        // ON (routing_enabled=false is the escape hatch, not the shipping default: a
+        // strict superset of legacy behavior is safe to enable by default). Live-flipped
+        // from here on via `routing_enabled_handle()` (see that method's doc).
+        let routing_enabled_pref = haily_db::queries::meta::get_preference(&db, "llm.routing_enabled")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true);
+        let routing_enabled = Arc::new(AtomicBool::new(routing_enabled_pref));
 
         let mut base_v1 = ToolRegistry::build_v1();
 
@@ -364,6 +384,7 @@ impl Orchestrator {
             tools,
             approval_broker: Arc::new(ApprovalBroker::with_auto_approve(auto_approve)),
             kill,
+            routing_enabled,
         })
     }
 
@@ -398,6 +419,7 @@ impl Orchestrator {
             llm,
             tools: Arc::clone(&self.tools),
             kill: Arc::clone(&self.kill),
+            routing_enabled: Arc::clone(&self.routing_enabled),
         };
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
     }
@@ -424,6 +446,14 @@ impl Orchestrator {
     /// this Arc is the runtime source of truth, the row is only persistence.
     pub fn kill_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kill)
+    }
+
+    /// Auto Model Routing R1 (phase 4): the `llm.routing_enabled` kill switch, for the app
+    /// layer to flip live from `set_preference` without an orchestrator round-trip — mirrors
+    /// `kill_handle()` exactly (same rationale: `set_preference` sits behind the
+    /// shutdown-guarded `app` Mutex and has no orchestrator access of its own).
+    pub fn routing_enabled_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.routing_enabled)
     }
 
     /// Snapshot of every in-flight tool approval across all channels (phase 11a), for the
@@ -809,5 +839,171 @@ mod wiring_tests {
                 s.tool_name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_enabled_tests {
+    //! Auto Model Routing R1 phase 4: proves the two halves `agent::turn`'s own
+    //! `routing_toggle_tests` cannot — (1) `Orchestrator::init` seeds `routing_enabled`
+    //! from the persisted `llm.routing_enabled` preference (mirrors `disable_writes`'s
+    //! own boot-read exactly), and (2) `routing_enabled_handle()` is the SAME live Atomic
+    //! `process()` reads on every turn, so flipping it takes effect on the very next
+    //! turn with no restart — the "flipping the GUI toggle takes effect NEXT turn"
+    //! success criterion, end-to-end through the real public `Orchestrator::process` path.
+    use super::*;
+    use haily_db::queries::{meta, routing_decisions};
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_plain_answer_sse_server(answer: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    let delta = serde_json::json!({
+                        "choices": [{ "delta": { "content": answer } }]
+                    })
+                    .to_string();
+                    let sse_body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn cloud_config(base_url: String) -> LlmConfig {
+        LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        }
+    }
+
+    /// Returns the orchestrator plus its shutdown handles, so every test can drain its
+    /// background workers cleanly at the end (mirrors `tests/fixtures/mod.rs`'s
+    /// `run_golden_task` convention) instead of leaking them into the runtime's teardown.
+    async fn init_orchestrator(
+        db: Arc<DbHandle>,
+        kms: Arc<KmsHandle>,
+        base_url: String,
+    ) -> (Orchestrator, CancellationToken, TaskTracker) {
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let orchestrator = Orchestrator::init(
+            kms,
+            db,
+            cloud_config(base_url),
+            shutdown.clone(),
+            tasks.clone(),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("orchestrator init");
+        (orchestrator, shutdown, tasks)
+    }
+
+    async fn cleanup(shutdown: CancellationToken, tasks: TaskTracker) {
+        shutdown.cancel();
+        tasks.close();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait()).await;
+    }
+
+    #[tokio::test]
+    async fn routing_enabled_defaults_to_true_when_the_preference_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let base_url = spawn_plain_answer_sse_server("hi").await;
+
+        let (orchestrator, shutdown, tasks) = init_orchestrator(db, kms, base_url).await;
+        assert!(
+            orchestrator.routing_enabled_handle().load(Ordering::Acquire),
+            "absent llm.routing_enabled preference must default to ON"
+        );
+        cleanup(shutdown, tasks).await;
+    }
+
+    #[tokio::test]
+    async fn routing_enabled_seeds_false_from_a_persisted_preference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
+        meta::upsert_preference(&db, "llm.routing_enabled", "false", "test")
+            .await
+            .expect("seed preference");
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let base_url = spawn_plain_answer_sse_server("hi").await;
+
+        let (orchestrator, shutdown, tasks) = init_orchestrator(db, kms, base_url).await;
+        assert!(
+            !orchestrator.routing_enabled_handle().load(Ordering::Acquire),
+            "a persisted llm.routing_enabled=false preference must seed the Atomic OFF"
+        );
+        cleanup(shutdown, tasks).await;
+    }
+
+    /// HIGH: flipping `routing_enabled_handle()` between two `process()` calls on the
+    /// SAME orchestrator changes the SECOND turn's behavior with no restart — proving
+    /// the Atomic `process()` reads is the live source of truth, not a boot-time snapshot.
+    #[tokio::test]
+    async fn live_toggle_takes_effect_on_the_very_next_turn_without_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let base_url = spawn_plain_answer_sse_server("hello").await;
+        let (orchestrator, shutdown, tasks) = init_orchestrator(Arc::clone(&db), kms, base_url).await;
+
+        async fn drive_one_turn(orchestrator: &Orchestrator, message: &str) {
+            let req = Request {
+                session_id: uuid::Uuid::new_v4(),
+                adapter_id: "test-adapter".to_string(),
+                message: message.to_string(),
+                user_ref: None,
+                depth: Default::default(),
+                origin: Default::default(),
+            };
+            let (tx, mut rx) = mpsc::channel(64);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            orchestrator
+                .process(req, tx, CancellationToken::new())
+                .await
+                .expect("process");
+            drain.await.expect("drain task");
+        }
+
+        // Turn 1: default ON — must write one routing_decisions row.
+        drive_one_turn(&orchestrator, "hi there").await;
+        assert_eq!(
+            routing_decisions::list_recent(&db, 10).await.expect("list_recent").len(),
+            1,
+            "the first (routing-enabled) turn must write exactly one telemetry row"
+        );
+
+        // Flip live — no restart, no new Orchestrator.
+        orchestrator.routing_enabled_handle().store(false, Ordering::Release);
+
+        // Turn 2: same orchestrator instance — must write ZERO additional rows.
+        drive_one_turn(&orchestrator, "what time is it").await;
+        assert_eq!(
+            routing_decisions::list_recent(&db, 10).await.expect("list_recent").len(),
+            1,
+            "flipping routing_enabled OFF must take effect on the VERY NEXT turn — no \
+             new row from the second turn, with no restart of the orchestrator"
+        );
+        cleanup(shutdown, tasks).await;
     }
 }

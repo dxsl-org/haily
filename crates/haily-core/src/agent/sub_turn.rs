@@ -435,6 +435,10 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     // delegated sub-turn are attributed to the SAME session, per the existing
     // "learns from delegated work too" convention above).
     let session_id_str = session_id.to_string();
+    // Auto Model Routing R1 phase 4: the R2 join key — reuses the PARENT turn's id (see
+    // `SubTurnRequest::turn_id`'s doc), never re-minted, so this sub-turn's trace joins the
+    // same `routing_decisions`/`action_journal` rows the parent L0 turn's own trace does.
+    let turn_id_str = turn_id.to_string();
     // FMA-m5: pair the (prompt, completion) usage into an all-or-nothing value. Both are None
     // today (complete_tiered surfaces no usage); the pairing guarantees no mixed Some/None ever
     // reaches the trace regardless of what a future backend returns.
@@ -464,6 +468,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
             owns_learning: false,
             approval_gate: &approval_gate,
             final_turn_deletes: turn_deletes.load(std::sync::atomic::Ordering::Relaxed),
+            turn_id: turn_id_str.as_str(),
         },
     )
     .await;

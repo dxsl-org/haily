@@ -58,6 +58,11 @@ struct AppState {
     /// `turns`) because `set_preference` has NO orchestrator access (it is behind the
     /// shutdown `Mutex`). Flipping this Bool changes dispatch behavior live, no restart.
     kill: Arc<AtomicBool>,
+    /// `llm.routing_enabled` kill switch (Auto Model Routing R1, phase 4) — the SAME
+    /// `Arc<AtomicBool>` every turn's `TurnRuntime` reads. Cloned out of `app` at setup,
+    /// mirroring `kill` exactly and for the identical reason (`set_preference` has no
+    /// orchestrator access).
+    routing_enabled: Arc<AtomicBool>,
     /// OS-keyring-backed credential store (Harness Completion phase 4). Cloned out of
     /// `app` at setup, mirroring `approval_resolver`/`turns`/`kill`, so the connector
     /// config UI's credential-set command (Phase 7) doesn't need to lock `app`.
@@ -197,6 +202,13 @@ async fn set_preference(key: String, value: String, state: State<'_, AppState>) 
     if key == "safety.disable_writes" {
         let on = value == "true" || value == "1";
         state.kill.store(on, Ordering::Release);
+    }
+    // Auto Model Routing R1 (phase 4): mirrors the `safety.disable_writes` special-case
+    // above exactly — flips the SAME live Atomic every turn's `TurnRuntime` reads, so the
+    // GUI toggle takes effect on the very next message with no restart.
+    if key == "llm.routing_enabled" {
+        let on = value == "true" || value == "1";
+        state.routing_enabled.store(on, Ordering::Release);
     }
     meta::upsert_preference(&state.db, &key, &value, "gui").await.map_err(|e| e.to_string())
 }
@@ -541,6 +553,7 @@ pub fn run() {
             let approval_resolver = app_handle.orchestrator.approval_resolver();
             let turns = app_handle.turn_registry();
             let kill = app_handle.orchestrator.kill_handle();
+            let routing_enabled = app_handle.orchestrator.routing_enabled_handle();
             let credential_store = Arc::clone(&app_handle.credential_store);
             app.manage(AppState {
                 gui_req_tx,
@@ -549,6 +562,7 @@ pub fn run() {
                 approval_resolver,
                 turns,
                 kill,
+                routing_enabled,
                 credential_store,
                 #[cfg(feature = "mobile-server")]
                 mobile: mobile_state,

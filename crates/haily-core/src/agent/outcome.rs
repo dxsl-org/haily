@@ -196,6 +196,11 @@ pub(super) struct OutcomeMetricsInput<'a> {
     /// replaying this log against it. See `approval_stats`'s doc comment for the
     /// residual cross-delegation imprecision this cannot fully resolve.
     pub(super) final_turn_deletes: usize,
+    /// The turn's minted id (`run_turn`'s own UUID, or the PARENT turn's id reused by a
+    /// delegated `run_sub_turn` — see `ToolContext::turn_id`'s doc) — the R2 join key
+    /// threaded into `TraceMetrics.turn_id` (Auto Model Routing R1 phase 2/4) so a trace
+    /// row can be joined against this same turn's `routing_decisions`/`action_journal` rows.
+    pub(super) turn_id: &'a str,
 }
 
 /// Shared tail of `run_turn`/`run_sub_turn`: compute the turn's outcome label from
@@ -278,6 +283,9 @@ pub(super) async fn record_outcome_and_update_skill(
             Some(label.confidence)
         },
         delegate_overhead_ms: input.delegate_overhead_ms,
+        // Auto Model Routing R1 phase 4: closes the cross-phase gap phase 2 flagged —
+        // `TraceMetrics.turn_id` now carries the real minted turn id from both call sites.
+        turn_id: Some(input.turn_id),
     };
 
     let _ = db_skills::insert_trace(
