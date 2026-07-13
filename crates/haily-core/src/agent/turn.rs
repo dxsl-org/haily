@@ -219,14 +219,15 @@ pub async fn run_turn(
     };
     let mut current_tier = decision.tier;
     // Chat escalation policy (LOCKED, phase 4 spec): a single dead-end rescue on a
-    // pre-first-token stream failure — strictly better than today's hard-fail. `enabled`
-    // is unconditionally `true` (the rescue is a reliability improvement independent of
-    // the tier-selection toggle); the no-op guard inside `open_stream_with_escalation`
-    // already collapses this to a no-op whenever no tier override is actually configured.
+    // pre-first-token stream failure — strictly better than today's hard-fail. Gated on
+    // `routing_active` so the kill switch's documented guarantee holds literally: with
+    // routing OFF, a stream failure reproduces the legacy hard-fail even when a tier
+    // override is configured (previously the no-op guard only caught the no-override
+    // case, leaving an untested gap where OFF could still switch models on failure).
     let escalation_policy = EscalationPolicy {
         failures_before_escalation: 1,
         max_tier: Tier::Thinking,
-        enabled: true,
+        enabled: routing_active,
     };
     // Egress derivation (LOCKED): llama primary ⇒ LocalOnly (escalation never silently
     // leaves the machine the user started local on); cloud primary ⇒ AllowCloud. An
@@ -530,7 +531,9 @@ pub async fn run_turn(
             escalation_trigger: escalated_to.map(|_| "stream_init_error"),
             prior_failures: i64::from(escalated_to.is_some()),
         };
-        let _ = routing_decisions::insert(&db, new_row).await;
+        if let Err(e) = routing_decisions::insert(&db, new_row).await {
+            tracing::warn!(turn = %turn_id, "routing_decisions insert failed: {e:#}");
+        }
     }
 
     // Only send `final_response` here if it was never streamed live during the loop
@@ -1831,9 +1834,10 @@ mod routing_toggle_tests {
     //! that trips no heuristic must select the SAME tier (`None`) and add exactly one
     //! telemetry row.
     use super::outcome_signal_tests::{run_plain_turn, run_plain_turn_with_routing};
-    use haily_db::{queries::routing_decisions, DbHandle};
-    use haily_kms::KmsHandle;
-    use std::sync::Arc;
+    use super::*;
+    use haily_llm::LlmConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     async fn test_db_kms() -> (Arc<DbHandle>, Arc<KmsHandle>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1911,5 +1915,91 @@ mod routing_toggle_tests {
         );
         assert_eq!(rows[0].decision_source, "default");
         assert!(rows[0].escalated_to.is_none());
+    }
+
+    /// A server that fails EVERY connection pre-first-token — mirrors `crate::routing`'s
+    /// own `spawn_server(usize::MAX, ..)` failure branch, duplicated here (not shared)
+    /// per this file's own per-module-helper convention.
+    async fn spawn_always_failing_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    // A malformed status line forces an immediate synchronous parse
+                    // error — a deterministic, fast pre-first-token failure.
+                    let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Closes the gap Stage 3 (adversarial) review found untested: with the kill switch
+    /// OFF, a stream failure must reproduce the legacy hard-fail EVEN when a tier
+    /// override is configured — the escalation rescue must not fire, because
+    /// `escalation_policy.enabled` is gated on `routing_active`, not unconditional.
+    /// Before this gate, the no-op guard alone caught only the no-override case,
+    /// leaving this exact (OFF + override + failure) intersection able to silently
+    /// switch models on a turn the user believes has routing fully disabled.
+    #[tokio::test]
+    async fn routing_disabled_never_escalates_even_with_a_tier_override_configured() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let session_id = uuid::Uuid::new_v4();
+
+        let base_url = spawn_always_failing_server().await;
+        let mut config = LlmConfig {
+            cloud_api_keys: vec!["test-key".to_string()],
+            cloud_base_url: base_url,
+            cloud_model: "test-model".to_string(),
+            ..LlmConfig::default()
+        };
+        // A distinct override — if escalation fired despite the kill switch, the no-op
+        // guard alone would not stop it (this is the exact config the gap allowed).
+        config.tier_models.medium = Some("distinct-medium-model".to_string());
+        let llm = Arc::new(LlmRouter::init(config).await);
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(ToolRegistry::new()),
+            kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(false)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let req = Request {
+            session_id,
+            adapter_id: "test-adapter".to_string(),
+            message: "hi".to_string(),
+            user_ref: None,
+            depth: Default::default(),
+            origin: Default::default(),
+        };
+
+        let result = run_turn(&req, runtime, tx, &broker, &cancel).await;
+        drain.await.expect("drain task");
+
+        assert!(
+            result.is_err(),
+            "routing_enabled=false must reproduce the legacy hard-fail — no escalation \
+             rescue may fire even with a tier override configured, got: {result:?}"
+        );
+
+        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        assert!(
+            rows.is_empty(),
+            "a failed turn with routing off must still write zero routing_decisions rows, got: {rows:?}"
+        );
     }
 }
