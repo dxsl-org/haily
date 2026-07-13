@@ -1,5 +1,7 @@
 # Haily — Codebase Guide for Claude
 
+**Use Fable subagents when you need more intelligence**
+
 Haily is a local-first, always-on AI assistant built as a single Rust binary + Tauri/Svelte desktop app. All data stays on-device. Three deployment modes share one binary: `--gui` (Tauri), `--cli` (terminal REPL), `--headless` (background daemon).
 
 ## Build & Run
@@ -63,6 +65,8 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-core/src/budget.rs` | Token-budgeted context assembly (replaces 15-turn window) |
 | `crates/haily-core/src/feedback_parser.rs` | Vietnamese + English feedback signal detection |
 | `crates/haily-core/src/tag_matcher.rs` | Canonical tag hold-back for streaming (llama + cloud SSE) |
+| `crates/haily-core/src/routing.rs` | Tier decision core (Auto Model Routing R1): deterministic 5-rung ladder selects tier from explicit intent phrases, message heuristics, depth mode, history length, and session default |
+| `crates/haily-core/src/tier_intent.rs` | Explicit tier-intent phrase detection (VN/EN) with source-guard anchoring; feeds tier decision ladder |
 | `crates/haily-core/src/delegate.rs` | Sub-agent spawning, tier selection, shared memory |
 | `crates/haily-core/src/tool_call.rs` | Tool dispatch, risk tier gating, kill-switch exemption logic |
 | `crates/haily-kms/src/skills.rs` | Skill synthesis (Jaccard clustering), EMA confidence, exponential decay |
@@ -74,6 +78,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-llm/src/sse.rs` | SSE parser for cloud streaming (OpenAI, Anthropic) |
 | `crates/haily-llm/src/breaker.rs` | Circuit breaker (real file; not circuit_breaker.rs) |
 | `crates/haily-db/src/queries/journal.rs` | Action journal insert, readback, undo queries (Safe Operator Harness) |
+| `crates/haily-db/src/queries/routing_decisions.rs` | Routing decision telemetry insert, list, and summary queries (Auto Model Routing R1) — the R2/R3 training set |
 | `crates/haily-db/src/queries/connectors.rs` | Connector manifest CRUD (Safe Operator Harness phase 4) |
 | `crates/haily-db/src/queries/` | All SQL — one file per domain |
 | `crates/haily-db/src/recurrence.rs` | RecurrenceRule engine + next_after (strict forward-progress) + occurrences_in_window; shared by reminders (proactive) and calendar |
@@ -147,7 +152,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 ## Docs
 
 Full documentation is in `docs/`:
-- `architecture.md` — 25 technical decisions (Decision 25 added 2026-07-04: outcome signal design & eval harness; Decisions 14–24 from earlier phases)
+- `architecture.md` — 30 technical decisions (Decision 30 added 2026-07-14: Auto Model Routing R1 heuristic selector; Decisions 1–29 from earlier phases)
 - `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait, out-param side-channel, credential-getter seam)
 - `project-structure.md` — 10-crate layout (haily-types, haily-app added), dependency graph, layering test
 - `project-roadmap.md` — Phase status (1–13.5 complete; 13.1–13.5 collapsed into single summary; Phase 14–15 planned; follow-up directions: generic declarative connectors + router A/B)
