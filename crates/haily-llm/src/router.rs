@@ -44,6 +44,11 @@ pub(crate) const DEFAULT_LLAMA_N_CTX: u32 = 8192;
 /// history doesn't balloon to an unreasonable size just because the backend changed.
 pub(crate) const CLOUD_CONTEXT_WINDOW_CLAMP: u32 = 32_000;
 
+/// Default `LlmConfig::cost_quality` — see that field's doc for the rationale.
+const DEFAULT_COST_QUALITY: u8 = 7;
+/// Upper bound `LlmRouter::cost_quality()` clamps to (dial is 0-10 inclusive).
+const COST_QUALITY_MAX: u8 = 10;
+
 #[cfg(feature = "llama")]
 use crate::LlamaClient;
 
@@ -224,6 +229,13 @@ pub struct LlmConfig {
     /// Per-tier cloud model-name overrides — see `Tier`/`TierModels`. All `None`
     /// by default (no behavior change until a caller opts a domain/specialist in).
     pub tier_models: TierModels,
+    /// Operator's cost/quality dial (0 = cheapest, 10 = highest-quality), consulted by
+    /// `EscalationPolicy` (Phase 4/6) when deciding whether an escalation attempt is
+    /// worth its cost. Defaults to 7 (mildly quality-biased) so existing deployments
+    /// that never set this preference get a reasonable default rather than 0. Stored
+    /// unclamped here — [`LlmRouter::cost_quality`] clamps at the point of use so an
+    /// out-of-range preference value still round-trips losslessly through storage.
+    pub cost_quality: u8,
 
     /// Path to GGUF model file for embedded inference (only used with `llama` feature).
     #[cfg(feature = "llama")]
@@ -256,6 +268,7 @@ impl Default for LlmConfig {
             cloud_base_url: "https://api.openai.com".into(),
             cloud_model: "gpt-4o-mini".into(),
             tier_models: TierModels::default(),
+            cost_quality: DEFAULT_COST_QUALITY,
             #[cfg(feature = "llama")]
             llama_model_path: None,
             #[cfg(feature = "llama")]
@@ -328,6 +341,9 @@ pub struct LlmRouter {
     /// Effective model name per tier that has an override, captured at init. Feeds
     /// [`RouterSnapshot::model_for_tier`] — see [`tier_model_names`].
     tier_model_names: HashMap<Tier, String>,
+    /// Clamped copy of `LlmConfig::cost_quality`, captured at init/reload so
+    /// `cost_quality()` never has to re-clamp an already-moved `LlmConfig`.
+    cost_quality: u8,
 }
 
 impl LlmRouter {
@@ -362,6 +378,7 @@ impl LlmRouter {
         // read sites unambiguous across feature flags.
         let default_model = config.cloud_model.clone();
         let tier_model_names = tier_model_names(&config);
+        let cost_quality = config.cost_quality.min(COST_QUALITY_MAX);
 
         #[cfg(feature = "llama")]
         {
@@ -390,6 +407,7 @@ impl LlmRouter {
                         tier_clients,
                         default_model,
                         tier_model_names,
+                        cost_quality,
                     },
                     Ok(Err(e)) => tracing::warn!("llama.cpp load failed: {e:#}"),
                     Err(e)     => tracing::warn!("llama.cpp spawn failed: {e:#}"),
@@ -405,6 +423,7 @@ impl LlmRouter {
                 tier_clients,
                 default_model,
                 tier_model_names,
+                cost_quality,
             };
         }
 
@@ -415,6 +434,7 @@ impl LlmRouter {
             tier_clients,
             default_model,
             tier_model_names,
+            cost_quality,
         }
     }
 
@@ -467,25 +487,126 @@ impl LlmRouter {
         self.primary.context_window()
     }
 
-    /// Tries the cloud fallback (if configured) after a pre-first-token primary
-    /// failure; returns `primary_err` unchanged if there is no fallback configured.
-    /// Never called once the primary has emitted a token — see `complete_stream`'s
-    /// doc comment for the fallback-scope rule this enforces.
+    /// Highest tier this router can serve without ever leaving the local machine.
+    /// A local llama.cpp primary caps out at `Thinking` — `Ultra` is cloud-effective-only
+    /// (see the [`Tier`] doc) and a local backend has no second model to escalate to, so
+    /// asking it for `Ultra` would silently collapse back to the same session. An
+    /// all-cloud config has no such ceiling: every cloud model name is reachable, so the
+    /// cap is `Ultra`. Consumed by `EscalationPolicy` (Phases 4, 6) to decide whether an
+    /// escalation step is reachable at all before spending a retry attempting it.
+    pub fn highest_local_tier(&self) -> Tier {
+        #[cfg(feature = "llama")]
+        {
+            // Only a `llama` build can ever have a llama.cpp primary — without the
+            // feature this branch is unreachable dead code, so the cap never applies.
+            if self.primary.provider_name() == "llama.cpp" {
+                return Tier::Thinking;
+            }
+        }
+        Tier::Ultra
+    }
+
+    /// Operator's cost/quality dial, clamped to `0..=10` regardless of what value
+    /// slipped into `LlmConfig` (e.g. a stray out-of-range preference) — clamping here
+    /// rather than at `LlmConfig` construction keeps the stored preference lossless
+    /// while guaranteeing every consumer sees an in-range value.
+    pub fn cost_quality(&self) -> u8 {
+        self.cost_quality
+    }
+
+    /// Tries the cloud fallback (if configured) after a pre-first-token failure on
+    /// whichever backend `stream_backend` was streaming from; returns `backend_err`
+    /// unchanged if there is no fallback configured. `failed_backend_name` is used only
+    /// for the log line — the fallback client itself is always `self.fallback`, never
+    /// parameterized (see `stream_backend`'s doc for why). Never called once that
+    /// backend has emitted a token — see `stream_backend`'s FALLBACK SCOPE comment.
     async fn fallback_stream_or_err(
         &self,
         req: CompletionRequest,
-        primary_err: anyhow::Error,
+        failed_backend_name: &str,
+        backend_err: anyhow::Error,
     ) -> Result<mpsc::Receiver<StreamChunk>> {
         match &self.fallback {
             Some(fallback) => {
                 tracing::warn!(
-                    "trying cloud fallback stream after primary ({}) pre-first-token failure",
-                    self.primary.provider_name()
+                    "trying cloud fallback stream after {failed_backend_name} pre-first-token failure"
                 );
                 fallback.complete_stream(req).await
             }
-            None => Err(primary_err),
+            None => Err(backend_err),
         }
+    }
+
+    /// Streams from `backend` (either `self.primary` via `complete_stream`, or a
+    /// `tier_clients` entry via `complete_stream_tiered`), applying the same
+    /// peek-first-item fallback contract either way.
+    ///
+    /// FALLBACK SCOPE (red-team constraint, phase-06; extraction, not duplication):
+    /// falls back to `self.fallback` — the cloud fallback, never a parameterized
+    /// substitute — ONLY when `backend` fails before emitting a single token: either by
+    /// returning `Err` from `complete_stream` itself, or by the FIRST item off its
+    /// channel being `StreamChunk::Error`. Once any `Token` has been forwarded, a later
+    /// stream error is relayed as-is and the fallback is never consulted — re-running
+    /// the whole request through a second backend at that point would re-stream the
+    /// answer and duplicate user-visible text. This holds identically whether `backend`
+    /// is the primary or a tier override: the fallback client is always `self.fallback`.
+    async fn stream_backend(
+        &self,
+        backend: &dyn LlmClient,
+        req: CompletionRequest,
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        let backend_name = backend.provider_name().to_string();
+        let mut backend_rx = match backend.complete_stream(req.clone()).await {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::warn!("LLM backend ({backend_name}) stream init failed: {err:#}");
+                return self.fallback_stream_or_err(req, &backend_name, err).await;
+            }
+        };
+
+        // Peek the first item to decide pre-first-token vs. post-first-token failure.
+        match backend_rx.recv().await {
+            None => {
+                // Channel closed with no message at all — treat as a pre-first-token
+                // init failure (same bucket as an immediate `Err`).
+                let err = anyhow::anyhow!("{backend_name} stream closed before producing any output");
+                tracing::warn!("LLM backend ({backend_name}) stream: {err:#}");
+                self.fallback_stream_or_err(req, &backend_name, err).await
+            }
+            Some(StreamChunk::Error(msg)) => {
+                let err = anyhow::anyhow!("{msg}");
+                tracing::warn!("LLM backend ({backend_name}) stream failed before first token: {msg}");
+                self.fallback_stream_or_err(req, &backend_name, err).await
+            }
+            Some(first @ StreamChunk::Token(_)) => {
+                tracing::info!(backend = %backend_name, "streaming from LLM backend");
+                Ok(relay_with_first_item(backend_name, backend_rx, first))
+            }
+            Some(first @ StreamChunk::Done { .. }) => {
+                // Zero-token completion (e.g. empty response) — still a legitimate
+                // stream, not a failure; forward as-is, no fallback.
+                tracing::info!(backend = %backend_name, "streaming from LLM backend (empty output)");
+                Ok(relay_with_first_item(backend_name, backend_rx, first))
+            }
+        }
+    }
+
+    /// Streams a request against a specific model `tier`. Falls back to `primary` (the
+    /// default model) when `tier` is `None`, or when `Some(tier)` names a tier with no
+    /// configured override — mirrors `complete_tiered`'s "wired but inert" contract, so
+    /// callers may pass a tier freely with zero behavior change until an operator
+    /// configures `LlmConfig::tier_models`. Applies the exact same pre-first-token
+    /// fallback-to-cloud contract as `complete_stream` — see `stream_backend`'s doc.
+    pub async fn complete_stream_tiered(
+        &self,
+        tier: Option<Tier>,
+        req: CompletionRequest,
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        let backend = tier
+            .and_then(|t| self.tier_clients.get(&t))
+            .map(Arc::as_ref)
+            .unwrap_or(&*self.primary);
+        self.stream_backend(backend, req).await
     }
 }
 
@@ -537,48 +658,10 @@ impl LlmClient for LlmRouter {
         }
     }
 
-    /// FALLBACK SCOPE (red-team constraint, phase-06): falls back to cloud ONLY when
-    /// the primary backend fails before emitting a single token — either by
-    /// returning `Err` from `complete_stream` itself, or by the FIRST item off its
-    /// channel being `StreamChunk::Error`. Once any `Token` has been forwarded, a
-    /// later primary-stream error is relayed as-is and the fallback is never
-    /// consulted — re-running the whole request through a second backend at that
-    /// point would re-stream the answer and duplicate user-visible text.
+    /// See `stream_backend`'s FALLBACK SCOPE doc — this is `stream_backend` applied to
+    /// `self.primary` specifically; `complete_stream_tiered` is the tier-routed sibling.
     async fn complete_stream(&self, req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
-        let primary_name = self.primary.provider_name().to_string();
-        let mut primary_rx = match self.primary.complete_stream(req.clone()).await {
-            Ok(rx) => rx,
-            Err(primary_err) => {
-                tracing::warn!("primary LLM ({primary_name}) stream init failed: {primary_err:#}");
-                return self.fallback_stream_or_err(req, primary_err).await;
-            }
-        };
-
-        // Peek the first item to decide pre-first-token vs. post-first-token failure.
-        match primary_rx.recv().await {
-            None => {
-                // Channel closed with no message at all — treat as a pre-first-token
-                // init failure (same bucket as an immediate `Err`).
-                let err = anyhow::anyhow!("{primary_name} stream closed before producing any output");
-                tracing::warn!("primary LLM ({primary_name}) stream: {err:#}");
-                self.fallback_stream_or_err(req, err).await
-            }
-            Some(StreamChunk::Error(msg)) => {
-                let err = anyhow::anyhow!("{msg}");
-                tracing::warn!("primary LLM ({primary_name}) stream failed before first token: {msg}");
-                self.fallback_stream_or_err(req, err).await
-            }
-            Some(first @ StreamChunk::Token(_)) => {
-                tracing::info!(backend = %primary_name, "streaming from primary LLM");
-                Ok(relay_with_first_item(primary_name, primary_rx, first))
-            }
-            Some(first @ StreamChunk::Done { .. }) => {
-                // Zero-token completion (e.g. empty response) — still a legitimate
-                // primary stream, not a failure; forward as-is, no fallback.
-                tracing::info!(backend = %primary_name, "streaming from primary LLM (empty output)");
-                Ok(relay_with_first_item(primary_name, primary_rx, first))
-            }
-        }
+        self.stream_backend(&*self.primary, req).await
     }
 
     fn provider_name(&self) -> &str {
@@ -831,5 +914,235 @@ mod resolution_tests {
         assert_eq!(snap.model_for_tier(Some(Tier::Medium)), "gpt-4o");
         // Session tier is derived from the default model (`gpt-4o` → Medium in the table).
         assert_eq!(snap.session_tier(&[]), Some(Tier::Medium));
+    }
+
+    #[test]
+    fn cost_quality_defaults_to_seven() {
+        assert_eq!(LlmConfig::default().cost_quality, DEFAULT_COST_QUALITY);
+    }
+
+    #[tokio::test]
+    async fn cost_quality_clamps_to_ten_and_in_range_values_round_trip() {
+        #[allow(clippy::needless_update)]
+        let over_range = LlmConfig { cost_quality: 11, ..LlmConfig::default() };
+        let router = LlmRouter::init(over_range).await;
+        assert_eq!(router.cost_quality(), 10, "11 must clamp down to the max of 10");
+
+        #[allow(clippy::needless_update)]
+        let in_range = LlmConfig { cost_quality: 3, ..LlmConfig::default() };
+        let router = LlmRouter::init(in_range).await;
+        assert_eq!(router.cost_quality(), 3, "an in-range value must round-trip unchanged");
+    }
+}
+
+#[cfg(test)]
+mod stream_backend_tests {
+    //! `stream_backend`/`complete_stream_tiered`/`highest_local_tier` — exercised with
+    //! an in-process scripted `LlmClient` double rather than a real HTTP/SSE server, so
+    //! these tests assert the peek+relay+fallback *shape* directly without needing to
+    //! match either backend's wire format. Direct `LlmRouter { .. }` construction (not
+    //! `LlmRouter::init`) is used to wire up scripted primary/fallback/tier clients —
+    //! legal here because these tests are a submodule of `router`, which owns the
+    //! struct's private fields.
+    use super::*;
+    use crate::Message;
+
+    /// Either fails `complete_stream` immediately (`init_err`), or streams a fixed
+    /// script of `StreamChunk`s over a real channel — so `stream_backend`'s peek/relay
+    /// logic runs unmodified against a deterministic source.
+    struct ScriptedClient {
+        name: &'static str,
+        init_err: Option<&'static str>,
+        chunks: Vec<StreamChunk>,
+    }
+
+    impl ScriptedClient {
+        fn ok(name: &'static str, chunks: Vec<StreamChunk>) -> Arc<dyn LlmClient> {
+            Arc::new(Self { name, init_err: None, chunks })
+        }
+        fn failing(name: &'static str, err: &'static str) -> Arc<dyn LlmClient> {
+            Arc::new(Self { name, init_err: Some(err), chunks: vec![] })
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedClient {
+        async fn complete(&self, _req: CompletionRequest) -> Result<String> {
+            Ok(self.name.to_string())
+        }
+
+        async fn complete_stream(&self, _req: CompletionRequest) -> Result<mpsc::Receiver<StreamChunk>> {
+            if let Some(msg) = self.init_err {
+                return Err(anyhow::anyhow!(msg));
+            }
+            let (tx, rx) = mpsc::channel(16);
+            for chunk in self.chunks.clone() {
+                tx.send(chunk).await.expect("test channel has capacity for its own fixed script");
+            }
+            Ok(rx)
+        }
+
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+
+        fn context_window(&self) -> u32 {
+            4096
+        }
+    }
+
+    fn req() -> CompletionRequest {
+        CompletionRequest::simple(vec![Message::user("hi")])
+    }
+
+    async fn drain(mut rx: mpsc::Receiver<StreamChunk>) -> Vec<StreamChunk> {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.push(chunk);
+        }
+        out
+    }
+
+    fn token(s: &str) -> StreamChunk {
+        StreamChunk::Token(s.to_string())
+    }
+
+    fn done() -> StreamChunk {
+        StreamChunk::Done { total_tokens: 1, prompt_tokens: None }
+    }
+
+    /// Builds a router with scripted backends and no tier overrides — the shared base
+    /// for tests that only care about `primary`/`fallback` behavior.
+    fn router_with(primary: Arc<dyn LlmClient>, fallback: Option<Arc<dyn LlmClient>>) -> LlmRouter {
+        router_with_tiers(primary, fallback, HashMap::new())
+    }
+
+    fn router_with_tiers(
+        primary: Arc<dyn LlmClient>,
+        fallback: Option<Arc<dyn LlmClient>>,
+        tier_clients: HashMap<Tier, Arc<dyn LlmClient>>,
+    ) -> LlmRouter {
+        LlmRouter {
+            primary,
+            fallback,
+            tier_clients,
+            default_model: "default-model".to_string(),
+            tier_model_names: HashMap::new(),
+            cost_quality: DEFAULT_COST_QUALITY,
+        }
+    }
+
+    /// CRITICAL: with no tier configured, `complete_stream_tiered(None, ..)` must be
+    /// byte-equivalent to plain `complete_stream(..)` — same backend, same chunks.
+    #[tokio::test]
+    async fn complete_stream_tiered_none_matches_complete_stream() {
+        let script = vec![token("hello"), done()];
+
+        let via_plain = drain(
+            router_with(ScriptedClient::ok("primary", script.clone()), None)
+                .complete_stream(req())
+                .await
+                .expect("plain stream"),
+        )
+        .await;
+        let via_tiered = drain(
+            router_with(ScriptedClient::ok("primary", script), None)
+                .complete_stream_tiered(None, req())
+                .await
+                .expect("tiered stream"),
+        )
+        .await;
+
+        assert_eq!(via_plain, via_tiered);
+    }
+
+    /// CRITICAL: `Some(configured tier)` routes to that tier's client; `Some(unconfigured
+    /// tier)` falls back to `primary` — mirrors `complete_tiered`'s non-streaming contract.
+    #[tokio::test]
+    async fn complete_stream_tiered_selects_configured_tier_and_falls_back_when_unconfigured() {
+        let mut tier_clients: HashMap<Tier, Arc<dyn LlmClient>> = HashMap::new();
+        tier_clients.insert(Tier::Fast, ScriptedClient::ok("fast-tier", vec![token("fast"), done()]));
+        let router = router_with_tiers(ScriptedClient::ok("primary", vec![token("primary"), done()]), None, tier_clients);
+
+        let fast = drain(router.complete_stream_tiered(Some(Tier::Fast), req()).await.expect("fast stream")).await;
+        assert_eq!(fast, vec![token("fast"), done()], "Some(configured) must route to the tier client");
+
+        let unconfigured = drain(
+            router
+                .complete_stream_tiered(Some(Tier::Medium), req())
+                .await
+                .expect("unconfigured-tier stream"),
+        )
+        .await;
+        assert_eq!(unconfigured, vec![token("primary"), done()], "Some(unconfigured) must fall back to primary");
+    }
+
+    /// HIGH: a pre-first-token failure on a TIER client triggers the exact same
+    /// cloud-fallback branch a primary failure would — `fallback_stream_or_err` never
+    /// distinguishes which backend it was called for.
+    #[tokio::test]
+    async fn tier_client_pre_first_token_failure_falls_back_to_cloud_like_primary_does() {
+        let mut tier_clients: HashMap<Tier, Arc<dyn LlmClient>> = HashMap::new();
+        tier_clients.insert(Tier::Thinking, ScriptedClient::failing("thinking-tier", "tier init failed"));
+        let router = router_with_tiers(
+            ScriptedClient::ok("primary", vec![token("primary"), done()]),
+            Some(ScriptedClient::ok("cloud-fallback", vec![token("fallback"), done()])),
+            tier_clients,
+        );
+
+        let out = drain(
+            router
+                .complete_stream_tiered(Some(Tier::Thinking), req())
+                .await
+                .expect("fallback stream"),
+        )
+        .await;
+        assert_eq!(out, vec![token("fallback"), done()], "tier failure must reach the same cloud fallback as primary");
+    }
+
+    /// HIGH: once a tier client has emitted its first token, a later error on that same
+    /// stream relays as-is — the fallback is never consulted post-first-token.
+    #[tokio::test]
+    async fn tier_client_post_first_token_error_relays_as_is() {
+        let mut tier_clients: HashMap<Tier, Arc<dyn LlmClient>> = HashMap::new();
+        tier_clients.insert(
+            Tier::Thinking,
+            ScriptedClient::ok("thinking-tier", vec![token("partial"), StreamChunk::Error("mid-stream drop".into())]),
+        );
+        let router = router_with_tiers(
+            ScriptedClient::ok("primary", vec![token("primary"), done()]),
+            Some(ScriptedClient::ok("cloud-fallback", vec![token("fallback"), done()])),
+            tier_clients,
+        );
+
+        let out = drain(
+            router
+                .complete_stream_tiered(Some(Tier::Thinking), req())
+                .await
+                .expect("stream returned despite later error"),
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![token("partial"), StreamChunk::Error("mid-stream drop".into())],
+            "post-first-token error must relay as-is, never substituted by the fallback"
+        );
+    }
+
+    /// HIGH: cloud-only primary has no local ceiling — `Ultra` is reachable.
+    #[tokio::test]
+    async fn highest_local_tier_is_ultra_under_cloud_only_primary() {
+        let router = router_with(ScriptedClient::ok("cloud", vec![token("x"), done()]), None);
+        assert_eq!(router.highest_local_tier(), Tier::Ultra);
+    }
+
+    /// HIGH: a llama.cpp primary caps out at `Thinking` — only meaningful (and only
+    /// compiled) when the `llama` feature's branch of `highest_local_tier` is active;
+    /// `cargo test -p haily-llm --features llama` covers this arm.
+    #[cfg(feature = "llama")]
+    #[tokio::test]
+    async fn highest_local_tier_is_thinking_under_llama_primary() {
+        let router = router_with(ScriptedClient::ok("llama.cpp", vec![token("x"), done()]), None);
+        assert_eq!(router.highest_local_tier(), Tier::Thinking);
     }
 }

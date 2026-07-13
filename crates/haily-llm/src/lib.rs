@@ -109,7 +109,7 @@ impl CompletionRequest {
 /// text, `Done` exactly once on clean completion, `Error` on any failure (init,
 /// mid-stream disconnect, or cancellation). After `Done`/`Error` the sender drops the
 /// channel; consumers must stop reading on either variant, not just on channel close.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamChunk {
     Token(String),
     Done {
