@@ -18,6 +18,9 @@ default = []
 # `cargo tauri build --features cuda` — or use `build.ps1 -Gpu cuda`.
 cuda   = ["haily-app/cuda"]
 vulkan = ["haily-app/vulkan"]
+# Desktop mobile-server pairing/devices GUI (Mobile Thin-Client plan phase 2b) — forwards to
+# both crates' own `mobile-server` feature, mirroring `haily-cli`'s existing passthrough.
+mobile-server = ["haily-app/mobile-server", "haily-io/mobile-server"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -29,6 +32,7 @@ haily-app  = { path = "../crates/haily-app", features = ["llama"] }
 haily-io   = { path = "../crates/haily-io" }
 haily-db   = { path = "../crates/haily-db" }
 haily-kms  = { path = "../crates/haily-kms" }
+haily-types = { path = "../crates/haily-types" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio      = { version = "1", features = ["full"] }

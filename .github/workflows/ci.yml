@@ -49,6 +49,11 @@ jobs:
         run: |
           npm ci
           npm run build
+      # Mobile Thin-Client plan phase 3 (M6): the separate build MODE producing `build-mobile/`
+      # — `src-tauri-mobile`'s own `cargo check` below validates `frontendDist` at compile time
+      # (tauri-build), exactly like the desktop step above, so this must exist first too.
+      - name: Build frontend (mobile target)
+        run: npm run build:mobile
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -64,7 +69,8 @@ jobs:
       - name: Clippy (per-crate, no feature unification)
         run: |
           for crate in haily-types haily-db haily-llm haily-io haily-kms \
-                       haily-tools haily-core haily-app haily-proactive haily-cli; do
+                       haily-tools haily-core haily-app haily-proactive haily-cli \
+                       haily-mobile-client; do
             echo "::group::clippy -p $crate"
             cargo clippy -p "$crate" --all-targets -- -D warnings
             echo "::endgroup::"
@@ -79,8 +85,37 @@ jobs:
       # feature on so that path stays green.
       - name: Build (telegram feature)
         run: cargo build -p haily-cli --features telegram
+      # Mobile Thin-Client plan phase 2a: `mobile-server` is likewise feature-gated (axum WS
+      # server, off by default) — build and clippy it explicitly, plus the combo with
+      # `telegram` (red team C2/M15), so a shared enum change (e.g. `Notification`) can't
+      # silently break either adapter's exhaustive match.
+      - name: Clippy (haily-io, mobile-server feature)
+        run: cargo clippy -p haily-io --features mobile-server --all-targets -- -D warnings
+      - name: Build (mobile-server feature)
+        run: cargo build -p haily-cli --features mobile-server
+      - name: Check (mobile-server + telegram combo)
+        run: cargo check -p haily-io --features "mobile-server telegram"
+      - name: Test (haily-io, mobile-server feature)
+        run: cargo test -p haily-io --features mobile-server
+      - name: Test (haily-mobile-client)
+        run: cargo test -p haily-mobile-client
       - name: Test
         run: cargo test --workspace
+      # Mobile Thin-Client plan phase 3 (C2): `src-tauri-mobile` is its OWN Cargo workspace,
+      # deliberately excluded from the root one (see root `Cargo.toml`'s `exclude` list) — this
+      # is a plain HOST-TARGET `cargo check` (no Android NDK on this runner), proving the Tauri
+      # shell's Rust side still type-checks against `haily-mobile-client` + the mobile
+      # `frontendDist`, without ever entering the main workspace's dependency graph.
+      - name: Check (src-tauri-mobile, host target)
+        working-directory: src-tauri-mobile
+        run: cargo check
+      # M14: static guard that the mobile WebView never grows its own socket/remote-fetch call.
+      - name: Mobile CSP grep-guard (no WebSocket/remote fetch under src/routes/mobile)
+        run: bash scripts/check-mobile-no-websocket.sh
+      # C3: static guard that the wire forward-compat trip-wire can't be silently disarmed by a
+      # future wildcard match arm (the compile-fail-on-new-variant trick only works exhaustive).
+      - name: Wire forward-compat guard (no wildcard arm in wire_forward_compat_guard.rs)
+        run: bash scripts/check-wire-guard-no-wildcard.sh
 
   frontend:
     name: Frontend — build + audit
@@ -94,6 +129,8 @@ jobs:
       - run: npm ci
       - name: Build
         run: npm run build
+      - name: Build (mobile target)
+        run: npm run build:mobile
       - name: npm audit (fail on high or critical)
         run: npm audit --audit-level=high
 

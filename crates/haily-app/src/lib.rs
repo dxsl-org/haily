@@ -11,6 +11,22 @@ pub mod connector_config;
 pub mod eval;
 pub mod credential_store;
 mod dispatch;
+/// Mobile-server config loader + DB-backed device store (Mobile Thin-Client plan phase 2a).
+/// Gated behind the `mobile-server` feature (which forwards to `haily-io/mobile-server`, see
+/// Cargo.toml) since both files reference `haily_io::mobile::*` types that only exist under
+/// that feature — a default (no-feature) build must not even see this module. Registered here
+/// as a minimal, additive edit purely so the two new source files this phase creates are part
+/// of the crate's module tree — no other logic in this file changes. See the phase's
+/// Deviation Log.
+#[cfg(feature = "mobile-server")]
+pub mod mobile_config;
+#[cfg(feature = "mobile-server")]
+pub mod mobile_device_store;
+/// Desktop GUI's mobile pairing/devices command backing (Mobile Thin-Client plan phase 2b) —
+/// pure delegation onto P2a's public `haily_io::mobile` API, no new persistence. Same feature
+/// gate as the two modules above, for the same reason (references `haily_io::mobile::*` types).
+#[cfg(feature = "mobile-server")]
+pub mod mobile_admin;
 mod session_transcript;
 mod turns;
 mod watchers;
@@ -24,6 +40,11 @@ pub use cockpit::{
     SkillView, WorkspaceView,
 };
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
+#[cfg(feature = "mobile-server")]
+pub use mobile_admin::{
+    confirm_pair, list_devices, mobile_status, pairing_qr, pending_pairs, regenerate_cert,
+    revoke_device, DeviceView, MobileStatusView, PendingPairView,
+};
 /// Re-exported so the mode layer (`src-tauri`) can name the approvals-queue snapshot type
 /// without a direct `haily-core` dependency (phase 11a).
 pub use haily_core::PendingApproval;

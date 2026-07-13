@@ -361,6 +361,13 @@ impl Adapter for CliAdapter {
             Notification::DistillationProposal { summary, rule_count, .. } => {
                 format!("\n[Distillation proposal — {rule_count} rule(s)]\n{summary}\n")
             }
+            Notification::KillStateChanged { on } => {
+                format!(
+                    "\n{} Kill switch {}\n",
+                    if on { "🔴" } else { "🟢" },
+                    if on { "ENABLED" } else { "DISABLED" }
+                )
+            }
         };
         stdout.write_all(text.as_bytes()).await?;
         stdout.flush().await?;

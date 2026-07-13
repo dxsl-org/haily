@@ -118,6 +118,17 @@ impl AdapterManager {
         }
         Ok(())
     }
+
+    /// Give every registered adapter a handle back to this manager (Mobile Thin-Client plan
+    /// phase 2a review fix, red team m7) — see `Adapter::set_adapter_manager`'s doc for why.
+    /// Called once by `haily-app::bootstrap`, right after `build()` (the manager cannot be
+    /// injected any earlier — it does not exist until every adapter has already been
+    /// constructed and registered).
+    pub fn wire_self_reference(&self) {
+        for adapter in self.adapters.values() {
+            adapter.set_adapter_manager(self.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,7 +182,11 @@ mod tests {
         for seq in 0..3u64 {
             am.deliver_run_event(
                 session,
-                RunEvent::StageOutput { run_id: "r".into(), seq, chunk: format!("line {seq}") },
+                RunEvent::StageOutput {
+                    run_id: "r".into(),
+                    seq,
+                    chunk: format!("line {seq}"),
+                },
             )
             .await
             .expect("deliver");
@@ -185,7 +200,11 @@ mod tests {
                 other => panic!("unexpected variant {other:?}"),
             }
         }
-        assert_eq!(seen, vec![0, 1, 2], "events must arrive in emission order, none coalesced");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2],
+            "events must arrive in emission order, none coalesced"
+        );
     }
 
     /// The manager is the SINGLE tag-strip chokepoint: untrusted repo/tool content in a
@@ -213,7 +232,10 @@ mod tests {
         let (_sid, ev) = rx.recv().await.expect("event");
         match ev {
             RunEvent::StageOutput { chunk, .. } => {
-                assert!(!chunk.contains("tool_call"), "adapter received un-stripped content: {chunk}");
+                assert!(
+                    !chunk.contains("tool_call"),
+                    "adapter received un-stripped content: {chunk}"
+                );
                 assert!(chunk.contains("log"));
             }
             other => panic!("unexpected variant {other:?}"),
@@ -231,9 +253,15 @@ mod tests {
         let err = am
             .deliver_run_event(
                 Uuid::new_v4(),
-                RunEvent::RunStarted { run_id: "r".into(), work_item_id: "w".into() },
+                RunEvent::RunStarted {
+                    run_id: "r".into(),
+                    work_item_id: "w".into(),
+                },
             )
             .await;
-        assert!(err.is_err(), "an unbound session must not resolve to an adapter");
+        assert!(
+            err.is_err(),
+            "an unbound session must not resolve to an adapter"
+        );
     }
 }

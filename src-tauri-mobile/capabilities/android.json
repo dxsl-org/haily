@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "identifier": "android",
+  "description": "Android-only plugin permissions (barcode-scanner/biometric/haily-voice) — split from `default.json` and scoped via `platforms` because those plugin CRATES are themselves Android/iOS-target-gated dependencies (Cargo.toml). Referencing their permission identifiers from a capability that applies to every platform breaks a host `cargo check`/`cargo test` build, which never compiles those crates and so has no registered schema for their permission names.",
+  "windows": ["main"],
+  "platforms": ["android"],
+  "permissions": ["barcode-scanner:default", "biometric:default", "haily-voice:default"]
+}

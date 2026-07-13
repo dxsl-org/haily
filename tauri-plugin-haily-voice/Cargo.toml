@@ -1,0 +1,28 @@
+# Mobile Thin-Client plan phase 4 — the custom Tauri plugin giving OS-native voice (push-to-talk
+# STT + streaming TTS) to `src-tauri-mobile`. An empty `[workspace]` table (same pattern as
+# `src-tauri-mobile/Cargo.toml`) makes this its own one-crate workspace root so Cargo never walks
+# up to the main `d:\haily\Cargo.toml` and tries to reconcile it against that workspace's
+# `members`/`exclude` — this crate is consumed purely as a path dependency, ANDROID-TARGET-GATED,
+# from `src-tauri-mobile`'s own separate workspace (see that crate's Cargo.toml doc comment).
+[workspace]
+
+[package]
+name = "tauri-plugin-haily-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Push-to-talk STT + streaming sentence-chunked TTS for the Haily mobile client (Android first; iOS deferred to a later phase)."
+links = "tauri-plugin-haily-voice"
+
+[lib]
+name = "tauri_plugin_haily_voice"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+log = "0.4"

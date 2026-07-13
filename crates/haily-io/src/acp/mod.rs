@@ -330,6 +330,13 @@ impl Adapter for AcpAdapter {
                 format!("🧪 distillation proposal ({rule_count} rule(s))\n{summary}")
             }
             Notification::WorkItemsChanged(_) => return Ok(()),
+            Notification::KillStateChanged { on } => {
+                format!(
+                    "{} kill switch changed — writes {}",
+                    if *on { "🔴" } else { "🟢" },
+                    if *on { "disabled" } else { "enabled" }
+                )
+            }
         };
         for acp_id in self.sessions.list() {
             self.conn

@@ -10,11 +10,17 @@ members = [
     "crates/haily-proactive",
     "crates/haily-app",
     "crates/haily-cli",
+    "crates/haily-mobile-client",
     "src-tauri",
 ]
 # Throwaway P0 capability-spike fixtures carry their own `[package]` manifests but are NOT
 # workspace members (they are copied to scratch repos and run standalone against the local model).
-exclude = ["evals"]
+# `src-tauri-mobile` (Mobile Thin-Client plan phase 3) is likewise excluded, on purpose (red team
+# C2): it is its own separate Cargo workspace so a mobile-only Tauri/plugin dependency graph
+# (which the CI ubuntu runner has no Android NDK for) can never break `cargo clippy --all-targets
+# -D warnings` / `cargo test --workspace` for every OTHER crate. Only `haily-mobile-client`
+# (above, host-compilable, haily-types + ws/tls/serde only) is a member.
+exclude = ["evals", "src-tauri-mobile"]
 resolver = "2"
 
 [workspace.package]

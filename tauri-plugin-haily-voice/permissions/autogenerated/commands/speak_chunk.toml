@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speak-chunk"
+description = "Enables the speak_chunk command without any pre-configured scope."
+commands.allow = ["speak_chunk"]
+
+[[permission]]
+identifier = "deny-speak-chunk"
+description = "Denies the speak_chunk command without any pre-configured scope."
+commands.deny = ["speak_chunk"]

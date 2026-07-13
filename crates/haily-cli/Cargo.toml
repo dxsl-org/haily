@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 haily-app       = { workspace = true }
 haily-io        = { workspace = true }
+haily-db        = { workspace = true }
+haily-types     = { workspace = true }
 tokio     = { workspace = true }
 tokio-util = { workspace = true }
 anyhow    = { workspace = true }
@@ -18,15 +20,22 @@ tracing   = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde     = { workspace = true }
 serde_json = { workspace = true }
+chrono    = { workspace = true }
 uuid      = { workspace = true }
 clap      = { version = "4", features = ["derive"] }
 dirs      = "5"
+# ASCII QR rendering for `haily pair` (headless — no GUI to render an image). Optional: only
+# pulled in under the `mobile-server` feature below.
+qrcode    = { version = "0.14", default-features = false, optional = true }
 
 [features]
 default = []
 # Enable Telegram bot adapter for headless mode.
 # Requires TELEGRAM_BOT_TOKEN env var at runtime.
 telegram = ["haily-io/telegram"]
+# Desktop mobile-server core (Mobile Thin-Client plan phase 2a) — WS/pairing server for the
+# mobile Tauri client (P3). Requires `haily-app/mobile-server` (config loader + device store).
+mobile-server = ["haily-io/mobile-server", "haily-app/mobile-server", "dep:qrcode"]
 # Enable embedded llama.cpp inference (requires C++ compiler + cmake).
 # Pass a GGUF model path via the `llm.llama_model_path` preference.
 llama  = ["haily-app/llama"]

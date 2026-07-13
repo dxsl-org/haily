@@ -390,6 +390,11 @@ async fn bootstrap_injects_the_approval_resolver_into_every_adapter() {
         adapter.has_approval_resolver(),
         "bootstrap must call Adapter::set_approval_resolver on every registered adapter"
     );
+    assert!(
+        adapter.has_turn_canceller(),
+        "bootstrap must call Adapter::set_turn_canceller on every registered adapter \
+         (Mobile Thin-Client plan phase 3 amendment)"
+    );
 
     handle.shutdown(std::time::Duration::from_secs(5)).await;
 }

@@ -1,6 +1,7 @@
 pub mod calendar;
 pub mod coding_workspaces;
 pub mod connectors;
+pub mod devices;
 pub mod episodic;
 pub mod eval_runs;
 pub mod facts;

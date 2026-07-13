@@ -1,0 +1,69 @@
+# Mobile Thin-Client plan phase 3 — a SEPARATE Cargo workspace (red team C2), deliberately NOT
+# a member of the root `d:\haily\Cargo.toml` workspace: this crate pulls mobile-only Tauri
+# plugins (biometric/barcode-scanner target-gate to Android/iOS) and the Tauri mobile build
+# toolchain, none of which the CI ubuntu runner (no Android NDK) can compile as part of the
+# main `cargo clippy --all-targets -D warnings` / `cargo test --workspace` gate. The empty
+# `[workspace]` table below makes this package its own workspace root (stops Cargo's upward
+# directory walk at this file, so it never accidentally re-joins the parent tree) — see root
+# `Cargo.toml`'s `exclude` list and the `evals/` fixtures for the same pattern.
+[workspace]
+
+[package]
+name = "haily-mobile-tauri"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "haily-mobile"
+path = "src/main.rs"
+
+[lib]
+name = "haily_mobile_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# Cross-platform vault engine (m8 decision — see the phase's Deviation Log): the SAME encrypted-
+# at-rest storage `tauri-plugin-stronghold` wraps, used DIRECTLY from Rust rather than through
+# that plugin's JS-exposed commands (`saveStore`/`getStore`/…). Registering the plugin would add
+# a JS-invokable command surface for a store this app's own frontend never needs to touch — the
+# device token stays never-JS-reachable structurally (no IPC command exists for it at all), not
+# merely by the frontend choosing not to call one.
+iota_stronghold = "2.1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+dashmap = "6"
+# `rustls-tls-manual-roots` (no webpki/native root store bundled) so `/pair`'s HTTPS POST can
+# reuse the EXACT SAME pinned-fingerprint verifier the WS client uses
+# (`haily_mobile_client::pinned_client_config`, via `Client::builder().use_preconfigured_tls`) —
+# never a second, less-strict trust path for the one other endpoint that talks to the desktop.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+# Path dependencies into the MAIN workspace — see `haily-mobile-client`'s own Cargo.toml doc
+# comment for why a path dep across two independent workspaces is fine (Cargo resolves a
+# package's `workspace = true` fields against ITS OWN home workspace, found by walking up from
+# its own directory, not by whichever graph happens to be consuming it here).
+haily-mobile-client = { path = "../crates/haily-mobile-client" }
+haily-types = { path = "../crates/haily-types" }
+
+# Real hardware-backed I/O; target-gated to mobile per the plugins' own published guidance
+# (`cargo add ... --target 'cfg(any(target_os = "android", target_os = "ios"))'`) — a host
+# `cargo check` (this crate's own gate) never compiles these, by design, not by omission.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2.4.5"
+tauri-plugin-biometric = "2.3.2"
+
+# Phase 4's own voice plugin — Android-only (narrower than the pair above): iOS's half is an
+# explicitly deferred follow-up, not implemented yet, so gating it into the shared android/ios
+# cfg above would make an iOS build depend on a crate whose Kotlin-only implementation can't
+# serve it. A path dependency into a SEPARATE one-crate workspace (own empty `[workspace]` table,
+# same pattern this crate itself uses) — see `tauri-plugin-haily-voice/Cargo.toml`'s doc comment.
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-haily-voice = { path = "../tauri-plugin-haily-voice" }
