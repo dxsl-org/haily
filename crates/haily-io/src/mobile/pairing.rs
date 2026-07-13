@@ -57,11 +57,19 @@ enum CodeState {
     /// treated as a fresh `Confirmed` too (rare race, mint is idempotent enough at the DB
     /// layer that a duplicate row is the caller's concern, not this state machine's).
     Resolved(bool),
-    /// Terminal state: a device was minted for this code — every subsequent redeem within the
-    /// TTL replays these exact credentials (m6).
+    /// Terminal state: a device was minted for this code — a subsequent redeem within the TTL
+    /// replays these exact credentials ONLY if `device_name` matches the value recorded at
+    /// issuance (m6 dropped-ack retry); a DIFFERENT name is rejected as `Invalid`, not replayed
+    /// (review HIGH: without this check, anyone who captures the code before its 120s TTL
+    /// elapses — a photographed QR, a shoulder-surfed `haily pair` code — could redeem it a
+    /// second time under a different device name and receive the ALREADY-ISSUED device's live
+    /// token, bypassing M4's out-of-band confirm entirely on the second call). `device_name` is
+    /// client-supplied and guessable, so this is defense-in-depth aligning behavior with
+    /// `docs/mobile-protocol.md`'s stated contract, not a cryptographic control.
     Issued {
         device_id: Uuid,
         token: String,
+        device_name: String,
     },
 }
 
@@ -158,7 +166,7 @@ impl PairingService {
         }
 
         enum Snapshot {
-            Issued(Uuid, String),
+            Issued(Uuid, String, String),
             Resolved(bool),
             Fresh,
         }
@@ -168,9 +176,11 @@ impl PairingService {
             };
             let expired = (self.now)().duration_since(entry.minted_at) > PAIRING_CODE_TTL;
             let snap = match &entry.state {
-                CodeState::Issued { device_id, token } => {
-                    Snapshot::Issued(*device_id, token.clone())
-                }
+                CodeState::Issued {
+                    device_id,
+                    token,
+                    device_name: issued_name,
+                } => Snapshot::Issued(*device_id, token.clone(), issued_name.clone()),
                 CodeState::Resolved(approved) => Snapshot::Resolved(*approved),
                 CodeState::AwaitingConfirm => Snapshot::Fresh,
             };
@@ -178,8 +188,15 @@ impl PairingService {
         };
         // An already-Issued code replays regardless of TTL elapsing between issuance and this
         // retry — the device is already real; only an UN-issued code is reaped on expiry.
-        if let Snapshot::Issued(device_id, token) = snapshot {
-            return RedeemOutcome::AlreadyIssued { device_id, token };
+        // BUT only for the SAME device_name recorded at issuance — a different name on a still-
+        // live code is a second party racing the code, not the legitimate dropped-ack retry m6
+        // exists for, and must be rejected rather than handed the live token.
+        if let Snapshot::Issued(device_id, token, issued_name) = snapshot {
+            return if device_name == issued_name {
+                RedeemOutcome::AlreadyIssued { device_id, token }
+            } else {
+                RedeemOutcome::Invalid
+            };
         }
         if expired {
             self.codes.remove(code);
@@ -192,8 +209,6 @@ impl PairingService {
                 RedeemOutcome::Denied
             };
         }
-
-        let _ = device_name; // reserved for surfacing in a future interactive confirm UI (P2b)
 
         if pre_approved {
             self.resolve(code, true);
@@ -227,14 +242,19 @@ impl PairingService {
         self.resolve(code, approved)
     }
 
-    /// Record that `code`'s `Confirmed` outcome was minted into a real device — every
-    /// subsequent `redeem` of this code within its TTL now replays these credentials (m6)
-    /// instead of re-running the confirm gate. A no-op if `code` is unknown (already reaped)
-    /// or already `Issued` (the caller should not double-mint in the first place).
-    pub fn record_issued(&self, code: &str, device_id: Uuid, token: String) {
+    /// Record that `code`'s `Confirmed` outcome was minted into a real device — a subsequent
+    /// `redeem` of this code within its TTL replays these credentials (m6) ONLY when its
+    /// `device_name` matches `device_name` here; a different name is rejected instead (see the
+    /// `Issued` variant's doc). A no-op if `code` is unknown (already reaped) or already
+    /// `Issued` (the caller should not double-mint in the first place).
+    pub fn record_issued(&self, code: &str, device_id: Uuid, token: String, device_name: String) {
         if let Some(mut entry) = self.codes.get_mut(code) {
             if !matches!(entry.state, CodeState::Issued { .. }) {
-                entry.state = CodeState::Issued { device_id, token };
+                entry.state = CodeState::Issued {
+                    device_id,
+                    token,
+                    device_name,
+                };
             }
         }
     }
@@ -359,7 +379,7 @@ mod tests {
 
         let device_id = Uuid::new_v4();
         let token = generate_token();
-        svc.record_issued(&code, device_id, token.clone());
+        svc.record_issued(&code, device_id, token.clone(), "Phone".to_string());
 
         match svc.redeem(&code, "Phone", ip()).await {
             RedeemOutcome::AlreadyIssued {
@@ -376,7 +396,12 @@ mod tests {
     #[test]
     fn record_issued_on_an_unknown_code_is_a_harmless_no_op() {
         let svc = PairingService::new();
-        svc.record_issued("000000", Uuid::new_v4(), "tok".to_string());
+        svc.record_issued(
+            "000000",
+            Uuid::new_v4(),
+            "tok".to_string(),
+            "Phone".to_string(),
+        );
     }
 
     #[tokio::test]

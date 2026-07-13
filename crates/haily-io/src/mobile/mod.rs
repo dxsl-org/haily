@@ -204,6 +204,23 @@ impl MobileAdapter {
         }
     }
 
+    /// Same as [`Self::new`], but injects a deterministic clock into the pairing service
+    /// (Mobile Thin-Client plan phase 6 test seam) — lets an E2E test age a minted pairing
+    /// code past its TTL without a real 120s wait. Never used by production code, which always
+    /// wants the real wall clock via [`Self::new`]; `pub` (not `#[cfg(test)]`) because the
+    /// consumer is an external integration-test crate (`crates/haily-io/tests/`), which cannot
+    /// see this crate's unit-test cfg.
+    pub fn new_with_pairing_clock(
+        config: MobileServerConfig,
+        devices: Arc<dyn MobileDeviceStore>,
+        data_dir: std::path::PathBuf,
+        pairing_clock: fn() -> Instant,
+    ) -> Self {
+        let mut adapter = Self::new(config, devices, data_dir);
+        adapter.pairing = Arc::new(PairingService::with_clock(pairing_clock));
+        adapter
+    }
+
     /// Every code still awaiting an interactive OOB confirm — the seam a future GUI dialog
     /// (P2b) polls, mirroring `haily-core::approval::ApprovalBroker::pending_snapshot`.
     pub fn pending_pair_confirms(&self) -> Vec<pairing::PendingConfirm> {

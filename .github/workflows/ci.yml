@@ -112,6 +112,10 @@ jobs:
       # M14: static guard that the mobile WebView never grows its own socket/remote-fetch call.
       - name: Mobile CSP grep-guard (no WebSocket/remote fetch under src/routes/mobile)
         run: bash scripts/check-mobile-no-websocket.sh
+      # C3: static guard that the wire forward-compat trip-wire can't be silently disarmed by a
+      # future wildcard match arm (the compile-fail-on-new-variant trick only works exhaustive).
+      - name: Wire forward-compat guard (no wildcard arm in wire_forward_compat_guard.rs)
+        run: bash scripts/check-wire-guard-no-wildcard.sh
 
   frontend:
     name: Frontend — build + audit

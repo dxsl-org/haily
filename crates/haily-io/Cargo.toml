@@ -42,3 +42,8 @@ futures     = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# E2E mobile-server test client (phase 6) — plain WS client, no TLS backend needed since the
+# suite only exercises the loopback (`ws://`) listener; pinned to the same major version
+# `haily-mobile-client` resolves so the workspace never carries two `tokio-tungstenite` majors.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+reqwest = { workspace = true }

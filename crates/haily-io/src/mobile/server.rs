@@ -161,9 +161,12 @@ async fn pair_handler(
                 .await
             {
                 Some(device_id) => {
-                    state
-                        .pairing
-                        .record_issued(&req.pairing_code, device_id, token.clone());
+                    state.pairing.record_issued(
+                        &req.pairing_code,
+                        device_id,
+                        token.clone(),
+                        req.device_name.clone(),
+                    );
                     Json(PairResponse {
                         device_token: token,
                         device_id,
