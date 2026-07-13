@@ -18,15 +18,19 @@
 //! - [`ws`] — the actual TLS+WebSocket connect primitive (token header, Hello/HelloAck).
 //! - [`client`] — the driving loop composing the above into "stay connected, forward frames,
 //!   reconnect on drop" — `src-tauri-mobile`'s command layer is the only consumer.
+//! - [`tts_chunker`] — sentence-boundary chunker for streaming TTS (phase 4): pure text
+//!   processing, no platform dependency, shared by Android (now) and iOS (P5).
 
 pub mod cert_verify;
 pub mod client;
 pub mod codec;
 pub mod endpoints;
 pub mod reconnect;
+pub mod tts_chunker;
 pub mod ws;
 
 pub use cert_verify::pinned_client_config;
 pub use client::{spawn, ClientEvent, ClientHandle, MobileClientConfig, StopReason};
 pub use reconnect::{Backoff, ResumeCursor, SeqDedup};
+pub use tts_chunker::TtsChunker;
 pub use ws::ConnectError;

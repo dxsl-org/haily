@@ -43,7 +43,10 @@ pub fn connect_and_spawn(app: &AppHandle, state: &AppState, qr: PairingQr, token
     bridge::spawn(app.clone(), events);
 }
 
-fn client_handle(state: &AppState) -> Result<ClientHandle, String> {
+/// `pub(crate)` (not just module-private) so `voice.rs`'s `voice_send_transcript` command can
+/// reuse the exact same "resolve the connected client or a uniform not-connected error" logic
+/// rather than re-implementing it.
+pub(crate) fn client_handle(state: &AppState) -> Result<ClientHandle, String> {
     state
         .client
         .lock()

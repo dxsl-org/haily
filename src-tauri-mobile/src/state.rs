@@ -1,10 +1,12 @@
 //! Command-facing app state: the live WS client handle (if paired+connected), the current
 //! connection/pairing status snapshot, and pending `FetchSession` request/response correlation.
+use crate::voice_state::PushToTalkGate;
 use dashmap::DashMap;
-use haily_mobile_client::ClientHandle;
+use haily_mobile_client::{ClientHandle, TtsChunker};
 use haily_types::SessionSnapshot;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
@@ -53,6 +55,29 @@ pub struct AppState {
     /// Last `HelloAck.epoch` seen — lets `bridge.rs` detect a server restart (C4) across
     /// reconnects and fire `mobile-resync-needed` (M7). `None` until the first `HelloAck`.
     pub last_epoch: Mutex<Option<u64>>,
+    /// Voice plugin state (phase 4): the m4 push-to-talk gate, the TTS on/off toggle, and the
+    /// shared sentence chunker `bridge.rs` feeds from the inbound `haily-chunk` stream.
+    pub voice: VoiceState,
+}
+
+/// Grouped so `AppState` itself doesn't grow a flat pile of voice-specific fields; see
+/// `voice.rs`'s module doc for how the gate/chunker/toggle interact.
+pub struct VoiceState {
+    pub gate: Mutex<PushToTalkGate>,
+    pub tts_enabled: AtomicBool,
+    pub chunker: Mutex<TtsChunker>,
+}
+
+impl VoiceState {
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(PushToTalkGate::new()),
+            // Off by default — a user opts in via the UI's TTS toggle rather than the app
+            // speaking unprompted on first launch.
+            tts_enabled: AtomicBool::new(false),
+            chunker: Mutex::new(TtsChunker::new()),
+        }
+    }
 }
 
 impl AppState {
@@ -71,6 +96,7 @@ impl AppState {
             data_dir,
             pending_snapshots: DashMap::new(),
             last_epoch: Mutex::new(None),
+            voice: VoiceState::new(),
         }
     }
 }

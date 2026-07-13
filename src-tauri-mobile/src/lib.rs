@@ -8,6 +8,8 @@ mod commands;
 mod pairing;
 mod state;
 mod vault;
+mod voice;
+mod voice_state;
 
 use state::AppState;
 use tauri::Manager;
@@ -28,6 +30,12 @@ pub fn run() {
         builder = builder
             .plugin(tauri_plugin_barcode_scanner::init())
             .plugin(tauri_plugin_biometric::init());
+    }
+    // Android-only (phase 4): iOS's voice half is an explicitly deferred follow-up (the plan's
+    // Next Steps), so this plugin is gated narrower than barcode-scanner/biometric above.
+    #[cfg(target_os = "android")]
+    {
+        builder = builder.plugin(tauri_plugin_haily_voice::init());
     }
 
     builder
@@ -62,6 +70,15 @@ pub fn run() {
             commands::approve_tool,
             commands::mobile_set_kill_switch,
             commands::mobile_fetch_session,
+            voice::voice_ptt_start,
+            voice::voice_ptt_stop,
+            voice::voice_send_transcript,
+            voice::voice_stt_cancelled,
+            voice::voice_ptt_is_listening,
+            voice::voice_set_tts_enabled,
+            voice::voice_tts_state,
+            voice::voice_check_permissions,
+            voice::voice_request_permissions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Haily Mobile");

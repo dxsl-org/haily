@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Library-module manifest — Android's manifest merger folds this permission declaration into
+  `src-tauri-mobile/gen/android/app/src/main/AndroidManifest.xml` at build time (that app manifest
+  does not exist yet on this host — Android init is HOST-GATED, same gap P3 already documented).
+  Push-to-talk only (no background/continuous capture), so RECORD_AUDIO is the only permission
+  this plugin needs; TTS requires none.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+</manifest>

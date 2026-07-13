@@ -16,6 +16,9 @@ src-tauri/target/
 src-tauri/WixTools/
 src-tauri-mobile/target/
 src-tauri-mobile/gen/
+tauri-plugin-haily-voice/target/
+tauri-plugin-haily-voice/android/build/
+tauri-plugin-haily-voice/android/.gradle/
 
 # Haily runtime data — never commit these
 *.gguf

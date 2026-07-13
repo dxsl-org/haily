@@ -77,6 +77,7 @@ fn handle_frame(app: &AppHandle, body: ServerBody) {
             }
         }
         ServerBody::Chunk { session_id, chunk } => {
+            crate::voice::handle_tts_chunk(app, &chunk);
             let _ = app.emit(
                 "haily-chunk",
                 serde_json::json!({ "session_id": session_id, "chunk": chunk }),

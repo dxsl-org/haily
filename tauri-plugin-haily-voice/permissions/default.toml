@@ -1,0 +1,13 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Default permissions for the haily-voice plugin — grants every command. Internal, single-consumer plugin (only `src-tauri-mobile` depends on it), so per-command allow/deny granularity is YAGNI; a published plugin would split these."
+permissions = [
+    "allow-start-stt",
+    "allow-stop-stt",
+    "allow-speak-chunk",
+    "allow-stop-speaking",
+    "allow-tts-state",
+    "allow-check-permissions",
+    "allow-request-permissions",
+]

@@ -15,8 +15,10 @@
     onResyncNeeded,
     onApprovalDenied,
   } from './mobile-tauri';
+  import { voiceSendTranscript } from './voice-tauri';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
   import ProactivePanel from '$lib/components/ProactivePanel.svelte';
+  import VoiceBar from '$lib/components/mobile/VoiceBar.svelte';
 
   type Role = 'user' | 'assistant' | 'system';
   interface Message {
@@ -123,16 +125,17 @@
     };
   });
 
-  async function send() {
-    const text = input.trim();
+  /** Shared by the typed-input send button and the voice bar's finalized-transcript callback:
+   * mints the session id HERE (client-side) and registers `sessionIndex` BEFORE the command even
+   * goes out — a `haily-chunk` event for this session can arrive over its own IPC channel before
+   * the send command's return value does (no ordering guarantee between the two), so registering
+   * only after `await` would risk dropping the earliest chunk(s). `deliver` performs the actual
+   * wire send (`mobileSendMessage` for typed text, `voiceSendTranscript` for voice — the latter
+   * also resumes the m4 chunker-pause gate as part of the same round trip). */
+  async function sendText(text: string, deliver: (sessionId: string) => Promise<void>) {
     if (!text || sending || pendingApproval || activeSession) return;
-    input = '';
     sending = true;
 
-    // Mint the session id HERE (client-side) and register `sessionIndex` BEFORE the command
-    // even goes out — a `haily-chunk` event for this session can arrive over its own IPC
-    // channel before `mobileSendMessage`'s return value does (no ordering guarantee between the
-    // two), so registering only after `await` would risk dropping the earliest chunk(s).
     const sessionId = crypto.randomUUID();
     messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false });
     const assistantIdx = messages.length;
@@ -142,7 +145,7 @@
     scrollToBottom();
 
     try {
-      await mobileSendMessage(sessionId, text);
+      await deliver(sessionId);
     } catch (e) {
       messages[assistantIdx].content = `⚠️ Connection error: ${e}`;
       messages[assistantIdx].pending = false;
@@ -151,6 +154,24 @@
     } finally {
       sending = false;
     }
+  }
+
+  async function send() {
+    const text = input.trim();
+    if (!text) return;
+    input = '';
+    await sendText(text, (sessionId) => mobileSendMessage(sessionId, text));
+  }
+
+  async function sendVoiceTranscript(text: string) {
+    await sendText(text, (sessionId) => voiceSendTranscript(sessionId, text));
+  }
+
+  function onVoiceError(message: string) {
+    deniedNotice = message;
+    setTimeout(() => {
+      deniedNotice = null;
+    }, 4000);
   }
 
   /** Mirrors `+page.svelte`'s (desktop) `stop()` — fires cancellation and tracks the transient
@@ -190,6 +211,11 @@
 </div>
 
 <div class="input-area">
+  <VoiceBar
+    disabled={sending || pendingApproval !== null || activeSession !== null}
+    onTranscript={sendVoiceTranscript}
+    onError={onVoiceError}
+  />
   <textarea
     bind:value={input}
     onkeydown={(e) => {
