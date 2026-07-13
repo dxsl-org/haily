@@ -45,6 +45,10 @@ pub struct TaskTrace {
     pub label_source: Option<String>,
     pub label_confidence: Option<f64>,
     pub delegate_overhead_ms: Option<i64>,
+    /// Auto Model Routing R1 join key (migration 0031) — correlates this trace with its
+    /// `routing_decisions` row(s). `None` for any trace inserted before this migration, or
+    /// any caller that has not yet been wired to pass the turn's id (see `TraceMetrics::turn_id`).
+    pub turn_id: Option<String>,
 }
 
 /// Per-turn telemetry to persist alongside a trace's outcome (Harness Completion
@@ -68,6 +72,10 @@ pub struct TraceMetrics<'a> {
     pub label_source: Option<&'a str>,
     pub label_confidence: Option<f64>,
     pub delegate_overhead_ms: Option<i64>,
+    /// Auto Model Routing R1 join key (migration 0031) — the routing decision log's
+    /// `turn_id`. Every existing caller passes `None` via `..Default::default()`/`Default`
+    /// until the routing decision emitter (Phase 4) wires the real value in.
+    pub turn_id: Option<&'a str>,
 }
 
 pub async fn insert_trace(
@@ -86,8 +94,8 @@ pub async fn insert_trace(
              (id, session_id, task_description, tool_calls, outcome, duration_ms, created_at,
               model_tier, prompt_tokens, completion_tokens, tool_call_count,
               approval_requested, approval_denied, undo_within_5min,
-              label_source, label_confidence, delegate_overhead_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              label_source, label_confidence, delegate_overhead_ms, turn_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING *",
     )
     .bind(&id)
@@ -107,6 +115,7 @@ pub async fn insert_trace(
     .bind(metrics.label_source)
     .bind(metrics.label_confidence)
     .bind(metrics.delegate_overhead_ms)
+    .bind(metrics.turn_id)
     .fetch_one(db.pool())
     .await?)
 }
