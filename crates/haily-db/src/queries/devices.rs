@@ -169,11 +169,16 @@ pub async fn reap_unconfirmed(db: &DbHandle, older_than: &str) -> Result<u64> {
 mod tests {
     use super::*;
 
-    async fn test_db() -> DbHandle {
+    // Returns the `TempDir` guard alongside the handle — it must outlive every query below it,
+    // or the directory (and the SQLite file in it) is deleted the instant this function returns.
+    // Windows tolerates the dangling handle long enough for tests to pass anyway; Linux does
+    // not, and every query fails closed with SQLITE_CANTOPEN ("unable to open database file").
+    async fn test_db() -> (DbHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        DbHandle::init(&dir.path().join("t.db"))
+        let db = DbHandle::init(&dir.path().join("t.db"))
             .await
-            .expect("db init")
+            .expect("db init");
+        (db, dir)
     }
 
     #[test]
@@ -187,7 +192,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_find_active_by_token_hash_roundtrips() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let device_id = Uuid::new_v4();
         let hash = hash_token("tok-1");
         insert(&db, device_id, "My Phone", &hash)
@@ -205,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_token_hash_resolves_to_none() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         assert!(find_active_by_token_hash(&db, "nope")
             .await
             .unwrap()
@@ -214,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_device_is_excluded_from_find_active() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let device_id = Uuid::new_v4();
         let hash = hash_token("tok-2");
         insert(&db, device_id, "Phone", &hash).await.unwrap();
@@ -229,13 +234,13 @@ mod tests {
 
     #[tokio::test]
     async fn is_revoked_fails_closed_for_unknown_device() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         assert!(is_revoked(&db, Uuid::new_v4()).await.unwrap());
     }
 
     #[tokio::test]
     async fn touch_last_seen_updates_the_timestamp() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let device_id = Uuid::new_v4();
         insert(&db, device_id, "Phone", &hash_token("tok-3"))
             .await
@@ -251,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_excludes_revoked_devices() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         insert(&db, a, "A", &hash_token("a")).await.unwrap();
@@ -265,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_unconfirmed_removes_only_never_connected_rows_past_cutoff() {
-        let db = test_db().await;
+        let (db, _dir) = test_db().await;
         let stale = Uuid::new_v4();
         insert(&db, stale, "Stale", &hash_token("stale"))
             .await
