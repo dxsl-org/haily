@@ -49,11 +49,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - app: plaintext credential write fails closed
 - core: block approval tools inside sub-agents
 - core: strip tool markup from results
+- types: mobile wire envelope with epoch and forward-compat
+- io: mobile WebSocket adapter with pinned pairing
+- db: devices table for mobile pairing tokens
+- gui: mobile pairing screen and devices panel
+- mobile: Tauri Android shell with pinned-TLS client
+- mobile: push-to-talk voice with sentence chunking
+- io: mobile server E2E harness proving protocol invariants
 
 ### Fixed
 - db: guard FTS5 triggers against index corruption
 - core: loop guard terminates runaway turns
 - telegram: handle work items changed notification
+- io: pairing replay bound to issuing device name
 
 ### Changed
 - tools: soft-delete tools re-tiered to reversible

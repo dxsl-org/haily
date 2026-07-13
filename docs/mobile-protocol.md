@@ -334,11 +334,14 @@ consistent with this shared reality.
 
 Approvals deny-on-timeout at 120 seconds (existing desktop behavior). A mobile client that
 reconnects after being backgrounded may receive a replayed `ToolApprovalRequest` for an approval
-that already expired server-side. The server reconciles replay against its live pending-approval
-set before resending — a dead approval is rewritten/suppressed as an inert "expired — action was
-declined" notice, never re-presented as an actionable modal. **This means a backgrounded phone
-silently declines destructive actions once 120 seconds elapse** — documented behavior, not a bug
-to "fix" by extending the timeout for mobile specifically.
+that already expired server-side. **v1 does not reconcile this replay against the live
+pending-approval set** — the client may briefly render an actionable-looking modal for an
+approval the broker no longer tracks. This is safe, not silent: a late `Approve`/`Deny` on an
+expired id resolves to `false` with no effect (`ApprovalResolver::resolve`'s unknown-id path), so
+no stale approval can ever be honored — the gap is a UX rough edge (a modal that does nothing),
+never a security hole. **A backgrounded phone silently declines destructive actions once 120
+seconds elapse regardless** — that deny-on-timeout is the real safety guarantee here, not the
+replay-suppression UX, which remains a tracked follow-up (see the phase's Deviation Log).
 
 ## 9. Version negotiation policy (C3)
 
