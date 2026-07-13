@@ -150,43 +150,15 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 
 ## Current Phase Status
 
-**Phase 1–13.5: Complete (2026-07-04)**
-- Architecture Remediation Plan (Phase Rem): all 10 phases shipped to main (2026-07-02)
-- Safe Operator Harness (Phase 13): RiskTier, ApprovalGate seam, action journal + undo + kill switch, connector manifests, Odoo CRM (2026-07-03)
-- Harness Completion (Phases 13.1–13.5): Local journal/undo, per-turn cap, human-verb UI, keyring credentials (dormant), TaskOutcome→EMA wiring, label sources + confidence weighting, anti-reinforcement invariants, golden-task eval harness (23 cases, zero network, behavior-asserting) (2026-07-04)
-- Red Team findings (32 total): all accepted, applied, verified
-- Regression gates: `cargo clippy -- -D warnings && cargo test` passing
+All shipped phases and what's next live in `docs/project-roadmap.md` (authoritative, updated per merge) — this file tracks architecture and code layout, not a phase timeline, so it doesn't duplicate that table here.
 
-**Sub-Agent & Skill Architecture (P0–P14): Complete (2026-07-12)**
-- Full plan→build→verify→ship pipeline with sandbox isolation, multi-language coding tools, skill synthesis, LSP semantics, stealth browser, automation eval harness
-- PR #6 merged to main
-
-**Mobile Thin-Client: Complete (2026-07-12)**
-- Android-first WS remote terminal with QR pairing, voice plugin, E2E harness
-- iOS (P5) explicitly deferred, host-gated on macOS
-- PR #7 merged to main
-
-**Auto Model Routing R1: Complete (2026-07-14)**
-- Heuristic tier selector + gate-verified escalation policy, routing decision telemetry, cost/quality UX dial
-- PR #8 merged to main
-
-**Pipeline Activation & Wiring (7 phases): Complete (2026-07-14)**
-- Phase 1: Launcher service + live RunEvent/distillation bridges (`launch_coding_run` in core, `spawn_distillation_bridge` in app)
-- Phase 2: Chat triggers — `/plan`, `/code`, `/build` slash + confirm-gated VN/EN intent classifier
-- Phase 3: GUI cockpit "New run" form feeding RunTimeline
-- Phase 4: LSP diagnostics into build fix-loop signal
-- Phase 5: Skill enable/pin enforcement at context-assembly time
-- Phase 6: Hourly worktree GC with graceful-shutdown semantics + grace-window fix (commit ce21efd)
-- Phase 7: Host-gated eval runbook scripts + documentation (`scripts/evals/`, `docs/runbooks/pipeline-evals.md`)
-- Status: Built on `feat/pipeline-activation`, awaiting merge/push
-
-**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation. R2/R3 router gated on ≥7 days routing_decisions data + P9 eval matrix.
+Regression gate for every merge: `cargo clippy -- -D warnings && cargo test` passing.
 
 ## Docs
 
 Full documentation is in `docs/`:
-- `architecture.md` — 30 technical decisions (Decision 30 added 2026-07-14: Auto Model Routing R1 heuristic selector; Decisions 1–29 from earlier phases)
+- `architecture.md` — technical decisions log, one entry per significant architectural choice
 - `code-standards.md` — Rust coding conventions; CancellationToken + TaskTracker patterns; Safe Operator Harness patterns (append-only trigger, representation-normalizing read-back, seam via leaf trait, out-param side-channel, credential-getter seam)
-- `project-structure.md` — 10-crate layout (haily-types, haily-app added), dependency graph, layering test
-- `project-roadmap.md` — Phase status (1–13.5 complete; 13.1–13.5 collapsed into single summary; Phase 14–15 planned; follow-up directions: generic declarative connectors + router A/B)
+- `project-structure.md` — crate layout, dependency graph, layering test
+- `project-roadmap.md` — phase status, in-flight plans, what's next
 - `project-changelog.md` — Significant changes, features, fixes by phase (Harness Completion Phase 5 added 2026-07-04)
