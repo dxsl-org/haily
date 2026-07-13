@@ -162,6 +162,20 @@ pub enum ResponseChunk {
     /// that don't buffer (CLI, GUI) may treat this the same as `Text` for rendering.
     Error(String),
     Complete,
+    /// Which tier/model produced this L0 turn (Auto Model Routing R1, transparency
+    /// invariant) — emitted once, immediately before `Complete`, ONLY when routing is
+    /// enabled (`routing_enabled=false` legacy turns emit none of these). Additive by
+    /// construction: this is a NEW variant, not a change to `Complete` itself, which
+    /// stays byte-identical (an adjacently-tagged enum breaks on either wire direction
+    /// if an EXISTING fieldless variant grows a payload — see the phase's red-team
+    /// finding). Never emitted on a sub-turn/pipeline-stage synthetic `Complete` — the
+    /// badge is strictly an L0-turn concept. `#[serde(default)]` on `badge` keeps this
+    /// lenient the same way every other chunk field is: a `TurnMeta` payload missing the
+    /// key still decodes, defaulting to `None`, rather than erroring.
+    TurnMeta {
+        #[serde(default)]
+        badge: Option<String>,
+    },
 }
 
 /// Snapshot of a single active work item for display in adapters.
@@ -646,6 +660,56 @@ mod tests {
             ResponseChunk::Error(msg) => assert_eq!(msg, "boom"),
             other => panic!("unexpected variant after roundtrip: {other:?}"),
         }
+    }
+
+    /// Auto Model Routing R1 (phase 5): `TurnMeta` is a NEW additive variant, not a change
+    /// to `Complete` — this proves it round-trips on its own wire tag, distinct from every
+    /// existing variant (in particular `Complete`, which this phase's red team proved must
+    /// stay byte-identical).
+    #[test]
+    fn turn_meta_variant_roundtrips() {
+        let chunk = ResponseChunk::TurnMeta {
+            badge: Some("thinking · llama-3".to_string()),
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"type\":\"TurnMeta\""));
+        assert!(json.contains("\"badge\":\"thinking · llama-3\""));
+
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::TurnMeta { badge } => {
+                assert_eq!(badge, Some("thinking · llama-3".to_string()));
+            }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    /// `#[serde(default)]` on `badge` keeps a `TurnMeta` payload missing the key lenient
+    /// (defaults to `None`) rather than a hard decode error — the same additive guarantee
+    /// every other chunk field in this enum follows (M8 convention).
+    #[test]
+    fn turn_meta_absent_badge_deserializes_to_none() {
+        let legacy = r#"{"type":"TurnMeta","data":{}}"#;
+        let chunk: ResponseChunk =
+            serde_json::from_str(legacy).expect("TurnMeta payload without badge must deserialize");
+        match chunk {
+            ResponseChunk::TurnMeta { badge } => {
+                assert_eq!(badge, None, "absent badge must default to None");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// A pre-phase-5 stream (no `TurnMeta` chunk ever sent) is untouched by this change —
+    /// `Complete` still decodes from its exact legacy wire shape with no `data` field at
+    /// all, proving the new variant did not turn `Complete` into a struct variant (the
+    /// change the red team empirically falsified).
+    #[test]
+    fn legacy_complete_payload_with_no_data_field_still_decodes() {
+        let legacy = r#"{"type":"Complete"}"#;
+        let chunk: ResponseChunk =
+            serde_json::from_str(legacy).expect("legacy Complete payload must still deserialize");
+        assert!(matches!(chunk, ResponseChunk::Complete));
     }
 
     /// M8/M4 (Harness Completion phase 3): a `ToolResult` payload minted BEFORE

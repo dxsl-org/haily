@@ -56,7 +56,23 @@ export interface CompleteChunk {
   type: 'Complete';
 }
 
-export type Chunk = TextChunk | ErrorChunk | ToolApprovalRequestChunk | ToolResultChunk | CompleteChunk;
+/** Which tier/model produced this L0 turn (Auto Model Routing R1, transparency
+ * invariant) — a NEW additive variant, never a change to `CompleteChunk` (adjacently-
+ * tagged serde breaks on an existing fieldless variant gaining a payload). Emitted once,
+ * immediately before `Complete`, ONLY when server-side routing is enabled; `badge` is
+ * `undefined`/absent on a legacy (pre-phase-5) payload. */
+export interface TurnMetaChunk {
+  type: 'TurnMeta';
+  data: { badge?: string | null };
+}
+
+export type Chunk =
+  | TextChunk
+  | ErrorChunk
+  | ToolApprovalRequestChunk
+  | ToolResultChunk
+  | CompleteChunk
+  | TurnMetaChunk;
 
 export interface ChunkPayload {
   session_id: string;

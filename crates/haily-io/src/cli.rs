@@ -328,6 +328,13 @@ impl Adapter for CliAdapter {
                     .write_all(render_tool_result_line(&name, ok).as_bytes())
                     .await?;
             }
+            ResponseChunk::TurnMeta { badge } => {
+                if let Some(badge) = badge {
+                    stdout
+                        .write_all(render_turn_meta_line(&badge).as_bytes())
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -432,6 +439,13 @@ fn handle_writes_command(kill: &Arc<Mutex<Option<Arc<AtomicBool>>>>, arg: &str) 
 fn render_tool_result_line(name: &str, ok: bool) -> String {
     let status = if ok { "✓" } else { "✗" };
     format!("[{status} {name}]\n")
+}
+
+/// Render a `TurnMeta` badge as a dim `(tier · model)` line (ANSI SGR 2 = dim, reset via
+/// SGR 0). Pure and unit-testable like `render_tool_result_line`. `badge` is built from
+/// internal config strings only (never model/tool output), so no escaping is needed here.
+fn render_turn_meta_line(badge: &str) -> String {
+    format!("\x1b[2m({badge})\x1b[0m\n")
 }
 
 /// Parse a `/undo` REPL command. `arg` is the text after `/undo`. Returns the chat
@@ -734,5 +748,32 @@ mod tests {
         )
         .await
         .expect("deliver must not error on a ToolResult with the new fields populated");
+    }
+
+    /// Pure-function contract for the dim `(tier · model)` badge line, mirroring
+    /// `render_tool_result_line`'s own byte-shape test.
+    #[test]
+    fn render_turn_meta_line_wraps_badge_in_dim_ansi_and_parens() {
+        let line = render_turn_meta_line("thinking · llama-3");
+        assert_eq!(line, "\x1b[2m(thinking · llama-3)\x1b[0m\n");
+    }
+
+    /// `deliver()` must not error on a `TurnMeta` chunk, with or without a badge (the
+    /// `None` case never reaches here in practice — `run_turn` only ever sends
+    /// `Some(badge)` — but the CLI arm is written to tolerate it as a defensive no-op).
+    #[tokio::test]
+    async fn deliver_turn_meta_renders_without_error() {
+        let cli = CliAdapter::new();
+        cli.deliver(
+            Uuid::new_v4(),
+            ResponseChunk::TurnMeta {
+                badge: Some("thinking · llama-3".to_string()),
+            },
+        )
+        .await
+        .expect("deliver must not error on TurnMeta with a badge");
+        cli.deliver(Uuid::new_v4(), ResponseChunk::TurnMeta { badge: None })
+            .await
+            .expect("deliver must not error on TurnMeta with no badge");
     }
 }

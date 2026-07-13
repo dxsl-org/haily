@@ -30,6 +30,11 @@
     /** Reversible actions completed during this turn, revealed only once `pending` flips
      * false (the turn's `Complete` chunk arrived) — see `UndoableAction`. */
     undoable: UndoableAction[];
+    /** "tier · model" (or bare model name for a `None`-tier turn) from a `TurnMeta`
+     * chunk — `null` until it arrives (a legacy/routing-disabled turn never sets it, and
+     * a `system`/`user` bubble never receives one). Rendered as a footer once the turn
+     * completes, mirroring `undoable`'s "arrives mid-stream, shown at Complete" gating. */
+    badge: string | null;
   }
 
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
@@ -54,6 +59,7 @@
       content: 'Xin chào! Tôi là Haily 💜 Hỏi tôi bất cứ điều gì.',
       pending: false,
       undoable: [],
+      badge: null,
     },
   ]);
   let input = $state('');
@@ -94,7 +100,7 @@
       let idx: number | undefined;
       if (session_id === NIL_UUID) {
         // Proactive notification — create a new system bubble
-        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true, undoable: [] });
+        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true, undoable: [], badge: null });
         idx = messages.length - 1;
       } else {
         idx = sessionIndex.get(session_id);
@@ -120,6 +126,10 @@
         if (reversible && journal_id) {
           messages[idx].undoable.push({ journalId: journal_id, verb: toolVerb(name, '{}') });
         }
+      } else if (chunk.type === 'TurnMeta') {
+        // Buffer only — rendered as a footer once `Complete` lands below, same gating
+        // as `undoable` (more of this turn could still be in flight).
+        messages[idx].badge = chunk.data.badge ?? null;
       } else if (chunk.type === 'Complete') {
         messages[idx].pending = false;
         sessionIndex.delete(session_id);
@@ -150,10 +160,10 @@
     sending = true;
     autoResize();
 
-    messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false, undoable: [] });
+    messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false, undoable: [], badge: null });
 
     const assistantIdx = messages.length;
-    messages.push({ id: crypto.randomUUID(), role: 'assistant', content: '', pending: true, undoable: [] });
+    messages.push({ id: crypto.randomUUID(), role: 'assistant', content: '', pending: true, undoable: [], badge: null });
     scrollToBottom();
 
     try {
@@ -287,6 +297,12 @@
                 </button>
               {/each}
             </div>
+          {/if}
+          <!-- Same `!msg.pending` gate as the undo list: a badge is only meaningful once
+               the turn it describes has actually finished. `routing_enabled=false` or a
+               non-assistant bubble never sets `badge`, so this renders nothing then. -->
+          {#if !msg.pending && msg.badge}
+            <div class="turn-badge">{msg.badge}</div>
           {/if}
         </div>
       {/each}
@@ -442,6 +458,13 @@
 
   .undo-inline:hover:not(:disabled) { border-color: #7c3aed; background: #271a4a; }
   .undo-inline:disabled { opacity: 0.5; cursor: default; }
+
+  .turn-badge {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #7c7c9a;
+    opacity: 0.8;
+  }
 
   .bubble.user {
     background: #7c3aed;

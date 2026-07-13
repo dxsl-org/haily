@@ -4,7 +4,9 @@ use haily_db::{
     DbHandle,
 };
 use haily_kms::KmsHandle;
-use haily_llm::{CompletionRequest, Egress, EscalationPolicy, LlmRouter, Message, Role, Tier};
+use haily_llm::{
+    CompletionRequest, Egress, EscalationPolicy, LlmRouter, Message, Role, RouterSnapshot, Tier,
+};
 use haily_tools::{ToolContext, ToolRegistry};
 use haily_types::{Request, ResponseChunk};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +23,76 @@ use super::stream::stream_llm_response;
 
 fn estimate_tokens(s: &str) -> i64 {
     (s.len() / 4) as i64
+}
+
+/// The L0 transparency badge (Auto Model Routing R1): "tier · model" when a tier was
+/// actually selected for this turn's last call, else just the session-default model name —
+/// transparency even when routing didn't act. Pure and unit-testable, mirroring
+/// `render_tool_result_line`'s split-out-for-testing pattern in `haily-io::cli`.
+fn build_turn_meta_badge(snapshot: &RouterSnapshot, tier: Option<Tier>) -> String {
+    match tier {
+        Some(t) => format!(
+            "{} · {}",
+            routing::tier_label(t),
+            snapshot.model_for_tier(Some(t))
+        ),
+        None => snapshot.model_for_tier(None).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod turn_meta_badge_tests {
+    use super::*;
+    use haily_llm::{LlmConfig, TierModels};
+
+    /// `Some(tier)` with a configured tier-model override renders "tier · model".
+    #[tokio::test]
+    async fn some_tier_with_override_renders_tier_and_model() {
+        let llm = LlmRouter::init(LlmConfig {
+            cloud_api_keys: vec!["k".to_string()],
+            cloud_base_url: "http://127.0.0.1:1".to_string(),
+            cloud_model: "default-model".to_string(),
+            tier_models: TierModels {
+                thinking: Some("big-model".to_string()),
+                ..TierModels::default()
+            },
+            ..LlmConfig::default()
+        })
+        .await;
+        let badge = build_turn_meta_badge(&llm.snapshot(), Some(Tier::Thinking));
+        assert_eq!(badge, "thinking · big-model");
+    }
+
+    /// `Some(tier)` with NO override for that tier falls back to the session-default
+    /// model name, still prefixed with the tier label (mirrors `complete_tiered`'s own
+    /// no-override fallback).
+    #[tokio::test]
+    async fn some_tier_without_override_falls_back_to_default_model() {
+        let llm = LlmRouter::init(LlmConfig {
+            cloud_api_keys: vec!["k".to_string()],
+            cloud_base_url: "http://127.0.0.1:1".to_string(),
+            cloud_model: "default-model".to_string(),
+            ..LlmConfig::default()
+        })
+        .await;
+        let badge = build_turn_meta_badge(&llm.snapshot(), Some(Tier::Fast));
+        assert_eq!(badge, "fast · default-model");
+    }
+
+    /// `None` tier shows the bare session-default model name — no `·` separator, since
+    /// there is no tier to show (transparency even when routing didn't act).
+    #[tokio::test]
+    async fn none_tier_shows_bare_default_model_name() {
+        let llm = LlmRouter::init(LlmConfig {
+            cloud_api_keys: vec!["k".to_string()],
+            cloud_base_url: "http://127.0.0.1:1".to_string(),
+            cloud_model: "default-model".to_string(),
+            ..LlmConfig::default()
+        })
+        .await;
+        let badge = build_turn_meta_badge(&llm.snapshot(), None);
+        assert_eq!(badge, "default-model");
+    }
 }
 
 /// Shared runtime handles for a full turn — grouped so `run_turn` stays within a
@@ -468,6 +540,15 @@ pub async fn run_turn(
     if !final_text_already_streamed && !final_response.is_empty() {
         let _ = tx.send(ResponseChunk::Text(final_response)).await;
     }
+
+    // Auto Model Routing R1 (phase 5) transparency badge — emitted ONLY when routing is
+    // enabled, so a `routing_enabled=false` turn produces the exact legacy chunk stream
+    // (no `TurnMeta` at all). Never emitted from `run_sub_turn`/the pipeline runner's own
+    // synthetic `Complete` sites — the badge is strictly an L0-turn concept.
+    if routing_active {
+        let badge = build_turn_meta_badge(&llm.snapshot(), current_tier);
+        let _ = tx.send(ResponseChunk::TurnMeta { badge: Some(badge) }).await;
+    }
     let _ = tx.send(ResponseChunk::Complete).await;
 
     Ok(())
@@ -883,6 +964,113 @@ mod turn_integration_tests {
             remaining_active.iter().any(|t| t.id == ids[5]),
             "the 6th (denied, over-cap) task must survive undeleted"
         );
+    }
+
+    /// Auto Model Routing R1 (phase 5): `routing_enabled=true` on a plain message (no
+    /// heuristic trigger, `tier=None`) must still emit exactly one `TurnMeta` chunk,
+    /// arriving immediately before `Complete`, whose badge is the session-default model
+    /// name (no `tier ·` prefix — there is no tier to show).
+    #[tokio::test]
+    async fn routing_enabled_emits_turn_meta_badge_before_complete() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let base_url = spawn_scripted_sse_server(vec!["Hello there.".to_string()]).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(ToolRegistry::new()),
+            kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(true)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let req = Request {
+            session_id: uuid::Uuid::new_v4(),
+            adapter_id: "test-adapter".to_string(),
+            message: "hi".to_string(),
+            user_ref: None,
+            depth: Default::default(),
+            origin: Default::default(),
+        };
+
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c);
+        }
+
+        let last_two: Vec<&ResponseChunk> = chunks.iter().rev().take(2).collect();
+        match (last_two.first(), last_two.get(1)) {
+            (Some(ResponseChunk::Complete), Some(ResponseChunk::TurnMeta { badge })) => {
+                assert_eq!(
+                    badge.as_deref(),
+                    Some("test-model"),
+                    "a tier=None turn's badge must be the bare session-default model name"
+                );
+            }
+            other => panic!(
+                "expected [.., TurnMeta, Complete] as the last two chunks, got: {other:?}"
+            ),
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|c| matches!(c, ResponseChunk::TurnMeta { .. }))
+                .count(),
+            1,
+            "exactly one TurnMeta chunk must be emitted per turn, got: {chunks:?}"
+        );
+    }
+
+    /// CRITICAL: `routing_enabled=false` must reproduce the exact legacy chunk stream —
+    /// no `TurnMeta` chunk at all, only the pre-phase-5 `Text`/`Complete` sequence.
+    #[tokio::test]
+    async fn routing_disabled_emits_no_turn_meta_chunk() {
+        let (db, kms, _dir) = test_db_kms().await;
+        let base_url = spawn_scripted_sse_server(vec!["Hello there.".to_string()]).await;
+        let llm = Arc::new(LlmRouter::init(cloud_config(base_url)).await);
+
+        let runtime = TurnRuntime {
+            db: db.clone(),
+            kms,
+            llm,
+            tools: Arc::new(ToolRegistry::new()),
+            kill: Arc::new(AtomicBool::new(false)),
+            routing_enabled: Arc::new(AtomicBool::new(false)),
+        };
+        let broker = Arc::new(ApprovalBroker::new());
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let req = Request {
+            session_id: uuid::Uuid::new_v4(),
+            adapter_id: "test-adapter".to_string(),
+            message: "hi".to_string(),
+            user_ref: None,
+            depth: Default::default(),
+            origin: Default::default(),
+        };
+
+        run_turn(&req, runtime, tx, &broker, &cancel)
+            .await
+            .expect("run_turn");
+
+        let mut chunks = Vec::new();
+        while let Some(c) = rx.recv().await {
+            chunks.push(c);
+        }
+        assert!(
+            !chunks.iter().any(|c| matches!(c, ResponseChunk::TurnMeta { .. })),
+            "routing_enabled=false must emit ZERO TurnMeta chunks, got: {chunks:?}"
+        );
+        assert!(matches!(chunks.last(), Some(ResponseChunk::Complete)));
     }
 }
 
