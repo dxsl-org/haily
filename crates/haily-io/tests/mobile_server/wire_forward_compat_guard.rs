@@ -154,3 +154,29 @@ fn server_frame_envelope_degrades_an_unknown_body_variant_to_unknown_at_the_full
         other => panic!("expected Unknown, got {other:?}"),
     }
 }
+
+/// Auto Model Routing R1 (phase 5) mobile decision, decided by THIS test: a mobile client is a
+/// separately-shipped binary (unlike the GUI/CLI/Telegram adapters, which decode in-process on
+/// the same build), so adding a `ResponseChunk` variant (the model-tier badge) is only safe to
+/// relay over the mobile wire if an OLD client's `ServerBody` decode survives receiving it. The
+/// `Chunk` body's `type` tag ("Chunk") is already recognized by every mobile build, but its
+/// nested `chunk` payload carries a variant that predates the client — exactly the shape a badge
+/// chunk has for a client compiled before this phase. A synthetic tag stands in for the real
+/// variant name so this test's meaning does not depend on whether this build's `ResponseChunk`
+/// itself recognizes the real one — it exercises the GENERAL "unknown inner variant" path, which
+/// covers the badge and every future addition alike.
+///
+/// Result: the whole `Chunk` frame degrades to `Unknown` (never a hard decode failure), so the
+/// badge is safe to RELAY unconditionally over mobile — `haily_io::mobile::MobileAdapter::deliver`
+/// needs no suppression logic; an old client just drops that one chunk.
+#[test]
+fn a_chunk_body_carrying_an_unrecognized_inner_response_chunk_variant_degrades_the_whole_frame_to_unknown(
+) {
+    let json = r#"{"epoch":1,"seq":1,"body":{"type":"Chunk","data":{"session_id":"00000000-0000-0000-0000-000000000000","chunk":{"type":"SomeFutureResponseChunkVariantAnOldMobileClientHasNeverSeen","data":{"badge":"thinking · llama-3"}}}}}"#;
+    let frame: haily_types::ServerFrame = serde_json::from_str(json)
+        .expect("the envelope must decode even when the nested ResponseChunk variant is unknown");
+    match frame.body {
+        ServerBody::Unknown { type_tag } => assert_eq!(type_tag, "Chunk"),
+        other => panic!("expected Unknown{{type_tag:\"Chunk\"}}, got {other:?}"),
+    }
+}

@@ -303,6 +303,13 @@ impl Adapter for AcpAdapter {
             ResponseChunk::ToolApprovalRequest { tool, args, approval_id, reversible, .. } => {
                 self.surface_approval(&acp_id, haily_id, &tool, &args, approval_id, reversible).await?;
             }
+            ResponseChunk::TurnMeta { badge } => {
+                if let Some(badge) = badge {
+                    self.conn
+                        .notify(protocol::M_SESSION_UPDATE, protocol::text_update(&acp_id, "assistant", &format!("\n[{badge}]")))
+                        .await?;
+                }
+            }
         }
         Ok(())
     }

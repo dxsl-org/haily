@@ -177,7 +177,17 @@ impl AppHandle {
             .await?,
         );
 
-        info!(llm = orchestrator.llm_provider(), "ready");
+        info!(
+            llm = orchestrator.llm_provider(),
+            // Auto Model Routing R1 (phase 4): surfaces the live kill-switch state at
+            // boot for operator visibility — the SAME `Arc<AtomicBool>` `set_preference`
+            // flips live (see `routing_enabled_handle()`'s doc), read here only for the
+            // log line, never re-derived.
+            routing_enabled = orchestrator
+                .routing_enabled_handle()
+                .load(std::sync::atomic::Ordering::Acquire),
+            "ready"
+        );
 
         // Adapters are constructed by the caller before the orchestrator (and its
         // approval broker) exist, so the resolver is injected here — after `init`,

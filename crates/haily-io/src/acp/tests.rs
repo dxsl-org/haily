@@ -311,3 +311,34 @@ async fn deliver_to_unknown_session_is_a_no_op() {
     adapter.deliver(Uuid::new_v4(), ResponseChunk::Text("hi".into())).await.unwrap();
     assert!(read_frames(&mut reader, 1).await.is_empty());
 }
+
+/// Auto Model Routing R1 (phase 5): a `TurnMeta` chunk with a badge renders as one more
+/// `session/update` text chunk, arriving as its own message (there is no separate ACP
+/// "footer" affordance) before the `Complete` that follows it.
+#[tokio::test]
+async fn deliver_turn_meta_renders_a_session_update_with_the_badge() {
+    let (w, mut reader) = wired();
+    let adapter = AcpAdapter::with_writer(w);
+    let (_acp_id, haily_id) = adapter.sessions.new_session();
+    adapter
+        .deliver(haily_id, ResponseChunk::TurnMeta { badge: Some("thinking · llama-3".to_string()) })
+        .await
+        .unwrap();
+    let frames = read_frames(&mut reader, 1).await;
+    assert_eq!(frames[0]["method"], protocol::M_SESSION_UPDATE);
+    assert!(frames[0]["params"]["update"]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("thinking · llama-3"));
+}
+
+/// A `TurnMeta` chunk with no badge (defensive — `run_turn` only ever sends `Some`) emits
+/// no frame at all, rather than an empty/garbled `session/update`.
+#[tokio::test]
+async fn deliver_turn_meta_with_no_badge_emits_no_frame() {
+    let (w, mut reader) = wired();
+    let adapter = AcpAdapter::with_writer(w);
+    let (_acp_id, haily_id) = adapter.sessions.new_session();
+    adapter.deliver(haily_id, ResponseChunk::TurnMeta { badge: None }).await.unwrap();
+    assert!(read_frames(&mut reader, 1).await.is_empty());
+}

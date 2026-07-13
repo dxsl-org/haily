@@ -44,6 +44,16 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
     pref!("llm.cloud_base_url", cfg.cloud_base_url);
     pref!("llm.cloud_model", cfg.cloud_model);
 
+    // Cost/quality dial (Auto Model Routing R1, phase 7) — the single user-facing knob
+    // (0 = cheapest, 10 = best). A garbage or out-of-range string must fall back to the
+    // struct's own default (`DEFAULT_COST_QUALITY` = 7) rather than panic; `LlmRouter`
+    // clamps again at construction, so this read only needs to guard the parse itself.
+    if let Ok(Some(v)) = meta::get_preference(db, "llm.cost_quality").await {
+        if let Ok(n) = v.parse::<u8>() {
+            cfg.cost_quality = n;
+        }
+    }
+
     // Per-tier cloud model-name overrides (Phase 3 tier foundation). Each is stored as a
     // plain model-name string under `llm.tier_model.<tier>`; an absent key leaves the
     // tier at `None`, which `complete_tiered` treats as "use the default model" — so
@@ -153,6 +163,38 @@ mod tests {
     async fn store(dir: &std::path::Path) -> CredentialStore {
         let db = Arc::new(DbHandle::init(&dir.join("t.db")).await.unwrap());
         CredentialStore::new(db, CredentialPolicy::default())
+    }
+
+    async fn test_kms(dir: &std::path::Path) -> KmsHandle {
+        let db = DbHandle::init(&dir.join("kms.db")).await.unwrap();
+        KmsHandle::init(db, dir).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_cost_quality_preference_defaults_to_seven() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        assert_eq!(load_llm_config(&kms).await.cost_quality, 7);
+    }
+
+    #[tokio::test]
+    async fn garbage_cost_quality_preference_falls_back_to_seven_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.cost_quality", "not-a-number", "test")
+            .await
+            .unwrap();
+        assert_eq!(load_llm_config(&kms).await.cost_quality, 7);
+    }
+
+    #[tokio::test]
+    async fn valid_cost_quality_preference_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.cost_quality", "3", "test")
+            .await
+            .unwrap();
+        assert_eq!(load_llm_config(&kms).await.cost_quality, 3);
     }
 
     #[tokio::test]

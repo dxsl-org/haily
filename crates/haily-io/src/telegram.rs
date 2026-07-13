@@ -44,6 +44,11 @@ pub struct TelegramAdapter {
     session_to_chat: Arc<DashMap<Uuid, i64>>,
     /// Accumulates streamed text per session; sent as one Telegram message on Complete.
     text_buffer: Arc<DashMap<Uuid, String>>,
+    /// Holds the L0 turn's model badge (Auto Model Routing R1, phase 5), set on `TurnMeta`
+    /// and consumed as a suffix line when `Complete` flushes `text_buffer` — mirrors
+    /// `text_buffer`'s own "arrives mid-stream, rendered at flush" lifecycle so the badge
+    /// lands in the SAME Telegram message as the answer it describes, not a separate one.
+    badge_buffer: Arc<DashMap<Uuid, String>>,
     /// Injected by `haily-app::bootstrap` after the orchestrator exists (see
     /// `Adapter::set_approval_resolver`).
     resolver: Arc<Mutex<Option<Arc<dyn ApprovalResolver>>>>,
@@ -66,6 +71,7 @@ impl TelegramAdapter {
             chat_to_session: Arc::new(DashMap::new()),
             session_to_chat: Arc::new(DashMap::new()),
             text_buffer: Arc::new(DashMap::new()),
+            badge_buffer: Arc::new(DashMap::new()),
             resolver: Arc::new(Mutex::new(None)),
             kill: Arc::new(Mutex::new(None)),
         }
@@ -449,6 +455,7 @@ impl Adapter for TelegramAdapter {
                 // entry here — rather than leaving it for `Complete` to flush — is
                 // what actually prevents the fusion.
                 self.text_buffer.remove(&session_id);
+                self.badge_buffer.remove(&session_id);
                 if let Some(chat_id) = self.session_to_chat.get(&session_id) {
                     let trimmed = error_text.trim();
                     if !trimmed.is_empty() {
@@ -460,15 +467,23 @@ impl Adapter for TelegramAdapter {
                 }
             }
             ResponseChunk::Complete => {
+                // Consumed regardless of whether text flushes below — a badge with no
+                // accompanying answer (unlikely, but not this adapter's contract to
+                // assume) must never leak into the NEXT turn's flush.
+                let badge = self.badge_buffer.remove(&session_id).map(|(_, b)| b);
                 if let Some((_, text)) = self.text_buffer.remove(&session_id) {
                     if let Some(chat_id) = self.session_to_chat.get(&session_id) {
-                        let trimmed = text.trim().to_string();
+                        let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             // Buffered LLM output is untrusted — it may contain
                             // characters that would otherwise be read as HTML markup
                             // (or a breakout of the message context) by Telegram.
+                            let mut out = escape_html(trimmed);
+                            if let Some(badge) = &badge {
+                                out.push_str(&format!("\n<i>({})</i>", escape_html(badge)));
+                            }
                             self.bot
-                                .send_message(ChatId(*chat_id), escape_html(&trimmed))
+                                .send_message(ChatId(*chat_id), out)
                                 .parse_mode(ParseMode::Html)
                                 .await?;
                         }
@@ -515,6 +530,11 @@ impl Adapter for TelegramAdapter {
                 journal_id,
             } => {
                 let _ = (name, ok, reversible, journal_id);
+            }
+            ResponseChunk::TurnMeta { badge } => {
+                if let Some(badge) = badge {
+                    self.badge_buffer.insert(session_id, badge);
+                }
             }
         }
         Ok(())
@@ -770,6 +790,76 @@ mod tests {
             .await
             .unwrap();
         assert!(adapter.text_buffer.get(&session_id).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto Model Routing R1 (phase 5) — TurnMeta badge buffering.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn turn_meta_with_badge_is_buffered_until_complete() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+
+        adapter
+            .deliver(
+                session_id,
+                ResponseChunk::TurnMeta {
+                    badge: Some("thinking · llama-3".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter.badge_buffer.get(&session_id).map(|e| e.value().clone()),
+            Some("thinking · llama-3".to_string()),
+            "a TurnMeta badge must be buffered, mirroring text_buffer's lifecycle"
+        );
+
+        adapter.deliver(session_id, ResponseChunk::Complete).await.unwrap();
+        assert!(
+            adapter.badge_buffer.get(&session_id).is_none(),
+            "Complete must consume (remove) the buffered badge"
+        );
+    }
+
+    /// `Error` must clear a buffered badge exactly like it clears buffered text — a
+    /// badge from a turn that then failed must never leak into the NEXT turn's flush.
+    #[tokio::test]
+    async fn error_chunk_discards_buffered_badge() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+
+        adapter
+            .deliver(
+                session_id,
+                ResponseChunk::TurnMeta {
+                    badge: Some("thinking · llama-3".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        adapter
+            .deliver(session_id, ResponseChunk::Error("boom".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            adapter.badge_buffer.get(&session_id).is_none(),
+            "Error must discard the buffered badge, not leave it for a later Complete"
+        );
+    }
+
+    /// A `TurnMeta` chunk with `badge: None` is a clean no-op — nothing gets buffered.
+    #[tokio::test]
+    async fn turn_meta_with_no_badge_buffers_nothing() {
+        let adapter = test_adapter();
+        let session_id = Uuid::new_v4();
+
+        adapter
+            .deliver(session_id, ResponseChunk::TurnMeta { badge: None })
+            .await
+            .unwrap();
+        assert!(adapter.badge_buffer.get(&session_id).is_none());
     }
 
     /// Regression: `WorkItemsChanged` must never panic `notify()`. This is currently

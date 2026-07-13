@@ -257,6 +257,7 @@ async fn insert_trace_persists_all_telemetry_columns() {
         label_source: Some("tool_error_ratio"),
         label_confidence: Some(0.6),
         delegate_overhead_ms: Some(15),
+        turn_id: Some("turn-abc"),
     };
 
     let trace = skills::insert_trace(&db, &sid, "do the thing", "[]", "partial", Some(500), metrics)
@@ -273,6 +274,7 @@ async fn insert_trace_persists_all_telemetry_columns() {
     assert_eq!(trace.label_source.as_deref(), Some("tool_error_ratio"));
     assert_eq!(trace.label_confidence, Some(0.6));
     assert_eq!(trace.delegate_overhead_ms, Some(15));
+    assert_eq!(trace.turn_id.as_deref(), Some("turn-abc"));
 }
 
 #[tokio::test]
@@ -288,6 +290,7 @@ async fn insert_trace_with_no_metrics_leaves_columns_null() {
     assert!(trace.prompt_tokens.is_none());
     assert!(trace.label_source.is_none(), "no signal ⇒ no fabricated label");
     assert!(trace.label_confidence.is_none());
+    assert!(trace.turn_id.is_none(), "no turn_id passed ⇒ NULL, never fabricated");
 }
 
 #[tokio::test]
