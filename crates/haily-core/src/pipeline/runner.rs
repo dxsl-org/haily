@@ -24,9 +24,10 @@ use anyhow::{bail, Result};
 use haily_db::queries::journal::NewAction;
 use haily_db::queries::pipeline_runs::{self, RunTransition};
 use haily_db::queries::skills as db_skills;
+use haily_db::queries::{meta, routing_decisions};
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_llm::{LlmRouter, Tier};
+use haily_llm::{Egress, EscalationPolicy, LlmRouter, Tier};
 use haily_tools::coding::workspace::CodingWorkspace;
 use haily_tools::exec::{
     build_child_env, ExecRequest, Manager, SandboxConfig, SandboxError, ScopeKey, MAX_OUTPUT_BYTES,
@@ -115,16 +116,6 @@ pub(crate) fn stage_outcome(decision: StageDecision, is_last_stage: bool) -> Sta
         StageDecision::Pause => StageOutcome::AbortRun,
         StageDecision::Retry | StageDecision::Escalate => StageOutcome::Continue,
     }
-}
-
-/// Bump a stage's model tier one level for an escalated retry (P3 policy). `None` (inherit
-/// default) escalates to `Medium`; `Ultra` is the ceiling.
-fn escalate_tier(t: Option<Tier>) -> Option<Tier> {
-    Some(match t {
-        None | Some(Tier::Fast) => Tier::Medium,
-        Some(Tier::Medium) => Tier::Thinking,
-        Some(Tier::Thinking) | Some(Tier::Ultra) => Tier::Ultra,
-    })
 }
 
 /// Display NAME of a tier for the `RunEvent` stream (`haily-types` is a leaf and cannot depend
@@ -256,6 +247,84 @@ impl PipelineRunner {
             }
             Ok(None) => tracing::debug!(run_session = %sid, "no trace to label with gate result"),
             Err(e) => tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}"),
+        }
+    }
+
+    /// Derive this run's network-egress pin (phase 6) — MIRRORS `agent::turn`'s phase-4
+    /// derivation exactly (same preference key, same locality rule) rather than duplicating the
+    /// rule itself: an explicit `llm.escalation.egress` preference wins; otherwise
+    /// [`Egress::from_provider`] caps a local llama.cpp primary to `LocalOnly` so a run started
+    /// local never silently escalates to the cloud (FMA-M2). Read fresh per run (not cached at
+    /// boot), same freshness contract as `agent::turn`'s own read.
+    async fn derive_egress(&self, llm: &LlmRouter) -> Egress {
+        let override_pref = meta::get_preference(&self.db, "llm.escalation.egress")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| crate::routing::parse_egress_override(&v));
+        override_pref.unwrap_or_else(|| Egress::from_provider(llm.provider_name()))
+    }
+
+    /// Read the operator's `llm.escalation.max_tier` preference, falling back to
+    /// [`EscalationPolicy::default`]'s ceiling (`Thinking`) when absent or unparseable. Read
+    /// fresh per run, same cadence as [`Self::derive_egress`]. Config here is deliberately NOT
+    /// read via `haily-app::config::load_llm_config` (out of this phase's file ownership) — this
+    /// mirrors `agent::turn`'s own per-turn-fresh preference read pattern rather than the
+    /// boot-time `LlmConfig` loader.
+    async fn escalation_max_tier(&self) -> Tier {
+        meta::get_preference(&self.db, "llm.escalation.max_tier")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| Tier::from_name(&v))
+            .unwrap_or(EscalationPolicy::default().max_tier)
+    }
+
+    /// Best-effort `routing_decisions` telemetry for ONE stage (phase 6, red-team fix: every
+    /// stage logs, not just escalating ones — the R2 training set otherwise starves on the
+    /// majority case). `chosen_tier` is the stage's BASE configured tier (mirrors `agent::turn`'s
+    /// `chosen_tier=decision.tier`); `escalated_to` is `Some` only when this stage actually
+    /// escalated, matching the `escalated_to`/`escalation_trigger` pairing convention. Never
+    /// called on a whole-run abort path (verifier-absent, gate exec error, pre-stage kill/cancel
+    /// checkpoint) — those exit before a stage decision was actually reached, so there is nothing
+    /// meaningful to log. A write failure is logged and swallowed (best-effort, not transactional
+    /// with `persist_progress` — a crash may lose this one row).
+    #[allow(clippy::too_many_arguments)]
+    async fn record_stage_decision(
+        &self,
+        run_id: &str,
+        turn_id: Uuid,
+        stage: &Stage,
+        cost_quality: u8,
+        chosen_tier: Option<Tier>,
+        escalated_to: Option<Tier>,
+        attempt: u32,
+    ) {
+        let turn_id_str = turn_id.to_string();
+        let new_row = routing_decisions::NewRoutingDecision {
+            turn_id: &turn_id_str,
+            run_id: Some(run_id),
+            context_kind: "pipeline_stage",
+            stage_kind: Some(stage.name.as_str()),
+            chosen_tier: chosen_tier.map(crate::routing::tier_label),
+            escalated_to: escalated_to.map(crate::routing::tier_label),
+            // The stage's tier comes from static pipeline config, not a per-message heuristic —
+            // "default" is the closest existing `decision_source` label (mirrors an un-routed
+            // chat turn's own `TierDecision::default()`).
+            decision_source: "default",
+            cost_quality: i64::from(cost_quality),
+            // Chat-only features (message text was never scanned for a pipeline stage).
+            feature_msg_words: 0,
+            feature_has_code: false,
+            feature_history_user_msgs: 0,
+            feature_depth: haily_types::DepthMode::Normal.as_label(),
+            escalation_trigger: escalated_to.map(|_| "gate_failure"),
+            // The PER-STAGE attempt count at the stage's terminal decision — the exact signal
+            // the R2 training set needs, captured for every stage regardless of outcome.
+            prior_failures: i64::from(attempt),
+        };
+        if let Err(e) = routing_decisions::insert(&self.db, new_row).await {
+            tracing::warn!(run = %run_id, stage = %stage.name, "routing_decisions insert failed: {e:#}");
         }
     }
 
@@ -413,6 +482,31 @@ impl PipelineRunner {
         let mut last_stage_idx = 0i64;
         let mut seq: u64 = 0;
 
+        // Phase 6 escalation-policy inputs — snapshotted ONCE per run (mirrors
+        // `RouterSnapshot`'s own contract: a live `reload_llm` swaps the whole `Arc<LlmRouter>`
+        // and must only take effect at the NEXT run boundary, never mid-run). `session_default_tier`
+        // anchors a `None` stage tier the same way `open_stream_with_escalation` anchors a `None`
+        // `current_tier` (agent::turn) — a real ordinal starting point for the escalation ladder.
+        let llm_for_policy = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
+        let egress = self.derive_egress(&llm_for_policy).await;
+        let highest_local_tier = llm_for_policy.highest_local_tier();
+        let session_default_tier =
+            llm_for_policy.snapshot().session_tier(&[]).unwrap_or(Tier::Fast);
+        let cost_quality = llm_for_policy.cost_quality();
+        // ONE policy for the WHOLE run (config-sourced `enabled`/`max_tier`; `enabled` mirrors
+        // the pre-existing `self.escalation_enabled` field so a disabled run is a total no-op —
+        // `failures_before_escalation` stays at `EscalationPolicy::default()`'s value (NOT
+        // `stage.max_retries`): coupling it to the per-stage retry budget would make the
+        // threshold trivially satisfied every time `decide()` offers `Escalate` at all, hiding
+        // the exact bug the per-stage-`failures` fix guards against (a stage whose OWN attempt
+        // count hasn't met the policy's bar must Pause, not silently inherit a prior stage's
+        // failure count).
+        let escalation_policy = EscalationPolicy {
+            enabled: self.escalation_enabled,
+            max_tier: self.escalation_max_tier().await,
+            ..EscalationPolicy::default()
+        };
+
         'run: for (idx, stage) in spec.pipeline.runs.iter().enumerate() {
             last_stage_idx = idx as i64;
             // Kill/cancel checkpoint BETWEEN stages (dispatch enforces it between tool calls).
@@ -432,6 +526,12 @@ impl PipelineRunner {
             let mut escalated = false;
             let mut feedback: Option<String> = None;
             let mut last_fail_hash: Option<String> = None;
+            // The turn_id of the LAST sub-turn attempted this stage — the join key the
+            // stage-end `routing_decisions` row uses (mirrors `label_stage_trace`'s own
+            // "most recent trace" convention: the last attempt is what decided the stage).
+            // Assigned unconditionally as the first statement of every loop iteration below
+            // (the loop body always runs at least once) before it is ever read.
+            let mut last_turn_id;
 
             let advanced = loop {
                 if attempt > 0 {
@@ -447,9 +547,19 @@ impl PipelineRunner {
                     .await;
                 }
 
+                last_turn_id = Uuid::new_v4();
                 let task = stage_task(&stage.prompt_ref, feedback.as_deref());
-                self.run_stage_subturn(&spec, &run_id, stage, effective_tier, task, &turn_deletes, &mut seq)
-                    .await;
+                self.run_stage_subturn(
+                    &spec,
+                    &run_id,
+                    stage,
+                    effective_tier,
+                    task,
+                    &turn_deletes,
+                    &mut seq,
+                    last_turn_id,
+                )
+                .await;
                 attempt_tokens.push(attempt_token_record(&stage.name, attempt, effective_tier));
 
                 // FMA-C2 review fix: a gate execution error (verifier timeout, mid-gate
@@ -524,21 +634,36 @@ impl PipelineRunner {
                                     match decide(false, attempt, stage.max_retries, attempts_remaining, self.escalation_enabled && !escalated) {
                                         StageDecision::Retry => { attempt += 1; total_retries += 1; continue; }
                                         StageDecision::Escalate => {
-                                            escalated = true;
-                                            let to = escalate_tier(effective_tier);
-                                            // Review fix: the flaky-confirm escalation path must
-                                            // emit the SAME RunEvent::Escalation the Fail branch
-                                            // does, so a P11 timeline reflects the tier change.
-                                            self.emit(RunEvent::Escalation {
-                                                run_id: run_id.clone(),
-                                                from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                                to: tier_name(to).unwrap_or_else(|| "default".into()),
-                                            })
-                                            .await;
-                                            effective_tier = to;
-                                            attempt += 1;
-                                            total_retries += 1;
-                                            continue;
+                                            let current = effective_tier.unwrap_or(session_default_tier);
+                                            match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                                Some(to) => {
+                                                    escalated = true;
+                                                    // Review fix: the flaky-confirm escalation path
+                                                    // must emit the SAME RunEvent::Escalation the
+                                                    // Fail branch does, so a P11 timeline reflects
+                                                    // the tier change.
+                                                    self.emit(RunEvent::Escalation {
+                                                        run_id: run_id.clone(),
+                                                        from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
+                                                        to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                                    })
+                                                    .await;
+                                                    effective_tier = Some(to);
+                                                    attempt += 1;
+                                                    total_retries += 1;
+                                                    continue;
+                                                }
+                                                None => {
+                                                    // CRITICAL FIX (red-team): decide() said Escalate
+                                                    // but the policy has no reachable step (max_tier
+                                                    // ceiling, egress cap) — Pause, never fall through
+                                                    // to a Retry that would burn attempts_remaining at
+                                                    // a tier already proven to fail.
+                                                    final_status = RunStatus::Paused;
+                                                    paused_reason = Some("flaky gate could not be confirmed; escalation ceiling reached".to_string());
+                                                    break false;
+                                                }
+                                            }
                                         }
                                         _ => { final_status = RunStatus::Paused; paused_reason = Some("flaky gate could not be confirmed".to_string()); break false; }
                                     }
@@ -578,19 +703,37 @@ impl PipelineRunner {
                                 continue;
                             }
                             StageDecision::Escalate => {
-                                escalated = true;
-                                let to = escalate_tier(effective_tier);
-                                self.emit(RunEvent::Escalation {
-                                    run_id: run_id.clone(),
-                                    from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                    to: tier_name(to).unwrap_or_else(|| "default".into()),
-                                })
-                                .await;
-                                effective_tier = to;
-                                feedback = Some(retry_feedback(&decisive));
-                                attempt += 1;
-                                total_retries += 1;
-                                continue;
+                                let current = effective_tier.unwrap_or(session_default_tier);
+                                match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                    Some(to) => {
+                                        escalated = true;
+                                        self.emit(RunEvent::Escalation {
+                                            run_id: run_id.clone(),
+                                            from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
+                                            to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                        })
+                                        .await;
+                                        effective_tier = Some(to);
+                                        feedback = Some(retry_feedback(&decisive));
+                                        attempt += 1;
+                                        total_retries += 1;
+                                        continue;
+                                    }
+                                    None => {
+                                        // CRITICAL FIX (red-team): decide() said Escalate but the
+                                        // policy has no reachable step (max_tier ceiling, egress
+                                        // cap, or its own threshold unmet) — Pause, never Retry.
+                                        // Retrying at the SAME tier that already exhausted
+                                        // stage.max_retries would silently burn attempts_remaining
+                                        // on a tier already proven to fail.
+                                        final_status = RunStatus::Paused;
+                                        paused_reason = Some(format!(
+                                            "stage '{}' gate failed; escalation ceiling reached (max_tier/egress)",
+                                            stage.name
+                                        ));
+                                        break false;
+                                    }
+                                }
                             }
                             StageDecision::Pause => {
                                 final_status = RunStatus::Paused;
@@ -605,6 +748,20 @@ impl PipelineRunner {
                     }
                 }
             };
+
+            // Phase 6 (red-team fix): log EVERY stage's decision, not just escalating ones — the
+            // R2 training set otherwise starves on the majority case. `attempt` here is the
+            // PER-STAGE attempt count at the stage's terminal decision (the loop var above).
+            self.record_stage_decision(
+                &run_id,
+                last_turn_id,
+                stage,
+                cost_quality,
+                stage.tier,
+                if escalated { effective_tier } else { None },
+                attempt,
+            )
+            .await;
 
             if advanced {
                 // FMA-M3 review fix: commit the worktree at the STAGE boundary (isolated object
@@ -670,7 +827,8 @@ impl PipelineRunner {
 
     /// Run one stage as a `run_sub_turn`, threading ALL shared harness handles (DEP-C1/SEC-H).
     /// The forwarder is joined on EVERY exit path so a leaked task can never relay a stale
-    /// approval into a later stage or turn.
+    /// approval into a later stage or turn. `turn_id` is minted by the CALLER (not here) so the
+    /// same value can be reused as the stage-end `routing_decisions` join key (phase 6).
     #[allow(clippy::too_many_arguments)]
     async fn run_stage_subturn(
         &self,
@@ -681,6 +839,7 @@ impl PipelineRunner {
         task: String,
         turn_deletes: &Arc<AtomicUsize>,
         seq: &mut u64,
+        turn_id: Uuid,
     ) {
         let whitelist: Vec<&str> = stage.tool_whitelist.iter().map(String::as_str).collect();
         let stage_registry = Arc::new(self.base_tools.sub_registry(&whitelist));
@@ -706,9 +865,9 @@ impl PipelineRunner {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
-            // Per-stage fresh turn_id (a fresh turn per stage) but the SHARED turn_deletes
+            // Per-attempt fresh turn_id (minted by the caller) but the SHARED turn_deletes
             // counter + one run_id span the whole run (DEP-C1).
-            turn_id: Uuid::new_v4(),
+            turn_id,
             turn_deletes: Arc::clone(turn_deletes),
             max_tool_calls: Some(stage.max_tool_calls),
             run_id: Some(run_id.to_string()),

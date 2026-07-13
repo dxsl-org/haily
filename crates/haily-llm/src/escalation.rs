@@ -15,6 +15,23 @@
 
 use crate::Tier;
 
+impl Tier {
+    /// Parses the lowercase wire label (`"fast"` | `"medium"` | `"thinking"` | `"ultra"`,
+    /// case-insensitive) — the same vocabulary `haily_core::routing::tier_label` serializes to
+    /// `routing_decisions.chosen_tier`/`escalated_to` and the `llm.tier_model.<tier>`/
+    /// `llm.escalation.max_tier` preference keys use. `None` for anything else (fail-safe:
+    /// callers fall back to a sane default rather than erroring on an operator typo).
+    pub fn from_name(s: &str) -> Option<Tier> {
+        match s.trim().to_lowercase().as_str() {
+            "fast" => Some(Tier::Fast),
+            "medium" => Some(Tier::Medium),
+            "thinking" => Some(Tier::Thinking),
+            "ultra" => Some(Tier::Ultra),
+            _ => None,
+        }
+    }
+}
+
 /// Network-egress pin for a run/pipeline. `AllowCloud` lets escalation cross to a
 /// cloud-served tier; `LocalOnly` caps escalation at the highest locally-served tier so
 /// a run the user started local never silently reaches out to the cloud.
@@ -24,6 +41,23 @@ pub enum Egress {
     LocalOnly,
     /// Escalation may cross to a cloud-served tier (subject only to `max_tier`).
     AllowCloud,
+}
+
+impl Egress {
+    /// Derives the default egress pin from a router's primary-backend locality: a local
+    /// `llama.cpp` primary pins `LocalOnly` (escalation must never silently leave the machine
+    /// the user started local on); any other primary (cloud) allows `AllowCloud`. Phase 4
+    /// (`agent::turn`) and phase 6 (the pipeline runner) both derive egress this same way — an
+    /// explicit `llm.escalation.egress` preference override takes precedence over this default
+    /// at BOTH call sites and is applied by the caller, not here (this fn is the locality
+    /// half only).
+    pub fn from_provider(provider_name: &str) -> Egress {
+        if provider_name == "llama.cpp" {
+            Egress::LocalOnly
+        } else {
+            Egress::AllowCloud
+        }
+    }
 }
 
 /// Verifier-failure-driven tier escalation policy. Default is OFF with a `Thinking`
@@ -146,5 +180,22 @@ mod tests {
             Some(Tier::Medium)
         );
         assert_eq!(p.next_tier(Tier::Medium, 2, Egress::LocalOnly, Tier::Medium), None);
+    }
+
+    #[test]
+    fn tier_from_name_parses_case_insensitively_and_rejects_unknown() {
+        assert_eq!(Tier::from_name("fast"), Some(Tier::Fast));
+        assert_eq!(Tier::from_name("MEDIUM"), Some(Tier::Medium));
+        assert_eq!(Tier::from_name("Thinking"), Some(Tier::Thinking));
+        assert_eq!(Tier::from_name(" ultra "), Some(Tier::Ultra));
+        assert_eq!(Tier::from_name("nonsense"), None);
+        assert_eq!(Tier::from_name(""), None);
+    }
+
+    #[test]
+    fn egress_from_provider_pins_local_only_for_llama_cpp() {
+        assert_eq!(Egress::from_provider("llama.cpp"), Egress::LocalOnly);
+        assert_eq!(Egress::from_provider("cloud"), Egress::AllowCloud);
+        assert_eq!(Egress::from_provider("unconfigured"), Egress::AllowCloud);
     }
 }

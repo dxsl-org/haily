@@ -5,6 +5,7 @@
 use super::*;
 use crate::approval::ApprovalBroker;
 use async_trait::async_trait;
+use haily_db::queries::{meta, routing_decisions};
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::LlmConfig;
@@ -305,6 +306,39 @@ fn make_runner(
         events,
         false, // escalation disabled (P3 default)
     )
+}
+
+/// Same as [`make_runner`] with the P6 escalation policy switched ON.
+#[allow(clippy::too_many_arguments)]
+fn make_runner_escalating(
+    fx: &Fixture,
+    llm: Arc<RwLock<Arc<LlmRouter>>>,
+    base_tools: Arc<ToolRegistry>,
+    broker: Arc<dyn haily_types::ApprovalGate>,
+    kill: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+    user_tx: tokio::sync::mpsc::Sender<haily_types::ResponseChunk>,
+    events: tokio::sync::mpsc::Sender<RunEvent>,
+) -> PipelineRunner {
+    PipelineRunner::new(
+        Arc::clone(&fx.db),
+        Arc::clone(&fx.kms),
+        llm,
+        base_tools,
+        broker,
+        kill,
+        cancel,
+        user_tx,
+        events,
+        true,
+    )
+}
+
+// A cross-platform verifier that always fails (git IS installed — the fixture requires it — but
+// this invocation is malformed, so it exits nonzero: a genuine `GateVerdict::Fail`, never the
+// non-retryable `VerifierAbsent` a missing binary would produce).
+fn fail_gate() -> Gate {
+    command_gate("git", &["--this-flag-does-not-exist"])
 }
 
 fn spec<'a>(fx: &'a Fixture, pipeline: Pipeline) -> RunSpec<'a> {
@@ -822,4 +856,332 @@ async fn retry_reset_preserves_earlier_passed_stage_output() {
         "stage1's marker file must survive stage2's retry-triggered worktree reset"
     );
     assert!(artifact.exists(), "stage2's artifact must exist after the retry succeeded");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: EscalationPolicy wiring — every stage logs telemetry, the per-stage attempt count
+// never leaks across stages, and a policy-None result Pauses rather than silently retrying.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_stage_writes_one_routing_decision_row_even_when_escalation_disabled() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec!["s1 done".to_string()]).await;
+    let llm = build_router(base).await;
+
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    let pipeline = Pipeline { runs: vec![stage("s1", &[], pass_gate(), 0)] };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+    assert_eq!(report.status, RunStatus::Done);
+
+    // Identity (critical): disabled escalation must behave exactly as before this phase — the
+    // NEW behavior is that a routing_decisions row is written regardless (red-team fix: every
+    // stage, not just escalating ones).
+    let rows: Vec<_> = routing_decisions::list_recent(&fx.db, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.run_id.as_deref() == Some(report.run_id.as_str()))
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one routing_decisions row for the one stage");
+    let row = &rows[0];
+    assert_eq!(row.context_kind, "pipeline_stage");
+    assert_eq!(row.stage_kind.as_deref(), Some("s1"));
+    assert!(row.chosen_tier.is_none(), "the test stage declares no tier override");
+    assert!(row.escalated_to.is_none(), "escalation is disabled by default — must never fire");
+    assert!(row.escalation_trigger.is_none());
+    assert_eq!(row.prior_failures, 0, "the stage passed on its first attempt");
+}
+
+#[tokio::test]
+async fn escalation_ceiling_reached_pauses_without_burning_an_extra_retry() {
+    let fx = fixture().await;
+    // 3 always-failing attempts: attempt 0,1 retry (max_retries=2); attempt 2 is where decide()
+    // offers Escalate.
+    let base = spawn_scripted(vec![
+        "attempt0".to_string(),
+        "attempt1".to_string(),
+        "attempt2".to_string(),
+    ])
+    .await;
+    let llm = build_router(base).await;
+
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+    let runner = make_runner_escalating(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    // Ultra is the ordinal ceiling — `Tier::next()` is `None`, so the policy can never step
+    // regardless of the failure threshold: proves the policy-None ⇒ Pause fallthrough (never a
+    // silent Retry that would burn a 4th attempt at a tier already proven to fail).
+    let mut s = stage("ceiling", &[], fail_gate(), 2);
+    s.tier = Some(Tier::Ultra);
+    let attempts_budget: i64 = 10;
+
+    let report = runner
+        .run(RunSpec {
+            pipeline: Pipeline { runs: vec![s] },
+            session_id: fx.session_id,
+            work_item_id: None,
+            system_prompt: "test",
+            domain_name: "test",
+            attempts_budget,
+            workspace: &fx.workspace,
+        })
+        .await
+        .expect("run");
+
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "policy-None must Pause, never Retry/silently continue at a tier that already failed"
+    );
+
+    let mut escalations = 0;
+    while let Ok(ev) = ev_rx.try_recv() {
+        if matches!(ev, RunEvent::Escalation { .. }) {
+            escalations += 1;
+        }
+    }
+    assert_eq!(escalations, 0, "a ceiling-blocked escalation must never emit RunEvent::Escalation");
+
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(
+        run.attempts_remaining,
+        attempts_budget - 3,
+        "exactly 3 attempts consumed (0,1,2) — the ceiling-blocked escalation must not burn a 4th"
+    );
+}
+
+#[tokio::test]
+async fn per_stage_failure_counter_does_not_leak_into_the_next_stage() {
+    let fx = fixture().await;
+    let artifact1 = fx.workspace.worktree_root().join("s1.json");
+
+    // stage1 (max_retries=2): fails twice then passes on attempt 2 — never reaches its own
+    // escalate threshold, but DOES consume 2 of the run's `attempts_remaining` budget. stage2
+    // (max_retries=0, a fresh `attempt` counter starting at 0): fails ONCE, which is immediately
+    // decide()=Escalate (0 retries allowed) — a run-global `initial_attempts - attempts_remaining`
+    // count (the pre-fix bug) would see stage1's 2 failures baked in here and wrongly escalate;
+    // the per-stage fix sees `failures=0`, below the policy's threshold, and Pauses instead.
+    let base = spawn_scripted(vec![
+        "s1 attempt0 no artifact".to_string(),
+        "s1 attempt1 no artifact".to_string(),
+        tool_call_json("create_artifact"),
+        "s1 attempt2 artifact created".to_string(),
+        "s2 attempt0 fails".to_string(),
+    ])
+    .await;
+    let llm = build_router(base).await;
+
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CreateArtifactTool { path: artifact1 }));
+
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+    let runner = make_runner_escalating(
+        &fx,
+        llm,
+        Arc::new(reg),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    let pipeline = Pipeline {
+        runs: vec![
+            stage(
+                "s1",
+                &["create_artifact"],
+                Gate::Artifact { path: "s1.json".to_string(), parseable_as: Some(ArtifactKind::Json) },
+                2,
+            ),
+            stage("s2", &[], fail_gate(), 0),
+        ],
+    };
+    let report = runner
+        .run(RunSpec {
+            pipeline,
+            session_id: fx.session_id,
+            work_item_id: None,
+            system_prompt: "test",
+            domain_name: "test",
+            attempts_budget: 10,
+            workspace: &fx.workspace,
+        })
+        .await
+        .expect("run");
+
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "stage2 must Pause on its very FIRST failure (below the policy's threshold) — a \
+         run-global counter would instead inherit stage1's 2 failures and wrongly escalate"
+    );
+    assert_eq!(report.retries, 2, "only stage1's two retries — stage2 must not retry/escalate");
+
+    let mut escalations = 0;
+    while let Ok(ev) = ev_rx.try_recv() {
+        if matches!(ev, RunEvent::Escalation { .. }) {
+            escalations += 1;
+        }
+    }
+    assert_eq!(escalations, 0, "stage2's single failure must never trigger an escalation");
+
+    let rows: Vec<_> = routing_decisions::list_recent(&fx.db, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.run_id.as_deref() == Some(report.run_id.as_str()))
+        .collect();
+    let s2_row = rows
+        .iter()
+        .find(|r| r.stage_kind.as_deref() == Some("s2"))
+        .expect("stage2 must have logged a routing_decisions row");
+    assert_eq!(
+        s2_row.prior_failures, 0,
+        "stage2's row must carry ITS OWN per-stage attempt count (0), never stage1's failures"
+    );
+    assert!(s2_row.escalated_to.is_none());
+}
+
+#[tokio::test]
+async fn escalation_fires_once_within_ceiling_then_pauses_via_single_escalation_guard() {
+    let fx = fixture().await;
+    // 4 always-failing attempts: attempt 0,1 retry (max_retries=2); attempt 2 reaches decide()=
+    // Escalate (failures=2 meets the default threshold) with the ceiling open (Fast→Medium is
+    // well under the default Thinking max_tier), so it actually escalates; attempt 3 fails again
+    // but `!escalated` is now false, so decide() Pauses instead of escalating a second time.
+    let base = spawn_scripted(vec![
+        "attempt0".to_string(),
+        "attempt1".to_string(),
+        "attempt2".to_string(),
+        "attempt3".to_string(),
+    ])
+    .await;
+    let llm = build_router(base).await;
+
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+    let runner = make_runner_escalating(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    let mut s = stage("escalates", &[], fail_gate(), 2);
+    s.tier = Some(Tier::Fast);
+
+    let report = runner
+        .run(RunSpec {
+            pipeline: Pipeline { runs: vec![s] },
+            session_id: fx.session_id,
+            work_item_id: None,
+            system_prompt: "test",
+            domain_name: "test",
+            attempts_budget: 10,
+            workspace: &fx.workspace,
+        })
+        .await
+        .expect("run");
+
+    assert_eq!(report.status, RunStatus::Paused, "the single-escalation guard must pause after one bump");
+    assert_eq!(report.retries, 3, "2 plain retries + 1 escalated retry");
+
+    let mut escalations = Vec::new();
+    while let Ok(ev) = ev_rx.try_recv() {
+        if let RunEvent::Escalation { from, to, .. } = ev {
+            escalations.push((from, to));
+        }
+    }
+    assert_eq!(escalations.len(), 1, "exactly ONE escalation must fire (single-step, R1 design)");
+    assert_eq!(escalations[0], ("fast".to_string(), "medium".to_string()));
+
+    let rows: Vec<_> = routing_decisions::list_recent(&fx.db, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.run_id.as_deref() == Some(report.run_id.as_str()))
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].chosen_tier.as_deref(), Some("fast"), "chosen_tier is the STAGE's base tier");
+    assert_eq!(rows[0].escalated_to.as_deref(), Some("medium"));
+    assert_eq!(rows[0].escalation_trigger.as_deref(), Some("gate_failure"));
+    // The row is written at the stage's TERMINAL decision (the Pause after the single escalated
+    // retry also failed), not at the moment escalation fired — attempt 3, not attempt 2.
+    assert_eq!(rows[0].prior_failures, 3, "the per-stage attempt count at the terminal decision");
+}
+
+#[tokio::test]
+async fn derive_egress_and_max_tier_honor_preference_overrides_and_defaults() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec![]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(64);
+    let broker = Arc::new(ApprovalBroker::new());
+    let runner = make_runner(
+        &fx,
+        Arc::clone(&llm),
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    let router = Arc::clone(&*llm.read().unwrap());
+    // Default: no override preference, cloud-primary test router → AllowCloud (locality-derived).
+    assert_eq!(runner.derive_egress(&router).await, Egress::AllowCloud);
+    // Default max_tier: EscalationPolicy::default()'s ceiling (Thinking).
+    assert_eq!(runner.escalation_max_tier().await, Tier::Thinking);
+
+    meta::upsert_preference(&fx.db, "llm.escalation.egress", "localonly", "test")
+        .await
+        .unwrap();
+    assert_eq!(
+        runner.derive_egress(&router).await,
+        Egress::LocalOnly,
+        "an explicit override must win over locality derivation"
+    );
+
+    meta::upsert_preference(&fx.db, "llm.escalation.max_tier", "medium", "test")
+        .await
+        .unwrap();
+    assert_eq!(runner.escalation_max_tier().await, Tier::Medium);
 }
