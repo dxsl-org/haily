@@ -1,6 +1,10 @@
 mod agent;
 pub mod approval;
 mod budget;
+/// Chat-intent classifier for pipeline auto-detection (Pipeline Activation & Wiring, phase 2).
+/// Lives here (not `haily-app`) because it reuses `feedback_parser`'s `pub(crate)` anchor
+/// primitives — see that module's doc comment.
+pub mod coding_intent;
 mod context;
 pub mod depth;
 mod delegate;
@@ -15,13 +19,20 @@ mod tool_call;
 pub mod worktree;
 
 pub use approval::{ApprovalBroker, PendingApproval};
+/// Pipeline Activation & Wiring (phase 2): the chat-intent classifier's public entrypoint,
+/// re-exported at the crate root so `haily-app::trigger` never needs the `coding_intent` path.
+pub use coding_intent::classify as classify_coding_intent;
+/// Pipeline Activation & Wiring (phase 1): the caller-facing launch request type + its Plan/
+/// Build/PlanThenBuild selector, re-exported at the crate root so an app-layer caller (`haily-
+/// app`) never needs a `haily_core::pipeline::launcher` path.
+pub use pipeline::{CodingRunSpec, RunKind};
 
 use anyhow::Result;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
 use haily_llm::{LlmConfig, LlmRouter};
 use haily_tools::ToolRegistry;
-use haily_types::{ApprovalResolver, Request, ResponseChunk};
+use haily_types::{ApprovalGate, ApprovalResolver, Notification, Request, ResponseChunk, RunEvent};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -424,6 +435,36 @@ impl Orchestrator {
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
     }
 
+    /// Launch a live coding-pipeline run (Pipeline Activation & Wiring, phase 1) bound to this
+    /// orchestrator's own handles. `LaunchDeps` is built here (never inside `pipeline::launcher`,
+    /// which does not know about `Orchestrator`'s private fields — mirrors `process`'s own
+    /// `TurnRuntime` construction) from the SAME approval broker + kill switch a normal turn
+    /// uses, so every write-tier tool call inside the launched run stays gated identically
+    /// (Security Considerations). `cancel` is the caller's per-run token, mirroring `process`'s
+    /// per-turn token.
+    ///
+    /// # Errors
+    /// Returns an error only for a setup failure (target-repo resolution, workspace open, or a
+    /// runner setup failure) — a paused/failed pipeline run is a normal `RunReport`, not an
+    /// error (see `pipeline::launcher::launch_coding_run`'s contract).
+    pub async fn launch_coding_run(
+        &self,
+        spec: pipeline::CodingRunSpec,
+        user_tx: mpsc::Sender<ResponseChunk>,
+        events_tx: mpsc::Sender<RunEvent>,
+        distillation_tx: Option<mpsc::Sender<Notification>>,
+        cancel: CancellationToken,
+    ) -> Result<pipeline::RunReport> {
+        let deps = pipeline::LaunchDeps {
+            db: Arc::clone(&self.db),
+            kms: Arc::clone(&self.kms),
+            llm: Arc::clone(&self.llm),
+            broker: Arc::clone(&self.approval_broker) as Arc<dyn ApprovalGate>,
+            kill: Arc::clone(&self.kill),
+        };
+        pipeline::launch_coding_run(deps, spec, user_tx, events_tx, distillation_tx, cancel).await
+    }
+
     pub fn llm_provider(&self) -> String {
         self.llm
             .read()
@@ -437,6 +478,18 @@ impl Orchestrator {
     /// on, upcast to the layering-safe trait object defined in `haily-types`.
     pub fn approval_resolver(&self) -> Arc<dyn ApprovalResolver> {
         Arc::clone(&self.approval_broker) as Arc<dyn ApprovalResolver>
+    }
+
+    /// App-layer-facing handle for RAISING a new approval request (not resolving one) —
+    /// Pipeline Activation & Wiring phase 2's confirm-gated chat-intent launch needs to request
+    /// its OWN pending approval (a run-launch confirmation) through the exact same broker a
+    /// normal turn's tool-approval flow uses (`process` → `agent::run_turn` →
+    /// `tool_call::dispatch`), so the confirm prompt shares one unified pending-approvals queue
+    /// with every other in-flight tool approval rather than a parallel policy. Mirrors
+    /// `approval_resolver()`'s "clone the handle once, upcast to the layering-safe trait object"
+    /// pattern, on the request-side trait instead of the resolve-side one.
+    pub fn approval_gate(&self) -> Arc<dyn ApprovalGate> {
+        Arc::clone(&self.approval_broker) as Arc<dyn ApprovalGate>
     }
 
     /// The `safety.disable_writes` kill switch (C8), for the app layer to flip live from

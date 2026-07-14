@@ -41,6 +41,13 @@ pub struct SlashCommand {
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "help", description: "List available commands", telegram: true },
     SlashCommand { name: "plan", description: "Plan a feature before coding", telegram: true },
+    // Pipeline Activation & Wiring phase 2: launch the build-only pipeline (P1's
+    // `RunKind::Build`) against an explicit task. `code` and `build` are deliberate aliases
+    // for the same action (both read naturally: "/code fix the login bug" and "/build fix
+    // the login bug") — the dispatch-layer trigger resolver (`haily-app::trigger`) maps
+    // either name to the identical `TriggerAction::LaunchBuild`.
+    SlashCommand { name: "code", description: "Launch a coding-pipeline build for a task", telegram: true },
+    SlashCommand { name: "build", description: "Launch a coding-pipeline build for a task", telegram: true },
     SlashCommand { name: "brainstorm", description: "Explore options and trade-offs", telegram: true },
     SlashCommand { name: "research", description: "Deep technical research on a topic", telegram: true },
     SlashCommand { name: "review", description: "Production-readiness review of recent changes", telegram: true },
@@ -174,6 +181,21 @@ mod tests {
     fn unknown_command_is_recognized_not_registered() {
         assert!(!is_registered("frobnicate"));
         assert!(unknown_hint("frobnicate").contains("/help"));
+    }
+
+    /// Pipeline Activation & Wiring phase 2: `/code` and `/build` are registered,
+    /// Telegram-legal (single token, `[a-z0-9_]`), and both appear on the bot menu —
+    /// the dispatch-layer trigger resolver depends on both names resolving here.
+    #[test]
+    fn code_and_build_are_registered_and_telegram_legal() {
+        for name in ["code", "build"] {
+            assert!(is_registered(name), "{name} must be a registered command");
+            let cmd = lookup(name).expect("registered above");
+            assert!(cmd.telegram, "{name} must be on the Telegram menu");
+        }
+        let menu = telegram_menu();
+        assert!(menu.iter().any(|(n, _)| n == "code"));
+        assert!(menu.iter().any(|(n, _)| n == "build"));
     }
 
     #[test]

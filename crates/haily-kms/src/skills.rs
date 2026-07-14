@@ -272,23 +272,101 @@ pub fn find_matching_skill<'a>(
 /// steer a sub-agent yet.
 pub const SYNTH_SKILL_MIN_CONFIDENCE: f64 = 0.6;
 
+/// The persisted skill enable/pin admin state (Pipeline Activation phase 5), read ONCE per
+/// injection assembly by the caller that already holds `db` (`skill_gates::load`) and passed
+/// into the pure selection functions below — [`playbooks_for`](crate::authored_skills::AuthoredRegistry::playbooks_for)
+/// and [`synthesized_playbooks`] — so those stay DB-free and unit-testable. Lives here (not in
+/// `haily-app`) because BOTH the authored (sync, in-memory) and synthesized (async, DB-backed)
+/// selection paths in this crate need it, and `haily-core::agent::sub_turn` (the real injection
+/// call site) cannot depend on `haily-app` (reverse of the actual crate layering).
+///
+/// `Default` (empty sets) reproduces pre-phase-5 behavior exactly — the regression guard the
+/// phase's Risk Assessment calls for.
+#[derive(Debug, Clone, Default)]
+pub struct SkillGates {
+    disabled: HashSet<String>,
+    pinned: HashSet<String>,
+}
+
+impl SkillGates {
+    pub fn new(disabled: HashSet<String>, pinned: HashSet<String>) -> Self {
+        SkillGates { disabled, pinned }
+    }
+
+    /// Whether `name` has an explicit `skill.enabled.<name> = "false"` pref (default is
+    /// enabled, so absence is never disabled).
+    pub fn is_disabled(&self, name: &str) -> bool {
+        self.disabled.contains(name)
+    }
+
+    /// Whether `name` has an explicit `skill.pinned.<name> = "true"` pref (default is
+    /// unpinned).
+    pub fn is_pinned(&self, name: &str) -> bool {
+        self.pinned.contains(name)
+    }
+}
+
 /// Select synthesized skills to inject into a sub-turn's `## Playbooks` pool (phase 8).
 ///
-/// Filters `active` skills to those at or above [`SYNTH_SKILL_MIN_CONFIDENCE`] whose
-/// `description`/`pattern` matches `task` at the same Jaccard bar clustering uses
-/// (`CLUSTER_SIMILARITY_THRESHOLD`), ranks by (match strength, then confidence), takes the top
-/// `top_n`, and renders each as a `(heading, body)` pair with the source made VISIBLE in the
-/// heading (`"{name} (synthesized skill)"`) so provenance is never hidden from the model.
-/// The body is the skill's description plus its steps. Pure over its inputs so the confidence
-/// gate is unit-testable without a DB.
+/// Filters out any name `gates` marks disabled, then splits the remainder into pinned and
+/// unpinned: a PINNED skill bypasses [`SYNTH_SKILL_MIN_CONFIDENCE`] and the Jaccard match bar
+/// entirely (Pipeline Activation phase 5 — the user explicitly asked for it), ranked by (match
+/// strength, then confidence) among themselves; the unpinned remainder keeps the original
+/// floor + Jaccard-bar filter. Pinned entries are ordered first, then unpinned, both bounded by
+/// `top_n` — a pin can surface a skill ahead of the ranked pool but never floods it past budget.
+/// Each surviving entry renders as a `(heading, body)` pair with the source made VISIBLE in the
+/// heading (`"{name} (synthesized skill)"`) so provenance is never hidden from the model. Pure
+/// over its inputs (including `gates`) so the confidence gate and the enable/pin enforcement are
+/// both unit-testable without a DB.
 pub fn synthesized_playbooks(
     active: &[db_skills::Skill],
     task: &str,
     min_confidence: f64,
     top_n: usize,
+    gates: &SkillGates,
 ) -> Vec<(String, String)> {
-    let mut scored: Vec<(f32, f64, &db_skills::Skill)> = active
+    let render = |s: &db_skills::Skill| -> (String, String) {
+        let steps: Vec<String> = serde_json::from_str(&s.steps).unwrap_or_default();
+        let body = if steps.is_empty() {
+            s.description.clone()
+        } else {
+            format!(
+                "{}\nSteps:\n{}",
+                s.description,
+                steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, st)| format!("{}. {st}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        (format!("{} (synthesized skill)", s.name), body)
+    };
+
+    let candidates: Vec<&db_skills::Skill> = active.iter().filter(|s| !gates.is_disabled(&s.name)).collect();
+
+    let mut pinned: Vec<(f32, f64, &db_skills::Skill)> = candidates
         .iter()
+        .copied()
+        .filter(|s| gates.is_pinned(&s.name))
+        .map(|s| {
+            let sim = jaccard(task, &s.description).max(jaccard(task, &s.pattern));
+            (sim, s.confidence, s)
+        })
+        .collect();
+    // Descending by match strength, then confidence — a partial_cmp fallback keeps NaN-free
+    // f32/f64 comparisons total.
+    pinned.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut unpinned: Vec<(f32, f64, &db_skills::Skill)> = candidates
+        .iter()
+        .copied()
+        .filter(|s| !gates.is_pinned(&s.name))
         .filter(|s| s.confidence >= min_confidence)
         .filter_map(|s| {
             // Match against description AND pattern; take the stronger of the two so a skill
@@ -297,34 +375,17 @@ pub fn synthesized_playbooks(
             (sim >= CLUSTER_SIMILARITY_THRESHOLD).then_some((sim, s.confidence, s))
         })
         .collect();
-    // Descending by match strength, then confidence — a partial_cmp fallback keeps NaN-free
-    // f32/f64 comparisons total.
-    scored.sort_by(|a, b| {
+    unpinned.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
     });
-    scored
+
+    pinned
         .into_iter()
+        .chain(unpinned)
         .take(top_n)
-        .map(|(_, _, s)| {
-            let steps: Vec<String> = serde_json::from_str(&s.steps).unwrap_or_default();
-            let body = if steps.is_empty() {
-                s.description.clone()
-            } else {
-                format!(
-                    "{}\nSteps:\n{}",
-                    s.description,
-                    steps
-                        .iter()
-                        .enumerate()
-                        .map(|(i, st)| format!("{}. {st}", i + 1))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            };
-            (format!("{} (synthesized skill)", s.name), body)
-        })
+        .map(|(_, _, s)| render(s))
         .collect()
 }
 

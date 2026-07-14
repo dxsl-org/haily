@@ -347,6 +347,30 @@ async fn list_approvals(state: State<'_, AppState>) -> Result<Vec<PendingApprova
     Ok(app.pending_approvals())
 }
 
+/// Launch a coding-pipeline run from the GUI's "New run" form (Pipeline Activation & Wiring
+/// phase 3) — the cockpit's only run-INITIATE surface (`RunTimeline` only ever consumes
+/// events a run already produced). Delegates entirely to `haily_app::start_coding_run`,
+/// which mints the session id, binds it to the `"gui"` adapter, and fires the P1 launch
+/// entrypoint on this same `AppHandle` — so the run inherits the SAME `ApprovalGate` and
+/// kill switch as any other turn, and its events land on the existing `haily-run-events`
+/// bridge/`RunTimeline` with no new channel. Locks `app` only long enough to hand off the
+/// (non-blocking) launch call, mirroring `reload_llm`/`list_approvals`.
+#[tauri::command]
+async fn start_coding_run(
+    kind: String,
+    task: String,
+    repo_path: Option<String>,
+    depth: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let guard = state.app.lock().await;
+    let app = guard.as_ref().ok_or("app is shutting down")?;
+    let depth = DepthMode::from_label(&depth);
+    haily_app::start_coding_run(app, &kind, task, repo_path.map(std::path::PathBuf::from), depth)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Mobile Thin-Client plan phase 2b — pairing QR, OOB confirm-on-pair (M4), devices panel,
 // status banners, cert lifecycle (m5). Pure delegation onto `haily_app::mobile_admin`; no
@@ -597,6 +621,7 @@ pub fn run() {
             discard_workspace,
             workspace_diff,
             list_approvals,
+            start_coding_run,
             #[cfg(feature = "mobile-server")]
             mobile_pairing_qr,
             #[cfg(feature = "mobile-server")]

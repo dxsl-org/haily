@@ -8,7 +8,7 @@ use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
 use crate::credential_store::{is_keyring_marker, CredentialPolicy, CredentialStore};
 use crate::turns::TurnRegistry;
-use crate::{dispatch, watchers};
+use crate::{dispatch, reaper, watchers};
 use anyhow::Result;
 use haily_core::Orchestrator;
 use haily_db::{queries::meta, DbHandle};
@@ -79,8 +79,12 @@ pub struct AppHandle {
     /// the same read/write-fallback policy the startup migration used — never by reaching
     /// into `kms_preferences` directly for a credential.
     pub credential_store: Arc<CredentialStore>,
-    shutdown: CancellationToken,
-    tasks: TaskTracker,
+    /// `pub(crate)` (not private): `launch.rs`'s coding-run entrypoint needs its own child
+    /// token per launch, mirroring `dispatch_loop`'s own `shutdown.child_token()` per turn.
+    pub(crate) shutdown: CancellationToken,
+    /// `pub(crate)`: `launch.rs` registers the run-event/distillation bridges plus the tracked
+    /// launch task on this SAME tracker, so `AppHandle::shutdown`'s drain covers them too.
+    pub(crate) tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
 }
 
@@ -264,6 +268,18 @@ impl AppHandle {
             data_dir.join("backups"),
             credential_migration_clean,
             vec![ODOO_API_KEY_PREF.to_string()],
+            shutdown.child_token(),
+            tasks.clone(),
+        );
+
+        // Phase 6 ("Pipeline Activation & Wiring"): periodic worktree reaper — reclaims
+        // coding_workspaces whose owning pipeline run finished (or never linked to one and
+        // went stale), plus crash-orphaned worktree directories with no matching row. Runs
+        // regardless of `opts` (same rationale as `spawn_backup`: bounding disk usage from
+        // launched runs is not an optional feature toggle).
+        reaper::spawn_worktree_reaper(
+            Arc::clone(&db),
+            reaper::default_worktrees_root(),
             shutdown.child_token(),
             tasks.clone(),
         );

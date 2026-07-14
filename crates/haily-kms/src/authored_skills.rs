@@ -19,7 +19,7 @@
 //!    at a time via `fetch_section`. They are NEVER concatenated into the body — a
 //!    full-dump is the forbidden anti-pattern.
 
-use crate::skills::jaccard_similarity;
+use crate::skills::{jaccard_similarity, SkillGates};
 use crate::system_prompt::strip_tool_tags;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -276,9 +276,21 @@ impl AuthoredRegistry {
     /// When `domain` is `Some`, only skills whose `domain` matches EXACTLY are returned
     /// — so a finance sub-turn never receives a `developer` playbook. Returns
     /// `(name, body)`; references are NOT included (progressive disclosure).
-    pub fn playbooks_for(&self, task: &str, domain: Option<&str>, k: usize) -> Vec<(String, String)> {
+    ///
+    /// `gates` (Pipeline Activation phase 5) excludes any disabled name outright, and lets a
+    /// PINNED name bypass the `score > 0.0` Jaccard bar entirely — the user explicitly asked
+    /// for it, so it is ranked among the other pinned names and placed ahead of the unpinned
+    /// pool, both still bounded by `k`. A default (empty) `gates` reproduces the pre-phase-5
+    /// ranking exactly.
+    pub fn playbooks_for(
+        &self,
+        task: &str,
+        domain: Option<&str>,
+        k: usize,
+        gates: &SkillGates,
+    ) -> Vec<(String, String)> {
         let snap = self.snap();
-        let mut scored: Vec<(f32, &AuthoredSkill)> = snap
+        let candidates: Vec<&AuthoredSkill> = snap
             .by_name
             .values()
             .filter(|s| s.kind.is_playbook())
@@ -286,17 +298,38 @@ impl AuthoredRegistry {
                 Some(d) => s.domain.as_deref() == Some(d),
                 None => true,
             })
+            .filter(|s| !gates.is_disabled(&s.name))
+            .collect();
+
+        let mut pinned: Vec<(f32, &AuthoredSkill)> = candidates
+            .iter()
+            .copied()
+            .filter(|s| gates.is_pinned(&s.name))
             .map(|s| (jaccard_similarity(task, &s.match_text()), s))
-            .filter(|(score, _)| *score > 0.0)
             .collect();
         // Highest score first; break ties by name for determinism.
-        scored.sort_by(|a, b| {
+        pinned.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.1.name.cmp(&b.1.name))
         });
-        scored
+
+        let mut unpinned: Vec<(f32, &AuthoredSkill)> = candidates
+            .iter()
+            .copied()
+            .filter(|s| !gates.is_pinned(&s.name))
+            .map(|s| (jaccard_similarity(task, &s.match_text()), s))
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+        unpinned.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
+
+        pinned
             .into_iter()
+            .chain(unpinned)
             .take(k)
             .map(|(_, s)| (s.name.clone(), s.body.clone()))
             .collect()
@@ -459,6 +492,7 @@ fn parse_list(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn skill(name: &str, kind: SkillKind, domain: Option<&str>, blurb: &str) -> AuthoredSkill {
         AuthoredSkill {
@@ -573,7 +607,7 @@ mod tests {
             skill("budget", SkillKind::StagePrompt, Some("finance"), "budget money spend"),
         ]]);
         // A finance sub-turn must never receive the developer playbook.
-        let finance = reg.playbooks_for("fix compile bug", Some("finance"), 5);
+        let finance = reg.playbooks_for("fix compile bug", Some("finance"), 5, &SkillGates::default());
         assert!(
             finance.iter().all(|(n, _)| n != "fix"),
             "developer playbook leaked into finance domain: {finance:?}"
@@ -587,9 +621,71 @@ mod tests {
             skill("fix", SkillKind::StagePrompt, Some("developer"), "fix compile bug error root cause"),
             skill("writer", SkillKind::Playbook, Some("developer"), "write essays prose narrative story"),
         ]]);
-        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 1);
+        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 1, &SkillGates::default());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "fix", "the compile/bug task must rank fix first");
+    }
+
+    // ------------------------------------------------------------------
+    // Pipeline Activation phase 5 — skill enable/pin gate enforcement
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn disabled_skill_is_excluded_even_when_it_would_otherwise_rank_first() {
+        let reg = AuthoredRegistry::from_tiers(vec![vec![
+            skill("fix", SkillKind::StagePrompt, Some("developer"), "fix compile bug error root cause"),
+            skill("writer", SkillKind::Playbook, Some("developer"), "write essays prose narrative story"),
+        ]]);
+        let gates = SkillGates::new(HashSet::from(["fix".to_string()]), HashSet::new());
+        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 5, &gates);
+        assert!(
+            hits.iter().all(|(n, _)| n != "fix"),
+            "disabled skill must never reach the injected pool: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_skill_is_ordered_first_and_bypasses_the_score_floor() {
+        // "writer" scores 0 against this task (no word overlap) and would normally be
+        // filtered out entirely; pinning it must surface it anyway, ahead of the
+        // genuinely-matching "fix" skill.
+        let reg = AuthoredRegistry::from_tiers(vec![vec![
+            skill("fix", SkillKind::StagePrompt, Some("developer"), "fix compile bug error root cause"),
+            skill("writer", SkillKind::Playbook, Some("developer"), "write essays prose narrative story"),
+        ]]);
+        let gates = SkillGates::new(HashSet::new(), HashSet::from(["writer".to_string()]));
+        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 5, &gates);
+        assert_eq!(
+            hits.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["writer", "fix"],
+            "pinned skill must be ordered first even though it does not match the task: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_skill_stays_bounded_by_the_k_budget() {
+        let reg = AuthoredRegistry::from_tiers(vec![vec![
+            skill("fix", SkillKind::StagePrompt, Some("developer"), "fix compile bug error root cause"),
+            skill("writer", SkillKind::Playbook, Some("developer"), "write essays prose narrative story"),
+        ]]);
+        let gates = SkillGates::new(HashSet::new(), HashSet::from(["writer".to_string()]));
+        // k=1: the pinned skill takes the single slot, the otherwise-matching "fix" is dropped.
+        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 1, &gates);
+        assert_eq!(hits.len(), 1, "pinned entries stay bounded by the k budget: {hits:?}");
+        assert_eq!(hits[0].0, "writer");
+    }
+
+    #[test]
+    fn default_gates_reproduce_unset_state_exactly() {
+        // Regression guard (phase 5 Risk Assessment): default (empty) gates must yield the
+        // identical ranking `jaccard_ranks_relevant_playbook_over_irrelevant` already pins.
+        let reg = AuthoredRegistry::from_tiers(vec![vec![
+            skill("fix", SkillKind::StagePrompt, Some("developer"), "fix compile bug error root cause"),
+            skill("writer", SkillKind::Playbook, Some("developer"), "write essays prose narrative story"),
+        ]]);
+        let hits = reg.playbooks_for("sửa bug compile", Some("developer"), 1, &SkillGates::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "fix");
     }
 
     #[test]
@@ -603,7 +699,7 @@ mod tests {
             body: "SECRET_REFERENCE_BODY".to_string(),
         });
         let reg = AuthoredRegistry::from_tiers(vec![vec![s]]);
-        let hits = reg.playbooks_for("cook build implement", Some("developer"), 1);
+        let hits = reg.playbooks_for("cook build implement", Some("developer"), 1, &SkillGates::default());
         assert_eq!(hits.len(), 1);
         assert!(
             !hits[0].1.contains("SECRET_REFERENCE_BODY"),

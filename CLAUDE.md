@@ -104,6 +104,11 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `src-tauri/src/lib.rs` | Tauri app initialization (Tauri glue only) |
 | `src/lib/tauri.ts` | Typed Tauri invoke wrappers |
 | `src/lib/components/` | GUI panels: WorkItemsPanel, ProactivePanel, JournalBrowser, ConnectorConfig + settings tabs |
+| `crates/haily-core/src/pipeline/launcher/` | Pipeline launcher service (Pipeline Activation phase 1): `Orchestrator::launch_coding_run` constructs PipelineRunner from orchestrator handles, wires RunEvent/distillation bridges to live runs, resolves target-repo path + verifier commands; split into mod.rs (launcher), registry.rs (tool/verifier helpers), tests.rs |
+| `crates/haily-app/src/trigger.rs` | Dispatch-layer trigger resolver (Pipeline Activation phase 2): resolves Request → TriggerAction (NormalTurn / LaunchPlan / LaunchBuild / ConfirmThenLaunch / PromptTask / UnknownSlashHint); handles confirm-gated launch flow via ApprovalGate broker; runs as part of turn execution, never blocks dispatch loop |
+| `crates/haily-core/src/coding_intent.rs` | Chat-intent classifier (Pipeline Activation phase 2): VN/EN pattern detection for pipeline auto-launch (`classify(msg, origin) -> Option<RunKind>`); reuses `feedback_parser` anchoring rules (phrases must be short or leading, never buried in long text); narrow multi-word lexicon (e.g. "build this feature", "fix this bug") to minimize false positives |
+| `crates/haily-app/src/reaper.rs` | Worktree GC worker (Pipeline Activation phase 6): hourly background task reconciling coding_workspaces DB rows + on-disk git worktrees against pipeline run status; reaps terminal runs (past grace window) + aged NULL-run workspaces + crash orphans; best-effort (logs errors, continues tick); graceful shutdown via `tokio::select!` |
+| `crates/haily-kms/src/skill_gates.rs` | Skill enable/pin enforcement loader (Pipeline Activation phase 5): reads persisted enable/pin admin state from `meta` prefs table (`skill.enabled.<name>` / `skill.pinned.<name>`), returns `SkillGates` for injection filtering; fail-open (DB read error yields default empty gates) so admin state never blocks turn context assembly |
 
 ## Code Standards
 
@@ -147,7 +152,30 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 - Red Team findings (32 total): all accepted, applied, verified
 - Regression gates: `cargo clippy -- -D warnings && cargo test` passing
 
-**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation. Router A/B experiment unblocked by Phase 5's outcome data + eval harness.
+**Sub-Agent & Skill Architecture (P0–P14): Complete (2026-07-12)**
+- Full plan→build→verify→ship pipeline with sandbox isolation, multi-language coding tools, skill synthesis, LSP semantics, stealth browser, automation eval harness
+- PR #6 merged to main
+
+**Mobile Thin-Client: Complete (2026-07-12)**
+- Android-first WS remote terminal with QR pairing, voice plugin, E2E harness
+- iOS (P5) explicitly deferred, host-gated on macOS
+- PR #7 merged to main
+
+**Auto Model Routing R1: Complete (2026-07-14)**
+- Heuristic tier selector + gate-verified escalation policy, routing decision telemetry, cost/quality UX dial
+- PR #8 merged to main
+
+**Pipeline Activation & Wiring (7 phases): Complete (2026-07-14)**
+- Phase 1: Launcher service + live RunEvent/distillation bridges (`launch_coding_run` in core, `spawn_distillation_bridge` in app)
+- Phase 2: Chat triggers — `/plan`, `/code`, `/build` slash + confirm-gated VN/EN intent classifier
+- Phase 3: GUI cockpit "New run" form feeding RunTimeline
+- Phase 4: LSP diagnostics into build fix-loop signal
+- Phase 5: Skill enable/pin enforcement at context-assembly time
+- Phase 6: Hourly worktree GC with graceful-shutdown semantics + grace-window fix (commit ce21efd)
+- Phase 7: Host-gated eval runbook scripts + documentation (`scripts/evals/`, `docs/runbooks/pipeline-evals.md`)
+- Status: Built on `feat/pipeline-activation`, awaiting merge/push
+
+**Next phases:** Phase 14 (Voice/Multimodal), Phase 15 (Multi-Device Sync) — deferred pending UX validation. R2/R3 router gated on ≥7 days routing_decisions data + P9 eval matrix.
 
 ## Docs
 

@@ -4,6 +4,7 @@
   // from `+page.svelte` (toggled next to the existing chat), not a separate route — this
   // app has no client-side router, so the toggle mirrors the existing Settings-drawer
   // pattern (conditional render off local state).
+  import NewRunForm from './NewRunForm.svelte';
   import RunTimeline from './RunTimeline.svelte';
   import WorkspacePanel from './WorkspacePanel.svelte';
   import SkillsBrowser from './SkillsBrowser.svelte';
@@ -28,6 +29,7 @@
 
 <div class="cockpit">
   <section class="col-main">
+    <NewRunForm />
     <RunTimeline onOutputText={appendOutput} />
   </section>
   <section class="col-side">
@@ -52,6 +54,9 @@
     overflow-y: auto;
     padding: 16px;
     border-right: 1px solid #1e1e2e;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
   }
 
   .col-side {
