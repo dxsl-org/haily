@@ -438,3 +438,87 @@ async fn auto_approve_listing_a_destructive_tool_fails_bootstrap() {
         "error should name the offending tool, got: {err:#}"
     );
 }
+
+/// Critical (Pipeline Activation & Wiring phase 3): `start_coding_run` must reject an
+/// unrecognized `kind` string synchronously — never minting a session or touching the
+/// adapter — since the Tauri command layer forwards this string verbatim from the GUI's
+/// Plan/Build toggle with no validation of its own.
+#[tokio::test]
+async fn start_coding_run_rejects_an_unknown_kind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = AppHandle::bootstrap(
+        dir.path(),
+        vec![MockAdapter::new() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    let result = crate::cockpit::start_coding_run(
+        &handle,
+        "sprint",
+        "do something".to_string(),
+        None,
+        haily_types::DepthMode::Normal,
+    );
+    let err = result.expect_err("an unknown kind must be rejected");
+    assert!(
+        err.to_string().contains("sprint"),
+        "error should name the offending kind, got: {err:#}"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}
+
+/// Critical: a valid `start_coding_run` call must bind its minted session to the GUI
+/// adapter and forward the launch's terminal chunks through that exact binding — proves
+/// the wiring end to end (bind → launch → resp_tx forwarder → `AdapterManager::deliver`)
+/// without needing a real LLM or a full pipeline run. Pointing `repo_path` at a plain
+/// (non-git) tempdir makes `CodingWorkspace::open` fail fast (`ensure_git_repo`), so the
+/// launch reaches its documented setup-failure path (`ResponseChunk::Error` then
+/// `Complete`) well before any LLM call would be attempted.
+#[tokio::test]
+async fn start_coding_run_binds_the_session_and_forwards_the_launch_failure() {
+    let data_dir = tempfile::tempdir().expect("data tempdir");
+    let non_git_repo = tempfile::tempdir().expect("non-git repo tempdir");
+
+    // Registered under "gui" (not the default "mock") since `start_coding_run` binds its
+    // minted session to that fixed adapter id, mirroring the real `GuiAdapter::id()`.
+    let adapter = MockAdapter::with_id("gui");
+    let handle = AppHandle::bootstrap(
+        data_dir.path(),
+        vec![adapter.clone() as Arc<dyn Adapter>],
+        BootstrapOptions::default(),
+    )
+    .await
+    .expect("bootstrap");
+
+    let session_id = crate::cockpit::start_coding_run(
+        &handle,
+        "plan",
+        "wire up start_coding_run".to_string(),
+        Some(non_git_repo.path().to_path_buf()),
+        haily_types::DepthMode::Normal,
+    )
+    .expect("a recognized kind with an explicit repo_path must not fail synchronously");
+
+    let chunks = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let chunks = adapter.chunks_for(session_id);
+            if chunks.iter().any(|c| matches!(c, ResponseChunk::Complete)) {
+                return chunks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the launched run's setup failure did not reach the adapter in time");
+
+    assert!(
+        chunks.iter().any(|c| matches!(c, ResponseChunk::Error(_))),
+        "a non-git repo_path should surface as a ResponseChunk::Error on the bound \
+         session, got: {chunks:?}"
+    );
+
+    handle.shutdown(std::time::Duration::from_secs(5)).await;
+}

@@ -16,14 +16,21 @@
 //! are re-exported FROM `haily-kms` (not redeclared) so the setters here and that reader can
 //! never silently drift apart.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use haily_core::{CodingRunSpec, RunKind};
 use haily_db::queries::{coding_workspaces, meta, skills as db_skills};
 use haily_db::DbHandle;
 use haily_kms::skill_gates::{SKILL_ENABLED_PREFIX, SKILL_PINNED_PREFIX};
 use haily_kms::KmsHandle;
 use haily_tools::coding::workspace::CodingWorkspace;
 use haily_tools::exec::{Manager, SandboxKind};
+use haily_types::{DepthMode, ResponseChunk};
 use serde::Serialize;
+use std::path::PathBuf;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::bootstrap::AppHandle;
 
 /// Cap on a workspace diff returned to the GUI, so a huge generated diff cannot flood the
 /// IPC channel (the frontend virtualizes/paginates — phase risk note). 512 KiB is ample
@@ -237,4 +244,65 @@ pub async fn workspace_diff(db: &DbHandle, id: &str, session_id: &str) -> Result
     };
     let diff = CodingWorkspace { row }.unified_diff(MAX_DIFF_BYTES).await?;
     Ok(Some(diff))
+}
+
+/// Launch a coding-pipeline run from the GUI's "New run" form (Pipeline Activation & Wiring
+/// phase 3) — the GUI's own trigger onto the P1 launch entrypoint (`crate::launch_coding_run`).
+/// Mints a fresh `session_id` (mirrors `send_message`: every GUI-initiated unit of work gets
+/// its own id) and binds it to the `"gui"` adapter BEFORE launching — `launch_coding_run`'s
+/// internal `spawn_run_event_bridge`/`spawn_distillation_bridge` deliver through this exact
+/// binding, and `AdapterManager::deliver_run_event` errors on an unbound session. The delivery
+/// loop below mirrors `dispatch::dispatch_loop`'s own per-turn forwarder (chunk-drain until
+/// `Complete`, then unbind) so a launched run behaves identically to a normal chat turn from
+/// the adapter's point of view — no new event channel, no bypass of the terminal-chunk
+/// contract `AppHandle::shutdown`'s drain relies on.
+///
+/// Returns the minted session id so the caller can log/correlate it; `RunTimeline` itself is
+/// session-agnostic (it renders every observed `run_id` regardless of session), so the
+/// frontend does not need to thread this id anywhere further.
+///
+/// # Errors
+/// Returns an error only for an unrecognized `kind` string. The launch itself never fails
+/// synchronously — `crate::launch_coding_run` fires the run on a tracked background task and
+/// reports a setup failure as a `ResponseChunk::Error` on the bound session instead (see its
+/// own doc comment).
+pub fn start_coding_run(
+    app: &AppHandle,
+    kind: &str,
+    task: String,
+    repo_path: Option<PathBuf>,
+    depth: DepthMode,
+) -> Result<Uuid> {
+    let kind = match kind {
+        "plan" => RunKind::Plan,
+        "build" => RunKind::Build,
+        other => bail!("unknown coding-run kind '{other}' (expected 'plan' or 'build')"),
+    };
+
+    let session_id = Uuid::new_v4();
+    app.adapters.bind_session(session_id, "gui");
+
+    let (resp_tx, mut resp_rx) = mpsc::channel::<ResponseChunk>(256);
+    let adapters = app.adapters.clone();
+    app.tasks.clone().spawn(async move {
+        while let Some(chunk) = resp_rx.recv().await {
+            let done = matches!(chunk, ResponseChunk::Complete);
+            adapters.deliver(session_id, chunk).await.ok();
+            if done {
+                break;
+            }
+        }
+        adapters.unbind_session(&session_id);
+    });
+
+    let spec = CodingRunSpec {
+        kind,
+        task,
+        session_id,
+        work_item_id: None,
+        repo_path,
+        depth,
+    };
+    crate::launch_coding_run(app, spec, resp_tx);
+    Ok(session_id)
 }

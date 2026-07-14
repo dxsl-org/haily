@@ -408,6 +408,32 @@ export async function onRunEvents(
   return listen<RunEventPayload>('haily-run-events', (event) => callback(event.payload));
 }
 
+/** Which kind of coding-pipeline run to launch (Pipeline Activation & Wiring phase 3).
+ * `'plan'` runs scout→design→write→approval; `'build'` runs build→verify→ship on the
+ * given task description. Mirrors the two GUI-reachable arms of the Rust
+ * `haily_core::pipeline::RunKind` enum accepted by `start_coding_run` (its
+ * `PlanThenBuild` variant has no toggle position in this form yet). */
+export type CodingRunKind = 'plan' | 'build';
+
+/**
+ * Launch a coding-pipeline run bound to a freshly minted session id — the GUI's own
+ * trigger onto the P1 launch entrypoint (`haily_app::launch_coding_run`), reachable
+ * anywhere a chat turn already is. Inherits the SAME `ApprovalGate` + kill switch as any
+ * other turn; this call never bypasses approval. The launched run's events stream into
+ * the existing `onRunEvents`/`RunTimeline` — no new subscription is needed. `repoPath`
+ * of `null` falls back server-side to the `coding.default_repo` preference; if neither
+ * resolves (or the repo is not a git repository), the call rejects — surface that as an
+ * inline error, not a launch.
+ */
+export async function startCodingRun(
+  kind: CodingRunKind,
+  task: string,
+  repoPath: string | null,
+  depth: DepthMode,
+): Promise<void> {
+  return invoke('start_coding_run', { kind, task, repoPath, depth });
+}
+
 /** One skill row for the cockpit skills browser. Mirrors `haily_app::cockpit::SkillView`.
  * `source` is `"authored"` (trusted kit-pack — no confidence/use lifecycle) or
  * `"synthesized"` (EMA/decay lifecycle; confidence/use_count/last_used_at populated). */

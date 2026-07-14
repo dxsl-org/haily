@@ -1,6 +1,10 @@
 mod agent;
 pub mod approval;
 mod budget;
+/// Chat-intent classifier for pipeline auto-detection (Pipeline Activation & Wiring, phase 2).
+/// Lives here (not `haily-app`) because it reuses `feedback_parser`'s `pub(crate)` anchor
+/// primitives — see that module's doc comment.
+pub mod coding_intent;
 mod context;
 pub mod depth;
 mod delegate;
@@ -15,6 +19,9 @@ mod tool_call;
 pub mod worktree;
 
 pub use approval::{ApprovalBroker, PendingApproval};
+/// Pipeline Activation & Wiring (phase 2): the chat-intent classifier's public entrypoint,
+/// re-exported at the crate root so `haily-app::trigger` never needs the `coding_intent` path.
+pub use coding_intent::classify as classify_coding_intent;
 /// Pipeline Activation & Wiring (phase 1): the caller-facing launch request type + its Plan/
 /// Build/PlanThenBuild selector, re-exported at the crate root so an app-layer caller (`haily-
 /// app`) never needs a `haily_core::pipeline::launcher` path.
@@ -471,6 +478,18 @@ impl Orchestrator {
     /// on, upcast to the layering-safe trait object defined in `haily-types`.
     pub fn approval_resolver(&self) -> Arc<dyn ApprovalResolver> {
         Arc::clone(&self.approval_broker) as Arc<dyn ApprovalResolver>
+    }
+
+    /// App-layer-facing handle for RAISING a new approval request (not resolving one) —
+    /// Pipeline Activation & Wiring phase 2's confirm-gated chat-intent launch needs to request
+    /// its OWN pending approval (a run-launch confirmation) through the exact same broker a
+    /// normal turn's tool-approval flow uses (`process` → `agent::run_turn` →
+    /// `tool_call::dispatch`), so the confirm prompt shares one unified pending-approvals queue
+    /// with every other in-flight tool approval rather than a parallel policy. Mirrors
+    /// `approval_resolver()`'s "clone the handle once, upcast to the layering-safe trait object"
+    /// pattern, on the request-side trait instead of the resolve-side one.
+    pub fn approval_gate(&self) -> Arc<dyn ApprovalGate> {
+        Arc::clone(&self.approval_broker) as Arc<dyn ApprovalGate>
     }
 
     /// The `safety.disable_writes` kill switch (C8), for the app layer to flip live from

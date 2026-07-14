@@ -292,6 +292,22 @@ pub async fn count_for_session(db: &DbHandle, session_id: &str) -> Result<i64> {
     Ok(row.0)
 }
 
+/// Fetch just the `status` string of one run (the P6 worktree reaper's terminal-run check) —
+/// avoids pulling the whole row when only the status is needed. `None` if `id` does not
+/// reference an active run (never existed, or soft-deleted); the caller treats that identically
+/// to "unknown", never as a reap signal on its own — see the `haily-app` reaper's `is_reapable`.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn status_of(db: &DbHandle, id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM pipeline_runs WHERE id = ? AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?;
+    Ok(row.map(|(status,)| status))
+}
+
 /// Soft-delete a run. C10-guarded (`WHERE id = ? AND deleted_at IS NULL`) so a double-delete
 /// is detected via `rows_affected()` rather than a separate SELECT.
 ///

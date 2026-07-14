@@ -12,6 +12,7 @@ pub mod eval;
 pub mod credential_store;
 mod dispatch;
 mod launch;
+mod reaper;
 /// Mobile-server config loader + DB-backed device store (Mobile Thin-Client plan phase 2a).
 /// Gated behind the `mobile-server` feature (which forwards to `haily-io/mobile-server`, see
 /// Cargo.toml) since both files reference `haily_io::mobile::*` types that only exist under
@@ -29,6 +30,10 @@ pub mod mobile_device_store;
 #[cfg(feature = "mobile-server")]
 pub mod mobile_admin;
 mod session_transcript;
+/// Dispatch-layer trigger resolver (Pipeline Activation & Wiring, phase 2) — slash + chat-intent
+/// routing into the Phase 1 pipeline launcher. Not exported at the crate root: only
+/// `dispatch.rs` (same crate) calls into it.
+mod trigger;
 mod turns;
 mod watchers;
 
@@ -37,8 +42,8 @@ pub mod bootstrap;
 pub use auto_approve::{load_auto_approve, validate_auto_approve};
 pub use bootstrap::{export_database, AppHandle, BootstrapOptions};
 pub use cockpit::{
-    discard_workspace, list_skills, list_workspaces, pin_skill, set_skill_enabled, workspace_diff,
-    SkillView, WorkspaceView,
+    discard_workspace, list_skills, list_workspaces, pin_skill, set_skill_enabled,
+    start_coding_run, workspace_diff, SkillView, WorkspaceView,
 };
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
 #[cfg(feature = "mobile-server")]

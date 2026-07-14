@@ -20,6 +20,7 @@ use uuid::Uuid;
 /// Test adapter driven entirely by the test body: `send()` injects a `Request`,
 /// `chunks_for()` returns every chunk delivered so far for a session.
 pub struct MockAdapter {
+    id: &'static str,
     req_tx: Mutex<Option<mpsc::Sender<Request>>>,
     delivered: Arc<Mutex<Vec<(Uuid, ResponseChunk)>>>,
     /// Set by `set_approval_resolver` — lets bootstrap tests confirm
@@ -33,7 +34,16 @@ pub struct MockAdapter {
 
 impl MockAdapter {
     pub fn new() -> Arc<Self> {
+        Self::with_id("mock")
+    }
+
+    /// Same as `new()`, but registered under `id` instead of the fixed `"mock"` — needed by
+    /// any test exercising a code path that binds a session to a specific adapter id (e.g.
+    /// `haily-app::cockpit::start_coding_run`'s hard-coded `"gui"` binding, which mirrors the
+    /// real `haily-io::GuiAdapter`'s own `id()`).
+    pub fn with_id(id: &'static str) -> Arc<Self> {
         Arc::new(Self {
+            id,
             req_tx: Mutex::new(None),
             delivered: Arc::new(Mutex::new(Vec::new())),
             approval_resolver: Mutex::new(None),
@@ -113,7 +123,7 @@ impl Adapter for MockAdapter {
     }
 
     fn id(&self) -> &str {
-        "mock"
+        self.id
     }
 }
 

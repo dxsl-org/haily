@@ -54,6 +54,10 @@ keyring = { workspace = true, features = ["sync-secret-service", "linux-native"]
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the P6 worktree-reaper tests backdate a `coding_workspaces.updated_at` directly
+# (mirrors `haily-db/tests/skills.rs`'s own row-aging idiom) — no production code in this
+# crate touches sqlx directly.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "chrono"] }
 # Self-dependency so `tests/*.rs` integration tests (compiled as an external crate) can
 # see `CredentialStore::force_next_keyring_error` behind the `test-support` feature above.
 haily-app = { path = ".", features = ["test-support"] }

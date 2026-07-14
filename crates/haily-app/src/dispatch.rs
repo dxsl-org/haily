@@ -1,8 +1,9 @@
 //! Request dispatch loop — pulls requests from adapter channels, fans out to the
 //! orchestrator, and forwards response chunks back to the originating adapter.
+use crate::trigger::{self, TriggerAction};
 use crate::turns::TurnRegistry;
 use anyhow::Result;
-use haily_core::Orchestrator;
+use haily_core::{Orchestrator, RunKind};
 use haily_io::AdapterManager;
 use haily_types::{Request, ResponseChunk};
 use std::sync::Arc;
@@ -79,6 +80,10 @@ async fn dispatch_loop(
         let (resp_tx, mut resp_rx) = mpsc::channel::<ResponseChunk>(256);
         let orc_clone = Arc::clone(&orc);
         let am_clone = am.clone();
+        // Cloned here (not moved) so a Launch/ConfirmThenLaunch branch below can hand its own
+        // owned `TaskTracker` to `trigger::launch`'s bridge spawns — the outer `tasks` binding
+        // stays available for every subsequent loop iteration exactly as before this phase.
+        let tasks_for_launch = tasks.clone();
         // Per-turn child of the root shutdown token: cancelling the root cancels every
         // in-flight turn's token too, so a pending tool approval (ApprovalBroker::request)
         // denies immediately on shutdown instead of blocking the drain for up to 120s.
@@ -104,19 +109,51 @@ async fn dispatch_loop(
                 })
             };
 
-            let resp_tx_err = resp_tx.clone();
-            if let Err(e) = orc_clone.process(req, resp_tx, turn_cancel).await {
-                tracing::error!("orchestrator error: {e:#}");
-                // `Error`, not `Text` — a turn that streamed partial text before
-                // failing (e.g. a mid-stream `StreamChunk::Error` from the LLM) must
-                // let buffering adapters (Telegram) tell "discard what's buffered"
-                // apart from "append this too", or the user sees a single fused
-                // "partial-answer⚠️error" message. See `haily_types::ResponseChunk::Error`.
-                resp_tx_err
-                    .send(ResponseChunk::Error(format!("⚠️ {e:#}")))
-                    .await
-                    .ok();
-                resp_tx_err.send(ResponseChunk::Complete).await.ok();
+            // Pipeline Activation & Wiring phase 2: decide whether this request is a normal
+            // chat turn, an explicit slash-triggered pipeline launch, or a confirm-gated
+            // chat-intent launch — `resolve` only borrows `req`, so every branch below can
+            // still move the original `req` where it needs to (the `NormalTurn` and
+            // `ConfirmThenLaunch`-denied-fallback paths both need it).
+            match trigger::resolve(&req) {
+                TriggerAction::NormalTurn => {
+                    trigger::run_normal_turn(&orc_clone, req, resp_tx, turn_cancel).await;
+                }
+                TriggerAction::LaunchPlan(task) => {
+                    let depth = req.depth;
+                    let handles = trigger::LaunchHandles {
+                        orc: orc_clone,
+                        am: am_clone.clone(),
+                        tasks: tasks_for_launch,
+                    };
+                    trigger::launch(handles, turn_cancel, RunKind::Plan, task, session_id, depth, resp_tx);
+                }
+                TriggerAction::LaunchBuild(task) => {
+                    let depth = req.depth;
+                    let handles = trigger::LaunchHandles {
+                        orc: orc_clone,
+                        am: am_clone.clone(),
+                        tasks: tasks_for_launch,
+                    };
+                    trigger::launch(handles, turn_cancel, RunKind::Build, task, session_id, depth, resp_tx);
+                }
+                TriggerAction::ConfirmThenLaunch(kind, task) => {
+                    let handles = trigger::LaunchHandles {
+                        orc: orc_clone,
+                        am: am_clone.clone(),
+                        tasks: tasks_for_launch,
+                    };
+                    trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx).await;
+                }
+                TriggerAction::PromptTask(kind) => {
+                    let hint = trigger::task_prompt_hint(kind);
+                    resp_tx.send(ResponseChunk::Text(hint)).await.ok();
+                    resp_tx.send(ResponseChunk::Complete).await.ok();
+                }
+                TriggerAction::UnknownSlashHint(name) => {
+                    let hint = haily_io::slash::unknown_hint(&name);
+                    resp_tx.send(ResponseChunk::Text(hint)).await.ok();
+                    resp_tx.send(ResponseChunk::Complete).await.ok();
+                }
             }
 
             // INVARIANT: `delivery` is a bare `tokio::spawn`, so it is only drained by
