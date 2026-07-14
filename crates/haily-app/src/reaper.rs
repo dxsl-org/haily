@@ -44,8 +44,11 @@ const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// where that synchronous discard itself failed.
 const TERMINAL_GRACE: Duration = Duration::hours(1);
 
-/// TTL for a workspace that never got a `run_id` at all (opened but the driving run crashed
-/// before reaching a terminal state and stamping it — see `coding_workspaces::set_run_id`).
+/// TTL for a workspace whose owning run is `Paused` or has no `run_id` at all (opened but the
+/// driving run crashed before reaching any status, or paused with no resume mechanism wired
+/// yet — `finalize_workspace` never discards either case, on the theory a follow-up trigger
+/// might resume them; today nothing implements that follow-up, so both classes are abandoned
+/// after this TTL rather than held forever).
 const NULL_RUN_TTL: Duration = Duration::hours(24);
 
 /// Minimum on-disk age before a rowless directory under `worktrees_root` is treated as a crash
@@ -173,11 +176,20 @@ fn is_reapable(
     let age = now - updated_at.with_timezone(&Utc);
 
     match &row.run_id {
-        Some(_) => {
-            let is_terminal =
-                run_status.and_then(RunStatus::parse).is_some_and(RunStatus::is_terminal);
-            is_terminal && age >= TERMINAL_GRACE
-        }
+        Some(_) => match run_status.and_then(RunStatus::parse) {
+            // Done/Failed are `is_terminal()`; Interrupted (a user Stop) never resumes either
+            // but is deliberately NOT `is_terminal()` at the `RunStatus` level (that flag means
+            // "pipeline logic treats this as finished", which Interrupted isn't — a cancelled
+            // run's stage state is just abandoned, not concluded). The reaper only cares that
+            // nothing will ever touch this workspace again, which is true for both.
+            Some(RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted) => {
+                age >= TERMINAL_GRACE
+            }
+            // Paused implies "might resume" but no resume trigger exists yet — bound it with
+            // the same long TTL as a run_id-less row rather than holding it forever.
+            Some(RunStatus::Paused) => age >= NULL_RUN_TTL,
+            Some(RunStatus::Queued | RunStatus::Running) | None => false,
+        },
         None => {
             let has_live_run = live_sessions.contains(&row.session_id)
                 || row.work_item_id.as_ref().is_some_and(|w| live_work_items.contains(w));
@@ -349,16 +361,46 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_run_is_never_reapable_regardless_of_age() {
-        // The critical safety invariant: an in-flight run's workspace must never be torn
-        // down, even if it looks very old.
+    fn in_flight_run_is_never_reapable_regardless_of_age() {
+        // The critical safety invariant: an actually-in-flight run's workspace must never be
+        // torn down, even if it looks very old.
         let r = row(Some("run1"), None, Duration::days(30));
-        for status in ["queued", "running", "paused", "interrupted"] {
+        for status in ["queued", "running"] {
             assert!(
                 !is_reapable(&r, Some(status), &HashSet::new(), &HashSet::new(), Utc::now()),
                 "status {status} must never be reaped"
             );
         }
+    }
+
+    #[test]
+    fn interrupted_run_is_reaped_like_failed_once_past_grace() {
+        // A user Stop never resumes, same as Failed — just via a different code path
+        // (RunStatus::is_terminal() intentionally excludes Interrupted at the pipeline-status
+        // level, but the reaper's concern is "will anything ever touch this again", not that flag).
+        let fresh = row(Some("run1"), None, Duration::minutes(1));
+        assert!(!is_reapable(&fresh, Some("interrupted"), &HashSet::new(), &HashSet::new(), Utc::now()));
+
+        let aged = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
+        assert!(is_reapable(&aged, Some("interrupted"), &HashSet::new(), &HashSet::new(), Utc::now()));
+    }
+
+    #[test]
+    fn paused_run_is_reaped_after_the_long_ttl_not_the_short_grace() {
+        // Paused nominally means "might resume" — no resume trigger exists yet, so it must not
+        // be held forever, but it gets the same long runway as a run_id-less row rather than
+        // the short terminal grace (a paused run is likelier to still be actionable soon).
+        let within_terminal_grace_but_not_ttl = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
+        assert!(!is_reapable(
+            &within_terminal_grace_but_not_ttl,
+            Some("paused"),
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
+
+        let past_ttl = row(Some("run1"), None, NULL_RUN_TTL + Duration::minutes(5));
+        assert!(is_reapable(&past_ttl, Some("paused"), &HashSet::new(), &HashSet::new(), Utc::now()));
     }
 
     #[test]
