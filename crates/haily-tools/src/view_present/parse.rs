@@ -65,9 +65,17 @@ fn build_data_view(payload: ArgsPayload) -> Result<DataView> {
         bail!("present_view: `schema` must include at least one field");
     }
 
+    // Dedup by `name`, keeping the first occurrence: same reasoning as the `projections` dedup
+    // below — `ViewTable`/`ViewCards` key their per-field render (header cell, row cell, card
+    // field) by `field.name` (Svelte `{#each ... (field.name)}`), and this array is entirely
+    // model-authored, so nothing stops a model from repeating a field name. An unresolved
+    // duplicate key hands Svelte the same duplicate-key crash the projections dedup exists to
+    // prevent.
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let schema: Vec<FieldDef> = payload
         .schema
         .into_iter()
+        .filter(|f| seen_names.insert(f.name.clone()))
         .map(|f| FieldDef {
             name: f.name,
             label: f.label,
@@ -209,6 +217,26 @@ mod tests {
         assert_eq!(view.projections[0].kind, ProjectionKind::Table);
         assert_eq!(view.active.kind, ProjectionKind::Table);
         assert_eq!(view.provenance, ViewProvenance::LlmProjected);
+    }
+
+    #[test]
+    fn duplicate_schema_field_names_are_deduped_keeping_the_first() {
+        let mut args = valid_args();
+        args["schema"] = json!([
+            { "name": "status", "label": "Status A", "ftype": { "type": "Text" } },
+            { "name": "status", "label": "Status B (dup)", "ftype": { "type": "Bool" } },
+            { "name": "balance", "label": "Balance", "ftype": { "type": "Money", "data": { "currency": "USD" } } },
+        ]);
+        let view = parse_present_view_args(&args).expect("valid args must parse");
+        assert_eq!(
+            view.schema.len(),
+            2,
+            "repeated field names must collapse to one entry each — the GUI keys table/card \
+             cells by field name"
+        );
+        assert_eq!(view.schema[0].name, "status");
+        assert_eq!(view.schema[0].label, "Status A", "first occurrence wins");
+        assert_eq!(view.schema[1].name, "balance");
     }
 
     #[test]
