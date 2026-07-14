@@ -81,7 +81,16 @@ fn build_data_view(payload: ArgsPayload) -> Result<DataView> {
     // Normalize: default to a single Table layout when the model omitted `projections`, and
     // to the first available layout when it omitted `active` — a view with no renderable
     // layout at all is never emitted (see the phase's unknown-kind→Table wire contract).
-    let mut projections = payload.projections;
+    // Dedup by `kind`, keeping the first occurrence: the GUI's projection switcher keys its
+    // list by `kind` (Svelte `{#each ... (spec.kind)}`), so a model repeating a kind — nothing
+    // stops it, this field is entirely model-authored — would otherwise hand the renderer a
+    // duplicate key and break the pane.
+    let mut projections: Vec<ProjectionSpec> = Vec::new();
+    for p in payload.projections {
+        if !projections.iter().any(|existing: &ProjectionSpec| existing.kind == p.kind) {
+            projections.push(p);
+        }
+    }
     if projections.is_empty() {
         projections.push(ProjectionSpec {
             kind: ProjectionKind::Table,
@@ -200,6 +209,24 @@ mod tests {
         assert_eq!(view.projections[0].kind, ProjectionKind::Table);
         assert_eq!(view.active.kind, ProjectionKind::Table);
         assert_eq!(view.provenance, ViewProvenance::LlmProjected);
+    }
+
+    #[test]
+    fn duplicate_projection_kinds_are_deduped_keeping_the_first() {
+        let mut args = valid_args();
+        args["projections"] = json!([
+            { "kind": "Table" },
+            { "kind": "Cards", "binding": "name" },
+            { "kind": "Table" },
+        ]);
+        let view = parse_present_view_args(&args).expect("valid args must parse");
+        assert_eq!(
+            view.projections.len(),
+            2,
+            "repeated kinds must collapse to one entry each — the GUI keys its switcher by kind"
+        );
+        assert_eq!(view.projections[0].kind, ProjectionKind::Table);
+        assert_eq!(view.projections[1].kind, ProjectionKind::Cards);
     }
 
     #[test]
