@@ -364,6 +364,12 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         run_id,
         // Propagate the calling turn's depth to any deeper delegation this sub-turn spawns.
         depth_mode,
+        // View Engine Phase A: a fresh, sub-turn-scoped store (same placeholder rationale
+        // as `run_turn` — not yet threaded from the parent `ToolContext`/`SubTurnRequest`,
+        // since nothing constructs a `DataView` yet in this phase). Phase 3 unifies this
+        // with the parent's store so a delegated tool's view reaches the same command-path
+        // fetch as an L0 tool's.
+        view_sink: Arc::new(crate::view::ViewStore::new()),
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just

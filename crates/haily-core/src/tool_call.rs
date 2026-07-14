@@ -425,6 +425,15 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    /// A throwaway view sink (stores nothing) — these dispatch tests never publish a
+    /// view; it exists only because `ToolContext` requires a handle.
+    struct NoopViewSink;
+    impl haily_types::ViewSink for NoopViewSink {
+        fn insert(&self, _view: haily_types::DataView) -> Uuid {
+            Uuid::nil()
+        }
+    }
+
     #[test]
     fn strip_tool_tags_removes_tags_but_keeps_content() {
         // A malicious web result carrying a ready-made tool call.
@@ -673,6 +682,7 @@ mod tests {
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
             run_id: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(NoopViewSink),
         };
         (ctx, rx, dir)
     }

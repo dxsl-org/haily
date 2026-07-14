@@ -16,6 +16,10 @@ mod specialists;
 mod tag_matcher;
 mod tier_intent;
 mod tool_call;
+/// View Engine Phase A — in-memory `ViewStore` for `DataView` snapshots. Public because
+/// Phase 3 wires `Arc<ViewStore>` into the Orchestrator and beyond; not yet bootstrap-
+/// threaded in this phase (see `view::store` doc comment).
+pub mod view;
 pub mod worktree;
 
 pub use approval::{ApprovalBroker, PendingApproval};

@@ -265,6 +265,11 @@ pub async fn run_turn(
         // An L0 chat turn is not a pipeline run — only the P4b runner sets this.
         run_id: None,
         depth_mode: effective_depth,
+        // View Engine Phase A: a fresh, turn-scoped store. Not yet an Orchestrator-held,
+        // cross-turn-shared handle — that wiring (and threading it into a delegated
+        // sub-turn's OWN `ToolContext`) is Phase 3's job; nothing in this phase inserts a
+        // `DataView` yet, so a turn-scoped store is a correct, minimal placeholder.
+        view_sink: Arc::new(crate::view::ViewStore::new()),
     };
 
     let mut guard = tool_call::LoopGuard::new();

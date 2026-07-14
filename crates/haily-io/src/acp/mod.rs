@@ -310,6 +310,14 @@ impl Adapter for AcpAdapter {
                         .await?;
                 }
             }
+            ResponseChunk::ViewRef { entity, .. } => {
+                // ACP is a text/session-update channel — render the handle; the full
+                // `DataView` payload never crosses this channel (GUI-only command path,
+                // built in Phase 3).
+                self.conn
+                    .notify(protocol::M_SESSION_UPDATE, protocol::text_update(&acp_id, "assistant", &format!("\n[view] {entity}")))
+                    .await?;
+            }
         }
         Ok(())
     }

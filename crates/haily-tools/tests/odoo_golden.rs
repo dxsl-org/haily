@@ -153,6 +153,15 @@ impl ApprovalGate for NoopGate {
     }
 }
 
+/// A throwaway view sink (stores nothing) — the golden connector tests never publish a
+/// view; it exists only because `ToolContext` requires a handle.
+struct NoopViewSink;
+impl haily_types::ViewSink for NoopViewSink {
+    fn insert(&self, _view: haily_types::DataView) -> uuid::Uuid {
+        uuid::Uuid::nil()
+    }
+}
+
 /// Build a `ToolContext` for driving `HttpConnectorTool::execute`. The connector tool never
 /// touches kms, but the context requires a handle, so a throwaway one is initialized on the
 /// same tempdir (kept alive by the returned guard).
@@ -175,6 +184,7 @@ async fn tool_ctx(db: Arc<DbHandle>) -> (ToolContext, tempfile::TempDir) {
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         run_id: None,
         depth_mode: haily_types::DepthMode::Normal,
+        view_sink: Arc::new(NoopViewSink),
     };
     (ctx, dir)
 }

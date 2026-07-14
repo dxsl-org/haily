@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_types::{ApprovalGate, DepthMode};
+use haily_types::{ApprovalGate, DepthMode, ViewSink};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -103,6 +103,12 @@ pub struct ToolContext {
     /// `DepthMode::Normal` for every ordinary path (the default); only `run_turn` sets a
     /// non-default value and only from a user-sourced signal.
     pub depth_mode: DepthMode,
+    /// Seam handle for a tool to publish a [`haily_types::DataView`] for display in the GUI
+    /// (View Engine Phase A) without `haily-tools` depending on `haily-core` — the trait
+    /// lives in the leaf `haily-types` crate, mirroring `approval_gate`'s seam exactly. The
+    /// production implementer is `haily-core::view::ViewStore`; construction sites that
+    /// never exercise view insertion (most tests) may hand a no-op implementer instead.
+    pub view_sink: Arc<dyn ViewSink>,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so
