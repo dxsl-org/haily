@@ -48,6 +48,27 @@ const TERMINAL_GRACE: Duration = Duration::hours(1);
 /// before reaching a terminal state and stamping it — see `coding_workspaces::set_run_id`).
 const NULL_RUN_TTL: Duration = Duration::hours(24);
 
+/// Minimum on-disk age before a rowless directory under `worktrees_root` is treated as a crash
+/// orphan. `CodingWorkspace::open` runs `git worktree add` (workspace.rs:63) before inserting the
+/// owning DB row (workspace.rs:71) — a dir can legitimately exist with no active row for a brief
+/// window while a launch is still in flight. Five minutes is generous against that gap (typically
+/// milliseconds) and cheap against the hourly tick; a dir this young is skipped for THIS tick and
+/// re-evaluated next tick, never force-removed on the strength of a single snapshot.
+const FS_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// True if `path`'s mtime is at least `grace` old — old enough to treat an ownerless directory
+/// as a genuine orphan rather than one still mid-`CodingWorkspace::open`. Unreadable metadata or
+/// a clock-skewed future mtime fail closed (treated as "too young") — leaking a rare unremovable
+/// orphan dir one more tick is cheaper than risking a live worktree. `grace` is a parameter (not
+/// the `FS_ORPHAN_GRACE` constant directly) so tests can exercise both branches deterministically
+/// instead of sleeping for real wall-clock minutes.
+async fn old_enough_to_reap(path: &Path, grace: std::time::Duration) -> bool {
+    match tokio::fs::metadata(path).await.and_then(|m| m.modified()) {
+        Ok(modified) => modified.elapsed().map(|age| age >= grace).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 /// Suffix marking a workspace's isolated git-object sibling dir (mirrors
 /// `haily_tools::coding::workspace`'s private `OBJ_DIR_SUFFIX`). These are plain scratch
 /// directories — never git-tracked, never a row's own id — so unlike a worktree dir proper
@@ -80,7 +101,7 @@ pub fn spawn_worktree_reaper(
                 _ = tokio::time::sleep(TICK_INTERVAL) => {}
             }
             reap_rows(&db).await;
-            reconcile_filesystem(&db, &worktrees_root).await;
+            reconcile_filesystem(&db, &worktrees_root, FS_ORPHAN_GRACE).await;
         }
     });
 }
@@ -168,7 +189,7 @@ fn is_reapable(
 /// Reconcile `worktrees_root`'s on-disk entries against the live `coding_workspaces` set —
 /// any directory with no matching active row is a crash orphan (or its now-parentless
 /// isolated object-store sibling) and is removed.
-async fn reconcile_filesystem(db: &DbHandle, worktrees_root: &Path) {
+async fn reconcile_filesystem(db: &DbHandle, worktrees_root: &Path, grace: std::time::Duration) {
     let active_ids: HashSet<String> = match coding_workspaces::list_active(db).await {
         Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
         Err(e) => {
@@ -204,14 +225,19 @@ async fn reconcile_filesystem(db: &DbHandle, worktrees_root: &Path) {
         if let Some(owner_id) = name.strip_suffix(OBJECT_DIR_SUFFIX) {
             // A workspace's own object-store sibling outlives its worktree only when
             // `discard`'s best-effort `remove_dir_all` failed — never git-tracked, so it is
-            // always safe to remove directly.
-            if !active_ids.contains(owner_id) {
+            // always safe to remove directly, once old enough to rule out a fresh in-flight open.
+            if !active_ids.contains(owner_id) && old_enough_to_reap(&entry.path(), grace).await {
                 let _ = tokio::fs::remove_dir_all(entry.path()).await;
             }
             continue;
         }
 
         if active_ids.contains(&name) {
+            continue;
+        }
+        if !old_enough_to_reap(&entry.path(), grace).await {
+            // Too young to distinguish "mid-`CodingWorkspace::open`" from "genuine orphan" —
+            // the DB row for a brand-new workspace lands a moment after its worktree dir does.
             continue;
         }
         remove_orphan_worktree(&entry.path(), &name).await;
@@ -515,13 +541,44 @@ mod tests {
         .await;
         assert!(orphan_path.is_dir(), "fixture setup: orphan worktree must exist before reconcile");
 
-        reconcile_filesystem(&db, wt_root.path()).await;
+        // grace=ZERO: this test asserts the STEADY-STATE orphan case (dir has existed for a
+        // while with no row) — the grace window itself is covered separately below.
+        reconcile_filesystem(&db, wt_root.path(), std::time::Duration::ZERO).await;
 
         assert!(!orphan_path.exists(), "crash-orphan worktree must be removed");
         assert!(ws_live.worktree_root().is_dir(), "a live worktree with an active row must survive");
         assert!(
             coding_workspaces::get(&db, &ws_live.row.id).await.unwrap().is_some(),
             "the live workspace's row must be untouched"
+        );
+    }
+
+    /// A rowless directory younger than the grace window is preserved, not reaped — this is the
+    /// window between `CodingWorkspace::open`'s `git worktree add` and its DB row insert
+    /// (workspace.rs:63,71), where a brand-new in-flight launch briefly looks identical to a
+    /// crash orphan. Reaping it here would delete a live run's worktree out from under it.
+    #[tokio::test]
+    async fn reconcile_filesystem_preserves_a_rowless_dir_younger_than_the_grace_window() {
+        let repo = init_repo().await;
+        let (_dbdir, db, _session_id) = test_db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+
+        let fresh_id = uuid::Uuid::new_v4().to_string();
+        let fresh_path = wt_root.path().join(&fresh_id);
+        let fresh_path_str = fresh_path.to_str().unwrap();
+        git(
+            repo.path(),
+            &["worktree", "add", "-b", &format!("haily/fresh-{fresh_id}"), fresh_path_str, "HEAD"],
+        )
+        .await;
+        assert!(fresh_path.is_dir(), "fixture setup: fresh worktree must exist before reconcile");
+
+        // Default grace (FS_ORPHAN_GRACE) — the dir is milliseconds old, nowhere near 5 minutes.
+        reconcile_filesystem(&db, wt_root.path(), FS_ORPHAN_GRACE).await;
+
+        assert!(
+            fresh_path.is_dir(),
+            "a rowless dir younger than the grace window must survive this tick"
         );
     }
 }
