@@ -889,6 +889,12 @@ impl PipelineRunner {
             // A pipeline stage's depth is expressed by its per-mode stage GRAPH, not by a
             // sub-turn prompt variant — keep the stage sub-turn itself at Normal.
             depth_mode: haily_types::DepthMode::Normal,
+            // View Engine Phase A (phase 3): `PipelineRunner` has no calling `ToolContext` to
+            // forward a shared sink from (unlike `DelegateTool`, see its `view_sink` doc) and
+            // a coding-pipeline stage's tool registry (`base_registry`) carries no
+            // view-producing tool (`present_view` is a chat-domain tool only) — a fresh,
+            // isolated store is therefore a correctness no-op, not a shared-store gap.
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         };
 
         let result = run_with_pausable_timeout(

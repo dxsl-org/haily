@@ -32,6 +32,7 @@ haily-app  = { path = "../crates/haily-app", features = ["llama"] }
 haily-io   = { path = "../crates/haily-io" }
 haily-db   = { path = "../crates/haily-db" }
 haily-kms  = { path = "../crates/haily-kms" }
+haily-core = { path = "../crates/haily-core" }
 haily-types = { path = "../crates/haily-types" }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

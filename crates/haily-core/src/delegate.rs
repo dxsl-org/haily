@@ -204,6 +204,11 @@ impl Tool for DelegateTool {
             // never LLM-forged) so a researcher/writer sub-agent picks up the user's chosen
             // depth playbook variant.
             depth_mode: ctx.depth_mode,
+            // View Engine Phase A (phase 3): forward the CALLING context's view sink rather
+            // than minting a fresh one, so a delegated sub-agent's `present_view` call lands
+            // in the same store the L0 turn (and ultimately `get_view`) observes — this is
+            // what makes the sharing transitive across however many delegation hops occur.
+            view_sink: Arc::clone(&ctx.view_sink),
         });
 
         let result = run_with_pausable_timeout(

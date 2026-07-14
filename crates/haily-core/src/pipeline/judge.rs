@@ -182,6 +182,11 @@ impl JudgeContext {
             run_id: None,
             grammar,
             depth_mode: DepthMode::Normal,
+            // View Engine Phase A (phase 3): a judge sub-turn's tool registry is read-only
+            // (`fs_read`/`fs_grep` + the synthetic `EmitJsonTool`) — no view-producing tool
+            // is ever reachable here, so a fresh, isolated store is a correctness no-op
+            // (mirrors `pipeline::runner`'s identical reasoning).
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         };
 
         let result = run_with_pausable_timeout(

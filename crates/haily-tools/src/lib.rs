@@ -8,6 +8,7 @@ pub mod schedule;
 pub mod security;
 pub mod skill_fetch;
 pub mod v1;
+pub mod view_present;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -244,6 +245,11 @@ impl ToolRegistry {
             // so they register + resolve unconditionally with no cargo feature gate.
             Arc::new(lsp::LspDiagnosticsTool) as Arc<dyn Tool>,
             Arc::new(lsp::LspRenameTool) as Arc<dyn Tool>,
+            // View Engine Phase A (phase 2) — the model's self-authored LlmProjected view.
+            // Read tier, no journal; quarantined to depth 0 (see execute()'s guard) and NOT
+            // listed in any domain/specialist whitelist below, so no sub-agent decision
+            // surface can ever reach it (see the exclusion test in haily-core's lib.rs).
+            Arc::new(view_present::PresentViewTool::new()) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }
