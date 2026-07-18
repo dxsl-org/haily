@@ -20,7 +20,10 @@ const CLOUD_STREAM_BOUND: usize = 32;
 /// against (see research report 01 sources).
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// OpenAI-compatible client with multi-key round-robin rotation.
+/// Cloud LLM client with multi-key round-robin rotation, speaking either the
+/// OpenAI-compatible dialect or Anthropic's native dialect (chosen by `base_url`, see
+/// `dialect()`) — both the streaming and non-streaming paths branch identically via
+/// `build_request`.
 ///
 /// On HTTP 429 (rate-limited) the current key is skipped and the next one is tried
 /// within the same request. Non-429 errors propagate immediately without rotation.

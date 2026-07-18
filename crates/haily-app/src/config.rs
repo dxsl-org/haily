@@ -51,18 +51,27 @@ async fn load_tier_endpoint(
     if let Ok(Some(json)) = meta::get_preference(db, json_key).await {
         if !json.trim().is_empty() {
             if let Ok(tp) = serde_json::from_str::<TierPref>(&json) {
-                if !tp.model.trim().is_empty() {
-                    let base_url = tp.base_url.filter(|s| !s.trim().is_empty());
+                let model = tp.model.trim().to_string();
+                if !model.is_empty() {
+                    // Trim before storing, not just before the emptiness check — the GUI
+                    // already trims on save, but a pref written by hand/migration/future
+                    // API must not persist surrounding whitespace into the model name or
+                    // URL (a trailing space in base_url breaks the request URL silently).
+                    let base_url = tp
+                        .base_url
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
                     let api_keys = tp
                         .api_keys
                         .map(|ks| {
                             ks.into_iter()
-                                .filter(|k| !k.trim().is_empty())
+                                .map(|k| k.trim().to_string())
+                                .filter(|k| !k.is_empty())
                                 .collect::<Vec<_>>()
                         })
                         .filter(|ks: &Vec<String>| !ks.is_empty());
                     return Some(TierEndpoint {
-                        model: tp.model,
+                        model,
                         base_url,
                         api_keys,
                     });
@@ -296,6 +305,30 @@ mod tests {
         assert_eq!(ep.model, "m");
         assert!(ep.base_url.is_none(), "blank base_url → inherit");
         assert!(ep.api_keys.is_none(), "all-blank key list → inherit");
+    }
+
+    #[tokio::test]
+    async fn tier_json_surrounding_whitespace_is_trimmed_before_storing() {
+        // The GUI already trims before saving, but a pref written by hand (DB edit,
+        // migration, future API) must not persist stray whitespace into the model name
+        // or endpoint — a trailing space in base_url silently breaks the request URL.
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(
+            kms.db(),
+            "llm.tier.fast",
+            r#"{"model":" gpt-4o-mini ","base_url":" https://api.openai.com ","api_keys":[" sk-1 "," sk-2 "]}"#,
+            "test",
+        )
+        .await
+        .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.fast.unwrap();
+        assert_eq!(ep.model, "gpt-4o-mini");
+        assert_eq!(ep.base_url.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(
+            ep.api_keys.as_deref(),
+            Some(&["sk-1".to_string(), "sk-2".to_string()][..])
+        );
     }
 
     #[tokio::test]
