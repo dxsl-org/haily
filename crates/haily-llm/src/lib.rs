@@ -15,7 +15,7 @@ pub use cloud::CloudClient;
 pub use escalation::{Egress, EscalationPolicy};
 pub use prompt::PromptFormat;
 pub use router::{
-    resolve_model_tier, LlmConfig, LlmRouter, RouterSnapshot, Tier, TierModels,
+    resolve_model_tier, LlmConfig, LlmRouter, RouterSnapshot, Tier, TierEndpoint, TierModels,
 };
 
 #[cfg(feature = "llama")]

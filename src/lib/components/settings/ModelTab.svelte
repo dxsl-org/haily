@@ -136,6 +136,53 @@
     apiKeys = apiKeys.map((k, idx) => (idx === i ? val : k));
   }
 
+  // ── Per-tier model config (hybrid multi-model) ──────────────────────────────
+  // Each routing tier names one cloud model; base_url/keys left blank inherit the
+  // defaults above (aggregator/single-provider case), or are overridden per tier
+  // (direct multi-provider case). Persisted as JSON under `llm.tier.<tier>`.
+
+  type TierKey = 'fast' | 'medium' | 'thinking' | 'ultra';
+  const TIER_ORDER: TierKey[] = ['fast', 'medium', 'thinking', 'ultra'];
+  const TIER_LABELS: Record<TierKey, string> = {
+    fast: 'Nhanh / rẻ',
+    medium: 'Cân bằng',
+    thinking: 'Suy luận',
+    ultra: 'Cao cấp',
+  };
+
+  interface TierCfg { model: string; baseUrl: string; apiKeys: string[]; showOverride: boolean; }
+  const emptyTier = (): TierCfg => ({ model: '', baseUrl: '', apiKeys: [], showOverride: false });
+  let tiers = $state<Record<TierKey, TierCfg>>({
+    fast: emptyTier(), medium: emptyTier(), thinking: emptyTier(), ultra: emptyTier(),
+  });
+
+  // Populate from prefs. New JSON `llm.tier.<t>` wins; legacy plain-model
+  // `llm.tier_model.<t>` (Phase-3 foundation) is a backward-compat fallback.
+  $effect(() => {
+    for (const t of TIER_ORDER) {
+      const json = prefs[`llm.tier.${t}`];
+      if (json) {
+        try {
+          const o = JSON.parse(json);
+          if (o && typeof o.model === 'string') {
+            const baseUrl = typeof o.base_url === 'string' ? o.base_url : '';
+            const keys = Array.isArray(o.api_keys) ? o.api_keys.filter((k: unknown) => typeof k === 'string') : [];
+            tiers[t] = { model: o.model, baseUrl, apiKeys: keys, showOverride: Boolean(baseUrl.trim() || keys.length) };
+            continue;
+          }
+        } catch {}
+      }
+      const legacy = prefs[`llm.tier_model.${t}`];
+      if (legacy) tiers[t] = { model: legacy, baseUrl: '', apiKeys: [], showOverride: false };
+    }
+  });
+
+  function addTierKey(t: TierKey) { tiers[t].apiKeys = [...tiers[t].apiKeys, '']; }
+  function removeTierKey(t: TierKey, i: number) { tiers[t].apiKeys = tiers[t].apiKeys.filter((_, idx) => idx !== i); }
+  function updateTierKey(t: TierKey, i: number, val: string) {
+    tiers[t].apiKeys = tiers[t].apiKeys.map((k, idx) => (idx === i ? val : k));
+  }
+
   async function applyCloud() {
     cloudApplyError = '';
     cloudApplyOk = '';
@@ -143,9 +190,30 @@
     try {
       const filtered = apiKeys.map(k => k.trim()).filter(Boolean);
       await save('llm.cloud_api_keys', JSON.stringify(filtered));
+
+      // Persist each tier's model + optional own endpoint/keys. A blank model clears the
+      // tier; the legacy plain-string pref is always cleared so it can never resurrect and
+      // shadow the new JSON schema.
+      let tierCount = 0;
+      for (const t of TIER_ORDER) {
+        const model = tiers[t].model.trim();
+        if (model) {
+          const blob: Record<string, unknown> = { model };
+          const bu = tiers[t].baseUrl.trim();
+          if (bu) blob.base_url = bu;
+          const keys = tiers[t].apiKeys.map(k => k.trim()).filter(Boolean);
+          if (keys.length) blob.api_keys = keys;
+          await save(`llm.tier.${t}`, JSON.stringify(blob));
+          tierCount++;
+        } else {
+          await save(`llm.tier.${t}`, '');
+        }
+        await save(`llm.tier_model.${t}`, '');
+      }
+
       const provider = await reloadLlm();
       cloudApplyOk = provider !== 'unconfigured'
-        ? `✓ Đã áp dụng — ${filtered.length} key, provider: ${provider}`
+        ? `✓ Đã áp dụng — ${filtered.length} key, ${tierCount} model theo tier, provider: ${provider}`
         : '⚠️ Không có key hợp lệ — kiểm tra lại API key.';
     } catch (e) {
       cloudApplyError = String(e);
@@ -261,14 +329,15 @@
       <input type="text" value={p('llm.cloud_base_url', 'https://api.openai.com')}
         onblur={e => save('llm.cloud_base_url', e.currentTarget.value)} />
     </label>
-    <label>Model
+    <label>Model mặc định
       <input type="text" value={p('llm.cloud_model', 'gpt-4o-mini')}
         onblur={e => save('llm.cloud_model', e.currentTarget.value)} />
+      <span class="hint">Dùng khi tắt auto-routing, hoặc làm fallback cho tier chưa gán model.</span>
     </label>
 
     <div class="key-section">
       <div class="key-header">
-        <span class="key-label">API Keys <span class="key-count">({apiKeys.length})</span></span>
+        <span class="key-label">API Keys mặc định <span class="key-count">({apiKeys.length})</span></span>
         <button class="add-btn" onclick={addKey}>+ Thêm key</button>
       </div>
       {#if apiKeys.length === 0}
@@ -291,6 +360,69 @@
       {/if}
       <span class="hint">
         Nhiều key luân phiên theo vòng tròn. Nếu một key bị rate-limit (429), key kế tiếp được dùng tự động.
+      </span>
+    </div>
+
+    <div class="tier-section">
+      <div class="tier-title">
+        Model theo tier <span class="tier-sub">(khi bật auto-routing)</span>
+      </div>
+      {#each TIER_ORDER as t}
+        <div class="tier-row">
+          <span class="tier-label">{TIER_LABELS[t]}</span>
+          <input
+            class="tier-model"
+            type="text"
+            placeholder="để trống = dùng model mặc định"
+            value={tiers[t].model}
+            oninput={e => tiers[t].model = e.currentTarget.value}
+          />
+          <button
+            class="ovr-btn"
+            class:active={tiers[t].showOverride}
+            onclick={() => tiers[t].showOverride = !tiers[t].showOverride}
+            title="Endpoint / key riêng cho tier này"
+          >⚙</button>
+        </div>
+        {#if tiers[t].showOverride}
+          <div class="tier-override">
+            <label>Base URL riêng
+              <input
+                type="text"
+                placeholder="trống = dùng Base URL mặc định"
+                value={tiers[t].baseUrl}
+                oninput={e => tiers[t].baseUrl = e.currentTarget.value}
+              />
+              <span class="hint">Nên là endpoint OpenAI-compatible (OpenAI, Groq, Together, OpenRouter, vLLM…). Anthropic/Google native chưa chạy đủ trên mọi luồng.</span>
+            </label>
+            <div class="key-section">
+              <div class="key-header">
+                <span class="key-label">API Keys riêng <span class="key-count">({tiers[t].apiKeys.length})</span></span>
+                <button class="add-btn" onclick={() => addTierKey(t)}>+ Thêm key</button>
+              </div>
+              {#if tiers[t].apiKeys.length}
+                <div class="key-list">
+                  {#each tiers[t].apiKeys as key, i}
+                    <div class="key-row">
+                      <span class="key-idx">{i + 1}</span>
+                      <input
+                        type="password"
+                        placeholder="sk-..."
+                        value={key}
+                        oninput={e => updateTierKey(t, i, e.currentTarget.value)}
+                      />
+                      <button class="del-btn" onclick={() => removeTierKey(t, i)} title="Xóa key này">✕</button>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              <span class="hint">Trống = dùng key mặc định ở trên.</span>
+            </div>
+          </div>
+        {/if}
+      {/each}
+      <span class="hint">
+        Mỗi tier gọi 1 model. Để trống endpoint/key = kế thừa mặc định (đủ cho OpenRouter). Điền riêng khi dùng provider trực tiếp khác nhau.
       </span>
     </div>
 
@@ -457,6 +589,49 @@
     border-radius: 8px;
     border: 1px dashed #2e2e4a;
   }
+  .tier-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 14px;
+    border-top: 1px solid #2e2e4a;
+  }
+  .tier-title { font-size: 12px; color: #8884aa; }
+  .tier-sub { color: #4a4a6a; font-size: 11px; }
+  .tier-row { display: flex; align-items: center; gap: 6px; }
+  .tier-label {
+    flex-shrink: 0;
+    width: 82px;
+    font-size: 11px;
+    color: #a09ac0;
+  }
+  .tier-model { flex: 1; }
+  .ovr-btn {
+    flex-shrink: 0;
+    width: 30px;
+    height: 30px;
+    border: 1px solid #2e2e4a;
+    border-radius: 6px;
+    background: #16162a;
+    color: #6b6b8a;
+    font-size: 13px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .ovr-btn:hover { color: #c084fc; border-color: #4a3a7a; }
+  .ovr-btn.active { color: #c084fc; border-color: #4c1d95; background: #1e1635; }
+  .tier-override {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin: 2px 0 6px 88px;
+    padding: 10px;
+    background: #0f0f18;
+    border: 1px solid #2e2e4a;
+    border-radius: 8px;
+  }
+
   .apply-btn {
     padding: 8px 14px;
     border: none;

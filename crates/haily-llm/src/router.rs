@@ -195,24 +195,52 @@ impl RouterSnapshot {
     }
 }
 
-/// Optional cloud model-name override per tier. Every field defaults to `None`,
-/// meaning "no override — use `LlmConfig::cloud_model`" — this is the zero-behavior-
-/// change default the phase-07 spec requires.
+/// One tier's cloud endpoint override: which model to call, and optionally its own
+/// base URL / API-key pool.
+///
+/// `base_url == None` inherits [`LlmConfig::cloud_base_url`]; `api_keys == None` (or an
+/// empty vec) inherits [`LlmConfig::cloud_api_keys`]. This is the hybrid model-config
+/// contract: a single-provider / aggregator user (e.g. OpenRouter) leaves both `None` and
+/// only names a model per tier, while a direct multi-provider user overrides the endpoint
+/// and keys per tier. Key material here follows the same no-log discipline as
+/// `LlmConfig::cloud_api_keys` — never emit it to `tracing`.
+#[derive(Debug, Clone)]
+pub struct TierEndpoint {
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_keys: Option<Vec<String>>,
+}
+
+impl TierEndpoint {
+    /// A tier endpoint that names only a model and inherits the session-default base URL
+    /// and API-key pool (the aggregator / single-provider case).
+    pub fn inherit(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            base_url: None,
+            api_keys: None,
+        }
+    }
+}
+
+/// Optional cloud endpoint override per tier. Every field defaults to `None`,
+/// meaning "no override — use `LlmConfig::cloud_model` on the default endpoint" — this is
+/// the zero-behavior-change default the phase-07 spec requires.
 #[derive(Debug, Clone, Default)]
 pub struct TierModels {
-    pub fast: Option<String>,
-    pub medium: Option<String>,
-    pub thinking: Option<String>,
-    pub ultra: Option<String>,
+    pub fast: Option<TierEndpoint>,
+    pub medium: Option<TierEndpoint>,
+    pub thinking: Option<TierEndpoint>,
+    pub ultra: Option<TierEndpoint>,
 }
 
 impl TierModels {
-    fn get(&self, tier: Tier) -> Option<&str> {
+    fn get(&self, tier: Tier) -> Option<&TierEndpoint> {
         match tier {
-            Tier::Fast => self.fast.as_deref(),
-            Tier::Medium => self.medium.as_deref(),
-            Tier::Thinking => self.thinking.as_deref(),
-            Tier::Ultra => self.ultra.as_deref(),
+            Tier::Fast => self.fast.as_ref(),
+            Tier::Medium => self.medium.as_ref(),
+            Tier::Thinking => self.thinking.as_ref(),
+            Tier::Ultra => self.ultra.as_ref(),
         }
     }
 }
@@ -282,22 +310,47 @@ impl Default for LlmConfig {
 }
 
 /// Builds one `CloudClient` per tier that names a model override in
-/// `config.tier_models`, reusing `config`'s base URL and API keys. Silently skips
-/// (with a warning) a tier whose override is set but no cloud keys are configured —
-/// `complete_tiered` degrades to `primary` in that case, which is always correct.
+/// `config.tier_models`. Each tier's `base_url` / `api_keys` come from its own
+/// [`TierEndpoint`] when set, else inherit `config`'s session defaults (the hybrid
+/// contract). Silently skips (with a warning) a tier whose resolved key pool is empty —
+/// both its own AND the inherited default are empty — since `complete_tiered` then
+/// degrades to `primary`, which is always correct.
+///
+/// Note: unlike the pre-hybrid version, there is NO early return when the session-default
+/// keys are empty — a tier may carry its OWN keys (direct-provider case) even when no
+/// default pool is configured.
+/// The effective API-key pool for a tier endpoint: its OWN keys when non-empty, else the
+/// session-default pool. An empty result means no keys resolve anywhere — the tier cannot
+/// build a client and routing falls back to `primary`. Shared by [`build_tier_clients`] and
+/// [`tier_model_names`] so the snapshot never names a tier the router can't actually route to.
+fn resolve_tier_keys(config: &LlmConfig, ep: &TierEndpoint) -> Vec<String> {
+    match &ep.api_keys {
+        Some(k) if !k.is_empty() => k.clone(),
+        _ => config.cloud_api_keys.clone(),
+    }
+}
+
 fn build_tier_clients(config: &LlmConfig) -> HashMap<Tier, Arc<dyn LlmClient>> {
     let mut clients: HashMap<Tier, Arc<dyn LlmClient>> = HashMap::new();
-    if config.cloud_api_keys.is_empty() {
-        return clients;
-    }
-    for (tier, model) in [
-        (Tier::Fast, config.tier_models.get(Tier::Fast)),
-        (Tier::Medium, config.tier_models.get(Tier::Medium)),
-        (Tier::Thinking, config.tier_models.get(Tier::Thinking)),
-        (Tier::Ultra, config.tier_models.get(Tier::Ultra)),
-    ] {
-        let Some(model) = model else { continue };
-        match CloudClient::new(config.cloud_base_url.clone(), config.cloud_api_keys.clone(), model) {
+    for tier in [Tier::Fast, Tier::Medium, Tier::Thinking, Tier::Ultra] {
+        let Some(ep) = config.tier_models.get(tier) else {
+            continue;
+        };
+        // Inherit-or-override: a blank per-tier base_url/keys falls back to the session
+        // defaults, so an aggregator user who only names models gets the default endpoint.
+        let base_url = ep
+            .base_url
+            .clone()
+            .unwrap_or_else(|| config.cloud_base_url.clone());
+        let keys = resolve_tier_keys(config, ep);
+        if keys.is_empty() {
+            tracing::warn!(
+                ?tier,
+                "tier model override set but no API keys (own or inherited) — skipping; routing falls back to primary"
+            );
+            continue;
+        }
+        match CloudClient::new(base_url, keys, &ep.model) {
             Ok(client) => {
                 clients.insert(tier, Arc::new(client));
             }
@@ -314,8 +367,14 @@ fn build_tier_clients(config: &LlmConfig) -> HashMap<Tier, Arc<dyn LlmClient>> {
 fn tier_model_names(config: &LlmConfig) -> HashMap<Tier, String> {
     let mut names = HashMap::new();
     for tier in [Tier::Fast, Tier::Medium, Tier::Thinking, Tier::Ultra] {
-        if let Some(model) = config.tier_models.get(tier) {
-            names.insert(tier, model.to_string());
+        if let Some(ep) = config.tier_models.get(tier) {
+            // Only report a tier the router can actually build a client for — a tier whose
+            // keys resolve empty (own blank AND default blank) is skipped by
+            // `build_tier_clients`, so naming it here would make the badge/snapshot report
+            // a model routing never uses (it silently falls back to `primary`).
+            if !resolve_tier_keys(config, ep).is_empty() {
+                names.insert(tier, ep.model.clone());
+            }
         }
     }
     names
@@ -730,7 +789,7 @@ mod tier_tests {
             cloud_base_url: base_url,
             cloud_model: "default-model".to_string(),
             tier_models: TierModels {
-                fast: Some("fast-model".to_string()),
+                fast: Some(TierEndpoint::inherit("fast-model")),
                 medium: None,
                 thinking: None,
                 ultra: None,
@@ -748,6 +807,139 @@ mod tier_tests {
         let text = router.complete_tiered(Some(Tier::Fast), req).await.expect("completion");
 
         assert_eq!(text, "fast-model", "Some(configured tier) must route to its override model");
+    }
+
+    /// Always responds with `content` verbatim, ignoring the request body. Distinguishes
+    /// "which server handled the call" from "which model name was sent" — the model-echo
+    /// server can't prove a per-tier `base_url` override because the model name rides in
+    /// the request body regardless of endpoint.
+    async fn spawn_fixed_content_server(content: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let _ = stream.read(&mut buf).await;
+                    let payload =
+                        serde_json::json!({ "choices": [{ "message": { "content": content } }] })
+                            .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Echoes back the bearer token from the `Authorization` header as the completion
+    /// text — proves which API key a call actually sent (the non-stream path uses
+    /// `.bearer_auth(key)`, i.e. `Authorization: Bearer <token>`).
+    async fn spawn_auth_echo_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request_text = String::from_utf8_lossy(&buf[..n]);
+                    let token = request_text
+                        .split("Bearer ")
+                        .nth(1)
+                        .and_then(|rest| rest.split(['\r', '\n']).next())
+                        .unwrap_or("no-token")
+                        .to_string();
+                    let payload =
+                        serde_json::json!({ "choices": [{ "message": { "content": token } }] })
+                            .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn tier_endpoint_with_own_base_url_routes_to_its_own_server() {
+        let default_url = spawn_model_echo_server().await;
+        let tier_url = spawn_fixed_content_server("HIT-TIER-SERVER").await;
+        #[allow(clippy::needless_update)]
+        let config = LlmConfig {
+            cloud_api_keys: vec!["default-key".to_string()],
+            cloud_base_url: default_url,
+            cloud_model: "default-model".to_string(),
+            tier_models: TierModels {
+                fast: Some(TierEndpoint {
+                    model: "fast-model".to_string(),
+                    base_url: Some(tier_url),
+                    api_keys: None, // inherits default-key
+                }),
+                ..TierModels::default()
+            },
+            ..LlmConfig::default()
+        };
+        let router = LlmRouter::init(config).await;
+
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text = router
+            .complete_tiered(Some(Tier::Fast), req)
+            .await
+            .expect("completion");
+        assert_eq!(
+            text, "HIT-TIER-SERVER",
+            "Fast tier must hit its OWN base_url, not the default endpoint"
+        );
+
+        // The default path (tier=None) still routes to the default endpoint.
+        let req2 = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text2 = router
+            .complete_tiered(None, req2)
+            .await
+            .expect("completion");
+        assert_eq!(text2, "default-model");
+    }
+
+    #[tokio::test]
+    async fn tier_endpoint_with_own_api_keys_sends_its_own_key() {
+        let url = spawn_auth_echo_server().await;
+        #[allow(clippy::needless_update)]
+        let config = LlmConfig {
+            cloud_api_keys: vec!["default-key".to_string()],
+            cloud_base_url: url,
+            cloud_model: "default-model".to_string(),
+            tier_models: TierModels {
+                ultra: Some(TierEndpoint {
+                    model: "big".to_string(),
+                    base_url: None, // inherits the (single) test endpoint
+                    api_keys: Some(vec!["ultra-key".to_string()]),
+                }),
+                ..TierModels::default()
+            },
+            ..LlmConfig::default()
+        };
+        let router = LlmRouter::init(config).await;
+
+        let req = CompletionRequest::simple(vec![Message::user("hi")]);
+        let text = router
+            .complete_tiered(Some(Tier::Ultra), req)
+            .await
+            .expect("completion");
+        assert_eq!(
+            text, "ultra-key",
+            "Ultra tier must send its OWN api key, not the inherited default"
+        );
     }
 
     #[tokio::test]
@@ -771,6 +963,46 @@ mod tier_tests {
         let text = router.complete_tiered(Some(Tier::Medium), req).await.expect("completion");
 
         assert_eq!(text, "default-model", "tier=Some(unconfigured) must fall back to the default model");
+    }
+
+    #[tokio::test]
+    async fn tier_with_no_resolvable_keys_is_absent_from_snapshot() {
+        // A tier that names a model but has neither its own keys nor a default pool is
+        // unbuildable — `build_tier_clients` skips it and routing falls back to primary.
+        // The snapshot must NOT name it (else the turn-meta badge would report a model the
+        // router never uses); a tier WITH its own keys is still reported even when defaults
+        // are empty.
+        #[allow(clippy::needless_update)]
+        let config = LlmConfig {
+            cloud_api_keys: vec![], // no default key pool
+            cloud_base_url: "http://127.0.0.1:1".to_string(),
+            cloud_model: "default-model".to_string(),
+            tier_models: TierModels {
+                ultra: Some(TierEndpoint {
+                    model: "big".to_string(),
+                    base_url: None,
+                    api_keys: None, // resolves empty (own None + default empty)
+                }),
+                fast: Some(TierEndpoint {
+                    model: "fast-model".to_string(),
+                    base_url: None,
+                    api_keys: Some(vec!["own-key".to_string()]), // resolvable on its own
+                }),
+                ..TierModels::default()
+            },
+            ..LlmConfig::default()
+        };
+        let snap = LlmRouter::init(config).await.snapshot();
+        assert_eq!(
+            snap.model_for_tier(Some(Tier::Ultra)),
+            "default-model",
+            "unbuildable tier must report the default model, mirroring the routing fallback"
+        );
+        assert_eq!(
+            snap.model_for_tier(Some(Tier::Fast)),
+            "fast-model",
+            "a tier with its own keys is reported even when default keys are empty"
+        );
     }
 
     #[tokio::test]
@@ -897,10 +1129,10 @@ mod resolution_tests {
             cloud_base_url: "http://127.0.0.1:1".to_string(),
             cloud_model: "gpt-4o".to_string(),
             tier_models: TierModels {
-                fast: Some("gpt-4o-mini".to_string()),
+                fast: Some(TierEndpoint::inherit("gpt-4o-mini")),
                 medium: None,
                 thinking: None,
-                ultra: Some("claude-opus-4".to_string()),
+                ultra: Some(TierEndpoint::inherit("claude-opus-4")),
             },
             ..LlmConfig::default()
         };
