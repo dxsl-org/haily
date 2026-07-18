@@ -393,7 +393,7 @@
                 value={tiers[t].baseUrl}
                 oninput={e => tiers[t].baseUrl = e.currentTarget.value}
               />
-              <span class="hint">Nên là endpoint OpenAI-compatible (OpenAI, Groq, Together, OpenRouter, vLLM…). Anthropic/Google native chưa chạy đủ trên mọi luồng.</span>
+              <span class="hint">Hỗ trợ endpoint OpenAI-compatible (OpenAI, Groq, Together, OpenRouter, vLLM…) và Anthropic native (api.anthropic.com). Gemini: dùng endpoint OpenAI-compatible của Google (…/v1beta/openai).</span>
             </label>
             <div class="key-section">
               <div class="key-header">
