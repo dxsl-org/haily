@@ -43,7 +43,7 @@ fn build_turn_meta_badge(snapshot: &RouterSnapshot, tier: Option<Tier>) -> Strin
 #[cfg(test)]
 mod turn_meta_badge_tests {
     use super::*;
-    use haily_llm::{LlmConfig, TierModels};
+    use haily_llm::{LlmConfig, TierEndpoint, TierModels};
 
     /// `Some(tier)` with a configured tier-model override renders "tier · model".
     #[tokio::test]
@@ -53,7 +53,7 @@ mod turn_meta_badge_tests {
             cloud_base_url: "http://127.0.0.1:1".to_string(),
             cloud_model: "default-model".to_string(),
             tier_models: TierModels {
-                thinking: Some("big-model".to_string()),
+                thinking: Some(TierEndpoint::inherit("big-model")),
                 ..TierModels::default()
             },
             ..LlmConfig::default()
@@ -1852,7 +1852,7 @@ mod routing_toggle_tests {
     //! telemetry row.
     use super::outcome_signal_tests::{run_plain_turn, run_plain_turn_with_routing};
     use super::*;
-    use haily_llm::LlmConfig;
+    use haily_llm::{LlmConfig, TierEndpoint};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1979,7 +1979,7 @@ mod routing_toggle_tests {
         };
         // A distinct override — if escalation fired despite the kill switch, the no-op
         // guard alone would not stop it (this is the exact config the gap allowed).
-        config.tier_models.medium = Some("distinct-medium-model".to_string());
+        config.tier_models.medium = Some(TierEndpoint::inherit("distinct-medium-model"));
         let llm = Arc::new(LlmRouter::init(config).await);
 
         let runtime = TurnRuntime {

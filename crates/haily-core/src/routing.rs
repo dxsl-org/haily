@@ -512,7 +512,7 @@ mod escalation_tests {
     //! convention, duplicated rather than shared — see `sub_turn.rs`'s doc for that
     //! precedent). No real network call: bound to `127.0.0.1:0`, OS-assigned port.
     use super::*;
-    use haily_llm::{LlmConfig, Message};
+    use haily_llm::{LlmConfig, Message, TierEndpoint};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -661,7 +661,7 @@ mod escalation_tests {
         let mut config = cloud_config(base_url);
         // A distinct Medium override so `model_for_tier(Some(Medium)) != model_for_tier(None)`
         // — the no-op guard must NOT fire here.
-        config.tier_models.medium = Some("distinct-medium-model".to_string());
+        config.tier_models.medium = Some(TierEndpoint::inherit("distinct-medium-model"));
         let llm = LlmRouter::init(config).await;
         let cancel = CancellationToken::new();
 

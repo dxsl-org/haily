@@ -10,9 +10,10 @@
 use crate::credential_store::CredentialStore;
 use haily_db::queries::meta;
 use haily_kms::KmsHandle;
-use haily_llm::LlmConfig;
+use haily_llm::{LlmConfig, TierEndpoint};
 #[cfg(feature = "llama")]
 use haily_llm::PromptFormat;
+use serde::Deserialize;
 
 /// A stored preference string mapped to `Some` only when non-empty — an empty tier
 /// override must read as "no override" (`None`), not as a model literally named `""`.
@@ -22,6 +23,67 @@ fn non_empty(v: String) -> Option<String> {
     } else {
         Some(v)
     }
+}
+
+/// Wire shape of the per-tier endpoint preference `llm.tier.<tier>` (hybrid multi-model
+/// config). `base_url`/`api_keys` are optional — absent or blank means "inherit the
+/// session default" (`LlmConfig::cloud_base_url` / `cloud_api_keys`).
+#[derive(Deserialize)]
+struct TierPref {
+    model: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_keys: Option<Vec<String>>,
+}
+
+/// Load one tier's endpoint override, preferring the new JSON schema
+/// (`llm.tier.<tier>` = `{"model","base_url","api_keys"}`) and falling back to the legacy
+/// plain-model-name pref (`llm.tier_model.<tier>`) for backward compatibility. A blank
+/// model, blank base_url, or all-blank key list each normalize to `None` (inherit), so a
+/// half-filled row never produces a model literally named `""` or an empty-string endpoint.
+async fn load_tier_endpoint(
+    db: &haily_db::DbHandle,
+    json_key: &str,
+    legacy_key: &str,
+) -> Option<TierEndpoint> {
+    // New schema: JSON blob. Only accept it when it parses AND names a non-blank model.
+    if let Ok(Some(json)) = meta::get_preference(db, json_key).await {
+        if !json.trim().is_empty() {
+            if let Ok(tp) = serde_json::from_str::<TierPref>(&json) {
+                let model = tp.model.trim().to_string();
+                if !model.is_empty() {
+                    // Trim before storing, not just before the emptiness check — the GUI
+                    // already trims on save, but a pref written by hand/migration/future
+                    // API must not persist surrounding whitespace into the model name or
+                    // URL (a trailing space in base_url breaks the request URL silently).
+                    let base_url = tp
+                        .base_url
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let api_keys = tp
+                        .api_keys
+                        .map(|ks| {
+                            ks.into_iter()
+                                .map(|k| k.trim().to_string())
+                                .filter(|k| !k.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|ks: &Vec<String>| !ks.is_empty());
+                    return Some(TierEndpoint {
+                        model,
+                        base_url,
+                        api_keys,
+                    });
+                }
+            }
+        }
+    }
+    // Legacy: plain model-name string; endpoint + keys inherit the session default.
+    if let Ok(Some(v)) = meta::get_preference(db, legacy_key).await {
+        return non_empty(v).map(TierEndpoint::inherit);
+    }
+    None
 }
 
 /// Load LLM routing config from KMS preferences, falling back to env vars then defaults.
@@ -54,22 +116,18 @@ pub async fn load_llm_config(kms: &KmsHandle) -> LlmConfig {
         }
     }
 
-    // Per-tier cloud model-name overrides (Phase 3 tier foundation). Each is stored as a
-    // plain model-name string under `llm.tier_model.<tier>`; an absent key leaves the
-    // tier at `None`, which `complete_tiered` treats as "use the default model" — so
-    // routing is IDENTICAL to today until an operator sets at least one of these.
-    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.fast").await {
-        cfg.tier_models.fast = non_empty(v);
-    }
-    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.medium").await {
-        cfg.tier_models.medium = non_empty(v);
-    }
-    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.thinking").await {
-        cfg.tier_models.thinking = non_empty(v);
-    }
-    if let Ok(Some(v)) = meta::get_preference(db, "llm.tier_model.ultra").await {
-        cfg.tier_models.ultra = non_empty(v);
-    }
+    // Per-tier cloud endpoint overrides (hybrid multi-model config). New schema is a JSON
+    // blob under `llm.tier.<tier>` carrying model + optional own base_url/api_keys;
+    // legacy plain-model-name `llm.tier_model.<tier>` still loads (inherit endpoint+keys).
+    // An absent/blank tier leaves it `None`, which `complete_tiered` treats as "use the
+    // default model" — so routing is IDENTICAL to today until an operator sets at least one.
+    cfg.tier_models.fast = load_tier_endpoint(db, "llm.tier.fast", "llm.tier_model.fast").await;
+    cfg.tier_models.medium =
+        load_tier_endpoint(db, "llm.tier.medium", "llm.tier_model.medium").await;
+    cfg.tier_models.thinking =
+        load_tier_endpoint(db, "llm.tier.thinking", "llm.tier_model.thinking").await;
+    cfg.tier_models.ultra =
+        load_tier_endpoint(db, "llm.tier.ultra", "llm.tier_model.ultra").await;
 
     // Multi-key: stored as JSON array under `llm.cloud_api_keys`.
     // Backward compat: fall back to the old single-key `llm.cloud_api_key`.
@@ -195,6 +253,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(load_llm_config(&kms).await.cost_quality, 3);
+    }
+
+    #[tokio::test]
+    async fn tier_json_schema_loads_model_and_own_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(
+            kms.db(),
+            "llm.tier.ultra",
+            r#"{"model":"claude-opus-4","base_url":"https://api.anthropic.com","api_keys":["sk-ant-1","sk-ant-2"]}"#,
+            "test",
+        )
+        .await
+        .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.ultra.unwrap();
+        assert_eq!(ep.model, "claude-opus-4");
+        assert_eq!(ep.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(
+            ep.api_keys.as_deref(),
+            Some(&["sk-ant-1".to_string(), "sk-ant-2".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_json_with_only_a_model_inherits_endpoint_and_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.tier.fast", r#"{"model":"gpt-4o-mini"}"#, "test")
+            .await
+            .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.fast.unwrap();
+        assert_eq!(ep.model, "gpt-4o-mini");
+        assert!(ep.base_url.is_none(), "absent base_url must inherit (None)");
+        assert!(ep.api_keys.is_none(), "absent api_keys must inherit (None)");
+    }
+
+    #[tokio::test]
+    async fn tier_json_blank_endpoint_and_key_fields_normalize_to_inherit() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(
+            kms.db(),
+            "llm.tier.medium",
+            r#"{"model":"m","base_url":"  ","api_keys":["","  "]}"#,
+            "test",
+        )
+        .await
+        .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.medium.unwrap();
+        assert_eq!(ep.model, "m");
+        assert!(ep.base_url.is_none(), "blank base_url → inherit");
+        assert!(ep.api_keys.is_none(), "all-blank key list → inherit");
+    }
+
+    #[tokio::test]
+    async fn tier_json_surrounding_whitespace_is_trimmed_before_storing() {
+        // The GUI already trims before saving, but a pref written by hand (DB edit,
+        // migration, future API) must not persist stray whitespace into the model name
+        // or endpoint — a trailing space in base_url silently breaks the request URL.
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(
+            kms.db(),
+            "llm.tier.fast",
+            r#"{"model":" gpt-4o-mini ","base_url":" https://api.openai.com ","api_keys":[" sk-1 "," sk-2 "]}"#,
+            "test",
+        )
+        .await
+        .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.fast.unwrap();
+        assert_eq!(ep.model, "gpt-4o-mini");
+        assert_eq!(ep.base_url.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(
+            ep.api_keys.as_deref(),
+            Some(&["sk-1".to_string(), "sk-2".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_json_blank_model_is_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.tier.thinking", r#"{"model":"   "}"#, "test")
+            .await
+            .unwrap();
+        assert!(load_llm_config(&kms).await.tier_models.thinking.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_plain_tier_model_pref_still_loads_as_inherit() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.tier_model.fast", "gpt-4o-mini", "test")
+            .await
+            .unwrap();
+        let ep = load_llm_config(&kms).await.tier_models.fast.unwrap();
+        assert_eq!(ep.model, "gpt-4o-mini");
+        assert!(ep.base_url.is_none());
+        assert!(ep.api_keys.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_tier_json_wins_over_legacy_plain_pref() {
+        let dir = tempfile::tempdir().unwrap();
+        let kms = test_kms(dir.path()).await;
+        meta::upsert_preference(kms.db(), "llm.tier_model.fast", "legacy-model", "test")
+            .await
+            .unwrap();
+        meta::upsert_preference(kms.db(), "llm.tier.fast", r#"{"model":"new-model"}"#, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_llm_config(&kms).await.tier_models.fast.unwrap().model,
+            "new-model"
+        );
     }
 
     #[tokio::test]
