@@ -16,6 +16,10 @@ mod specialists;
 mod tag_matcher;
 mod tier_intent;
 mod tool_call;
+/// View Engine Phase A — in-memory `ViewStore` for `DataView` snapshots. Public because
+/// Phase 3 wires `Arc<ViewStore>` into the Orchestrator and beyond; not yet bootstrap-
+/// threaded in this phase (see `view::store` doc comment).
+pub mod view;
 pub mod worktree;
 
 pub use approval::{ApprovalBroker, PendingApproval};
@@ -63,6 +67,13 @@ pub struct Orchestrator {
     /// `false` collapses every turn's tier decision to `None` (identical model selection
     /// to a pre-phase-4 turn) and skips the `routing_decisions` telemetry write entirely.
     routing_enabled: Arc<AtomicBool>,
+    /// View Engine Phase A (phase 3): the ONE `ViewStore` instance for this orchestrator's
+    /// lifetime — cloned into every turn/sub-turn `ToolContext` (as `Arc<dyn ViewSink>`, the
+    /// write side) and exposed via [`Self::view_store`] (the read side, GUI-consumption-only;
+    /// see the quarantine test in this module) so a tool's `present_view` insert and the
+    /// `get_view` Tauri command observe the SAME snapshot. Mirrors `approval_broker`: one
+    /// shared instance for the whole orchestrator lifetime, never per-turn.
+    view_store: Arc<view::ViewStore>,
 }
 
 impl Orchestrator {
@@ -396,6 +407,7 @@ impl Orchestrator {
             approval_broker: Arc::new(ApprovalBroker::with_auto_approve(auto_approve)),
             kill,
             routing_enabled,
+            view_store: Arc::new(view::ViewStore::new()),
         })
     }
 
@@ -431,6 +443,7 @@ impl Orchestrator {
             tools: Arc::clone(&self.tools),
             kill: Arc::clone(&self.kill),
             routing_enabled: Arc::clone(&self.routing_enabled),
+            view_store: Arc::clone(&self.view_store),
         };
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
     }
@@ -478,6 +491,16 @@ impl Orchestrator {
     /// on, upcast to the layering-safe trait object defined in `haily-types`.
     pub fn approval_resolver(&self) -> Arc<dyn ApprovalResolver> {
         Arc::clone(&self.approval_broker) as Arc<dyn ApprovalResolver>
+    }
+
+    /// View Engine Phase A (phase 3): the shared `ViewStore` handle, read via
+    /// `app_handle.orchestrator.view_store()` — exactly how `approve_tool` reaches
+    /// `app_handle.orchestrator.approval_resolver()`. GUI-CONSUMPTION-ONLY (SEC F2): this is
+    /// the read side (`get`); no `haily-core`/`haily-tools` code may call it (see the
+    /// `view_store_quarantine_tests` module below) — the write side is `ToolContext.view_sink`
+    /// (`Arc<dyn ViewSink>`, insert-only).
+    pub fn view_store(&self) -> Arc<view::ViewStore> {
+        Arc::clone(&self.view_store)
     }
 
     /// App-layer-facing handle for RAISING a new approval request (not resolving one) —
@@ -856,6 +879,33 @@ mod wiring_tests {
         );
     }
 
+    /// View Engine Phase A, phase 2 (quarantine): `present_view` must never appear in a
+    /// sub-agent decision-surface whitelist — every `DOMAINS`/`SPECIALISTS` `allowed_tools`
+    /// entry is a tool a delegated (depth >= 1) turn can reach, and an `LlmProjected` view is
+    /// explicitly quarantined from ever being minted inside such a chain (belt-and-suspenders
+    /// on top of `present_view`'s own `ctx.depth != 0` refusal and the sub-turn forwarder that
+    /// already discards non-approval chunks — see `delegate.rs`). `present_view` is registered
+    /// in `build_v1` for the interactive tool set only and is deliberately absent from every
+    /// whitelist literal below; this test pins that absence so a future edit cannot silently
+    /// add it to a delegation surface.
+    #[test]
+    fn present_view_excluded_from_every_delegation_whitelist() {
+        for d in DOMAINS {
+            assert!(
+                !d.allowed_tools.contains(&"present_view"),
+                "domain {} must not whitelist present_view (LlmProjected views are depth-0-only)",
+                d.tool_name
+            );
+        }
+        for s in SPECIALISTS {
+            assert!(
+                !s.allowed_tools.contains(&"present_view"),
+                "specialist {} must not whitelist present_view (LlmProjected views are depth-0-only)",
+                s.tool_name
+            );
+        }
+    }
+
     #[test]
     fn delegate_tool_names_are_globally_unique() {
         // Duplicate names would collide in a sub-registry's HashMap, silently
@@ -1058,5 +1108,141 @@ mod routing_enabled_tests {
              new row from the second turn, with no restart of the orchestrator"
         );
         cleanup(shutdown, tasks).await;
+    }
+}
+
+#[cfg(test)]
+mod view_store_sharing_tests {
+    //! View Engine Phase A (phase 3): proves `Orchestrator::view_store()` is a stable handle
+    //! onto the ONE shared `ViewStore` — not a fresh instance minted per call — which is the
+    //! property `get_view` (reading via a later `view_store()` call) depends on to ever see
+    //! what a tool wrote (via the `Arc<dyn ViewSink>` a real turn's `ToolContext.view_sink`
+    //! holds, itself `Arc::clone`d from this same field in `process()` — see `TurnRuntime`
+    //! construction above). Simulates the write side through the `ViewSink` trait object
+    //! exactly as a real tool call would, rather than depending on Phase 2's `present_view`
+    //! tool (built concurrently) to exercise the path end-to-end.
+    use super::*;
+    use haily_types::{DataView, ProjectionKind, ProjectionSpec, ViewProvenance, ViewSink};
+
+    fn sample_view() -> DataView {
+        DataView {
+            view_id: uuid::Uuid::new_v4(),
+            entity: "contact".to_string(),
+            schema: vec![],
+            records: vec![],
+            projections: vec![ProjectionSpec { kind: ProjectionKind::Table, binding: None }],
+            active: ProjectionSpec { kind: ProjectionKind::Table, binding: None },
+            total: None,
+            cursor: None,
+            provenance: ViewProvenance::LlmProjected,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_side_insert_and_command_side_get_observe_the_same_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(haily_db::DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
+        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let orchestrator = Orchestrator::init(
+            kms,
+            db,
+            LlmConfig::default(),
+            shutdown.clone(),
+            tasks.clone(),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("orchestrator init");
+
+        // Write side: exactly how a real `ToolContext.view_sink` (an `Arc<dyn ViewSink>`
+        // cloned from `orchestrator.view_store()` via `TurnRuntime`) would insert.
+        let write_handle: Arc<dyn ViewSink> = orchestrator.view_store();
+        let view = sample_view();
+        let view_id = view.view_id;
+        write_handle.insert(view.clone());
+
+        // Read side: a SEPARATE `view_store()` call — exactly how `get_view` reaches it from
+        // the Tauri command layer. Must see the exact row the write side just inserted.
+        let read_handle = orchestrator.view_store();
+        assert_eq!(
+            read_handle.get(&view_id),
+            Some(view),
+            "get_view's view_store() call must observe the SAME store a tool's ViewSink wrote \
+             to, not an independent instance"
+        );
+
+        shutdown.cancel();
+        tasks.close();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait()).await;
+    }
+}
+
+#[cfg(test)]
+mod view_store_quarantine_tests {
+    //! View Engine Phase A (phase 3), SEC F2: `ViewStore::get` — and the `view_store()` handle
+    //! that exposes it — is GUI-consumption-only. `Orchestrator`'s `view_store` field is
+    //! private, but private in Rust means "visible in the defining module and every descendant
+    //! module" — since `Orchestrator` is defined at the crate root, every module in this crate
+    //! is technically able to reach it. Only a convention (never call `view_store()` from
+    //! agent/tool code — read a `DataView` back into a prompt without the renderer's escaping
+    //! contract) stands between a future call site and a silent violation, so this test turns
+    //! that convention into a regression guard: no `haily-core` or `haily-tools` production
+    //! file may call `.view_store(`. `haily-tools` cannot even name `ViewStore` (it has no
+    //! dependency on `haily-core`, which is what avoids the layering cycle in the first place),
+    //! so the `haily-tools` half of this scan is defense-in-depth against a future dependency
+    //! change rather than a live risk today.
+    use std::path::Path;
+
+    /// `exclude_names` skips whole files by base name (e.g. `lib.rs`, where the handle is
+    /// DEFINED and where `view_store_sharing_tests` legitimately calls it to prove the
+    /// getter's own sharing contract — a meta-test of the accessor, not a consumption site).
+    /// Comment lines (trimmed prefix `//`, covering `//`/`///`/`//!`) are skipped so prose
+    /// explaining the getter's contract (as this very module does) cannot self-trip the scan
+    /// — only an actual call in code counts as an offense.
+    fn scan_dir_for(dir: &Path, needle: &str, exclude_names: &[&str], offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_for(&path, needle, exclude_names, offenders);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let is_excluded = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| exclude_names.contains(&n));
+                if is_excluded {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let has_call = text
+                        .lines()
+                        .any(|line| !line.trim_start().starts_with("//") && line.contains(needle));
+                    if has_call {
+                        offenders.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_core_or_tools_caller_of_view_store_handle() {
+        let core_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let tools_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../haily-tools/src");
+        let mut offenders = Vec::new();
+        // ".view_store(" (leading dot) matches only a METHOD CALL on the handle, not this
+        // module's own `fn view_store(&self)` definition line.
+        scan_dir_for(&core_src, ".view_store(", &["lib.rs"], &mut offenders);
+        scan_dir_for(&tools_src, ".view_store(", &[], &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "ViewStore::get is GUI-consumption-only (SEC F2) — found a core/tools caller of \
+             the view_store() handle in: {offenders:?}"
+        );
     }
 }

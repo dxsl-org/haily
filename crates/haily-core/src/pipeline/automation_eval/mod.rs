@@ -163,6 +163,12 @@ pub async fn run_automation_eval(
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         run_id: None,
         depth_mode: DepthMode::Normal,
+        // View Engine Phase A (phase 3): this eval harness is deliberately isolated from the
+        // Orchestrator (its own throwaway `kill`/`broker` above, never the live ones) and its
+        // scripted connector steps never include a view-producing tool — a fresh, call-scoped
+        // store is therefore correct here, unlike `run_turn`/`run_sub_turn`, which now share
+        // the Orchestrator's ONE `ViewStore` (see `Orchestrator::view_store`).
+        view_sink: Arc::new(crate::view::ViewStore::new()),
     };
 
     // Drive the scripted connector steps through the REAL dispatch harness (a failing step is a

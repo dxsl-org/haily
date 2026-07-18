@@ -352,6 +352,15 @@ impl ApprovalGate for NoopGate {
     }
 }
 
+/// A throwaway view sink (stores nothing) — these tests never publish a view; it exists
+/// only because `ToolContext` requires a handle.
+struct NoopViewSink;
+impl haily_types::ViewSink for NoopViewSink {
+    fn insert(&self, _view: haily_types::DataView) -> uuid::Uuid {
+        uuid::Uuid::nil()
+    }
+}
+
 async fn tool_ctx(db: Arc<DbHandle>) -> (ToolContext, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let kms_db = DbHandle::init(&dir.path().join("kms.db")).await.unwrap();
@@ -371,6 +380,7 @@ async fn tool_ctx(db: Arc<DbHandle>) -> (ToolContext, tempfile::TempDir) {
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         run_id: None,
         depth_mode: haily_types::DepthMode::Normal,
+        view_sink: Arc::new(NoopViewSink),
     };
     (ctx, dir)
 }

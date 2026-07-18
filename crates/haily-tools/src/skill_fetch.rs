@@ -167,6 +167,15 @@ mod tests {
         }
     }
 
+    /// A throwaway view sink (stores nothing) — these Read-tier tools never publish a
+    /// view; it exists only because `ToolContext` requires a handle.
+    struct NoopViewSink;
+    impl haily_types::ViewSink for NoopViewSink {
+        fn insert(&self, _view: haily_types::DataView) -> Uuid {
+            Uuid::nil()
+        }
+    }
+
     /// A `ToolContext` whose KMS loads the CWD-relative `assets/kit-pack` — the test
     /// runs from the repo root under `cargo test`, so the shipped pack is present. When
     /// it is not (isolated run), the assertions that require content are skipped.
@@ -188,6 +197,7 @@ mod tests {
             last_journal_id: Arc::new(Mutex::new(None)),
             run_id: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(NoopViewSink),
         };
         (ctx, kms)
     }

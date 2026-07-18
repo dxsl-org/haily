@@ -69,6 +69,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-core/src/tier_intent.rs` | Explicit tier-intent phrase detection (VN/EN) with source-guard anchoring; feeds tier decision ladder |
 | `crates/haily-core/src/delegate.rs` | Sub-agent spawning, tier selection, shared memory |
 | `crates/haily-core/src/tool_call.rs` | Tool dispatch, risk tier gating, kill-switch exemption logic |
+| `crates/haily-core/src/view/store.rs` | In-memory ViewStore (cap-bounded FIFO eviction, View Engine Phase A): holds DataView snapshots keyed by view_id; implements ViewSink trait |
 | `crates/haily-kms/src/skills.rs` | Skill synthesis (Jaccard clustering), EMA confidence, exponential decay |
 | `crates/haily-kms/src/feedback.rs` | FeedbackSignal enum (Positive, Negative, Correction) |
 | `crates/haily-kms/src/hnsw.rs` | HNSW index w/ tombstones, dump/load persistence, atomic swap; contains/un_tombstone primitives for memory-undo |
@@ -81,6 +82,7 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-db/src/queries/routing_decisions.rs` | Routing decision telemetry insert, list, and summary queries (Auto Model Routing R1) — the R2/R3 training set |
 | `crates/haily-db/src/queries/connectors.rs` | Connector manifest CRUD (Safe Operator Harness phase 4) |
 | `crates/haily-db/src/queries/` | All SQL — one file per domain |
+| `crates/haily-db/src/queries/view_events.rs` | View Engine telemetry funnel (View Engine Phase A): presented/viewed/projection_switched/usefulness/edit_demand events + DB-level anti-false-positive guard (drops empty-detail edit_demand rows) |
 | `crates/haily-db/src/recurrence.rs` | RecurrenceRule engine + next_after (strict forward-progress) + occurrences_in_window; shared by reminders (proactive) and calendar |
 | `crates/haily-tools/src/lib.rs` | RiskTier enum, Tool trait, ApprovalGate trait (via haily-types re-export) |
 | `crates/haily-tools/src/connector/manifest/` | Manifest schema v2 (schema.rs: version, auth, protocol, ops, risk_tier, compensability; diff.rs: re-approval diff) |
@@ -89,8 +91,9 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-tools/src/connector/executor.rs` | ConnectorExecutor trait, implementations for HTTP (generic) |
 | `crates/haily-tools/src/journal_undo/mod.rs` | JournalUndoTool (IrreversibleWrite, kill-switch-exempt) |
 | `crates/haily-tools/src/journal_undo/reconcile.rs` | Reconciliation state machine (attempt_undo, refusal logic) |
+| `crates/haily-tools/src/view_present/` | present_view tool (View Engine Phase A): depth-0 quarantine guard, parse-then-repair args validation, RiskTier::Read; GBNF projection grammar builders in schema.rs |
 | `crates/haily-tools/src/security.rs` | ssrf_guard_with_allowance (IP/CIDR pin, metadata block) |
-| `crates/haily-types/src/lib.rs` | RiskTier, ApprovalGate trait (leaf crate, avoids layering inversion) |
+| `crates/haily-types/src/lib.rs` | RiskTier, ApprovalGate trait, View Engine wire types (DataView/FieldType/ProjectionKind/ViewProvenance/ViewSink), Request/DepthMode/RunEvent/Notification (leaf crate, avoids layering inversion) |
 | `crates/haily-io/src/lib.rs` | Adapter trait definition, manager |
 | `crates/haily-app/src/bootstrap.rs` | Shared bootstrap (LlmConfig, db, orchestrator) |
 | `crates/haily-app/src/dispatch.rs` | Mode dispatch (GUI/CLI/headless) + adapter wiring |
@@ -103,7 +106,9 @@ src-tauri    (Tauri shell: 119 lines, GUI glue only)
 | `crates/haily-io/src/proactive_cards.rs` | Typed proactive card model + per-kind coalesce/eviction for the GUI panel |
 | `src-tauri/src/lib.rs` | Tauri app initialization (Tauri glue only) |
 | `src/lib/tauri.ts` | Typed Tauri invoke wrappers |
+| `src/lib/data-view.ts` | View Engine formatting/validation helpers (View Engine Phase A): safeHref scheme-allowlist gate for Url/Email/Phone attribute sinks (http/https/mailto/tel only; rejects javascript:/data:), sanitization utilities |
 | `src/lib/components/` | GUI panels: WorkItemsPanel, ProactivePanel, JournalBrowser, ConnectorConfig + settings tabs |
+| `src/lib/components/view/` | View Engine GUI pane (View Engine Phase A): WorkspacePane, ViewTable, ViewCards, ViewCell, ProjectionSwitcher, ViewMeasurementBar components + generic renderers for FieldType |
 | `crates/haily-core/src/pipeline/launcher/` | Pipeline launcher service (Pipeline Activation phase 1): `Orchestrator::launch_coding_run` constructs PipelineRunner from orchestrator handles, wires RunEvent/distillation bridges to live runs, resolves target-repo path + verifier commands; split into mod.rs (launcher), registry.rs (tool/verifier helpers), tests.rs |
 | `crates/haily-app/src/trigger.rs` | Dispatch-layer trigger resolver (Pipeline Activation phase 2): resolves Request → TriggerAction (NormalTurn / LaunchPlan / LaunchBuild / ConfirmThenLaunch / PromptTask / UnknownSlashHint); handles confirm-gated launch flow via ApprovalGate broker; runs as part of turn execution, never blocks dispatch loop |
 | `crates/haily-core/src/coding_intent.rs` | Chat-intent classifier (Pipeline Activation phase 2): VN/EN pattern detection for pipeline auto-launch (`classify(msg, origin) -> Option<RunKind>`); reuses `feedback_parser` anchoring rules (phrases must be short or leading, never buried in long text); narrow multi-word lexicon (e.g. "build this feature", "fix this bug") to minimize false positives |

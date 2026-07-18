@@ -18,4 +18,5 @@ pub mod routing_decisions;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;
+pub mod view_events;
 pub mod work_items;

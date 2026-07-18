@@ -8,12 +8,13 @@ pub mod schedule;
 pub mod security;
 pub mod skill_fetch;
 pub mod v1;
+pub mod view_present;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use haily_db::DbHandle;
 use haily_kms::KmsHandle;
-use haily_types::{ApprovalGate, DepthMode};
+use haily_types::{ApprovalGate, DepthMode, ViewSink};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -103,6 +104,12 @@ pub struct ToolContext {
     /// `DepthMode::Normal` for every ordinary path (the default); only `run_turn` sets a
     /// non-default value and only from a user-sourced signal.
     pub depth_mode: DepthMode,
+    /// Seam handle for a tool to publish a [`haily_types::DataView`] for display in the GUI
+    /// (View Engine Phase A) without `haily-tools` depending on `haily-core` — the trait
+    /// lives in the leaf `haily-types` crate, mirroring `approval_gate`'s seam exactly. The
+    /// production implementer is `haily-core::view::ViewStore`; construction sites that
+    /// never exercise view insertion (most tests) may hand a no-op implementer instead.
+    pub view_sink: Arc<dyn ViewSink>,
 }
 
 /// Blast-radius classification for a tool call, evaluated per-call against `args` so
@@ -238,6 +245,11 @@ impl ToolRegistry {
             // so they register + resolve unconditionally with no cargo feature gate.
             Arc::new(lsp::LspDiagnosticsTool) as Arc<dyn Tool>,
             Arc::new(lsp::LspRenameTool) as Arc<dyn Tool>,
+            // View Engine Phase A (phase 2) — the model's self-authored LlmProjected view.
+            // Read tier, no journal; quarantined to depth 0 (see execute()'s guard) and NOT
+            // listed in any domain/specialist whitelist below, so no sub-agent decision
+            // surface can ever reach it (see the exclusion test in haily-core's lib.rs).
+            Arc::new(view_present::PresentViewTool::new()) as Arc<dyn Tool>,
         ] {
             reg.register(tool);
         }

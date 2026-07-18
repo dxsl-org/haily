@@ -335,6 +335,14 @@ impl Adapter for CliAdapter {
                         .await?;
                 }
             }
+            ResponseChunk::ViewRef { entity, .. } => {
+                // The CLI is text-only — it renders the handle, never fetches the full
+                // `DataView` payload (that command path is GUI-only, built in Phase 3).
+                stdout
+                    .write_all(format!("\n[view] {entity}\n").as_bytes())
+                    .await?;
+                stdout.flush().await?;
+            }
         }
         Ok(())
     }

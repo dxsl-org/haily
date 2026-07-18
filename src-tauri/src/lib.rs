@@ -8,8 +8,9 @@ use haily_app::{
     AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, TurnRegistry,
     WorkspaceView,
 };
+use haily_core::view::ViewStore;
 use haily_db::{
-    queries::{journal, meta},
+    queries::{journal, meta, view_events},
     DbHandle,
 };
 use haily_io::{
@@ -17,6 +18,7 @@ use haily_io::{
     GuiResponseReceiver, GuiRunEventReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
 use haily_kms::KmsHandle;
+use haily_types::DataView;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 use tauri::{AppHandle as TauriAppHandle, Emitter, Manager, RunEvent, State};
@@ -67,6 +69,10 @@ struct AppState {
     /// `app` at setup, mirroring `approval_resolver`/`turns`/`kill`, so the connector
     /// config UI's credential-set command (Phase 7) doesn't need to lock `app`.
     credential_store: Arc<CredentialStore>,
+    /// View Engine Phase A (phase 3): the SAME `Arc<ViewStore>` the Orchestrator holds for
+    /// its whole lifetime (`orchestrator.view_store()`) — cloned out of `app` at setup,
+    /// mirroring `approval_resolver`, so `get_view` doesn't need to lock `app` per call.
+    view_store: Arc<ViewStore>,
     #[cfg(feature = "mobile-server")]
     mobile: MobileState,
     app: Mutex<Option<AppHandle>>,
@@ -372,6 +378,51 @@ async fn start_coding_run(
 }
 
 // ---------------------------------------------------------------------------
+// View Engine Phase A (phase 3) — `get_view` is the reconcile/transport for a
+// `ResponseChunk::ViewRef` handle (the command IS the fetch; there is no per-view streaming
+// channel, so a view opened before the pane mounts is simply fetched on mount). Telemetry
+// (`record_view_intent`) captures the Phase-B gate signal (design §14): presented/viewed/
+// projection-switched/usefulness/edit-demand. Both are observability-only — no approval, no
+// risk gating (Requirements #5).
+// ---------------------------------------------------------------------------
+
+/// Fetch a previously-produced [`DataView`] snapshot by id. Returns `None` (not an error) for
+/// an unparseable/unknown/evicted id — the frontend renders "view expired" either way, per
+/// `ViewStore`'s eviction contract (cap-bounded FIFO). Reads `state.view_store`, the SAME
+/// `Arc<ViewStore>` a tool's `present_view` call wrote to via `ToolContext.view_sink` — see
+/// `haily_core::Orchestrator::view_store`'s doc for the sharing contract this depends on.
+#[tauri::command]
+async fn get_view(view_id: String, state: State<'_, AppState>) -> Result<Option<DataView>, String> {
+    let Ok(id) = Uuid::parse_str(&view_id) else {
+        return Ok(None);
+    };
+    Ok(state.view_store.get(&id))
+}
+
+/// Record a GUI-originated view telemetry event: `viewed`, `projection_switched`,
+/// `usefulness`, or `edit_demand` (a `present_view` tool call itself records `presented` —
+/// see `haily-tools`' `view_present` module). `session_id` is the envelope value the frontend
+/// already has from the `haily-chunk` event that carried the originating `ViewRef` (mirrors
+/// `approve_tool`'s `session_id` contract). `detail`'s meaning is keyed by `kind` — see
+/// migration `0033_view_telemetry.sql`. An `edit_demand` with an empty/missing `detail` is
+/// silently dropped by `insert_view_event` (never an error) — "a click alone is not demand".
+/// A telemetry write failure here never blocks the view itself; it only fails this command's
+/// own (fire-and-forget, UI-invisible) result.
+#[tauri::command]
+async fn record_view_intent(
+    view_id: String,
+    session_id: String,
+    kind: String,
+    detail: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    view_events::insert_view_event(&state.db, &kind, &view_id, &session_id, detail.as_deref())
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Mobile Thin-Client plan phase 2b — pairing QR, OOB confirm-on-pair (M4), devices panel,
 // status banners, cert lifecycle (m5). Pure delegation onto `haily_app::mobile_admin`; no
 // logic beyond glue lives here, mirroring every other command in this file.
@@ -579,6 +630,7 @@ pub fn run() {
             let kill = app_handle.orchestrator.kill_handle();
             let routing_enabled = app_handle.orchestrator.routing_enabled_handle();
             let credential_store = Arc::clone(&app_handle.credential_store);
+            let view_store = app_handle.orchestrator.view_store();
             app.manage(AppState {
                 gui_req_tx,
                 db,
@@ -588,6 +640,7 @@ pub fn run() {
                 kill,
                 routing_enabled,
                 credential_store,
+                view_store,
                 #[cfg(feature = "mobile-server")]
                 mobile: mobile_state,
                 app: Mutex::new(Some(app_handle)),
@@ -622,6 +675,8 @@ pub fn run() {
             workspace_diff,
             list_approvals,
             start_coding_run,
+            get_view,
+            record_view_intent,
             #[cfg(feature = "mobile-server")]
             mobile_pairing_qr,
             #[cfg(feature = "mobile-server")]

@@ -181,6 +181,15 @@ pub struct SubTurnRequest {
     /// ([`crate::depth::research_depth_addendum`]) — prompt-level only. `Normal` for every
     /// pipeline stage and ordinary path; the LLM can never forge it.
     pub depth_mode: haily_types::DepthMode,
+    /// View Engine Phase A (phase 3): the write-side view sink for this sub-turn's
+    /// `ToolContext`. A delegated sub-turn (via `DelegateTool`) forwards the CALLING
+    /// context's `Arc<dyn ViewSink>` — itself ultimately `Arc::clone`d from the
+    /// Orchestrator's one shared `ViewStore` — so a `present_view` call at any delegation
+    /// depth lands in the SAME store `get_view` reads. A pipeline stage/judge sub-turn
+    /// (which has no calling `ToolContext` to forward — see `pipeline::runner`/`pipeline::
+    /// judge`) passes a fresh, isolated store instead: today's stage/judge tool registries
+    /// contain no view-producing tool, so this is a correctness no-op, not a shared-store gap.
+    pub view_sink: Arc<dyn haily_types::ViewSink>,
 }
 
 /// Stateless sub-agent turn for domain/specialist agents.
@@ -216,6 +225,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         run_id,
         grammar,
         depth_mode,
+        view_sink,
     } = req;
     let turn_start = std::time::Instant::now();
 
@@ -364,6 +374,9 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         run_id,
         // Propagate the calling turn's depth to any deeper delegation this sub-turn spawns.
         depth_mode,
+        // View Engine Phase A (phase 3): whatever the caller threaded in via
+        // `SubTurnRequest::view_sink` — see that field's doc for the sharing contract.
+        view_sink,
     };
 
     // No DB history to load for a stateless sub-turn (`msgs` starts as just
@@ -655,6 +668,7 @@ mod sub_turn_tests {
             run_id: None,
             grammar: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         }
     }
 
@@ -1217,6 +1231,7 @@ mod outcome_tests {
             run_id: None,
             grammar: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1254,6 +1269,7 @@ mod outcome_tests {
             run_id: None,
             grammar: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 
@@ -1332,6 +1348,7 @@ mod outcome_tests {
             run_id: None,
             grammar: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(crate::view::ViewStore::new()),
         };
         run_sub_turn(req).await.expect("run_sub_turn");
 

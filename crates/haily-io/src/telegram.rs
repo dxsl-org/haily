@@ -536,6 +536,15 @@ impl Adapter for TelegramAdapter {
                     self.badge_buffer.insert(session_id, badge);
                 }
             }
+            ResponseChunk::ViewRef { entity, .. } => {
+                // Telegram is text-only — render the handle inline; the full `DataView`
+                // payload never rides this channel (fetched via a command path, GUI-only,
+                // built in Phase 3).
+                self.text_buffer
+                    .entry(session_id)
+                    .or_default()
+                    .push_str(&format!("\n[view] {entity}\n"));
+            }
         }
         Ok(())
     }

@@ -72,6 +72,15 @@ async fn init_repo() -> tempfile::TempDir {
     dir
 }
 
+/// A throwaway view sink (stores nothing) — the coding tool surface never publishes a
+/// view; it exists only because `ToolContext` requires a handle.
+struct NoopViewSink;
+impl haily_types::ViewSink for NoopViewSink {
+    fn insert(&self, _view: haily_types::DataView) -> uuid::Uuid {
+        uuid::Uuid::nil()
+    }
+}
+
 async fn fixture(gate: Arc<dyn ApprovalGate>) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(DbHandle::init(&tmp.path().join("t.db")).await.unwrap());
@@ -109,6 +118,7 @@ async fn fixture(gate: Arc<dyn ApprovalGate>) -> Fixture {
         last_journal_id: Arc::new(std::sync::Mutex::new(None)),
         run_id: None,
         depth_mode: haily_types::DepthMode::Normal,
+        view_sink: Arc::new(NoopViewSink),
     };
     Fixture { _tmp: tmp, _repo: repo, _wt_root: wt_root, db, ctx, ws_id, repo_path, branch }
 }

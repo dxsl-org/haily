@@ -7,6 +7,7 @@
   import WorkItemsPanel from '$lib/components/WorkItemsPanel.svelte';
   import ProactivePanel from '$lib/components/ProactivePanel.svelte';
   import CockpitView from '$lib/components/CockpitView.svelte';
+  import WorkspacePane from '$lib/components/view/WorkspacePane.svelte';
   import { cancelTurn, sendMessage } from '$lib/tauri';
   import type { ChunkPayload, PendingApproval } from '$lib/tauri';
   import { toolVerb } from '$lib/tool-verbs';
@@ -46,6 +47,11 @@
   // exactly as left.
   let view = $state<'chat' | 'cockpit'>('chat');
   let pendingApproval = $state<PendingApproval | null>(null);
+  // Set for one tick whenever a `ViewRef` chunk arrives; `WorkspacePane` consumes and clears
+  // it via `bind:pendingView` (mirrors `pendingApproval`'s `bind:pending` contract on
+  // `ApprovalModal`). The pane itself owns the view-id back-stack and coexists with chat/
+  // cockpit (see the `.body` wrapper below) — it is never the thing that hides either view.
+  let pendingWorkspaceView = $state<{ viewId: string; sessionId: string } | null>(null);
   // The session_id of the turn currently streaming, or null when idle. Drives the
   // send/Stop button swap — set when `send_message` returns, cleared when that
   // session's `Complete`/`Error` chunk arrives (mirrors `sessionIndex`'s lifecycle).
@@ -93,6 +99,14 @@
           origin: chunk.data.origin,
           reversible: chunk.data.reversible,
         };
+        return;
+      }
+
+      // A presented view is a handle only — the bulk `DataView` payload never rides this
+      // stream (`WorkspacePane` fetches it separately via `getView`), so this never touches a
+      // message bubble, same early-return shape as `ToolApprovalRequest` above.
+      if (chunk.type === 'ViewRef') {
+        pendingWorkspaceView = { viewId: chunk.data.view_id, sessionId: session_id };
         return;
       }
 
@@ -264,72 +278,81 @@
   <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
   <ApprovalModal bind:pending={pendingApproval} />
 
-  {#if view === 'cockpit'}
-    <CockpitView />
-  {:else}
-    <WorkItemsPanel />
-    <ProactivePanel />
+  <!-- The workspace pane (View Engine Phase A) coexists with whichever main view is active —
+       it is a side region, never a replacement for chat or cockpit (Creative Director HIGH:
+       a presented view must not become a chat bubble or hide the conversation). -->
+  <div class="body">
+    <div class="main-content">
+      {#if view === 'cockpit'}
+        <CockpitView />
+      {:else}
+        <WorkItemsPanel />
+        <ProactivePanel />
 
-    <div class="messages">
-      {#each messages as msg (msg.id)}
-        <div class="bubble {msg.role}" class:pending={msg.pending}>
-          {#if msg.role === 'assistant' && msg.pending && !msg.content}
-            <span class="typing"><span></span><span></span><span></span></span>
-          {:else}
-            <span class="text">{msg.content}</span>
-            {#if msg.pending}
-              <span class="cursor">▋</span>
-            {/if}
-          {/if}
-          <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
-               gating — undo affordances for this turn's writes only appear once nothing
-               else from this turn can still land. -->
-          {#if !msg.pending && msg.undoable.length > 0}
-            <div class="undo-list">
-              {#each msg.undoable as action (action.journalId)}
-                <button
-                  class="undo-inline"
-                  onclick={() => requestUndo(action.journalId)}
-                  disabled={undoing === action.journalId}
-                  title={action.verb}
-                >
-                  {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
-                </button>
-              {/each}
+        <div class="messages">
+          {#each messages as msg (msg.id)}
+            <div class="bubble {msg.role}" class:pending={msg.pending}>
+              {#if msg.role === 'assistant' && msg.pending && !msg.content}
+                <span class="typing"><span></span><span></span><span></span></span>
+              {:else}
+                <span class="text">{msg.content}</span>
+                {#if msg.pending}
+                  <span class="cursor">▋</span>
+                {/if}
+              {/if}
+              <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
+                   gating — undo affordances for this turn's writes only appear once nothing
+                   else from this turn can still land. -->
+              {#if !msg.pending && msg.undoable.length > 0}
+                <div class="undo-list">
+                  {#each msg.undoable as action (action.journalId)}
+                    <button
+                      class="undo-inline"
+                      onclick={() => requestUndo(action.journalId)}
+                      disabled={undoing === action.journalId}
+                      title={action.verb}
+                    >
+                      {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+              <!-- Same `!msg.pending` gate as the undo list: a badge is only meaningful once
+                   the turn it describes has actually finished. `routing_enabled=false` or a
+                   non-assistant bubble never sets `badge`, so this renders nothing then. -->
+              {#if !msg.pending && msg.badge}
+                <div class="turn-badge">{msg.badge}</div>
+              {/if}
             </div>
-          {/if}
-          <!-- Same `!msg.pending` gate as the undo list: a badge is only meaningful once
-               the turn it describes has actually finished. `routing_enabled=false` or a
-               non-assistant bubble never sets `badge`, so this renders nothing then. -->
-          {#if !msg.pending && msg.badge}
-            <div class="turn-badge">{msg.badge}</div>
+          {/each}
+          <div bind:this={bottomAnchor}></div>
+        </div>
+
+        <div class="input-area">
+          <textarea
+            bind:this={textarea}
+            bind:value={input}
+            onkeydown={onKeydown}
+            oninput={autoResize}
+            placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
+            rows="1"
+            disabled={sending || pendingApproval !== null || activeSession !== null}
+          ></textarea>
+          {#if activeSession}
+            <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
+              {stopping ? '…' : '■'}
+            </button>
+          {:else}
+            <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
+              {sending ? '…' : '↑'}
+            </button>
           {/if}
         </div>
-      {/each}
-      <div bind:this={bottomAnchor}></div>
-    </div>
-
-    <div class="input-area">
-      <textarea
-        bind:this={textarea}
-        bind:value={input}
-        onkeydown={onKeydown}
-        oninput={autoResize}
-        placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
-        rows="1"
-        disabled={sending || pendingApproval !== null || activeSession !== null}
-      ></textarea>
-      {#if activeSession}
-        <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
-          {stopping ? '…' : '■'}
-        </button>
-      {:else}
-        <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
-          {sending ? '…' : '↑'}
-        </button>
       {/if}
     </div>
-  {/if}
+
+    <WorkspacePane bind:pendingView={pendingWorkspaceView} />
+  </div>
 </div>
 
 <style>
@@ -357,6 +380,24 @@
     padding: 12px 16px;
     border-bottom: 1px solid #1e1e2e;
     flex-shrink: 0;
+  }
+
+  /* Horizontal row: main view (chat/cockpit) + the workspace pane side region. Only takes
+     the space below the header; each child manages its own vertical layout/scrolling as
+     before this wrapper was introduced. */
+  .body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .main-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
 
   .view-toggle {

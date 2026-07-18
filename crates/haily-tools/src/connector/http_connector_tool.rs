@@ -1066,6 +1066,15 @@ mod tests {
         }
     }
 
+    /// A throwaway view sink (stores nothing) — these tests never exercise view
+    /// insertion; it exists only because `ToolContext` requires a handle.
+    struct NoopViewSink;
+    impl haily_types::ViewSink for NoopViewSink {
+        fn insert(&self, _view: haily_types::DataView) -> uuid::Uuid {
+            uuid::Uuid::nil()
+        }
+    }
+
     /// Build a `ToolContext` for a connector-tool test. The connector tool never touches
     /// kms, but `ToolContext` requires a handle, so we init a throwaway one on the same
     /// tempdir (kept alive via the returned guard).
@@ -1088,6 +1097,7 @@ mod tests {
             last_journal_id: Arc::new(std::sync::Mutex::new(None)),
             run_id: None,
             depth_mode: haily_types::DepthMode::Normal,
+            view_sink: Arc::new(NoopViewSink),
         };
         (c, dir)
     }

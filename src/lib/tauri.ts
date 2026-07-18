@@ -56,6 +56,15 @@ export interface CompleteChunk {
   type: 'Complete';
 }
 
+/** Handle-only chunk for a model-projected view (View Engine Phase A) — the bulk `DataView`
+ * payload never rides the chat stream; the GUI fetches it separately via `getView(view_id)`.
+ * Mirrors `haily_types::ResponseChunk::ViewRef`. A text-only channel (Telegram/CLI/ACP)
+ * renders this as a short "[view] {entity}" line instead of opening a pane. */
+export interface ViewRefChunk {
+  type: 'ViewRef';
+  data: { view_id: string; entity: string; provenance: ViewProvenance };
+}
+
 /** Which tier/model produced this L0 turn (Auto Model Routing R1, transparency
  * invariant) — a NEW additive variant, never a change to `CompleteChunk` (adjacently-
  * tagged serde breaks on an existing fieldless variant gaining a payload). Emitted once,
@@ -72,6 +81,7 @@ export type Chunk =
   | ToolApprovalRequestChunk
   | ToolResultChunk
   | CompleteChunk
+  | ViewRefChunk
   | TurnMetaChunk;
 
 export interface ChunkPayload {
@@ -406,6 +416,113 @@ export async function onRunEvents(
   callback: (payload: RunEventPayload) => void,
 ): Promise<UnlistenFn> {
   return listen<RunEventPayload>('haily-run-events', (event) => callback(event.payload));
+}
+
+// ---------------------------------------------------------------------------
+// View Engine Phase A — self-describing, read-only `DataView` snapshots rendered by the GUI
+// workspace pane (`src/lib/components/view/`). A view is fetched whole by id (`getView`),
+// NEVER streamed incrementally — see `ViewRefChunk` above for the chat-stream handle.
+// `schema`/`records` may hold MODEL-AUTHORED strings (`LlmProjected` provenance): treat every
+// value as untrusted display text and never interpolate it into HTML/attributes without going
+// through `src/lib/data-view.ts`'s scheme-allowlist helper first.
+// ---------------------------------------------------------------------------
+
+/** Mirrors `haily_types::EnumVariant`. */
+export interface EnumVariant {
+  value: string;
+  label: string;
+}
+
+/** Mirrors `haily_types::FieldType`'s `#[serde(tag = "type", content = "data")]` envelope — a
+ * discriminated union for the same reason as `Chunk`/`RunEvent`: unit variants carry no `data`
+ * key at all (adjacently-tagged serde omits it when there's no content), so this is NOT one
+ * interface with an optional `data?`. */
+export type FieldType =
+  | { type: 'Text' }
+  | { type: 'LongText' }
+  | { type: 'Int' }
+  | { type: 'Float' }
+  | { type: 'Money'; data: { currency: string } }
+  | { type: 'Bool' }
+  | { type: 'Date' }
+  | { type: 'DateTime' }
+  | { type: 'Enum'; data: { variants: EnumVariant[] } }
+  | { type: 'Reference'; data: { entity: string } }
+  | { type: 'Tags' }
+  | { type: 'Email' }
+  | { type: 'Phone' }
+  | { type: 'Url' }
+  | { type: 'Opaque' };
+
+/** Mirrors `haily_types::FieldDef`. `writable` is always `false` in View Engine Phase A
+ * (read-only views only) — kept as a real field so a future writable-field phase needs no
+ * reshape. */
+export interface FieldDef {
+  name: string;
+  label: string;
+  ftype: FieldType;
+  writable: boolean;
+  required: boolean;
+  help: string | null;
+}
+
+/** Mirrors `haily_types::ProjectionKind` — a bare-string enum on the wire (no `#[serde(tag)]`
+ * on the Rust side for a unit-only enum means it serializes as a plain string, unlike
+ * `FieldType` above). An unrecognized/future kind (or one this build's renderer doesn't yet
+ * implement) MUST be treated as `Table` — see `src/lib/data-view.ts`'s
+ * `normalizeProjectionKind`. */
+export type ProjectionKind = 'Table' | 'Cards' | 'Kanban' | 'Calendar' | 'Chart';
+
+/** Mirrors `haily_types::ProjectionSpec`. */
+export interface ProjectionSpec {
+  kind: ProjectionKind;
+  binding: string | null;
+}
+
+/** Mirrors `haily_types::ViewProvenance` — same bare-string wire encoding as `ProjectionKind`. */
+export type ViewProvenance = 'Registry' | 'LlmProjected';
+
+/** Mirrors `haily_types::DataView` — a read-only, self-describing latest-snapshot fetched via
+ * `getView`. `records` values are keyed by `schema[].name` and typed per the matching
+ * `FieldDef.ftype`; render every value through `src/lib/data-view.ts`'s formatters, never
+ * `{@html}`. */
+export interface DataView {
+  view_id: string;
+  entity: string;
+  schema: FieldDef[];
+  records: Record<string, unknown>[];
+  projections: ProjectionSpec[];
+  active: ProjectionSpec;
+  total: number | null;
+  cursor: string | null;
+  provenance: ViewProvenance;
+}
+
+/**
+ * Fetch a previously-produced `DataView` snapshot by id. Returns `null` (not a thrown error)
+ * for an unknown/evicted `view_id` — the workspace pane renders "view expired" for that case
+ * rather than treating it as a fetch failure. Mirrors the `get_view` Tauri command.
+ */
+export async function getView(viewId: string): Promise<DataView | null> {
+  return invoke('get_view', { viewId });
+}
+
+/**
+ * Record a GUI-originated view telemetry event — the Phase-B go/no-go signal (design §14).
+ * `sessionId` must be the session the originating `ViewRefChunk` arrived on
+ * (`ChunkPayload.session_id`) — mirrors `resolveApproval`'s auth-boundary contract; it is NOT
+ * part of `DataView`/`ViewRefChunk` itself. `detail`'s meaning is keyed by `kind`: the
+ * switched-to kind for `projection_switched`, `'+'`/`'-'` for `usefulness`, free-text intent
+ * for `edit_demand`. An `edit_demand` with an empty/absent `detail` is silently dropped
+ * server-side — "a click alone is not demand" — never surfaced as an error here.
+ */
+export async function recordViewIntent(
+  viewId: string,
+  sessionId: string,
+  kind: 'viewed' | 'projection_switched' | 'usefulness' | 'edit_demand',
+  detail?: string,
+): Promise<void> {
+  return invoke('record_view_intent', { viewId, sessionId, kind, detail: detail ?? null });
 }
 
 /** Which kind of coding-pipeline run to launch (Pipeline Activation & Wiring phase 3).

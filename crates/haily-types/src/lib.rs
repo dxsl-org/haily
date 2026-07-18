@@ -176,6 +176,16 @@ pub enum ResponseChunk {
         #[serde(default)]
         badge: Option<String>,
     },
+    /// A tiny handle to a [`DataView`] the current turn produced (View Engine Phase A) —
+    /// the full payload NEVER rides this chat stream (bulk data must not ride chat); a
+    /// consumer that wants the data fetches it by `view_id` over the separate command path
+    /// built in Phase 3. A text-only channel (Telegram, CLI, ACP) renders this as a short
+    /// "[view] {entity}" line rather than silently dropping it.
+    ViewRef {
+        view_id: Uuid,
+        entity: String,
+        provenance: ViewProvenance,
+    },
 }
 
 /// Snapshot of a single active work item for display in adapters.
@@ -295,6 +305,128 @@ pub enum RunEvent {
     /// The run reached a terminal state. `outcome` is the terminal RunStatus name
     /// (`"done"`/`"failed"`) or a short outcome label.
     RunComplete { run_id: String, outcome: String },
+}
+
+/// Closed field-type vocabulary for a [`DataView`]'s schema (View Engine Phase A, design
+/// §4.1). **FREEZE POINT**: this enum's shape is shared with a future registry-driven phase
+/// and travels over the wire/persistence — reshaping a variant later is a cross-crate + wire
+/// migration, so the FULL vocabulary is defined now even though this phase's renderer only
+/// handles a subset (`additive-serde` protects *adds*, not *reshapes*). An unrecognized/future
+/// variant a consumer does not understand should be treated as [`FieldType::Opaque`] by that
+/// consumer — the render fallback contract mirrors [`ProjectionKind`]'s unknown-kind→`Table`
+/// rule below.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "data")]
+pub enum FieldType {
+    Text,
+    LongText,
+    Int,
+    Float,
+    Money {
+        currency: String,
+    },
+    Bool,
+    Date,
+    DateTime,
+    Enum {
+        variants: Vec<EnumVariant>,
+    },
+    /// A foreign reference to another entity (e.g. a many2one) — `entity` names the
+    /// referenced type for display/navigation purposes only, no lookup happens here.
+    Reference {
+        entity: String,
+    },
+    Tags,
+    Email,
+    Phone,
+    Url,
+    /// Blast-radius-unknown / not-yet-modeled field shape. A renderer falls back to a
+    /// plain string display for this variant, never attempts type-specific formatting.
+    Opaque,
+}
+
+/// One labeled option of an [`FieldType::Enum`] field — `value` is the wire/stored value,
+/// `label` is the human-facing display text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnumVariant {
+    pub value: String,
+    pub label: String,
+}
+
+/// One column/attribute of a [`DataView`]'s self-describing schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FieldDef {
+    pub name: String,
+    pub label: String,
+    pub ftype: FieldType,
+    /// Always `false` in this phase (View Engine Phase A renders read-only views only) —
+    /// kept as a real field rather than omitted so a future writable-field phase does not
+    /// need to reshape this frozen struct, only flip existing rows to `true`.
+    pub writable: bool,
+    pub required: bool,
+    pub help: Option<String>,
+}
+
+/// How a [`DataView`]'s records are laid out for display. All five are defined now (FREEZE
+/// POINT) even though View Engine Phase A's renderer only implements `Table`/`Cards` —
+/// `Kanban`/`Calendar`/`Chart` exist so a future phase's `DataView` payloads need no reshape.
+/// **Contract:** a renderer that does not (yet) implement a given `ProjectionKind` MUST map
+/// it to `Table` — never fail to render and never invent a new fallback kind. Enforcement of
+/// this fallback lives in the GUI renderer (a later phase); this is the documented contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProjectionKind {
+    Table,
+    Cards,
+    Kanban,
+    Calendar,
+    Chart,
+}
+
+/// One selectable display layout for a [`DataView`] — `kind` picks the layout,
+/// `binding` is an optional layout-specific hint (e.g. a Kanban group-by field name);
+/// `None` when the layout needs no extra hint (e.g. a plain `Table`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectionSpec {
+    pub kind: ProjectionKind,
+    pub binding: Option<String>,
+}
+
+/// How a [`DataView`] came to exist. View Engine Phase A only ever constructs
+/// `LlmProjected` (an ad-hoc view the LLM assembled from a tool result, with no backing
+/// registry entry) — `Registry` is reserved for a future phase's pre-declared, curated
+/// entity views and is defined now so `DataView.provenance` need not reshape later.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ViewProvenance {
+    Registry,
+    LlmProjected,
+}
+
+/// A self-describing, read-only snapshot of tool-result data for display as a table/cards
+/// view in the GUI (View Engine Phase A). Self-describing means `schema` inlines every field
+/// definition needed to render `records` — a consumer needs no registry lookup, which is what
+/// makes the `LlmProjected` provenance renderable at all (there is no registry entry for it).
+///
+/// This is a LATEST-SNAPSHOT of `view_id`, not an incremental event stream: there is no
+/// per-view ordered channel, only a full-payload fetch by id (the command path built in
+/// Phase 3). Plain struct (not a tagged enum) — no `#[serde(tag=...)]` needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DataView {
+    pub view_id: Uuid,
+    /// Entity name this view displays (e.g. `"contact"`, `"task"`) — display/grouping label
+    /// only, not a registry lookup key in this phase.
+    pub entity: String,
+    pub schema: Vec<FieldDef>,
+    pub records: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Every layout this view CAN be rendered as; `active` (below) picks the current one.
+    pub projections: Vec<ProjectionSpec>,
+    pub active: ProjectionSpec,
+    /// Total record count when known (e.g. from a paginated source) — `None` when the
+    /// producing tool call did not determine a total (e.g. a single unpaginated result).
+    pub total: Option<u64>,
+    /// Opaque pagination cursor for a future "load more" fetch; `None` when there is no
+    /// further page. Never parsed/interpreted by a consumer — passed back verbatim.
+    pub cursor: Option<String>,
+    pub provenance: ViewProvenance,
 }
 
 /// A single discrete proactive event, shaped for a dedicated display surface (the
@@ -438,6 +570,21 @@ pub trait ApprovalGate: Send + Sync {
     fn is_auto_approved(&self, _tool_name: &str) -> bool {
         false
     }
+}
+
+/// Seam for inserting a [`DataView`] from wherever a `ToolContext` is used (View Engine
+/// Phase A) without `haily-tools` depending on `haily-core` — mirrors the `ApprovalGate`
+/// precedent exactly (leaf-crate trait, concrete implementer lives in `haily-core`).
+/// `haily-tools` already depends on `haily-types`, so `ToolContext` can carry
+/// `Arc<dyn ViewSink>` with no dependency cycle. `haily-core::ViewStore` is the sole
+/// production implementer; a test-only no-op implementer is used at construction sites
+/// that never exercise view insertion.
+pub trait ViewSink: Send + Sync {
+    /// Store `view` and return its `view_id` (already set on the passed-in `DataView`,
+    /// returned back to the caller for convenience so a caller need not re-read the field
+    /// after a move). Implementations MUST NOT block indefinitely — this is called from a
+    /// tool's synchronous execution path.
+    fn insert(&self, view: DataView) -> Uuid;
 }
 
 /// A single persisted transcript entry for session replay (Sub-Agent + Skill Architecture
@@ -998,5 +1145,176 @@ mod tests {
         assert!(json.contains("\"tier\":\"thinking\""));
         let round_tripped: RunEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, ev);
+    }
+
+    // ---- View Engine Phase A: wire type round-trips ----------------------------------
+
+    fn sample_data_view() -> DataView {
+        DataView {
+            view_id: Uuid::nil(),
+            entity: "contact".to_string(),
+            schema: vec![
+                FieldDef {
+                    name: "name".to_string(),
+                    label: "Name".to_string(),
+                    ftype: FieldType::Text,
+                    writable: false,
+                    required: true,
+                    help: None,
+                },
+                FieldDef {
+                    name: "balance".to_string(),
+                    label: "Balance".to_string(),
+                    ftype: FieldType::Money {
+                        currency: "USD".to_string(),
+                    },
+                    writable: false,
+                    required: false,
+                    help: Some("Outstanding balance".to_string()),
+                },
+                FieldDef {
+                    name: "status".to_string(),
+                    label: "Status".to_string(),
+                    ftype: FieldType::Enum {
+                        variants: vec![EnumVariant {
+                            value: "active".to_string(),
+                            label: "Active".to_string(),
+                        }],
+                    },
+                    writable: false,
+                    required: false,
+                    help: None,
+                },
+            ],
+            records: vec![serde_json::json!({"name": "Alice", "balance": 10.5, "status": "active"})
+                .as_object()
+                .cloned()
+                .expect("object")],
+            projections: vec![
+                ProjectionSpec {
+                    kind: ProjectionKind::Table,
+                    binding: None,
+                },
+                ProjectionSpec {
+                    kind: ProjectionKind::Cards,
+                    binding: None,
+                },
+            ],
+            active: ProjectionSpec {
+                kind: ProjectionKind::Table,
+                binding: None,
+            },
+            total: Some(1),
+            cursor: None,
+            provenance: ViewProvenance::LlmProjected,
+        }
+    }
+
+    /// FREEZE POINT guarantee: every field of `DataView` (including nested `FieldType`
+    /// variants with payloads — `Money`, `Enum`) survives a full serialize/deserialize
+    /// round trip with the documented snake_case wire keys intact.
+    #[test]
+    fn data_view_round_trips_with_snake_case_wire_keys() {
+        let view = sample_data_view();
+        let json = serde_json::to_string(&view).expect("serialize");
+        for key in [
+            "\"view_id\"",
+            "\"entity\"",
+            "\"schema\"",
+            "\"records\"",
+            "\"projections\"",
+            "\"active\"",
+            "\"total\"",
+            "\"cursor\"",
+            "\"provenance\"",
+            "\"writable\"",
+            "\"required\"",
+        ] {
+            assert!(json.contains(key), "missing wire key {key} in {json}");
+        }
+        let round_tripped: DataView = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, view);
+    }
+
+    /// Every `FieldType` variant — including the two carrying a payload — round-trips
+    /// under the `type`/`data` tagged envelope, mirroring `ResponseChunk`/`RunEvent`.
+    #[test]
+    fn field_type_variants_round_trip() {
+        let variants = [
+            FieldType::Text,
+            FieldType::LongText,
+            FieldType::Int,
+            FieldType::Float,
+            FieldType::Money {
+                currency: "VND".to_string(),
+            },
+            FieldType::Bool,
+            FieldType::Date,
+            FieldType::DateTime,
+            FieldType::Enum {
+                variants: vec![EnumVariant {
+                    value: "a".to_string(),
+                    label: "A".to_string(),
+                }],
+            },
+            FieldType::Reference {
+                entity: "task".to_string(),
+            },
+            FieldType::Tags,
+            FieldType::Email,
+            FieldType::Phone,
+            FieldType::Url,
+            FieldType::Opaque,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let round_tripped: FieldType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, v, "round-trip mismatch for {json}");
+        }
+    }
+
+    /// All five `ProjectionKind` variants round-trip — the frozen closed vocabulary (only
+    /// `Table`/`Cards` render in Phase A, but all five must survive the wire).
+    #[test]
+    fn projection_kind_all_variants_round_trip() {
+        for kind in [
+            ProjectionKind::Table,
+            ProjectionKind::Cards,
+            ProjectionKind::Kanban,
+            ProjectionKind::Calendar,
+            ProjectionKind::Chart,
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            let round_tripped: ProjectionKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, kind);
+        }
+    }
+
+    /// `ResponseChunk::ViewRef` is additive (a new variant, not a reshape) and round-trips
+    /// distinctly from every existing variant — the handle a text channel renders as
+    /// "[view] {entity}" without ever seeing the full `DataView` payload.
+    #[test]
+    fn response_chunk_view_ref_roundtrips() {
+        let chunk = ResponseChunk::ViewRef {
+            view_id: Uuid::nil(),
+            entity: "contact".to_string(),
+            provenance: ViewProvenance::LlmProjected,
+        };
+        let json = serde_json::to_string(&chunk).expect("serialize");
+        assert!(json.contains("\"type\":\"ViewRef\""));
+        assert!(json.contains("\"entity\":\"contact\""));
+        let round_tripped: ResponseChunk = serde_json::from_str(&json).expect("deserialize");
+        match round_tripped {
+            ResponseChunk::ViewRef {
+                view_id,
+                entity,
+                provenance,
+            } => {
+                assert_eq!(view_id, Uuid::nil());
+                assert_eq!(entity, "contact");
+                assert_eq!(provenance, ViewProvenance::LlmProjected);
+            }
+            other => panic!("unexpected variant after roundtrip: {other:?}"),
+        }
     }
 }

@@ -111,6 +111,11 @@ pub struct TurnRuntime {
     /// makes this turn behave identically to the pre-phase-4 turn (tier always `None`, zero
     /// `routing_decisions` rows, no escalation rescue attempted).
     pub routing_enabled: Arc<AtomicBool>,
+    /// View Engine Phase A (phase 3): the SAME `Arc<ViewStore>` the Orchestrator holds for
+    /// its whole lifetime (`Orchestrator::view_store()`), not a fresh turn-scoped store —
+    /// so a `present_view` insert here and the `get_view` Tauri command's read observe one
+    /// shared snapshot set.
+    pub view_store: Arc<crate::view::ViewStore>,
 }
 
 /// Full agent turn. Called once per incoming Request.
@@ -133,6 +138,7 @@ pub async fn run_turn(
         tools,
         kill,
         routing_enabled,
+        view_store,
     } = runtime;
     let session_id = req.session_id.to_string();
     let turn_start = std::time::Instant::now();
@@ -265,6 +271,10 @@ pub async fn run_turn(
         // An L0 chat turn is not a pipeline run — only the P4b runner sets this.
         run_id: None,
         depth_mode: effective_depth,
+        // View Engine Phase A (phase 3): the Orchestrator's ONE shared store (see
+        // `TurnRuntime::view_store` doc) — a `present_view` insert here is visible to the
+        // `get_view` Tauri command, which reads the SAME store off the Orchestrator handle.
+        view_sink: Arc::clone(&view_store) as Arc<dyn haily_types::ViewSink>,
     };
 
     let mut guard = tool_call::LoopGuard::new();
@@ -735,6 +745,7 @@ mod turn_integration_tests {
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -884,6 +895,7 @@ mod turn_integration_tests {
             tools: Arc::new(l0_registry),
             kill,
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -986,6 +998,7 @@ mod turn_integration_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1047,6 +1060,7 @@ mod turn_integration_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(false)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1178,6 +1192,7 @@ mod outcome_signal_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(routing_enabled)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1311,6 +1326,7 @@ mod outcome_signal_tests {
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1763,6 +1779,7 @@ mod outcome_signal_tests {
             tools: Arc::new(l0_registry),
             kill,
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
@@ -1972,6 +1989,7 @@ mod routing_toggle_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(false)),
+            view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
         let cancel = CancellationToken::new();
