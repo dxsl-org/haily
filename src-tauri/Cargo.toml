@@ -43,3 +43,6 @@ dirs       = "5"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 tauri-plugin-dialog = "2.7.1"
+# Desktop OS toast notifications (unified-chat-ui P07: RunComplete/ApprovalNeeded/RunPaused
+# alerts when the window is unfocused). Registered at setup here; no command until P07.
+tauri-plugin-notification = "2.3.3"

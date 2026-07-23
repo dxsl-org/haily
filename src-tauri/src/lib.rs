@@ -571,6 +571,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // Registered here (unified-chat-ui P01) so P07 can fire OS toasts with no further
+        // `Cargo.toml` churn — unused until then, no command exposes it yet.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = haily_app::default_data_dir();
             std::fs::create_dir_all(&data_dir)?;
