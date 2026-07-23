@@ -18,6 +18,14 @@ export interface Job {
   currentTier: string | null;
   lastAttempt: number | null;
   events: RunEvent[];
+  /** Client wall-clock ms at the first event this GUI observed for the run (NOT the
+   * backend's actual start time — this reducer is purely event-sourced, see the module
+   * doc). Used by `RunProgressCard`'s elapsed-time display (P04). */
+  startedAt: number;
+  /** Client wall-clock ms when `RunComplete` landed, or `null` while still running/paused
+   * — freezes the elapsed-time display once a run finishes instead of letting it keep
+   * counting up past completion (P04). */
+  completedAt: number | null;
 }
 
 /**
@@ -42,6 +50,8 @@ export function applyRunEvent(jobs: Map<string, Job>, sessionId: string, event: 
         currentTier: null,
         lastAttempt: null,
         events: [event],
+        startedAt: Date.now(),
+        completedAt: null,
       };
 
   if (event.type === 'StageStarted') {
@@ -57,6 +67,7 @@ export function applyRunEvent(jobs: Map<string, Job>, sessionId: string, event: 
     job.currentTier = event.data.to;
   } else if (event.type === 'RunComplete') {
     job.status = /fail|error/i.test(event.data.outcome) ? 'failed' : 'complete';
+    job.completedAt = Date.now();
   }
 
   next.set(runId, job);
@@ -66,6 +77,32 @@ export function applyRunEvent(jobs: Map<string, Job>, sessionId: string, event: 
 /** Newest-first job order for the timeline list — the most recently active run on top. */
 export function orderedJobs(jobs: Map<string, Job>): Job[] {
   return [...jobs.values()].reverse();
+}
+
+/** Number of verifier-grounded retries recorded so far for a job — derived from the
+ * ordered event log rather than a separate counter field (DRY: `events` is already the
+ * source of truth). Reused by `RunProgressCard` (P04) and P07's Runs-list row. */
+export function retryCount(job: Job): number {
+  return job.events.filter((e) => e.type === 'Retry').length;
+}
+
+/** Number of model-tier escalations recorded so far for a job — same derivation style as
+ * `retryCount`. */
+export function escalationCount(job: Job): number {
+  return job.events.filter((e) => e.type === 'Escalation').length;
+}
+
+/** Formats a millisecond duration as `mm:ss` (or `h:mm:ss` past one hour) for
+ * `RunProgressCard`'s elapsed-time label (P04). Negative/invalid input clamps to zero
+ * rather than rendering a negative or NaN duration. */
+export function formatElapsed(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
 export interface EventDescriptor {

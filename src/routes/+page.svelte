@@ -22,7 +22,28 @@
   // toggle — Settings stays a drawer opened by the rail's gear, not a route, so its
   // overlay behavior is unchanged.
   let route = $state<RouteId>('chat');
+  // Single latest-wins approval — feeds `ApprovalModal`, the OUT-OF-SESSION fallback
+  // (P04, D6): rendered only while `route !== 'chat'`, since the in-session surface is
+  // `ChatStream`'s inline `ApprovalQueue` below.
   let pendingApproval = $state<PendingApproval | null>(null);
+  // Every approval this GUI window has observed and not yet resolved, oldest first —
+  // the shared queue `ChatStream`'s `ApprovalQueue` renders inline. Populated from the
+  // SAME chunk as `pendingApproval` below (both structures see every approval; the two
+  // surfaces are simply gated to different routes, not to different data — see the sync
+  // effect further down for why a resolve on either side clears both).
+  let approvalQueue = $state<PendingApproval[]>([]);
+
+  /** Removes one approval from the shared queue — called by `ChatStream` once it (or a
+   * stale idempotent no-op) resolves an entry. Also clears `pendingApproval` when it's
+   * the same id: `ChatInput` gates sending on `pendingApproval` truthiness alone, so
+   * without this an approval resolved via the inline queue would leave the input
+   * permanently blocked (only `ApprovalModal`'s own resolve flow nulls it otherwise). */
+  function removeFromQueue(approvalId: string) {
+    approvalQueue = approvalQueue.filter((a) => a.approvalId !== approvalId);
+    if (pendingApproval?.approvalId === approvalId) {
+      pendingApproval = null;
+    }
+  }
   // Set for one tick whenever a `ViewRef` chunk arrives (written by the `haily-chunk`
   // listener below); `WorkspacePane` consumes and clears it via `bind:pendingView`
   // (mirrors `pendingApproval`'s `bind:pending` contract on `ApprovalModal`). The pane
@@ -77,7 +98,7 @@
       // tied to, so it's handled before the bubble lookup (which requires an
       // already-tracked session index).
       if (chunk.type === 'ToolApprovalRequest') {
-        pendingApproval = {
+        const approval: PendingApproval = {
           sessionId: session_id,
           approvalId: chunk.data.approval_id,
           tool: chunk.data.tool,
@@ -85,6 +106,10 @@
           origin: chunk.data.origin,
           reversible: chunk.data.reversible,
         };
+        pendingApproval = approval;
+        if (!approvalQueue.some((a) => a.approvalId === approval.approvalId)) {
+          approvalQueue = [...approvalQueue, approval];
+        }
         return;
       }
 
@@ -144,6 +169,22 @@
 
     return () => { unlistenPromise.then(fn => fn()); };
   });
+
+  // Keeps the two approval surfaces (out-of-session modal, in-session inline queue) from
+  // showing a stale entry for something already decided on the OTHER surface. Resolving
+  // via `ApprovalModal` only nulls `pendingApproval` (that component's own contract,
+  // unowned by this phase) — this effect notices that null transition and drops the same
+  // id from `approvalQueue` too. The reverse direction (queue resolves first) is handled
+  // by `removeFromQueue` below, called from `ChatStream`'s `onApprovalResolved`.
+  let lastModalApprovalId: string | null = null;
+  $effect(() => {
+    if (pendingApproval) {
+      lastModalApprovalId = pendingApproval.approvalId;
+    } else if (lastModalApprovalId) {
+      removeFromQueue(lastModalApprovalId);
+      lastModalApprovalId = null;
+    }
+  });
 </script>
 
 <div class="app">
@@ -156,7 +197,12 @@
     </header>
 
     <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
-    <ApprovalModal bind:pending={pendingApproval} />
+    <!-- Out-of-session fallback ONLY (P04, D6): while the chat route is mounted, the
+         in-session surface is `ChatStream`'s inline `ApprovalQueue` instead — this modal
+         must not double up with it. -->
+    {#if route !== 'chat'}
+      <ApprovalModal bind:pending={pendingApproval} />
+    {/if}
 
     <!-- The workspace pane (View Engine Phase A) coexists with whichever destination is
          active — it is a side region, never a replacement for the main content (Creative
@@ -167,7 +213,13 @@
         {#if route === 'chat'}
           <WorkItemsPanel />
           <ProactivePanel />
-          <ChatStream {messages} bind:bottomAnchor />
+          <ChatStream
+            {messages}
+            {sessionIndex}
+            approvals={approvalQueue}
+            onApprovalResolved={removeFromQueue}
+            bind:bottomAnchor
+          />
           <ChatInput
             {messages}
             {sessionIndex}
