@@ -230,6 +230,40 @@ pub async fn get_skill(db: &DbHandle, id: &str) -> Result<Option<Skill>> {
     .await?)
 }
 
+/// Fetch a single active skill by NAME — the skill editor's (Unified Chat UI phase 8) lookup
+/// key, unlike `get_skill`'s ID-keyed targeted EMA updates.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn get_skill_by_name(db: &DbHandle, name: &str) -> Result<Option<Skill>> {
+    Ok(sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
+/// Overwrite a synthesized skill's `description` column — the skill editor's (phase 8, D4)
+/// "body" for a synthesized skill: `kms_skills` has no dedicated body column, and `description`
+/// is already the free-form prose field `synthesized_skill_body`/Jaccard matching read, so the
+/// structured-editor's rendered markdown replaces it directly rather than adding a migration.
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn update_skill_body(db: &DbHandle, id: &str, body: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE kms_skills SET description = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(body)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 /// Fetch a skill by ID regardless of archived/deleted state — unlike `get_skill`
 /// (which exists for "targeted EMA updates" on ACTIVE skills only), this is for
 /// callers that need to observe the archival outcome itself (e.g. a corroboration-

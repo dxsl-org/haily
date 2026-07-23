@@ -4,6 +4,7 @@ pub mod feedback;
 pub mod hnsw;
 pub mod kit_pack;
 pub mod search;
+pub mod skill_editor;
 pub mod skill_gates;
 pub mod skills;
 pub mod system_prompt;
@@ -12,7 +13,7 @@ pub mod voice_check;
 #[cfg(feature = "embeddings")]
 pub mod embedder;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use haily_db::{queries::facts, queries::meta, queries::skills as db_skills, DbHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +70,7 @@ impl KmsHandle {
 
         // Phase-02: load the authored-skill kit-pack (tolerant of absence — a missing or
         // unverifiable pack logs and yields an empty registry, never fails boot).
-        let authored = Self::load_authored(data_dir);
+        let authored = Self::load_authored(&db, data_dir).await;
 
         #[cfg(feature = "embeddings")]
         let embedder = {
@@ -94,13 +95,15 @@ impl KmsHandle {
     /// Source precedence: `<data_dir>/kit-pack` (the shipped/packaged location) first,
     /// else a CWD-relative `assets/kit-pack` (dev/`cargo run` from the repo root). Only
     /// the kit-pack tier is populated today; the merge supports the full 5-tier order.
-    /// Any absence or load failure yields an empty registry (logged, never fatal).
-    fn load_authored(data_dir: &Path) -> authored_skills::AuthoredRegistry {
+    /// Any absence or load failure yields an empty registry (logged, never fatal). Uses the
+    /// version-fallback loader (phase 8, D4) so a boot right after a crashed edit recovers the
+    /// pre-edit content instead of silently dropping the skill.
+    async fn load_authored(db: &DbHandle, data_dir: &Path) -> authored_skills::AuthoredRegistry {
         let Some(dir) = Self::kit_pack_source(data_dir) else {
             tracing::debug!("no kit-pack found — authored-skill registry is empty");
             return authored_skills::AuthoredRegistry::new();
         };
-        match kit_pack::load(&dir) {
+        match kit_pack::load_with_versions_fallback(&dir, db).await {
             Ok(skills) => {
                 tracing::info!(count = skills.len(), path = %dir.display(), "kit-pack loaded");
                 // kit-pack is the LOWEST precedence tier (user/project tiers, when they
@@ -125,6 +128,34 @@ impl KmsHandle {
             return Some(dev);
         }
         None
+    }
+
+    /// The kit-pack directory currently in use (same precedence as boot) — the skill editor's
+    /// (phase 8, D4) write-target resolver.
+    pub fn kit_pack_dir(&self) -> Option<PathBuf> {
+        Self::kit_pack_source(&self.data_dir)
+    }
+
+    /// Re-parse the kit-pack directory from disk and hot-swap it into the live registry
+    /// (phase 8, D4) — called after `skill_editor::ops` commits an atomic write so the edit is
+    /// visible without a restart. Idempotent; safe to call at any time.
+    ///
+    /// # Errors
+    /// Returns an error if no kit-pack directory can be located.
+    pub async fn reload_authored(&self) -> Result<()> {
+        let dir = self
+            .kit_pack_dir()
+            .ok_or_else(|| anyhow!("kit-pack not found — cannot reload authored skills"))?;
+        let skills = kit_pack::load_with_versions_fallback(&dir, &self.db).await?;
+        self.authored.reload(vec![skills]);
+        Ok(())
+    }
+
+    /// One authored skill's full parsed record (phase 8, D4) — unlike `fetch_skill_section`'s
+    /// single-section lazy-load, the editor needs the whole record to reconstruct a complete
+    /// file on save/revert.
+    pub fn authored_get(&self, name: &str) -> Option<authored_skills::AuthoredSkill> {
+        self.authored.get(name)
     }
 
     // ---------------------------------------------------------------------

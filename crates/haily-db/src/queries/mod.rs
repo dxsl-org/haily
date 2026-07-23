@@ -17,6 +17,7 @@ pub mod review_findings;
 pub mod routing_decisions;
 pub mod run_events;
 pub mod sessions;
+pub mod skill_versions;
 pub mod skills;
 pub mod tasks;
 pub mod view_events;

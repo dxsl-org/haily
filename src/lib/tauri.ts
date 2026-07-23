@@ -776,3 +776,68 @@ export interface SlashCommand {
 export async function listSlashCommands(): Promise<SlashCommand[]> {
   return invoke('list_slash_commands');
 }
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 8 (D4) — structured skill editor + versioning. Mirrors
+// `haily_kms::skill_editor`. Local-GUI-only: never bridged to mobile.
+// ---------------------------------------------------------------------------
+
+/** Which store a skill's content lives in. Mirrors `haily_kms::skill_editor::SkillEditKind`. */
+export type SkillEditKind = 'authored' | 'synthesized';
+
+/** The 4-field structured shape both edit paths render to/from markdown. Mirrors
+ * `haily_kms::skill_editor::SkillDraft`. */
+export interface SkillDraft {
+  procedure: string;
+  success_conditions: string;
+  forbidden_actions: string;
+  required_from_user: string;
+}
+
+/** One skill's editable view. Mirrors `haily_kms::skill_editor::SkillDetail`. */
+export interface SkillDetail {
+  name: string;
+  kind: SkillEditKind;
+  draft: SkillDraft;
+}
+
+/** One recorded save/pre-edit snapshot. Mirrors `haily_db::queries::skill_versions::SkillVersion`. */
+export interface SkillVersion {
+  id: string;
+  skill_name: string;
+  kind: SkillEditKind;
+  content_md: string;
+  sha256: string;
+  note: string | null;
+  created_at: string;
+}
+
+/** Fetch one skill's structured-editor view — the editor's "open" action. */
+export async function getSkillDetail(name: string, kind: SkillEditKind): Promise<SkillDetail> {
+  return invoke('get_skill_detail', { name, kind });
+}
+
+/** Save a skill's structured fields. Returns the full saved content (informational). */
+export async function editSkill(name: string, kind: SkillEditKind, draft: SkillDraft): Promise<string> {
+  return invoke('edit_skill', { name, kind, draft });
+}
+
+/** Version history for one skill, newest first. */
+export async function listSkillVersions(name: string): Promise<SkillVersion[]> {
+  return invoke('list_skill_versions', { name });
+}
+
+/** Restore a skill to a prior recorded version. */
+export async function revertSkill(name: string, versionId: string): Promise<string> {
+  return invoke('revert_skill', { name, versionId });
+}
+
+/** Promote a synthesized skill to an authored kit-pack file — exits the decay lifecycle. */
+export async function promoteSkill(name: string): Promise<string> {
+  return invoke('promote_skill', { name });
+}
+
+/** Manually archive a synthesized skill (distinct from automatic confidence-decay archival). */
+export async function archiveSkillManual(name: string): Promise<void> {
+  return invoke('archive_skill_manual', { name });
+}

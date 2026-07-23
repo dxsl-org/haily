@@ -10,13 +10,14 @@ use haily_app::{
 };
 use haily_core::view::ViewStore;
 use haily_db::{
-    queries::{journal, meta, view_events},
+    queries::{journal, meta, skill_versions::SkillVersion, view_events},
     DbHandle,
 };
 use haily_io::{
     Adapter, ApprovalResolver, DepthMode, GuiProactiveReceiver, GuiRequestSender,
     GuiResponseReceiver, GuiRunEventReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
+use haily_kms::skill_editor::{SkillDetail, SkillDraft, SkillEditKind};
 use haily_kms::KmsHandle;
 use haily_types::DataView;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -310,6 +311,58 @@ async fn set_skill_enabled(name: String, enabled: bool, state: State<'_, AppStat
 #[tauri::command]
 async fn pin_skill(name: String, pinned: bool, state: State<'_, AppState>) -> Result<(), String> {
     haily_app::pin_skill(&state.db, &name, pinned).await.map_err(|e| e.to_string())
+}
+
+/// Fetch one skill's structured-editor view (Unified Chat UI phase 8, D4) — the editor's
+/// "open" action. `kind` selects the authored (kit-pack) or synthesized (`kms_skills`) store.
+#[tauri::command]
+async fn get_skill_detail(name: String, kind: String, state: State<'_, AppState>) -> Result<SkillDetail, String> {
+    let kind = SkillEditKind::parse(&kind).map_err(|e| e.to_string())?;
+    haily_kms::skill_editor::get_skill_detail(&state.kms, &name, kind).await.map_err(|e| e.to_string())
+}
+
+/// Save a skill's structured fields (phase 8, D4). The pre-edit content is snapshotted into
+/// `skill_versions` first (crash-safety + history), then written through the atomic path for
+/// `kind`. Returns the full saved content. Local-GUI-only — never bridged to mobile (a paired
+/// device must not rewrite a manifest-pinned skill file).
+#[tauri::command]
+async fn edit_skill(
+    name: String,
+    kind: String,
+    draft: SkillDraft,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let kind = SkillEditKind::parse(&kind).map_err(|e| e.to_string())?;
+    haily_kms::skill_editor::edit_skill(&state.kms, &name, kind, &draft).await.map_err(|e| e.to_string())
+}
+
+/// Version history for one skill, newest first (phase 8, D4) — spans both authored and
+/// synthesized saves, since `skill_versions` is the one mechanism for both.
+#[tauri::command]
+async fn list_skill_versions(name: String, state: State<'_, AppState>) -> Result<Vec<SkillVersion>, String> {
+    haily_kms::skill_editor::list_versions(&state.kms, &name).await.map_err(|e| e.to_string())
+}
+
+/// Restore `name` to a prior recorded version (phase 8, D4) — dispatches by the version's OWN
+/// kind, not a caller-supplied one. Local-GUI-only, mirrors `edit_skill`.
+#[tauri::command]
+async fn revert_skill(name: String, version_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    haily_kms::skill_editor::revert_skill(&state.kms, &name, &version_id).await.map_err(|e| e.to_string())
+}
+
+/// Promote a synthesized skill to an authored kit-pack file (phase 8, D4) — exits the
+/// confidence/decay lifecycle permanently; archives the synthesized row in the same operation.
+/// Local-GUI-only, mirrors `edit_skill`.
+#[tauri::command]
+async fn promote_skill(name: String, state: State<'_, AppState>) -> Result<String, String> {
+    haily_kms::skill_editor::promote_to_authored(&state.kms, &name).await.map_err(|e| e.to_string())
+}
+
+/// Manually archive a synthesized skill (phase 8, D4) — the editor's explicit Archive action,
+/// distinct from the automatic confidence-decay archival.
+#[tauri::command]
+async fn archive_skill_manual(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    haily_kms::skill_editor::archive_synthesized(&state.kms, &name).await.map_err(|e| e.to_string())
 }
 
 /// Active coding workspaces (phase 11a): branch, dirty status, and the host sandbox
@@ -713,6 +766,12 @@ pub fn run() {
             mobile_server_status,
             #[cfg(feature = "mobile-server")]
             mobile_regenerate_cert,
+            get_skill_detail,
+            edit_skill,
+            list_skill_versions,
+            revert_skill,
+            promote_skill,
+            archive_skill_manual,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")
