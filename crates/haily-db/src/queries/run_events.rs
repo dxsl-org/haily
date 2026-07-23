@@ -54,13 +54,36 @@ fn event_kind(event: &RunEvent) -> &'static str {
 /// bridge already routes it to [`upsert_stage_marker`] instead; this is a defense-in-depth
 /// backstop so a future caller mistake can never leak `chunk` text into this table.
 ///
+/// `GateResult.decisive` is redacted to an empty string before this row is written — it is raw
+/// verifier output (a failing test/compiler line can echo a secret), the same leak class the
+/// `StageOutput` exclusion above closes, and this table's backup scrub is a keyed row-delete
+/// that cannot scan payload content. The live in-memory delivery above (before this call) still
+/// carries the full `decisive` text to the GUI/CLI/Telegram surface; only the persisted copy
+/// drops it, keeping gate identity + pass/fail for replay.
+///
 /// # Errors
 /// Returns an error if serialization or the insert fails.
 pub async fn insert_run_event(db: &DbHandle, run_id: &str, event: &RunEvent) -> Result<()> {
     if matches!(event, RunEvent::StageOutput { .. }) {
         return Ok(());
     }
-    let payload = serde_json::to_string(event).context("serialize RunEvent for persistence")?;
+    let redacted;
+    let to_persist: &RunEvent = if let RunEvent::GateResult {
+        run_id, gate, pass, ..
+    } = event
+    {
+        redacted = RunEvent::GateResult {
+            run_id: run_id.clone(),
+            gate: gate.clone(),
+            pass: *pass,
+            decisive: String::new(),
+        };
+        &redacted
+    } else {
+        event
+    };
+    let payload =
+        serde_json::to_string(to_persist).context("serialize RunEvent for persistence")?;
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO run_events (run_id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
         .bind(run_id)
@@ -245,6 +268,52 @@ mod tests {
         assert_eq!(
             markers[0].last_seq, 4,
             "last_seq tracks the most recent chunk"
+        );
+    }
+
+    /// `GateResult.decisive` is raw verifier output (same leak class as `StageOutput.chunk`) —
+    /// the persisted row must never carry it, even though the in-memory event handed to
+    /// `insert_run_event` does. Checks both the replayed value AND the raw stored payload text,
+    /// so a future refactor can't satisfy the struct-level assertion while still leaking the
+    /// secret into an untyped column.
+    #[tokio::test]
+    async fn gate_result_decisive_text_is_redacted_before_persist() {
+        let (db, run_id, _dir) = setup().await;
+        let secret = "SECRET_TOKEN=abc123 test failed";
+        insert_run_event(
+            &db,
+            &run_id,
+            &RunEvent::GateResult {
+                run_id: run_id.clone(),
+                gate: "command".into(),
+                pass: false,
+                decisive: secret.into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let replayed = list_run_events(&db, &run_id).await.unwrap();
+        assert_eq!(
+            replayed,
+            vec![RunEvent::GateResult {
+                run_id: run_id.clone(),
+                gate: "command".into(),
+                pass: false,
+                decisive: String::new(),
+            }],
+            "gate identity + pass/fail survive; decisive text is dropped"
+        );
+
+        let (raw_payload,): (String,) =
+            sqlx::query_as("SELECT payload FROM run_events WHERE run_id = ?")
+                .bind(&run_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !raw_payload.contains(secret),
+            "raw stored payload must not contain the secret text either"
         );
     }
 

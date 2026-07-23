@@ -146,6 +146,15 @@ pub fn spawn_run_event_bridge(
                         tracing::warn!(%session_id, "run-event delivery failed: {e:#}");
                     }
 
+                    // NOTE: persist is `.await`ed inline here, not spawned/detached, by design.
+                    // `run_events.id` is an AUTOINCREMENT assigned at INSERT time, so per-run
+                    // replay order depends on inserts happening in the same order events are
+                    // drained; detaching this write would let two persists race and land out of
+                    // emission order. Delivery to the live adapter already happened above, so a
+                    // slow write only backpressures the runner's own bounded mpsc — it never
+                    // delays the GUI/CLI/Telegram surface. Accepted for local SQLite; revisit
+                    // only if measurement shows this mattering (a detached queue would need its
+                    // own sequence field to restore ordering without the DB's AUTOINCREMENT).
                     if let Some(ev) = row_to_persist {
                         let run_id = run_events::run_id_of(&ev).to_string();
                         if let Err(e) = run_events::insert_run_event(&db, &run_id, &ev).await {
