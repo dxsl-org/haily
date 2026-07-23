@@ -17,6 +17,7 @@
 //! per-turn `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered
 //! launch stays cancellable by the same "Stop" action a normal turn already is. See the phase's
 //! Deviation Log.
+use crate::slash_registry::SlashRegistry;
 use haily_core::{classify_coding_intent, CodingRunSpec, Orchestrator, RunKind};
 use haily_io::{slash, AdapterManager};
 use haily_types::{DepthMode, Request, RequestOrigin, ResponseChunk};
@@ -42,6 +43,7 @@ pub struct LaunchHandles {
 }
 
 /// What a dispatch-layer trigger decides to do with one incoming [`Request`].
+#[derive(Debug)]
 pub enum TriggerAction {
     /// No launch — route to the orchestrator's normal turn (`orc.process`).
     NormalTurn,
@@ -62,13 +64,19 @@ pub enum TriggerAction {
 }
 
 /// Decide the trigger action for one incoming request. Parses a leading slash command via
-/// `slash::parse`, or — for a no-slash [`RequestOrigin::Chat`] message — classifies chat intent
-/// via `classify_coding_intent`. `Cli`-origin requests never reach the intent classifier here
-/// (SEC-H: `Cli` is the eval bypass path and must stay unreachable from a chat message); the
-/// classifier itself re-checks the same gate as a defense-in-depth mirror.
-pub fn resolve(req: &Request) -> TriggerAction {
+/// `slash::parse` and resolves it against the data-driven [`SlashRegistry`] (Unified Chat UI
+/// phase 2, D1) — built-ins map to the same actions `resolve_slash` always produced; an
+/// authored/synthesized skill command tags `req.forced_skill` and routes as a normal turn (see
+/// `slash_registry::resolve`). For a no-slash [`RequestOrigin::Chat`] message, classifies chat
+/// intent via `classify_coding_intent`. `Cli`-origin requests never reach the intent classifier
+/// here (SEC-H: `Cli` is the eval bypass path and must stay unreachable from a chat message);
+/// the classifier itself re-checks the same gate as a defense-in-depth mirror.
+///
+/// `req` is mutated ONLY when the slash resolves to a `SkillTurn` action — every other branch
+/// leaves it untouched, so a caller does not need to guard against surprise mutation.
+pub fn resolve(req: &mut Request, registry: &SlashRegistry) -> TriggerAction {
     if let Some((name, arg)) = slash::parse(&req.message) {
-        return resolve_slash(&name, &arg);
+        return crate::slash_registry::resolve::resolve(req, &name, &arg, registry);
     }
 
     if req.origin == RequestOrigin::Chat {
@@ -78,17 +86,6 @@ pub fn resolve(req: &Request) -> TriggerAction {
     }
 
     TriggerAction::NormalTurn
-}
-
-fn resolve_slash(name: &str, arg: &str) -> TriggerAction {
-    match name {
-        "plan" if !arg.is_empty() => TriggerAction::LaunchPlan(arg.to_string()),
-        "code" | "build" if !arg.is_empty() => TriggerAction::LaunchBuild(arg.to_string()),
-        "plan" => TriggerAction::PromptTask(RunKind::Plan),
-        "code" | "build" => TriggerAction::PromptTask(RunKind::Build),
-        _ if slash::is_registered(name) => TriggerAction::NormalTurn,
-        _ => TriggerAction::UnknownSlashHint(name.to_string()),
-    }
 }
 
 /// User-facing text for [`TriggerAction::PromptTask`] — deterministic (never routed through the

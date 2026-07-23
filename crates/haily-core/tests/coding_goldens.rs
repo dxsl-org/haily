@@ -114,6 +114,7 @@ fn cli_mode() -> EvalMode {
         user_ref: None,
         depth: DepthMode::Normal,
         origin: RequestOrigin::Cli,
+        forced_skill: None,
     };
     EvalMode::from_request(&req).expect("cli origin enables eval mode")
 }

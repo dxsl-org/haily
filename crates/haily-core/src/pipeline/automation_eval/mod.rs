@@ -361,6 +361,7 @@ mod tests {
             user_ref: None,
             depth: DepthMode::Normal,
             origin: RequestOrigin::Chat,
+            forced_skill: None,
         };
         assert!(
             EvalMode::from_request(&chat).is_none(),

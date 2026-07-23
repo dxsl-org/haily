@@ -1078,6 +1078,7 @@ mod routing_enabled_tests {
                 user_ref: None,
                 depth: Default::default(),
                 origin: Default::default(),
+                forced_skill: None,
             };
             let (tx, mut rx) = mpsc::channel(64);
             let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

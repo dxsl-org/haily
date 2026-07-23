@@ -115,6 +115,20 @@ pub fn build(ctx: &LifeContext) -> String {
         )
     };
 
+    // Unified Chat UI phase 2: a `/<skill>` slash command tags one skill's body onto THIS
+    // turn only (via `Request.forced_skill`, already gate-revalidated by the time it reaches
+    // here — see `KmsHandle::resolve_forced_skill`). Tag-stripped like every other
+    // caller-influenced block above: the name/body come from a trusted store, but stripping
+    // is cheap defense-in-depth against a poisoned kit-pack/synthesized entry.
+    let forced_skill_block = match &ctx.forced_skill {
+        Some(f) => format!(
+            "\n## Active Skill: {}\n{}\n",
+            strip_tool_tags(&f.name),
+            strip_tool_tags(&f.body)
+        ),
+        None => String::new(),
+    };
+
     format!(
         "\
 ## Identity
@@ -127,7 +141,7 @@ Bạn xưng là {pronoun}, gọi họ là {address}.
 {soul_style}
 
 {absolute_no}
-{facts_block}{directives_block}{skills_block}{skill_routing_block}",
+{facts_block}{directives_block}{skills_block}{skill_routing_block}{forced_skill_block}",
         agent_name = ctx.agent_name,
         pronoun = ctx.agent_pronoun,
         address = ctx.user_address,
@@ -151,6 +165,7 @@ mod tests {
             feedback_directives: vec![],
             active_skills: vec![],
             skill_routing_table: String::new(),
+            forced_skill: None,
         }
     }
 
@@ -226,6 +241,20 @@ Không dùng emoji. Particles trung tính — không thêm 'ạ', 'nhé', 'nha'.
         let prompt = build(&ctx);
         assert!(prompt.contains("## Skills"), "routing table must render a ## Skills section");
         assert!(prompt.contains("- **plan** — before coding"));
+    }
+
+    /// Unified Chat UI phase 2: a populated `forced_skill` renders an `## Active Skill`
+    /// section carrying the name and body — tag-stripped like every other block.
+    #[test]
+    fn forced_skill_renders_active_skill_section() {
+        let mut ctx = base_ctx(vec![]);
+        ctx.forced_skill = Some(crate::ForcedSkill {
+            name: "fix-bug".to_string(),
+            body: "1. Reproduce\n2. Root-cause\n3. Fix".to_string(),
+        });
+        let prompt = build(&ctx);
+        assert!(prompt.contains("## Active Skill: fix-bug"));
+        assert!(prompt.contains("1. Reproduce"));
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub async fn run_coding_eval_all(
         user_ref: None,
         depth,
         origin: RequestOrigin::Cli,
+        forced_skill: None,
     };
     let mode = EvalMode::from_request(&cli_req)
         .context("eval mode requires a CLI-origin request (SEC-H)")?;

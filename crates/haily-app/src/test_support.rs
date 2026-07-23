@@ -78,6 +78,7 @@ impl MockAdapter {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         })
         .await
         .expect("dispatch loop closed");

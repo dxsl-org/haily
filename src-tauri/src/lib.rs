@@ -5,8 +5,8 @@ mod models;
 
 use haily_app::connector_config::{self, ConnectorSummary};
 use haily_app::{
-    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, TurnRegistry,
-    WorkspaceView,
+    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, SlashCommand,
+    SlashRegistry, TurnRegistry, WorkspaceView,
 };
 use haily_core::view::ViewStore;
 use haily_db::{
@@ -75,6 +75,10 @@ struct AppState {
     view_store: Arc<ViewStore>,
     #[cfg(feature = "mobile-server")]
     mobile: MobileState,
+    /// Data-driven slash-command registry (Unified Chat UI phase 2, D1) — the SAME
+    /// `Arc<SlashRegistry>` `dispatch.rs` consults per-request. Cloned out of `app` at setup,
+    /// mirroring `kms`/`db`, so `list_slash_commands` doesn't need to lock `app`.
+    slash_registry: Arc<SlashRegistry>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -102,6 +106,7 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
         user_ref: None,
         depth,
         origin: Default::default(),
+        forced_skill: None,
     };
     state.gui_req_tx.send(req).await.map_err(|e| e.to_string())?;
     Ok(session_id.to_string())
@@ -351,6 +356,17 @@ async fn list_approvals(state: State<'_, AppState>) -> Result<Vec<PendingApprova
     let guard = state.app.lock().await;
     let app = guard.as_ref().ok_or("app is shutting down")?;
     Ok(app.pending_approvals())
+}
+
+/// The current slash-command registry (Unified Chat UI phase 2, D1) — built-ins + enabled
+/// authored + enabled synthesized skills, name-sorted, for the palette/＋ menu. Rebuilds
+/// opportunistically before returning so the palette reflects a just-edited skill even if no
+/// chat message has been sent since (`dispatch_loop`'s own per-request `ensure_fresh` call is
+/// the OTHER place this same lazy-rebuild check runs — see `SlashRegistry::ensure_fresh`).
+#[tauri::command]
+async fn list_slash_commands(state: State<'_, AppState>) -> Result<Vec<SlashCommand>, String> {
+    state.slash_registry.ensure_fresh(&state.kms, &state.db).await;
+    Ok(state.slash_registry.snapshot())
 }
 
 /// Launch a coding-pipeline run from the GUI's "New run" form (Pipeline Activation & Wiring
@@ -634,6 +650,7 @@ pub fn run() {
             let routing_enabled = app_handle.orchestrator.routing_enabled_handle();
             let credential_store = Arc::clone(&app_handle.credential_store);
             let view_store = app_handle.orchestrator.view_store();
+            let slash_registry = Arc::clone(&app_handle.slash_registry);
             app.manage(AppState {
                 gui_req_tx,
                 db,
@@ -646,6 +663,7 @@ pub fn run() {
                 view_store,
                 #[cfg(feature = "mobile-server")]
                 mobile: mobile_state,
+                slash_registry,
                 app: Mutex::new(Some(app_handle)),
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
@@ -680,6 +698,7 @@ pub fn run() {
             start_coding_run,
             get_view,
             record_view_intent,
+            list_slash_commands,
             #[cfg(feature = "mobile-server")]
             mobile_pairing_qr,
             #[cfg(feature = "mobile-server")]

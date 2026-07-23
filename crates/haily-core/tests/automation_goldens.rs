@@ -62,6 +62,7 @@ fn cli_mode() -> EvalMode {
         user_ref: None,
         depth: DepthMode::Normal,
         origin: RequestOrigin::Cli,
+        forced_skill: None,
     };
     EvalMode::from_request(&req).expect("cli origin enables eval mode")
 }
@@ -201,6 +202,7 @@ fn eval_mode_is_unreachable_from_a_chat_request() {
         user_ref: None,
         depth: DepthMode::Normal,
         origin: RequestOrigin::Chat,
+        forced_skill: None,
     };
     assert!(
         EvalMode::from_request(&req).is_none(),

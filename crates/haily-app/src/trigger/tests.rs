@@ -1,6 +1,9 @@
-//! Unit tests for `resolve` (pure, no I/O) plus integration tests for the confirm-gate + launch
-//! flow, bootstrapped through the real `AppHandle` so `confirm_then_launch` exercises the actual
-//! `ApprovalBroker` and `Orchestrator::launch_coding_run`/`process` paths.
+//! Unit tests for `resolve` (registry-backed slash routing + chat-intent) plus integration
+//! tests for the confirm-gate + launch flow, bootstrapped through the real `AppHandle` so
+//! `confirm_then_launch` exercises the actual `ApprovalBroker` and
+//! `Orchestrator::launch_coding_run`/`process` paths. The slash-routing tests also bootstrap
+//! a real `AppHandle` (rather than a bare `SlashRegistry`) so they exercise the SAME registry
+//! `dispatch_loop` actually consults — built-ins are always seeded regardless of DB state.
 use super::*;
 use crate::bootstrap::{AppHandle, BootstrapOptions};
 use crate::test_support::{cloud_config, spawn_slow_llm_server, MockAdapter};
@@ -14,38 +17,44 @@ fn make_request(message: &str, origin: RequestOrigin) -> Request {
         user_ref: None,
         depth: Default::default(),
         origin,
+        forced_skill: None,
     }
 }
 
 // -- resolve(): slash routing -------------------------------------------------------
 
-#[test]
-fn slash_plan_with_task_launches_plan() {
-    let req = make_request("/plan add dark mode", RequestOrigin::Chat);
-    match resolve(&req) {
+#[tokio::test]
+async fn slash_plan_with_task_launches_plan() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("/plan add dark mode", RequestOrigin::Chat);
+    match resolve(&mut req, &handle.slash_registry) {
         TriggerAction::LaunchPlan(task) => assert_eq!(task, "add dark mode"),
-        _ => panic!("expected LaunchPlan"),
+        other => panic!("expected LaunchPlan, got {other:?}"),
     }
 }
 
-#[test]
-fn slash_code_and_build_alias_launch_build() {
+#[tokio::test]
+async fn slash_code_and_build_alias_launch_build() {
+    let (handle, _dir) = bootstrapped().await;
     for cmd in ["/code fix the login bug", "/build fix the login bug"] {
-        let req = make_request(cmd, RequestOrigin::Chat);
-        match resolve(&req) {
+        let mut req = make_request(cmd, RequestOrigin::Chat);
+        match resolve(&mut req, &handle.slash_registry) {
             TriggerAction::LaunchBuild(task) => assert_eq!(task, "fix the login bug"),
-            _ => panic!("expected LaunchBuild for {cmd}"),
+            other => panic!("expected LaunchBuild for {cmd}, got {other:?}"),
         }
     }
 }
 
-#[test]
-fn slash_empty_arg_prompts_instead_of_launching() {
-    let plan_prompt = resolve(&make_request("/plan", RequestOrigin::Chat));
+#[tokio::test]
+async fn slash_empty_arg_prompts_instead_of_launching() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut plan_req = make_request("/plan", RequestOrigin::Chat);
+    let plan_prompt = resolve(&mut plan_req, &handle.slash_registry);
     assert!(matches!(plan_prompt, TriggerAction::PromptTask(RunKind::Plan)));
 
     for cmd in ["/code", "/build"] {
-        let prompt = resolve(&make_request(cmd, RequestOrigin::Chat));
+        let mut req = make_request(cmd, RequestOrigin::Chat);
+        let prompt = resolve(&mut req, &handle.slash_registry);
         assert!(
             matches!(prompt, TriggerAction::PromptTask(RunKind::Build)),
             "{cmd} with no arg must prompt for a task, not launch"
@@ -53,48 +62,75 @@ fn slash_empty_arg_prompts_instead_of_launching() {
     }
 }
 
-#[test]
-fn slash_unknown_command_returns_hint_not_a_swallow() {
-    let req = make_request("/frobnicate", RequestOrigin::Chat);
-    match resolve(&req) {
+#[tokio::test]
+async fn slash_unknown_command_returns_hint_not_a_swallow() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("/frobnicate", RequestOrigin::Chat);
+    match resolve(&mut req, &handle.slash_registry) {
         TriggerAction::UnknownSlashHint(name) => assert_eq!(name, "frobnicate"),
-        _ => panic!("expected UnknownSlashHint"),
+        other => panic!("expected UnknownSlashHint, got {other:?}"),
     }
 }
 
-#[test]
-fn slash_registered_noncoding_command_forwards_as_normal_turn() {
-    let req = make_request("/help", RequestOrigin::Chat);
-    assert!(matches!(resolve(&req), TriggerAction::NormalTurn));
+#[tokio::test]
+async fn slash_registered_noncoding_command_forwards_as_normal_turn() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("/help", RequestOrigin::Chat);
+    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
 }
 
 // -- resolve(): chat-intent detection -----------------------------------------------
 
-#[test]
-fn chat_intent_positive_on_chat_origin_returns_confirm_then_launch() {
-    let req = make_request("implement this feature", RequestOrigin::Chat);
-    match resolve(&req) {
+#[tokio::test]
+async fn chat_intent_positive_on_chat_origin_returns_confirm_then_launch() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("implement this feature", RequestOrigin::Chat);
+    match resolve(&mut req, &handle.slash_registry) {
         TriggerAction::ConfirmThenLaunch(kind, task) => {
             assert_eq!(kind, RunKind::Build);
             assert_eq!(task, "implement this feature");
         }
-        _ => panic!("expected ConfirmThenLaunch"),
+        other => panic!("expected ConfirmThenLaunch, got {other:?}"),
     }
 }
 
-#[test]
-fn chat_intent_never_fires_on_cli_origin_even_with_coding_shaped_text() {
-    let req = make_request("implement this feature", RequestOrigin::Cli);
+#[tokio::test]
+async fn chat_intent_never_fires_on_cli_origin_even_with_coding_shaped_text() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("implement this feature", RequestOrigin::Cli);
     assert!(
-        matches!(resolve(&req), TriggerAction::NormalTurn),
+        matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn),
         "Cli origin (the eval bypass path) must never intent-launch"
     );
 }
 
-#[test]
-fn ambiguous_chat_message_falls_through_to_a_normal_turn() {
-    let req = make_request("hey, how's it going today?", RequestOrigin::Chat);
-    assert!(matches!(resolve(&req), TriggerAction::NormalTurn));
+#[tokio::test]
+async fn ambiguous_chat_message_falls_through_to_a_normal_turn() {
+    let (handle, _dir) = bootstrapped().await;
+    let mut req = make_request("hey, how's it going today?", RequestOrigin::Chat);
+    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
+}
+
+/// Unified Chat UI phase 2: a synthesized skill's slash command tags `req.forced_skill` and
+/// routes as an ordinary chat turn (gate re-validation happens downstream, at context
+/// assembly — this only proves the dispatch-layer tagging itself).
+#[tokio::test]
+async fn slash_synthesized_skill_command_tags_forced_skill() {
+    let (handle, _dir) = bootstrapped().await;
+    haily_db::queries::skills::insert_skill(
+        &handle.db,
+        "weekly-report",
+        "compile the weekly report",
+        "pattern",
+        "[]",
+    )
+    .await
+    .expect("insert_skill");
+    handle.slash_registry.rebuild(&handle.kms, &handle.db).await;
+
+    let mut req = make_request("/weekly-report", RequestOrigin::Chat);
+    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
+    assert_eq!(req.forced_skill.as_deref(), Some("weekly-report"));
 }
 
 #[test]

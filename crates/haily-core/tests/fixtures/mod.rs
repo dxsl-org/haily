@@ -159,6 +159,7 @@ pub async fn run_golden_task(task: &GoldenTask) -> RunOutcome {
         user_ref: None,
         depth: Default::default(),
         origin: Default::default(),
+        forced_skill: None,
     };
 
     let (tx, mut rx) = mpsc::channel(64);

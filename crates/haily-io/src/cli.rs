@@ -167,6 +167,7 @@ impl Adapter for CliAdapter {
                                     user_ref: None,
                                     depth: Default::default(),
                                     origin: Default::default(),
+                                    forced_skill: None,
                                 })
                                 .await
                                 .is_err()
@@ -234,6 +235,7 @@ impl Adapter for CliAdapter {
                         user_ref: None,
                         depth: Default::default(),
                         origin: Default::default(),
+                        forced_skill: None,
                     })
                     .await
                     .is_err()

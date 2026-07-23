@@ -734,3 +734,45 @@ export async function mobileServerStatus(): Promise<MobileStatus> {
 export async function mobileRegenerateCert(): Promise<string> {
   return invoke('mobile_regenerate_cert');
 }
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 2 (D1) — data-driven slash-command registry: built-ins +
+// authored + gate-filtered synthesized skills, unioned and name-sorted. Consumed by the
+// slash palette + ＋ menu (phase 3).
+// ---------------------------------------------------------------------------
+
+/** Which built-in pipeline/control action a slash command maps to. Mirrors
+ * `haily_app::slash_registry::BuiltInKind` — `'pass_through'` covers every built-in that
+ * resolves to an ordinary chat turn (most non-`plan`/`build` commands; `/help`/`/undo`/
+ * `/writes`/`/kill`/`/settings` are intercepted earlier on CLI/Telegram and never reach the
+ * dispatch-layer registry there, but still appear here for the GUI palette). */
+export type BuiltInKind = 'plan' | 'build' | 'pass_through';
+
+/** Mirrors `haily_app::slash_registry::SlashAction`'s `#[serde(tag = "type", content = "data")]`
+ * envelope — a discriminated union for the same reason as `Chunk`/`RunEvent`. `SkillTurn`
+ * carries the underlying skill's OWN name (not necessarily the same as the command's slugified
+ * `name` above it, if the name was normalized or shadow-qualified). */
+export type SlashActionDto =
+  | { type: 'BuiltIn'; data: BuiltInKind }
+  | { type: 'SkillTurn'; data: string };
+
+/** Which store a command's underlying skill came from — badge the palette entry
+ * accordingly. Mirrors `haily_app::slash_registry::SlashSource`. */
+export type SlashSource = 'built_in' | 'authored' | 'synthesized';
+
+/** One command in the merged registry. Mirrors `haily_app::slash_registry::SlashCommand`. */
+export interface SlashCommand {
+  name: string;
+  description: string;
+  arg_hint: string | null;
+  example: string | null;
+  action: SlashActionDto;
+  source: SlashSource;
+}
+
+/** The current slash-command registry: built-ins + enabled authored + enabled synthesized
+ * skills, name-sorted. Rebuilds opportunistically server-side before returning, so a skill
+ * enabled/edited moments ago is reflected without waiting for the next chat message. */
+export async function listSlashCommands(): Promise<SlashCommand[]> {
+  return invoke('list_slash_commands');
+}

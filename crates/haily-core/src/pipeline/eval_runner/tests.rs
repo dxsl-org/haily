@@ -17,6 +17,7 @@ fn chat_request() -> Request {
         user_ref: None,
         depth: DepthMode::Normal,
         origin: RequestOrigin::Chat,
+        forced_skill: None,
     }
 }
 

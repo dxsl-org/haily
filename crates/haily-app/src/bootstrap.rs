@@ -7,6 +7,7 @@
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
 use crate::credential_store::{is_keyring_marker, CredentialPolicy, CredentialStore};
+use crate::slash_registry::SlashRegistry;
 use crate::turns::TurnRegistry;
 use crate::{dispatch, reaper, watchers};
 use anyhow::Result;
@@ -86,6 +87,11 @@ pub struct AppHandle {
     /// launch task on this SAME tracker, so `AppHandle::shutdown`'s drain covers them too.
     pub(crate) tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    /// Data-driven slash-command registry (Unified Chat UI phase 2, D1) — built-ins +
+    /// authored + gate-filtered synthesized skills, unioned. `pub` (mirrors `db`/`kms`) so the
+    /// mode layer (`src-tauri`) can clone the SAME handle into its own `AppState` for
+    /// `list_slash_commands`, rather than maintaining a second registry.
+    pub slash_registry: Arc<SlashRegistry>,
 }
 
 impl AppHandle {
@@ -226,12 +232,19 @@ impl AppHandle {
         // resolver/kill/transcript injection loop just above but necessarily separate from it.
         am.wire_self_reference();
 
+        // Unified Chat UI phase 2 (D1): built once at boot, then rebuilt lazily by the
+        // dispatch loop itself (`SlashRegistry::ensure_fresh` polls `AuthoredRegistry::version()`
+        // per request — no push hook, per the P02↔P08 interop contract).
+        let slash_registry = Arc::new(SlashRegistry::new());
+        slash_registry.rebuild(&kms, &db).await;
+
         dispatch::spawn_dispatch_loop(
             am.clone(),
             Arc::clone(&orchestrator),
             shutdown.child_token(),
             tasks.clone(),
             Arc::clone(&turns),
+            Arc::clone(&slash_registry),
         )
         .await?;
 
@@ -299,6 +312,7 @@ impl AppHandle {
             shutdown,
             tasks,
             turns,
+            slash_registry,
         })
     }
 

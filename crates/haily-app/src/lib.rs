@@ -30,6 +30,10 @@ pub mod mobile_device_store;
 #[cfg(feature = "mobile-server")]
 pub mod mobile_admin;
 mod session_transcript;
+/// Data-driven slash-command registry (Unified Chat UI phase 2, D1). `pub` so the mode layer
+/// (`src-tauri`) can name `SlashRegistry`/`SlashCommand` for its own `AppState` field and the
+/// `list_slash_commands` command's return type.
+pub mod slash_registry;
 /// Dispatch-layer trigger resolver (Pipeline Activation & Wiring, phase 2) — slash + chat-intent
 /// routing into the Phase 1 pipeline launcher. Not exported at the crate root: only
 /// `dispatch.rs` (same crate) calls into it.
@@ -57,6 +61,7 @@ pub use haily_core::PendingApproval;
 pub use credential_store::{CredentialPolicy, CredentialStore};
 pub use eval::run_coding_eval_all;
 pub use launch::launch_coding_run;
+pub use slash_registry::{SlashCommand, SlashRegistry};
 pub use turns::TurnRegistry;
 pub use watchers::{list_work_items_status, spawn_distillation_bridge, spawn_run_event_bridge};
 

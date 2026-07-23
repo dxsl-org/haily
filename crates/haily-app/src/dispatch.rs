@@ -1,5 +1,6 @@
 //! Request dispatch loop — pulls requests from adapter channels, fans out to the
 //! orchestrator, and forwards response chunks back to the originating adapter.
+use crate::slash_registry::SlashRegistry;
 use crate::trigger::{self, TriggerAction};
 use crate::turns::TurnRegistry;
 use anyhow::Result;
@@ -23,6 +24,7 @@ pub async fn spawn_dispatch_loop(
     shutdown: CancellationToken,
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    slash_registry: Arc<SlashRegistry>,
 ) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Request>(64);
     am.start_all(req_tx).await?;
@@ -36,6 +38,7 @@ pub async fn spawn_dispatch_loop(
         shutdown,
         dispatch_tasks,
         turns,
+        slash_registry,
     ));
     Ok(())
 }
@@ -54,6 +57,7 @@ async fn dispatch_loop(
     shutdown: CancellationToken,
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    slash_registry: Arc<SlashRegistry>,
 ) {
     loop {
         let req = tokio::select! {
@@ -93,8 +97,16 @@ async fn dispatch_loop(
         // token above.
         turns.register(session_id, turn_cancel.clone());
         let turns_clone = Arc::clone(&turns);
+        // Unified Chat UI phase 2: cloned per-iteration like `orc_clone`/`am_clone` — the
+        // registry itself is a cheap `Arc<RwLock<..>>` snapshot holder, shared (not rebuilt)
+        // across every request.
+        let registry_clone = Arc::clone(&slash_registry);
 
         tasks.spawn(async move {
+            // Re-bind mutable: `req` needs a mutable borrow below (a `SkillTurn` slash command
+            // tags `forced_skill` on it) but every other branch still moves the original value
+            // where it needs to (the `NormalTurn` and `ConfirmThenLaunch`-denied-fallback paths).
+            let mut req = req;
             // Forward chunks from orchestrator → adapter while the agent loop runs.
             let delivery = {
                 let am = am_clone.clone();
@@ -109,12 +121,16 @@ async fn dispatch_loop(
                 })
             };
 
+            // Lazy rebuild (P02↔P08 interop contract): cheap no-op unless the authored-skill
+            // kit-pack version has moved since the last build.
+            registry_clone.ensure_fresh(&orc_clone.kms, &orc_clone.db).await;
+
             // Pipeline Activation & Wiring phase 2: decide whether this request is a normal
             // chat turn, an explicit slash-triggered pipeline launch, or a confirm-gated
-            // chat-intent launch — `resolve` only borrows `req`, so every branch below can
-            // still move the original `req` where it needs to (the `NormalTurn` and
-            // `ConfirmThenLaunch`-denied-fallback paths both need it).
-            match trigger::resolve(&req) {
+            // chat-intent launch — `resolve` mutates `req` only for a `SkillTurn` slash command,
+            // so every branch below can still move the original `req` where it needs to (the
+            // `NormalTurn` and `ConfirmThenLaunch`-denied-fallback paths both need it).
+            match trigger::resolve(&mut req, &registry_clone) {
                 TriggerAction::NormalTurn => {
                     trigger::run_normal_turn(&orc_clone, req, resp_tx, turn_cancel).await;
                 }

@@ -326,22 +326,7 @@ pub fn synthesized_playbooks(
     gates: &SkillGates,
 ) -> Vec<(String, String)> {
     let render = |s: &db_skills::Skill| -> (String, String) {
-        let steps: Vec<String> = serde_json::from_str(&s.steps).unwrap_or_default();
-        let body = if steps.is_empty() {
-            s.description.clone()
-        } else {
-            format!(
-                "{}\nSteps:\n{}",
-                s.description,
-                steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, st)| format!("{}. {st}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
-        (format!("{} (synthesized skill)", s.name), body)
+        (format!("{} (synthesized skill)", s.name), synthesized_skill_body(s))
     };
 
     let candidates: Vec<&db_skills::Skill> = active.iter().filter(|s| !gates.is_disabled(&s.name)).collect();
@@ -387,6 +372,28 @@ pub fn synthesized_playbooks(
         .take(top_n)
         .map(|(_, _, s)| render(s))
         .collect()
+}
+
+/// Render a synthesized skill's playbook body: description, plus a numbered `Steps:` list
+/// when `steps` (a JSON-encoded `Vec<String>`) is non-empty. Shared by `synthesized_playbooks`
+/// (sub-turn injection) and `KmsHandle::build_life_context`'s `forced_skill` lookup (Unified
+/// Chat UI phase 2) — one rendering, not duplicated across both call sites.
+pub(crate) fn synthesized_skill_body(s: &db_skills::Skill) -> String {
+    let steps: Vec<String> = serde_json::from_str(&s.steps).unwrap_or_default();
+    if steps.is_empty() {
+        s.description.clone()
+    } else {
+        format!(
+            "{}\nSteps:\n{}",
+            s.description,
+            steps
+                .iter()
+                .enumerate()
+                .map(|(i, st)| format!("{}. {st}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -182,9 +182,16 @@ pub async fn run_turn(
 
     let context_window = llm.context_window();
     let token_budget = budget::TokenBudget::new(context_window);
-    let (mut messages, _ctx) =
-        context::build_messages(&kms, &db, &tools, &session_id, &req.message, context_window)
-            .await?;
+    let (mut messages, _ctx) = context::build_messages(
+        &kms,
+        &db,
+        &tools,
+        &session_id,
+        &req.message,
+        req.forced_skill.as_deref(),
+        context_window,
+    )
+    .await?;
 
     // Minted ONCE per turn (never from LLM/task text) — every tool call this turn, and
     // every sub-turn `delegate.rs` spawns from it, shares this id/counter so the whole
@@ -761,6 +768,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -924,6 +932,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -1011,6 +1020,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -1073,6 +1083,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -1206,6 +1217,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1340,6 +1352,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1793,6 +1806,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -2003,6 +2017,7 @@ mod routing_toggle_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         let result = run_turn(&req, runtime, tx, &broker, &cancel).await;
