@@ -49,7 +49,15 @@ impl SlashRegistry {
     /// it in. A DB read failure for the synthesized side degrades to "no synthesized skills
     /// this build" (logged) rather than failing the whole rebuild — a transient DB hiccup
     /// must never crash slash-command resolution.
+    ///
+    /// `authored_version()` is captured BEFORE reading `authored_skills_list()` (not after) —
+    /// a `reload()` landing in between must not be swallowed: storing the version read
+    /// AFTER the data would record a version newer than what was actually built, so the next
+    /// `ensure_fresh` call sees a match and skips a rebuild that reload genuinely warranted.
+    /// Capturing first means the recorded version is, if anything, stale-by-one relative to a
+    /// concurrent reload — `ensure_fresh` simply rebuilds again next poll, which is harmless.
     pub async fn rebuild(&self, kms: &KmsHandle, db: &DbHandle) {
+        let version_at_read = kms.authored_version();
         let gates = kms.load_skill_gates().await;
         let authored = kms.authored_skills_list();
         let synthesized = db_skills::active_skills(db).await.unwrap_or_else(|e| {
@@ -60,7 +68,7 @@ impl SlashRegistry {
         let commands = build(haily_io::slash::all(), &authored, &synthesized, &gates);
         *self.snapshot.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(commands);
         self.built_authored_version
-            .store(kms.authored_version(), Ordering::SeqCst);
+            .store(version_at_read, Ordering::SeqCst);
     }
 
     /// Rebuild only if the authored-skill kit-pack has changed since the last build (lazy
@@ -93,7 +101,9 @@ mod tests {
     #[tokio::test]
     async fn never_built_registry_is_empty_until_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
-        let db = haily_db::DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        let db = haily_db::DbHandle::init(&dir.path().join("t.db"))
+            .await
+            .unwrap();
         let kms = KmsHandle::init(db.clone(), dir.path()).await.unwrap();
         let registry = SlashRegistry::new();
         assert!(registry.snapshot().is_empty());
@@ -109,7 +119,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_fresh_is_a_noop_when_kit_pack_version_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let db = haily_db::DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        let db = haily_db::DbHandle::init(&dir.path().join("t.db"))
+            .await
+            .unwrap();
         let kms = KmsHandle::init(db.clone(), dir.path()).await.unwrap();
         let registry = SlashRegistry::new();
         registry.rebuild(&kms, &db).await;

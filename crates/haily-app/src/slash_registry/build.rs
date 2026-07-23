@@ -102,22 +102,36 @@ fn slugify(raw: &str) -> Option<String> {
 /// Insert `cmd` under `slug`, or — if `slug` is already taken by a higher-or-equal precedence
 /// entry — insert it under a `skill:`-qualified alias instead and log the shadowing. Never
 /// silently drops a skill (Requirements: "log the shadowed name ... expose it under a
-/// `skill:`-qualified token").
-fn insert_with_precedence(by_name: &mut HashMap<String, SlashCommand>, slug: String, cmd: SlashCommand) {
-    if by_name.contains_key(&slug) {
-        let qualified = format!("skill:{slug}");
-        tracing::warn!(
-            slug = %slug,
-            qualified = %qualified,
-            source = ?cmd.source,
-            "slash command name shadowed by a higher-precedence entry — reachable via qualified token"
-        );
-        let mut shadowed = cmd;
-        shadowed.name = qualified.clone();
-        by_name.insert(qualified, shadowed);
+/// `skill:`-qualified token") — including on a THREE-way collision (e.g. a built-in, an
+/// authored skill, AND a synthesized skill all slugifying to the same token): the qualified
+/// key itself is also checked, and a numeric suffix (`skill:<slug>-2`, `-3`, …) disambiguates
+/// deterministically by insertion order rather than the second/third entry silently
+/// overwriting the first shadowed alias.
+fn insert_with_precedence(
+    by_name: &mut HashMap<String, SlashCommand>,
+    slug: String,
+    cmd: SlashCommand,
+) {
+    if !by_name.contains_key(&slug) {
+        by_name.insert(slug.clone(), SlashCommand { name: slug, ..cmd });
         return;
     }
-    by_name.insert(slug.clone(), SlashCommand { name: slug, ..cmd });
+
+    let mut qualified = format!("skill:{slug}");
+    let mut suffix = 2;
+    while by_name.contains_key(&qualified) {
+        qualified = format!("skill:{slug}-{suffix}");
+        suffix += 1;
+    }
+    tracing::warn!(
+        slug = %slug,
+        qualified = %qualified,
+        source = ?cmd.source,
+        "slash command name shadowed by a higher-precedence entry — reachable via qualified token"
+    );
+    let mut shadowed = cmd;
+    shadowed.name = qualified.clone();
+    by_name.insert(qualified, shadowed);
 }
 
 /// Build the merged, name-sorted registry. `io_commands` seeds the built-in entries directly
@@ -134,8 +148,11 @@ pub fn build(
     let mut by_name: HashMap<String, SlashCommand> = HashMap::new();
 
     for c in io_commands {
-        let arg_hint = matches!(builtin_kind_for(c.name), BuiltInKind::Plan | BuiltInKind::Build)
-            .then(|| "<task description>".to_string());
+        let arg_hint = matches!(
+            builtin_kind_for(c.name),
+            BuiltInKind::Plan | BuiltInKind::Build
+        )
+        .then(|| "<task description>".to_string());
         by_name.insert(
             c.name.to_string(),
             SlashCommand {
@@ -238,9 +255,15 @@ mod tests {
             &[synth("weekly-report", "compile the weekly report")],
             &SkillGates::default(),
         );
-        assert!(out.iter().any(|c| c.name == "plan" && c.source == SlashSource::BuiltIn));
-        assert!(out.iter().any(|c| c.name == "db-design" && c.source == SlashSource::Authored));
-        assert!(out.iter().any(|c| c.name == "weekly-report" && c.source == SlashSource::Synthesized));
+        assert!(out
+            .iter()
+            .any(|c| c.name == "plan" && c.source == SlashSource::BuiltIn));
+        assert!(out
+            .iter()
+            .any(|c| c.name == "db-design" && c.source == SlashSource::Authored));
+        assert!(out
+            .iter()
+            .any(|c| c.name == "weekly-report" && c.source == SlashSource::Synthesized));
     }
 
     #[test]
@@ -265,7 +288,10 @@ mod tests {
             &[synth("review", "my custom review skill")],
             &SkillGates::default(),
         );
-        let builtin = out.iter().find(|c| c.name == "review").expect("built-in must survive");
+        let builtin = out
+            .iter()
+            .find(|c| c.name == "review")
+            .expect("built-in must survive");
         assert_eq!(builtin.source, SlashSource::BuiltIn);
         let shadowed = out
             .iter()
@@ -284,14 +310,65 @@ mod tests {
             &[synth("standup", "synthesized standup skill")],
             &SkillGates::default(),
         );
-        let winner = out.iter().find(|c| c.name == "standup").expect("one must win");
+        let winner = out
+            .iter()
+            .find(|c| c.name == "standup")
+            .expect("one must win");
         assert_eq!(winner.source, SlashSource::Authored);
-        assert!(out.iter().any(|c| c.name == "skill:standup" && c.source == SlashSource::Synthesized));
+        assert!(out
+            .iter()
+            .any(|c| c.name == "skill:standup" && c.source == SlashSource::Synthesized));
+    }
+
+    /// THREE-way collision: a built-in (`review`), an authored skill, AND a synthesized skill
+    /// all slugify to the same token. Every entry must survive under a distinct, reachable
+    /// name — the built-in keeps the bare token, the authored skill takes `skill:review`, and
+    /// the synthesized skill (which would otherwise silently overwrite the authored alias)
+    /// gets a disambiguated `skill:review-2`.
+    #[test]
+    fn three_way_collision_disambiguates_every_shadowed_entry() {
+        let out = build(
+            haily_io::slash::all(),
+            &[authored("review", "authored review playbook")],
+            &[synth("review", "synthesized review skill")],
+            &SkillGates::default(),
+        );
+
+        let builtin = out
+            .iter()
+            .find(|c| c.name == "review")
+            .expect("built-in must survive");
+        assert_eq!(builtin.source, SlashSource::BuiltIn);
+
+        let authored_entry = out
+            .iter()
+            .find(|c| c.name == "skill:review")
+            .expect("authored skill must be reachable under the first qualified slot");
+        assert_eq!(authored_entry.source, SlashSource::Authored);
+
+        let synth_entry = out
+            .iter()
+            .find(|c| c.name == "skill:review-2")
+            .expect("synthesized skill must NOT silently overwrite the authored alias — must get its own disambiguated slot");
+        assert_eq!(synth_entry.source, SlashSource::Synthesized);
+
+        // Exactly three distinct "review"-derived entries — nothing dropped, nothing duplicated.
+        let review_entries = out
+            .iter()
+            .filter(|c| c.name == "review" || c.name.starts_with("skill:review"))
+            .count();
+        assert_eq!(
+            review_entries, 3,
+            "all three colliding entries must be individually reachable"
+        );
     }
 
     #[test]
     fn multi_word_names_are_hyphen_joined() {
-        assert_eq!(slugify("Context Engineering"), Some("context-engineering".to_string()));
+        assert_eq!(
+            slugify("Context Engineering"),
+            Some("context-engineering".to_string())
+        );
         assert_eq!(slugify("Fix_Bug  Now"), Some("fix-bug-now".to_string()));
     }
 
@@ -312,7 +389,12 @@ mod tests {
 
     #[test]
     fn skill_with_unslugifiable_name_is_excluded_not_crashed() {
-        let out = build(haily_io::slash::all(), &[authored("!!!", "garbage name")], &[], &SkillGates::default());
+        let out = build(
+            haily_io::slash::all(),
+            &[authored("!!!", "garbage name")],
+            &[],
+            &SkillGates::default(),
+        );
         assert!(!out.iter().any(|c| c.description == "garbage name"));
     }
 
