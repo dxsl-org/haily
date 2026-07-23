@@ -123,7 +123,9 @@ async fn dispatch_loop(
 
             // Lazy rebuild (P02↔P08 interop contract): cheap no-op unless the authored-skill
             // kit-pack version has moved since the last build.
-            registry_clone.ensure_fresh(&orc_clone.kms, &orc_clone.db).await;
+            registry_clone
+                .ensure_fresh(&orc_clone.kms, &orc_clone.db)
+                .await;
 
             // Pipeline Activation & Wiring phase 2: decide whether this request is a normal
             // chat turn, an explicit slash-triggered pipeline launch, or a confirm-gated
@@ -137,28 +139,48 @@ async fn dispatch_loop(
                 TriggerAction::LaunchPlan(task) => {
                     let depth = req.depth;
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                     };
-                    trigger::launch(handles, turn_cancel, RunKind::Plan, task, session_id, depth, resp_tx);
+                    trigger::launch(
+                        handles,
+                        turn_cancel,
+                        RunKind::Plan,
+                        task,
+                        session_id,
+                        depth,
+                        resp_tx,
+                    );
                 }
                 TriggerAction::LaunchBuild(task) => {
                     let depth = req.depth;
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                     };
-                    trigger::launch(handles, turn_cancel, RunKind::Build, task, session_id, depth, resp_tx);
+                    trigger::launch(
+                        handles,
+                        turn_cancel,
+                        RunKind::Build,
+                        task,
+                        session_id,
+                        depth,
+                        resp_tx,
+                    );
                 }
                 TriggerAction::ConfirmThenLaunch(kind, task) => {
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                     };
-                    trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx).await;
+                    trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx)
+                        .await;
                 }
                 TriggerAction::PromptTask(kind) => {
                     let hint = trigger::task_prompt_hint(kind);

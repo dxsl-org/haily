@@ -48,6 +48,7 @@ pub fn launch_coding_run(
         session_id,
         events_rx,
         app.adapters.clone(),
+        Arc::clone(&app.db),
         run_cancel.clone(),
         app.tasks.clone(),
     );

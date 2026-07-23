@@ -2708,6 +2708,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "haily-types",
  "libsqlite3-sys",
  "serde",
  "serde_json",

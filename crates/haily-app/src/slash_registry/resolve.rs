@@ -12,7 +12,12 @@ use haily_types::Request;
 /// `req` is mutated ONLY on the `SkillTurn` branch (sets `forced_skill`); every other branch
 /// leaves it untouched. An unregistered `name` yields `TriggerAction::UnknownSlashHint` — a
 /// slash command never silently disappears.
-pub fn resolve(req: &mut Request, name: &str, arg: &str, registry: &SlashRegistry) -> TriggerAction {
+pub fn resolve(
+    req: &mut Request,
+    name: &str,
+    arg: &str,
+    registry: &SlashRegistry,
+) -> TriggerAction {
     let Some(cmd) = registry.lookup(name) else {
         return TriggerAction::UnknownSlashHint(name.to_string());
     };
@@ -59,9 +64,16 @@ mod tests {
         }
     }
 
-    async fn built_registry() -> (SlashRegistry, haily_db::DbHandle, KmsHandle, tempfile::TempDir) {
+    async fn built_registry() -> (
+        SlashRegistry,
+        haily_db::DbHandle,
+        KmsHandle,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let db = haily_db::DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        let db = haily_db::DbHandle::init(&dir.path().join("t.db"))
+            .await
+            .unwrap();
         db_skills::insert_skill(&db, "fix-bug", "diagnose and fix a bug", "pattern", "[]")
             .await
             .unwrap();
@@ -108,7 +120,10 @@ mod tests {
     async fn registered_passthrough_command_forwards_as_normal_turn() {
         let (registry, ..) = built_registry().await;
         let mut req = make_request("/review");
-        assert!(matches!(resolve(&mut req, "review", "", &registry), TriggerAction::NormalTurn));
+        assert!(matches!(
+            resolve(&mut req, "review", "", &registry),
+            TriggerAction::NormalTurn
+        ));
     }
 
     #[tokio::test]
@@ -127,7 +142,10 @@ mod tests {
     async fn skill_turn_tags_forced_skill_and_routes_normal_turn() {
         let (registry, ..) = built_registry().await;
         let mut req = make_request("/fix-bug");
-        assert!(matches!(resolve(&mut req, "fix-bug", "", &registry), TriggerAction::NormalTurn));
+        assert!(matches!(
+            resolve(&mut req, "fix-bug", "", &registry),
+            TriggerAction::NormalTurn
+        ));
         assert_eq!(req.forced_skill.as_deref(), Some("fix-bug"));
     }
 }

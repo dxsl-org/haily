@@ -16,6 +16,9 @@ chrono   = { workspace = true }
 serde    = { workspace = true }
 serde_json = { workspace = true }
 sha2     = "0.10"
+# Leaf crate — `RunEvent` is the wire/persistence contract for `queries::run_events` (phase 05,
+# Unified Chat UI D2). No cycle risk: haily-types depends on nothing else in this workspace.
+haily-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

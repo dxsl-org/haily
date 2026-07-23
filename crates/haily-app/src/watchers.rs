@@ -1,7 +1,7 @@
 //! Work-item watcher and proactive daemon startup — spawned identically for every
 //! mode (this phase's fix for F6: GUI previously lacked the watcher, CLI lacked the
 //! daemon; both are now unconditional, gated only by `BootstrapOptions`).
-use haily_db::{queries::journal, queries::work_items, DbHandle};
+use haily_db::{queries::journal, queries::run_events, queries::work_items, DbHandle};
 use haily_io::{AdapterManager, Notification, RunEvent, WorkItemStatus};
 use haily_kms::KmsHandle;
 use haily_proactive::ProactiveDaemon;
@@ -78,7 +78,7 @@ pub fn spawn_work_item_watcher(
 }
 
 /// Drain a pipeline run's ordered `RunEvent` stream into the adapter that owns `session_id`
-/// (Sub-Agent + Skill Architecture phase 11a).
+/// (Sub-Agent + Skill Architecture phase 11a), then persist it (Unified Chat UI phase 5, D2).
 ///
 /// This is the app-layer BRIDGE that preserves the "core never imports io" invariant: the
 /// P4 runner (in `haily-core`) emits `RunEvent`s to a plain `mpsc` it is handed, knowing
@@ -92,14 +92,24 @@ pub fn spawn_work_item_watcher(
 /// so a fast build log slows the runner instead of losing events. The loop ends when the
 /// runner drops its sender (run finished) or on shutdown, whichever comes first; it is
 /// registered on `tasks` so shutdown drains it.
+///
+/// Persistence is DELIVER-FIRST, PERSIST-AFTER and best-effort: a DB write never gates or
+/// delays the live delivery above, and a write failure is logged, never propagated — a run
+/// must never stall because its history couldn't be saved. One task instance runs PER RUN
+/// (this function is called fresh per launch, at three call sites), each writing only its own
+/// `run_id`, so concurrent runs never contend on each other's rows. `StageOutput` carries no
+/// `stage` field of its own (`haily_types::RunEvent`), so `current_stage` tracks the most
+/// recently seen `StageStarted` for THIS run and keys the marker upsert with it.
 pub fn spawn_run_event_bridge(
     session_id: Uuid,
     mut events: mpsc::Receiver<RunEvent>,
     am: AdapterManager,
+    db: Arc<DbHandle>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 ) {
     tasks.spawn(async move {
+        let mut current_stage = String::new();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -111,11 +121,42 @@ pub fn spawn_run_event_bridge(
                         // Runner dropped its sender — the run is over.
                         break;
                     };
+
+                    if let RunEvent::StageStarted { ref stage, .. } = event {
+                        current_stage = stage.clone();
+                    }
+                    // Captured BEFORE delivery moves `event`: StageOutput needs only `run_id`/
+                    // `seq` (its `chunk` text is never cloned just for marker bookkeeping);
+                    // every other variant is small, so cloning it whole for its persisted row
+                    // is cheap and keeps this one match the single source of truth for
+                    // "row vs. marker."
+                    let row_to_persist = match &event {
+                        RunEvent::StageOutput { .. } => None,
+                        other => Some(other.clone()),
+                    };
+                    let marker_to_persist = match &event {
+                        RunEvent::StageOutput { run_id, seq, .. } => Some((run_id.clone(), *seq)),
+                        _ => None,
+                    };
+
                     if let Err(e) = am.deliver_run_event(session_id, event).await {
                         // A closed adapter channel or an unbound session is not fatal to the
                         // run — log and keep draining so the runner is never blocked by a
                         // dead consumer.
                         tracing::warn!(%session_id, "run-event delivery failed: {e:#}");
+                    }
+
+                    if let Some(ev) = row_to_persist {
+                        let run_id = run_events::run_id_of(&ev).to_string();
+                        if let Err(e) = run_events::insert_run_event(&db, &run_id, &ev).await {
+                            tracing::warn!(%session_id, "run-event persist failed: {e:#}");
+                        }
+                    } else if let Some((run_id, seq)) = marker_to_persist {
+                        if let Err(e) =
+                            run_events::upsert_stage_marker(&db, &run_id, &current_stage, seq).await
+                        {
+                            tracing::warn!(%session_id, "run-event marker persist failed: {e:#}");
+                        }
                     }
                 }
             }
@@ -266,25 +307,42 @@ mod tests {
         }
     }
 
+    /// Fresh in-memory-backed `DbHandle` for a bridge test — mirrors `haily-db`'s own
+    /// `tempfile::tempdir()` test idiom; the `TempDir` guard must outlive every DB call or the
+    /// directory is removed before queries run (see feedback-tempdir-guard-dropped-in-test-helper).
+    async fn test_db() -> (Arc<DbHandle>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        (Arc::new(db), dir)
+    }
+
     /// The bridge forwards the runner's ordered event stream to the owning adapter in full,
     /// in order, and exits cleanly when the runner drops its sender.
     #[tokio::test]
     async fn bridge_forwards_run_events_in_order_and_exits_on_sender_drop() {
         let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
         let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
-        let adapter = Arc::new(RecordingAdapter { tx: seen_tx, notify_tx });
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
         let am = AdapterManager::builder().register(adapter).build();
         let session = Uuid::new_v4();
         am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
 
         let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
-        spawn_run_event_bridge(session, ev_rx, am, shutdown, tasks.clone());
+        spawn_run_event_bridge(session, ev_rx, am, db, shutdown, tasks.clone());
 
         for seq in 0..3u64 {
             ev_tx
-                .send(RunEvent::StageOutput { run_id: "r".into(), seq, chunk: format!("l{seq}") })
+                .send(RunEvent::StageOutput {
+                    run_id: "r".into(),
+                    seq,
+                    chunk: format!("l{seq}"),
+                })
                 .await
                 .unwrap();
         }
@@ -297,12 +355,104 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert_eq!(seen, vec![0, 1, 2], "bridge must preserve order and drop none");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2],
+            "bridge must preserve order and drop none"
+        );
 
         tasks.close();
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
             .await
             .expect("bridge task must exit after the runner drops its sender");
+    }
+
+    /// The bridge persists non-`StageOutput` events as `run_events` rows and routes
+    /// `StageOutput` chunks into a text-free `run_stage_marker` keyed by the last-seen
+    /// `StageStarted` stage — never a row, never the chunk's own text.
+    #[tokio::test]
+    async fn bridge_persists_rows_and_stage_markers_after_delivery() {
+        use haily_db::queries::{run_events, sessions};
+
+        let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
+        let am = AdapterManager::builder().register(adapter).build();
+        let session = Uuid::new_v4();
+        am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
+        let session_id_str = session.to_string();
+        sessions::create_session(&db, &session_id_str, "test", None)
+            .await
+            .unwrap();
+
+        let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        spawn_run_event_bridge(session, ev_rx, am, Arc::clone(&db), shutdown, tasks.clone());
+
+        let run_id = "r1".to_string();
+        ev_tx
+            .send(RunEvent::RunStarted {
+                run_id: run_id.clone(),
+                work_item_id: "w1".into(),
+            })
+            .await
+            .unwrap();
+        ev_tx
+            .send(RunEvent::StageStarted {
+                run_id: run_id.clone(),
+                stage: "build".into(),
+                tier: None,
+            })
+            .await
+            .unwrap();
+        ev_tx
+            .send(RunEvent::StageOutput {
+                run_id: run_id.clone(),
+                seq: 7,
+                chunk: "SECRET=xyz".into(),
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        for _ in 0..3 {
+            seen_rx
+                .recv()
+                .await
+                .expect("event forwarded before persistence");
+        }
+
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("bridge task must exit after the runner drops its sender");
+
+        let persisted = run_events::list_run_events(&db, &run_id).await.unwrap();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "RunStarted + StageStarted persist; StageOutput does not"
+        );
+        assert!(
+            !persisted
+                .iter()
+                .any(|e| matches!(e, RunEvent::StageOutput { .. })),
+            "StageOutput must never appear as a persisted row"
+        );
+
+        let markers = run_events::list_stage_markers(&db, &run_id).await.unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(
+            markers[0].stage, "build",
+            "marker keyed by the last-seen StageStarted stage"
+        );
+        assert_eq!(markers[0].count, 1);
+        assert_eq!(markers[0].last_seq, 7);
     }
 
     /// The distillation bridge forwards a proposal to every adapter via `notify_all` and exits
@@ -311,7 +461,10 @@ mod tests {
     async fn distillation_bridge_forwards_proposals_and_exits_on_sender_drop() {
         let (seen_tx, _seen_rx) = mpsc::channel::<RunEvent>(1);
         let (notify_tx, mut notify_rx) = mpsc::channel::<Notification>(16);
-        let adapter = Arc::new(RecordingAdapter { tx: seen_tx, notify_tx });
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
         let am = AdapterManager::builder().register(adapter).build();
 
         let (dist_tx, dist_rx) = mpsc::channel::<Notification>(16);
@@ -330,7 +483,11 @@ mod tests {
         drop(dist_tx); // run finished → bridge loop should end
 
         match notify_rx.recv().await.expect("proposal forwarded") {
-            Notification::DistillationProposal { class_key, rule_count, .. } => {
+            Notification::DistillationProposal {
+                class_key,
+                rule_count,
+                ..
+            } => {
                 assert_eq!(class_key, "compile_error:auth");
                 assert_eq!(rule_count, 2);
             }

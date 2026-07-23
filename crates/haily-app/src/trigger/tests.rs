@@ -50,7 +50,10 @@ async fn slash_empty_arg_prompts_instead_of_launching() {
     let (handle, _dir) = bootstrapped().await;
     let mut plan_req = make_request("/plan", RequestOrigin::Chat);
     let plan_prompt = resolve(&mut plan_req, &handle.slash_registry);
-    assert!(matches!(plan_prompt, TriggerAction::PromptTask(RunKind::Plan)));
+    assert!(matches!(
+        plan_prompt,
+        TriggerAction::PromptTask(RunKind::Plan)
+    ));
 
     for cmd in ["/code", "/build"] {
         let mut req = make_request(cmd, RequestOrigin::Chat);
@@ -76,7 +79,10 @@ async fn slash_unknown_command_returns_hint_not_a_swallow() {
 async fn slash_registered_noncoding_command_forwards_as_normal_turn() {
     let (handle, _dir) = bootstrapped().await;
     let mut req = make_request("/help", RequestOrigin::Chat);
-    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
+    assert!(matches!(
+        resolve(&mut req, &handle.slash_registry),
+        TriggerAction::NormalTurn
+    ));
 }
 
 // -- resolve(): chat-intent detection -----------------------------------------------
@@ -99,7 +105,10 @@ async fn chat_intent_never_fires_on_cli_origin_even_with_coding_shaped_text() {
     let (handle, _dir) = bootstrapped().await;
     let mut req = make_request("implement this feature", RequestOrigin::Cli);
     assert!(
-        matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn),
+        matches!(
+            resolve(&mut req, &handle.slash_registry),
+            TriggerAction::NormalTurn
+        ),
         "Cli origin (the eval bypass path) must never intent-launch"
     );
 }
@@ -108,7 +117,10 @@ async fn chat_intent_never_fires_on_cli_origin_even_with_coding_shaped_text() {
 async fn ambiguous_chat_message_falls_through_to_a_normal_turn() {
     let (handle, _dir) = bootstrapped().await;
     let mut req = make_request("hey, how's it going today?", RequestOrigin::Chat);
-    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
+    assert!(matches!(
+        resolve(&mut req, &handle.slash_registry),
+        TriggerAction::NormalTurn
+    ));
 }
 
 /// Unified Chat UI phase 2: a synthesized skill's slash command tags `req.forced_skill` and
@@ -129,7 +141,10 @@ async fn slash_synthesized_skill_command_tags_forced_skill() {
     handle.slash_registry.rebuild(&handle.kms, &handle.db).await;
 
     let mut req = make_request("/weekly-report", RequestOrigin::Chat);
-    assert!(matches!(resolve(&mut req, &handle.slash_registry), TriggerAction::NormalTurn));
+    assert!(matches!(
+        resolve(&mut req, &handle.slash_registry),
+        TriggerAction::NormalTurn
+    ));
     assert_eq!(req.forced_skill.as_deref(), Some("weekly-report"));
 }
 
@@ -187,6 +202,7 @@ async fn confirm_then_launch_approve_attempts_the_launch_not_a_normal_turn() {
         orc: Arc::clone(&handle.orchestrator),
         am: handle.adapters.clone(),
         tasks: handle.tasks.clone(),
+        db: Arc::clone(&handle.db),
     };
     let turn_cancel = handle.shutdown.child_token();
 
@@ -257,6 +273,7 @@ async fn confirm_then_launch_deny_falls_through_to_a_normal_turn() {
         orc: Arc::clone(&handle.orchestrator),
         am: handle.adapters.clone(),
         tasks: handle.tasks.clone(),
+        db: Arc::clone(&handle.db),
     };
     let turn_cancel = handle.shutdown.child_token();
 

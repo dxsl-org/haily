@@ -19,6 +19,7 @@
 //! Deviation Log.
 use crate::slash_registry::SlashRegistry;
 use haily_core::{classify_coding_intent, CodingRunSpec, Orchestrator, RunKind};
+use haily_db::DbHandle;
 use haily_io::{slash, AdapterManager};
 use haily_types::{DepthMode, Request, RequestOrigin, ResponseChunk};
 use std::sync::Arc;
@@ -40,6 +41,9 @@ pub struct LaunchHandles {
     pub orc: Arc<Orchestrator>,
     pub am: AdapterManager,
     pub tasks: TaskTracker,
+    /// Threaded into `spawn_run_event_bridge` (Unified Chat UI phase 5, D2) so this run's
+    /// events persist. Callers extract it from `orc.db` before moving `orc` into this struct.
+    pub db: Arc<DbHandle>,
 }
 
 /// What a dispatch-layer trigger decides to do with one incoming [`Request`].
@@ -131,7 +135,15 @@ pub async fn confirm_then_launch(
     resp_tx: mpsc::Sender<ResponseChunk>,
 ) {
     let session_id = req.session_id;
-    let approved = confirm(&handles.orc, &resp_tx, session_id, &turn_cancel, kind, &task).await;
+    let approved = confirm(
+        &handles.orc,
+        &resp_tx,
+        session_id,
+        &turn_cancel,
+        kind,
+        &task,
+    )
+    .await;
     if approved {
         let depth = req.depth;
         launch(handles, turn_cancel, kind, task, session_id, depth, resp_tx);
@@ -168,7 +180,9 @@ async fn confirm(
         // launch with no observable prompt.
         return false;
     }
-    orc.approval_gate().request(approval_id, session_id, cancel).await
+    orc.approval_gate()
+        .request(approval_id, session_id, cancel)
+        .await
 }
 
 /// Launch one coding-pipeline run bound to `resp_tx`, mirroring `haily_app::launch_coding_run`'s
@@ -186,7 +200,7 @@ pub fn launch(
     depth: DepthMode,
     resp_tx: mpsc::Sender<ResponseChunk>,
 ) {
-    let LaunchHandles { orc, am, tasks } = handles;
+    let LaunchHandles { orc, am, tasks, db } = handles;
     let spec = CodingRunSpec {
         kind,
         task,
@@ -203,6 +217,7 @@ pub fn launch(
         session_id,
         events_rx,
         am.clone(),
+        db,
         run_cancel.clone(),
         tasks.clone(),
     );

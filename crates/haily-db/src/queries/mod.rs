@@ -15,6 +15,7 @@ pub mod pipeline_runs;
 pub mod reminders;
 pub mod review_findings;
 pub mod routing_decisions;
+pub mod run_events;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;
