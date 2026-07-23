@@ -4,7 +4,7 @@
   // (`ChatInput.svelte`) only decides WHEN to show it and what to do with a selection
   // (phase-03 architecture: "SlashPalette owns fetch + filter + keyboard").
   import { listSlashCommands, type SlashCommand } from '$lib/tauri';
-  import { filterCommands, groupBySource, flattenGroups, groupLabel } from '$lib/palette-filter';
+  import { filterCommands, groupBySource, flattenGroups, groupLabel, confirmOrClose } from '$lib/palette-filter';
 
   interface Props {
     open: boolean;
@@ -12,14 +12,20 @@
     filter: string;
     onSelect: (name: string) => void;
     onClose: () => void;
+    /** The ＋ toggle button element, when this instance can be opened that way — excluded
+     * from the outside-pointerdown dismiss check below so clicking it to close doesn't
+     * immediately reopen via the button's own click handler firing right after. `null`/
+     * absent for the inline "/" trigger path, which has no such button. */
+    anchorEl?: HTMLElement | null;
   }
 
-  let { open, filter, onSelect, onClose }: Props = $props();
+  let { open, filter, onSelect, onClose, anchorEl }: Props = $props();
 
   let commands = $state<SlashCommand[]>([]);
   let loading = $state(false);
   let error = $state('');
   let selectedIndex = $state(0);
+  let paletteEl = $state<HTMLDivElement | undefined>(undefined);
 
   // Refetch every time the palette opens — cheap, in-memory snapshot server-side (P02) —
   // so a skill just enabled/edited elsewhere appears without restarting the GUI.
@@ -33,7 +39,8 @@
     try {
       commands = await listSlashCommands();
     } catch (e) {
-      error = String(e);
+      console.error('listSlashCommands failed', e);
+      error = 'Không thể tải danh sách lệnh.';
     } finally {
       loading = false;
     }
@@ -65,6 +72,10 @@
   $effect(() => {
     if (!open) return;
     const handleKey = (e: KeyboardEvent) => {
+      // An active IME composition (Vietnamese Telex/VNI, CJK, …) may use Enter to commit
+      // the candidate, not to confirm a row — never intercept any key mid-composition, so
+      // the composed text always commits via the browser's own default handling.
+      if (e.isComposing) return;
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         e.stopPropagation();
@@ -74,7 +85,12 @@
         e.stopPropagation();
         if (flat.length) selectedIndex = (selectedIndex - 1 + flat.length) % flat.length;
       } else if (e.key === 'Enter' || e.key === 'Tab') {
-        if (!flat.length) return;
+        // Zero matches (e.g. a typed "/zzz"): close WITHOUT consuming the key, so the
+        // caller's own handling still applies (Enter still sends the message).
+        if (confirmOrClose(flat.length > 0) === 'close') {
+          onClose();
+          return;
+        }
         e.preventDefault();
         e.stopPropagation();
         confirm(flat[selectedIndex]);
@@ -87,10 +103,29 @@
     window.addEventListener('keydown', handleKey, true);
     return () => window.removeEventListener('keydown', handleKey, true);
   });
+
+  // Dismiss on any pointerdown outside both this dropdown and its optional anchor button —
+  // without this, a stuck-open palette (opened, then the user clicks elsewhere without
+  // pressing Esc) keeps the capture-phase key handler above hijacking Arrows/Enter/Tab/Esc
+  // window-wide (e.g. the Settings drawer's own keyboard nav). `pointerdown` (not `click`)
+  // so this fires before the anchor button's own `click` — but since the anchor is
+  // explicitly excluded, its click handler remains the sole toggle authority and this can
+  // never race it into an immediate reopen.
+  $effect(() => {
+    if (!open) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (paletteEl?.contains(target)) return;
+      if (anchorEl?.contains(target)) return;
+      onClose();
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => document.removeEventListener('pointerdown', handlePointerDown);
+  });
 </script>
 
 {#if open}
-  <div class="palette" role="listbox" aria-label="Danh sách lệnh">
+  <div class="palette" bind:this={paletteEl} role="listbox" aria-label="Danh sách lệnh">
     {#if loading}
       <div class="status">Đang tải…</div>
     {:else if error}

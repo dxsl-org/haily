@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterCommands, groupBySource, groupLabel, flattenGroups } from './palette-filter';
+import { confirmOrClose, filterCommands, groupBySource, groupLabel, flattenGroups } from './palette-filter';
 import type { SlashCommand } from './tauri';
 
 function cmd(overrides: Partial<SlashCommand> & Pick<SlashCommand, 'name' | 'source'>): SlashCommand {
@@ -72,5 +72,16 @@ describe('groupLabel', () => {
   it('returns a distinct Vietnamese label for every source', () => {
     const labels = new Set((['built_in', 'authored', 'synthesized'] as const).map(groupLabel));
     expect(labels.size).toBe(3);
+  });
+});
+
+describe('confirmOrClose', () => {
+  it('confirms the highlighted row when there is at least one match', () => {
+    expect(confirmOrClose(true)).toBe('confirm');
+  });
+
+  it('closes without consuming the key when there are zero matches (e.g. a typed "/zzz") — ' +
+    'the caller applies its own normal handling for that key instead', () => {
+    expect(confirmOrClose(false)).toBe('close');
   });
 });

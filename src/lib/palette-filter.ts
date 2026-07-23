@@ -64,3 +64,13 @@ export function groupBySource(commands: SlashCommand[]): CommandGroup[] {
 export function flattenGroups(groups: CommandGroup[]): SlashCommand[] {
   return groups.flatMap((g) => g.items);
 }
+
+/**
+ * What Enter/Tab should do in the palette: confirm the highlighted row when there is one,
+ * otherwise close the palette WITHOUT consuming the keystroke — the caller (`ChatInput`)
+ * then applies its own normal handling for that key (e.g. Enter still sends the message
+ * when a typed "/xyz" matched nothing, rather than being silently swallowed).
+ */
+export function confirmOrClose(hasMatches: boolean): 'confirm' | 'close' {
+  return hasMatches ? 'confirm' : 'close';
+}

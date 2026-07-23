@@ -37,6 +37,10 @@
   let input = $state('');
   let sending = $state(false);
   let textarea: HTMLTextAreaElement;
+  // Must be reactive (`$state`, not a plain `let`): passed as `SlashPalette`'s `anchorEl`
+  // prop, which needs to see the real element once `bind:this` assigns it post-mount —
+  // a plain `let` would leave the child holding the pre-mount `undefined` forever.
+  let plusButton = $state<HTMLButtonElement | undefined>(undefined);
 
   // Slash palette (P03, D6): both entry paths ("/" inline trigger + ＋ button) read
   // from the same `palette` state so behavior can't diverge — see `chat-palette-state`.
@@ -110,7 +114,9 @@
   // open — this guard stops the same keystroke from ALSO sending the message here.
   function onKeydown(e: KeyboardEvent) {
     if (palette.open && ['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Never intercept Enter mid-IME-composition (Vietnamese Telex/VNI, CJK, …) — it commits
+    // the composed text, it is not a request to send.
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
     }
@@ -126,13 +132,26 @@
     textarea.style.height = 'auto';
     textarea.style.height = Math.min(textarea.scrollHeight, 160) + 'px';
   }
+
+  // Shared by the textarea and the ＋ button — both must go inert together while a turn
+  // is in flight or an approval is pending (M03 review: the ＋ button previously stayed
+  // clickable while the textarea it edits was disabled).
+  const inputDisabled = $derived(sending || pendingApproval !== null || activeSession !== null);
 </script>
 
 <div class="input-area">
-  <SlashPalette open={palette.open} filter={palette.filter} onSelect={insertCommand} onClose={palette.close} />
+  <SlashPalette
+    open={palette.open}
+    filter={palette.filter}
+    onSelect={insertCommand}
+    onClose={palette.close}
+    anchorEl={plusButton}
+  />
   <button
+    bind:this={plusButton}
     class="plus"
     onclick={palette.togglePlus}
+    disabled={inputDisabled}
     title="Danh sách lệnh"
     aria-label="Danh sách lệnh"
     aria-expanded={palette.usingPlus}
@@ -144,7 +163,7 @@
     oninput={onInput}
     placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng, / để xem lệnh)'}
     rows="1"
-    disabled={sending || pendingApproval !== null || activeSession !== null}
+    disabled={inputDisabled}
   ></textarea>
   {#if activeSession}
     <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
