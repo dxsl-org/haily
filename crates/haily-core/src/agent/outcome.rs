@@ -79,7 +79,10 @@ fn approval_stats(
             .unwrap_or(false)
             && entry["ok"] == true
     };
-    let successful_retiered_in_log = tool_call_log.iter().filter(|e| is_successful_retiered_delete(e)).count();
+    let successful_retiered_in_log = tool_call_log
+        .iter()
+        .filter(|e| is_successful_retiered_delete(e))
+        .count();
     // Reconstruct the counter's value BEFORE this log's own calls ran. Saturating: a
     // delegated sub-turn's log can never itself exceed the shared final count.
     let mut running_deletes = final_turn_deletes.saturating_sub(successful_retiered_in_log);
@@ -108,7 +111,9 @@ fn approval_stats(
             tier
         };
 
-        if effective_tier == haily_tools::RiskTier::IrreversibleWrite && !approval_gate.is_auto_approved(name) {
+        if effective_tier == haily_tools::RiskTier::IrreversibleWrite
+            && !approval_gate.is_auto_approved(name)
+        {
             requested = true;
             if entry["ok"] == false {
                 denied = true;
@@ -244,7 +249,9 @@ pub(super) async fn record_outcome_and_update_skill(
     // trace is inserted, so "previous" genuinely means the prior turn, not this one
     // compared against itself.
     let is_repeat = match db_skills::most_recent_trace(db, session_id).await {
-        Ok(Some(prev)) => haily_kms::skills::is_repeat_request(&prev.task_description, task_description),
+        Ok(Some(prev)) => {
+            haily_kms::skills::is_repeat_request(&prev.task_description, task_description)
+        }
         _ => false,
     };
     // M2 review fix: an uncorroborated repeat (a clean turn, no other negative
@@ -256,9 +263,18 @@ pub(super) async fn record_outcome_and_update_skill(
     // here (would never be reachable).
     let has_corroborating_negative_signal =
         outcome == TaskOutcome::Partial || has_explicit_negative_feedback_this_turn(tool_call_log);
-    let label = haily_kms::skills::derive_label(outcome, undo_within_5min, is_repeat, has_corroborating_negative_signal);
-    let (approval_requested, approval_denied) =
-        approval_stats(tool_call_log, tools, input.approval_gate, input.final_turn_deletes);
+    let label = haily_kms::skills::derive_label(
+        outcome,
+        undo_within_5min,
+        is_repeat,
+        has_corroborating_negative_signal,
+    );
+    let (approval_requested, approval_denied) = approval_stats(
+        tool_call_log,
+        tools,
+        input.approval_gate,
+        input.final_turn_deletes,
+    );
 
     let metrics = db_skills::TraceMetrics {
         model_tier: input.model_tier,
@@ -313,7 +329,9 @@ pub(super) async fn record_outcome_and_update_skill(
         if let Ok(active) = db_skills::active_skills(db).await {
             if let Some(skill) = haily_kms::skills::find_matching_skill(task_description, &active) {
                 let reward = outcome.ema_reward() * label.confidence;
-                if let Err(e) = haily_kms::skills::update_skill_confidence(db, &skill.id, reward).await {
+                if let Err(e) =
+                    haily_kms::skills::update_skill_confidence(db, &skill.id, reward).await
+                {
                     tracing::warn!(skill_id = %skill.id, error = %e, "{}", input.confidence_update_failure_msg);
                 }
             }
@@ -330,9 +348,9 @@ mod approval_stats_tests {
     //! `tool_call_log` entries (no real dispatch needed — `approval_stats` is a pure
     //! function of the log + registry + gate + counter).
     use super::*;
+    use crate::approval::ApprovalBroker;
     use anyhow::Result;
     use async_trait::async_trait;
-    use crate::approval::ApprovalBroker;
     use haily_tools::{RiskTier, Tool, ToolContext, ToolRegistry};
 
     /// Stand-in for a re-tiered delete tool (`task_delete` — in
@@ -405,15 +423,22 @@ mod approval_stats_tests {
         // `cap_escalation_approved_still_executes_and_increments_counter` behavior:
         // an approved escalated delete still executes and still increments).
         let log = vec![log_entry("task_delete", true)];
-        let (requested, denied) =
-            approval_stats(&log, &tools, &gate, haily_tools::MAX_AUTO_DELETES_PER_TURN + 1);
+        let (requested, denied) = approval_stats(
+            &log,
+            &tools,
+            &gate,
+            haily_tools::MAX_AUTO_DELETES_PER_TURN + 1,
+        );
 
         assert!(
             requested,
             "a cap-escalated re-tiered delete must be counted as approval_requested \
              (H1 fix — the old bare-RiskTier check always missed this)"
         );
-        assert!(!denied, "this call succeeded (ok:true), so it must not be counted as denied");
+        assert!(
+            !denied,
+            "this call succeeded (ok:true), so it must not be counted as denied"
+        );
     }
 
     /// Mirror of the above: a cap-escalated delete that was DENIED must count as
@@ -429,7 +454,10 @@ mod approval_stats_tests {
             approval_stats(&log, &tools, &gate, haily_tools::MAX_AUTO_DELETES_PER_TURN);
 
         assert!(requested);
-        assert!(denied, "a denied (ok:false) escalated delete must be counted as denied");
+        assert!(
+            denied,
+            "a denied (ok:false) escalated delete must be counted as denied"
+        );
     }
 
     /// A re-tiered delete UNDER the cap must NOT be counted as requested — it
@@ -486,7 +514,10 @@ mod approval_stats_tests {
         let log = vec![log_entry("memory_forget", true)];
         let (requested, _denied) = approval_stats(&log, &tools, &gate, 0);
 
-        assert!(requested, "a non-allowlisted IrreversibleWrite call must count as requested");
+        assert!(
+            requested,
+            "a non-allowlisted IrreversibleWrite call must count as requested"
+        );
     }
 }
 
@@ -516,8 +547,16 @@ mod pure_helper_tests {
     fn pair_usage_collapses_a_mixed_pair_to_none_none() {
         assert_eq!(pair_usage(Some(100), Some(50)), (Some(100), Some(50)));
         assert_eq!(pair_usage(None, None), (None, None));
-        assert_eq!(pair_usage(Some(100), None), (None, None), "prompt-only must not leak through");
-        assert_eq!(pair_usage(None, Some(50)), (None, None), "completion-only must not leak through");
+        assert_eq!(
+            pair_usage(Some(100), None),
+            (None, None),
+            "prompt-only must not leak through"
+        );
+        assert_eq!(
+            pair_usage(None, Some(50)),
+            (None, None),
+            "completion-only must not leak through"
+        );
     }
 
     #[test]

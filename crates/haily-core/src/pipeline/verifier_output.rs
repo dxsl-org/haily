@@ -242,7 +242,11 @@ fn go_items(stdout: &str, stderr: &str) -> Vec<String> {
 
 /// Generic fallback: first non-empty lines of stderr, or stdout if stderr is empty.
 fn generic_items(stdout: &str, stderr: &str) -> Vec<String> {
-    let src = if stderr.trim().is_empty() { stdout } else { stderr };
+    let src = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
     src.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -284,7 +288,10 @@ mod tests {
             VerifierLang::from_stack(Stack::TypeScript),
             VerifierLang::TypeScript
         );
-        assert_eq!(VerifierLang::from_stack(Stack::Python), VerifierLang::Python);
+        assert_eq!(
+            VerifierLang::from_stack(Stack::Python),
+            VerifierLang::Python
+        );
     }
 
     #[test]
@@ -353,7 +360,10 @@ mod tests {
         let out = parse_decisive(VerifierLang::TypeScript, stdout, "", 1);
         assert!(out.contains("parses config"));
         assert!(out.contains("handles error"));
-        assert!(!out.contains("adds numbers"), "passing tests excluded: {out}");
+        assert!(
+            !out.contains("adds numbers"),
+            "passing tests excluded: {out}"
+        );
     }
 
     #[test]
@@ -413,7 +423,12 @@ mod tests {
     #[test]
     fn structured_parser_falls_back_to_generic_when_no_items() {
         // Rust selected, but stdout has no cargo JSON — must still surface stderr grounding.
-        let out = parse_decisive(VerifierLang::Rust, "not json at all", "linker error: ld failed", 1);
+        let out = parse_decisive(
+            VerifierLang::Rust,
+            "not json at all",
+            "linker error: ld failed",
+            1,
+        );
         assert!(out.starts_with("verifier rust FAILED (exit 1)"));
         assert!(out.contains("linker error"), "{out}");
     }

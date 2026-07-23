@@ -84,7 +84,10 @@ mod tests {
     #[test]
     fn tp_leading_english_build_request_in_a_longer_sentence() {
         assert_eq!(
-            classify("build this feature please, it's urgent", RequestOrigin::Chat),
+            classify(
+                "build this feature please, it's urgent",
+                RequestOrigin::Chat
+            ),
             Some(RunKind::Build)
         );
     }

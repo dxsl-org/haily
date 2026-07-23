@@ -153,7 +153,9 @@ mod tests {
             prompt_ref: "p".into(),
             tool_whitelist: whitelist.iter().map(|s| s.to_string()).collect(),
             max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
-            gate: Gate::Approval { prompt: "ok?".into() },
+            gate: Gate::Approval {
+                prompt: "ok?".into(),
+            },
             max_retries: 1,
             grammar: None,
         }
@@ -175,10 +177,15 @@ mod tests {
 
     #[test]
     fn pipeline_leaf_check_spans_all_stages() {
-        let good = Pipeline { runs: vec![stage_with(&["fs_read"]), stage_with(&["shell_exec"])] };
+        let good = Pipeline {
+            runs: vec![stage_with(&["fs_read"]), stage_with(&["shell_exec"])],
+        };
         assert!(good.all_stages_are_leaves());
         let bad = Pipeline {
-            runs: vec![stage_with(&["fs_read"]), stage_with(&["delegate_to_researcher"])],
+            runs: vec![
+                stage_with(&["fs_read"]),
+                stage_with(&["delegate_to_researcher"]),
+            ],
         };
         assert!(!bad.all_stages_are_leaves());
     }

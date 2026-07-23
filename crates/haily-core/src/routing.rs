@@ -55,7 +55,12 @@ impl RouteFeatures {
 /// `tier`/`source` resolve to "session default, no decision made."
 impl Default for RouteFeatures {
     fn default() -> Self {
-        RouteFeatures { msg_words: 0, has_code: false, history_user_msgs: 0, depth_label: "normal" }
+        RouteFeatures {
+            msg_words: 0,
+            has_code: false,
+            history_user_msgs: 0,
+            depth_label: "normal",
+        }
     }
 }
 
@@ -107,7 +112,11 @@ pub struct TierDecision {
 /// unambiguously "no decision was made" rather than a fabricated heuristic result.
 impl Default for TierDecision {
     fn default() -> Self {
-        TierDecision { tier: None, source: DecisionSource::Default, features: RouteFeatures::default() }
+        TierDecision {
+            tier: None,
+            source: DecisionSource::Default,
+            features: RouteFeatures::default(),
+        }
     }
 }
 
@@ -214,7 +223,11 @@ pub fn select_tier(msg: &str, ctx: RouteCtx, cost_quality: u8) -> TierDecision {
 
     let tier = tier.map(|t| apply_remote_ceiling(t, ctx.remote_origin));
 
-    TierDecision { tier, source, features }
+    TierDecision {
+        tier,
+        source,
+        features,
+    }
 }
 
 /// Mirrors the `deny_remote_deep` remote-origin check (`haily-io::mobile::server`, which sets
@@ -301,14 +314,22 @@ mod tests {
     use super::*;
 
     fn ctx(depth: DepthMode, history_user_msgs: usize, remote_origin: bool) -> RouteCtx {
-        RouteCtx { depth, history_user_msgs, remote_origin }
+        RouteCtx {
+            depth,
+            history_user_msgs,
+            remote_origin,
+        }
     }
 
     // -- explicit phrase: always wins, anchored --------------------------------------
 
     #[test]
     fn explicit_upward_phrase_wins_over_default_and_is_anchored() {
-        let decision = select_tier("nghĩ kỹ về kiến trúc này", ctx(DepthMode::Normal, 0, false), 7);
+        let decision = select_tier(
+            "nghĩ kỹ về kiến trúc này",
+            ctx(DepthMode::Normal, 0, false),
+            7,
+        );
         assert_eq!(decision.tier, Some(Tier::Thinking));
         assert_eq!(decision.source, DecisionSource::ExplicitPhrase);
     }
@@ -380,11 +401,23 @@ mod tests {
         let long_msg = "word ".repeat(W_HIGH + 1);
         let at = |cq: u8| select_tier(&long_msg, ctx(DepthMode::Normal, 0, false), cq).tier;
 
-        assert_eq!(at(0), Some(Tier::Fast), "0 biases one step down from Medium");
+        assert_eq!(
+            at(0),
+            Some(Tier::Fast),
+            "0 biases one step down from Medium"
+        );
         assert_eq!(at(3), Some(Tier::Fast), "3 is still in the down-bias band");
         assert_eq!(at(7), Some(Tier::Medium), "7 is neutral");
-        assert_eq!(at(8), Some(Tier::Thinking), "8 biases one step up from Medium");
-        assert_eq!(at(10), Some(Tier::Thinking), "10 is still in the up-bias band, capped");
+        assert_eq!(
+            at(8),
+            Some(Tier::Thinking),
+            "8 biases one step up from Medium"
+        );
+        assert_eq!(
+            at(10),
+            Some(Tier::Thinking),
+            "10 is still in the up-bias band, capped"
+        );
     }
 
     #[test]
@@ -392,7 +425,11 @@ mod tests {
         let long_msg = "word ".repeat(W_HIGH + 1);
         for cq in 0..=10u8 {
             let decision = select_tier(&long_msg, ctx(DepthMode::Normal, 0, false), cq);
-            assert_ne!(decision.tier, Some(Tier::Ultra), "cost_quality={cq} must never reach Ultra");
+            assert_ne!(
+                decision.tier,
+                Some(Tier::Ultra),
+                "cost_quality={cq} must never reach Ultra"
+            );
         }
     }
 
@@ -400,9 +437,17 @@ mod tests {
 
     #[test]
     fn remote_origin_caps_final_tier_at_medium_even_for_explicit_phrase() {
-        let decision = select_tier("nghĩ kỹ về kiến trúc này", ctx(DepthMode::Normal, 0, true), 7);
+        let decision = select_tier(
+            "nghĩ kỹ về kiến trúc này",
+            ctx(DepthMode::Normal, 0, true),
+            7,
+        );
         assert_eq!(decision.tier, Some(Tier::Medium));
-        assert_eq!(decision.source, DecisionSource::ExplicitPhrase, "source is unaffected by the cap");
+        assert_eq!(
+            decision.source,
+            DecisionSource::ExplicitPhrase,
+            "source is unaffected by the cap"
+        );
     }
 
     #[test]
@@ -470,7 +515,10 @@ mod tests {
         // on `RouteCtx` — the only way to move the decision is the trusted count below.
         let bumped = ctx(DepthMode::Normal, N_CONT + 5, false);
         let c = select_tier("ok fix that", bumped, 5);
-        assert_ne!(c.tier, a.tier, "only the trusted history_user_msgs count can change the decision");
+        assert_ne!(
+            c.tier, a.tier,
+            "only the trusted history_user_msgs count can change the decision"
+        );
         assert_eq!(c.source, DecisionSource::Heuristic);
     }
 
@@ -497,8 +545,14 @@ mod tests {
     fn parse_egress_override_parses_known_values_case_insensitively() {
         assert_eq!(parse_egress_override("localonly"), Some(Egress::LocalOnly));
         assert_eq!(parse_egress_override("LocalOnly"), Some(Egress::LocalOnly));
-        assert_eq!(parse_egress_override("allowcloud"), Some(Egress::AllowCloud));
-        assert_eq!(parse_egress_override("ALLOWCLOUD"), Some(Egress::AllowCloud));
+        assert_eq!(
+            parse_egress_override("allowcloud"),
+            Some(Egress::AllowCloud)
+        );
+        assert_eq!(
+            parse_egress_override("ALLOWCLOUD"),
+            Some(Egress::AllowCloud)
+        );
         assert_eq!(parse_egress_override("garbage"), None);
         assert_eq!(parse_egress_override(""), None);
     }
@@ -532,7 +586,11 @@ mod escalation_tests {
     }
 
     fn enabled_policy() -> EscalationPolicy {
-        EscalationPolicy { failures_before_escalation: 1, max_tier: Tier::Thinking, enabled: true }
+        EscalationPolicy {
+            failures_before_escalation: 1,
+            max_tier: Tier::Thinking,
+            enabled: true,
+        }
     }
 
     /// Every connection this server accepts either fails immediately (closes without a
@@ -603,13 +661,19 @@ mod escalation_tests {
         )
         .await;
 
-        assert!(result.is_err(), "a pre-first-token failure on a cancelled turn must propagate");
+        assert!(
+            result.is_err(),
+            "a pre-first-token failure on a cancelled turn must propagate"
+        );
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
             "cancellation must prevent any escalated retry — exactly one attempt"
         );
-        assert_eq!(current_tier, None, "tier must be left untouched on a cancelled failure");
+        assert_eq!(
+            current_tier, None,
+            "tier must be left untouched on a cancelled failure"
+        );
     }
 
     #[tokio::test]
@@ -617,16 +681,32 @@ mod escalation_tests {
         let (base_url, call_count) = spawn_server(usize::MAX, "unused");
         let llm = LlmRouter::init(cloud_config(base_url)).await;
         let cancel = CancellationToken::new();
-        let disabled = EscalationPolicy { failures_before_escalation: 1, max_tier: Tier::Thinking, enabled: false };
+        let disabled = EscalationPolicy {
+            failures_before_escalation: 1,
+            max_tier: Tier::Thinking,
+            enabled: false,
+        };
 
         let mut current_tier = None;
         let result = open_stream_with_escalation(
-            &llm, &mut current_tier, req(), &disabled, Egress::AllowCloud, &cancel,
+            &llm,
+            &mut current_tier,
+            req(),
+            &disabled,
+            Egress::AllowCloud,
+            &cancel,
         )
         .await;
 
-        assert!(result.is_err(), "a disabled policy must behave exactly like plain complete_stream — no rescue");
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "disabled policy must never attempt a retry");
+        assert!(
+            result.is_err(),
+            "a disabled policy must behave exactly like plain complete_stream — no rescue"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "disabled policy must never attempt a retry"
+        );
     }
 
     #[tokio::test]
@@ -640,7 +720,12 @@ mod escalation_tests {
 
         let mut current_tier = None;
         let result = open_stream_with_escalation(
-            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+            &llm,
+            &mut current_tier,
+            req(),
+            &enabled_policy(),
+            Egress::AllowCloud,
+            &cancel,
         )
         .await;
 
@@ -667,12 +752,21 @@ mod escalation_tests {
 
         let mut current_tier = None;
         let result = open_stream_with_escalation(
-            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+            &llm,
+            &mut current_tier,
+            req(),
+            &enabled_policy(),
+            Egress::AllowCloud,
+            &cancel,
         )
         .await;
 
         assert!(result.is_ok(), "the escalated retry must succeed");
-        assert_eq!(call_count.load(Ordering::SeqCst), 2, "exactly one retry attempt");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "exactly one retry attempt"
+        );
         assert_eq!(
             current_tier,
             Some(Tier::Medium),
@@ -688,12 +782,24 @@ mod escalation_tests {
 
         let mut current_tier = None;
         let result = open_stream_with_escalation(
-            &llm, &mut current_tier, req(), &enabled_policy(), Egress::AllowCloud, &cancel,
+            &llm,
+            &mut current_tier,
+            req(),
+            &enabled_policy(),
+            Egress::AllowCloud,
+            &cancel,
         )
         .await;
 
         assert!(result.is_ok());
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "a clean success must never retry");
-        assert_eq!(current_tier, None, "tier must be untouched when no escalation ever happened");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "a clean success must never retry"
+        );
+        assert_eq!(
+            current_tier, None,
+            "tier must be untouched when no escalation ever happened"
+        );
     }
 }

@@ -38,8 +38,10 @@ pub use eval_runner::{
     ScoreResult, TaskManifest,
 };
 pub use gate::{ArtifactKind, Gate};
+pub use judge::{
+    apex_judge, judge_panel, plan_design, refuter_votes, ApexVerdict, DesignResult, JudgeContext,
+};
 pub use launcher::{launch_coding_run, CodingRunSpec, LaunchDeps, RunKind};
-pub use judge::{apex_judge, judge_panel, plan_design, refuter_votes, ApexVerdict, DesignResult, JudgeContext};
 pub use plan_pipeline::{
     build_plan_pipeline, run_plan, EmitPlanDraftTool, PlanDraft, PlanRunSpec, RenderPlanTool,
 };

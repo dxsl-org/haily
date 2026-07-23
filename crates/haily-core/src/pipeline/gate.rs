@@ -87,9 +87,17 @@ mod tests {
 
     #[test]
     fn kind_label_is_content_free() {
-        let cmd = Gate::Command { program: "cargo".into(), args: vec!["check".into()] };
-        let art = Gate::Artifact { path: "/secret/plan.md".into(), parseable_as: None };
-        let appr = Gate::Approval { prompt: "ship it?".into() };
+        let cmd = Gate::Command {
+            program: "cargo".into(),
+            args: vec!["check".into()],
+        };
+        let art = Gate::Artifact {
+            path: "/secret/plan.md".into(),
+            parseable_as: None,
+        };
+        let appr = Gate::Approval {
+            prompt: "ship it?".into(),
+        };
         assert_eq!(cmd.kind_label(), "command");
         assert_eq!(art.kind_label(), "artifact");
         assert_eq!(appr.kind_label(), "approval");

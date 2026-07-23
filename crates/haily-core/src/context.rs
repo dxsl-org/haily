@@ -134,7 +134,9 @@ pub async fn build_messages(
     // route this turn's memory/preferences lookups to the wrong (nil) identity.
     let parsed_session_id = uuid::Uuid::parse_str(session_id)
         .map_err(|e| anyhow::anyhow!("invalid session_id '{session_id}': {e}"))?;
-    let mut ctx = kms.build_life_context(parsed_session_id, forced_skill).await?;
+    let mut ctx = kms
+        .build_life_context(parsed_session_id, forced_skill)
+        .await?;
 
     // Hybrid search to surface relevant facts for this message
     let search_results = kms.search_hybrid(user_message, 8).await.unwrap_or_default();

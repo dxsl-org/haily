@@ -36,7 +36,14 @@ const DEEP_PHRASES: &[&str] = &[
 ];
 
 /// VN/EN phrases that request the Quick tier.
-const QUICK_PHRASES: &[&str] = &["làm nhanh", "nhanh thôi", "trả lời nhanh", "quick", "be quick", "fast"];
+const QUICK_PHRASES: &[&str] = &[
+    "làm nhanh",
+    "nhanh thôi",
+    "trả lời nhanh",
+    "quick",
+    "be quick",
+    "fast",
+];
 
 /// Detect a depth request in a GENUINE user message. Returns `None` when no phrase fires
 /// (the caller keeps the request's existing [`DepthMode`], typically the GUI toggle value).
@@ -129,7 +136,10 @@ mod tests {
     fn short_deep_phrase_sets_deep() {
         assert_eq!(detect_depth("làm kỹ vào"), Some(DepthMode::Deep));
         assert_eq!(detect_depth("think hard"), Some(DepthMode::Deep));
-        assert_eq!(detect_depth("phân tích sâu giúp tôi"), Some(DepthMode::Deep));
+        assert_eq!(
+            detect_depth("phân tích sâu giúp tôi"),
+            Some(DepthMode::Deep)
+        );
     }
 
     #[test]
@@ -171,11 +181,20 @@ mod tests {
     #[test]
     fn effective_depth_phrase_overrides_toggle_but_absence_keeps_it() {
         // A Deep phrase overrides a Normal toggle.
-        assert_eq!(effective_depth(DepthMode::Normal, "làm kỹ"), DepthMode::Deep);
+        assert_eq!(
+            effective_depth(DepthMode::Normal, "làm kỹ"),
+            DepthMode::Deep
+        );
         // No phrase → the toggle value stands (here Deep from the GUI).
-        assert_eq!(effective_depth(DepthMode::Deep, "help me plan a trip"), DepthMode::Deep);
+        assert_eq!(
+            effective_depth(DepthMode::Deep, "help me plan a trip"),
+            DepthMode::Deep
+        );
         // No phrase, Normal toggle → Normal.
-        assert_eq!(effective_depth(DepthMode::Normal, "help me plan a trip"), DepthMode::Normal);
+        assert_eq!(
+            effective_depth(DepthMode::Normal, "help me plan a trip"),
+            DepthMode::Normal
+        );
     }
 
     // -- parity_hint: text-only, never escalates --------------------------------------
@@ -184,7 +203,10 @@ mod tests {
     fn parity_hint_fires_below_thinking_only() {
         assert!(parity_hint(Some(Tier::Fast)).is_some());
         assert!(parity_hint(Some(Tier::Medium)).is_some());
-        assert!(parity_hint(None).is_some(), "unknown tier fails toward informing");
+        assert!(
+            parity_hint(None).is_some(),
+            "unknown tier fails toward informing"
+        );
         assert!(parity_hint(Some(Tier::Thinking)).is_none());
         assert!(parity_hint(Some(Tier::Ultra)).is_none());
     }
