@@ -1,17 +1,20 @@
 <script lang="ts">
-  // Authored + synthesized skills browser (P11b). `listSkills` is a plain read-back, no
-  // push channel — refetch on mount and via the manual refresh button, same pattern as
-  // `ConnectorConfig.svelte`.
-  import { listSkills, type SkillView } from '$lib/tauri';
+  // Authored + synthesized skills browser (P11b); relocated here as the Skills screen's list tab
+  // (Unified Chat UI phase 9, D4) — a row click opens the structured editor via `onOpenSkill`.
+  // `listSkills` is a plain read-back, no push channel — refetch on mount and via the manual
+  // refresh button, same pattern as `ConnectorConfig.svelte`.
+  import { listSkills, listRecoveredSkills, type SkillEditKind, type SkillView } from '$lib/tauri';
   import SkillRow from './SkillRow.svelte';
 
   // Rolling corpus of this session's `StageOutput` text, forwarded by whichever parent
   // also renders `RunTimeline`. `RunEvent` has no `SkillActivated` variant (see tauri.ts), so
   // "activated this run" is a best-effort substring match against skill names rather
   // than an authoritative backend field — documented in `activatedNames` below.
-  let { runOutputText = '' }: { runOutputText?: string } = $props();
+  let { runOutputText = '', onOpenSkill }: { runOutputText?: string; onOpenSkill: (name: string, kind: SkillEditKind) => void } =
+    $props();
 
   let skills = $state<SkillView[]>([]);
+  let recoveredNames = $state<string[]>([]);
   let loading = $state(true);
   let error = $state('');
 
@@ -29,6 +32,13 @@
     } finally {
       loading = false;
     }
+    // Best-effort: an empty/failed recovery read must never block the skill list itself —
+    // `listRecoveredSkills` is empty on a clean load anyway, so a failure reads the same way.
+    try {
+      recoveredNames = await listRecoveredSkills();
+    } catch {
+      recoveredNames = [];
+    }
   }
 
   const activatedNames = $derived(
@@ -38,19 +48,25 @@
 
 <div class="section">
   <div class="list-header">
-    <span class="switch-title">Skills</span>
-    <button class="refresh-btn" onclick={load} disabled={loading} title="Refresh">↻</button>
+    <span class="switch-title">Kỹ năng</span>
+    <button class="refresh-btn" onclick={load} disabled={loading} title="Làm mới">↻</button>
   </div>
   {#if loading}
-    <div class="empty">Loading…</div>
+    <div class="empty">Đang tải…</div>
   {:else if error}
     <div class="status-error">⚠️ {error}</div>
   {:else if skills.length === 0}
-    <div class="empty">No skills yet.</div>
+    <div class="empty">Chưa có kỹ năng nào.</div>
   {:else}
     <div class="rows">
       {#each skills as skill (skill.name)}
-        <SkillRow {skill} activated={activatedNames.has(skill.name)} onChanged={load} />
+        <SkillRow
+          {skill}
+          activated={activatedNames.has(skill.name)}
+          recovered={skill.source === 'authored' && recoveredNames.includes(skill.name)}
+          onChanged={load}
+          onOpen={() => onOpenSkill(skill.name, skill.source)}
+        />
       {/each}
     </div>
   {/if}

@@ -1,27 +1,35 @@
 <script lang="ts">
-  // Placeholder destination — Track C (P09) fills this with the structured skill editor
-  // (authored + synthesized skills, draft-with-Haily) reusing `SkillsBrowser`. Empty state only.
+  // Skills destination (P01 shell, filled by Unified Chat UI phase 9, D4): the list tab
+  // (`SkillsBrowser`, relocated here) opens the structured editor (`skills/SkillEditor`) on a
+  // row click; `selected` is the only state this composition owns.
+  import SkillsBrowser from './SkillsBrowser.svelte';
+  import SkillEditor from './skills/SkillEditor.svelte';
+  import type { SkillEditKind } from '$lib/tauri';
+
+  let selected = $state<{ name: string; kind: SkillEditKind } | null>(null);
+
+  function openSkill(name: string, kind: SkillEditKind) {
+    selected = { name, kind };
+  }
+
+  function back() {
+    selected = null;
+  }
 </script>
 
 <div class="screen">
-  <div class="empty">
-    <span class="glyph">✨</span>
-    <p>Chưa có kỹ năng nào.</p>
-    <p class="hint">Kỹ năng đã học và kỹ năng có sẵn sẽ xuất hiện ở đây.</p>
-  </div>
+  {#if selected}
+    <SkillEditor name={selected.name} kind={selected.kind} onBack={back} />
+  {:else}
+    <SkillsBrowser onOpenSkill={openSkill} />
+  {/if}
 </div>
 
 <style>
   .screen {
     flex: 1;
     min-height: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    overflow-y: auto;
+    padding: 4px 2px;
   }
-
-  .empty { text-align: center; color: #6b6b8a; }
-  .empty .glyph { display: block; font-size: 32px; margin-bottom: 10px; opacity: 0.6; }
-  .empty p { margin: 4px 0; font-size: 13px; }
-  .empty .hint { font-size: 12px; color: #4a4a6a; }
 </style>

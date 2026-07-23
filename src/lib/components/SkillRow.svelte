@@ -4,9 +4,27 @@
   // `pin_skill` commands; ENFORCEMENT (excluding disabled skills from injection,
   // prioritizing pinned) is a backend concern the P11a deviation log defers past this
   // admin surface — this row only reflects and toggles the persisted state.
+  //
+  // Unified Chat UI phase 9 (D4): `onOpen` opens the structured editor for this skill;
+  // `recovered` badges an authored skill currently served from its `skill_versions` fallback
+  // (manifest-hash mismatch — see `listRecoveredSkills`'s doc comment). Synthesized rows get an
+  // Archive + Promote-to-authored action group (`SkillSynthesizedActions`).
   import { setSkillEnabled, pinSkill, type SkillView } from '$lib/tauri';
+  import SkillSynthesizedActions from './SkillSynthesizedActions.svelte';
 
-  let { skill, activated, onChanged }: { skill: SkillView; activated: boolean; onChanged: () => void } = $props();
+  let {
+    skill,
+    activated,
+    recovered,
+    onChanged,
+    onOpen,
+  }: {
+    skill: SkillView;
+    activated: boolean;
+    recovered: boolean;
+    onChanged: () => void;
+    onOpen: () => void;
+  } = $props();
 
   let togglingEnabled = $state(false);
   let togglingPin = $state(false);
@@ -42,36 +60,48 @@
 </script>
 
 <div class="row">
-  <div class="head">
-    <span class="name">{skill.name}</span>
-    <span class="badge source-{skill.source}">{skill.source}</span>
-    {#if activated}<span class="badge activated">used this run</span>{/if}
-    {#if !skill.enabled}<span class="badge off">disabled</span>{/if}
-  </div>
-  <p class="desc">{skill.description}</p>
-  {#if skill.source === 'synthesized'}
-    <div class="meta">
-      {#if skill.confidence !== null}<span>confidence {(skill.confidence * 100).toFixed(0)}%</span>{/if}
-      {#if skill.use_count !== null}<span>used {skill.use_count}×</span>{/if}
-      {#if skill.last_used_at}<span>last {skill.last_used_at}</span>{/if}
+  <div
+    class="row-main"
+    role="button"
+    tabindex="0"
+    onclick={onOpen}
+    onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && onOpen()}
+  >
+    <div class="head">
+      <span class="name">{skill.name}</span>
+      <span class="badge source-{skill.source}">{skill.source}</span>
+      {#if recovered}<span class="badge recovered">⚠ khôi phục</span>{/if}
+      {#if activated}<span class="badge activated">đã dùng trong lượt này</span>{/if}
+      {#if !skill.enabled}<span class="badge off">đã tắt</span>{/if}
     </div>
-  {/if}
+    <p class="desc">{skill.description}</p>
+    {#if skill.source === 'synthesized'}
+      <div class="meta">
+        {#if skill.confidence !== null}<span>độ tin cậy {(skill.confidence * 100).toFixed(0)}%</span>{/if}
+        {#if skill.use_count !== null}<span>dùng {skill.use_count} lần</span>{/if}
+        {#if skill.last_used_at}<span>lần cuối {skill.last_used_at}</span>{/if}
+      </div>
+    {/if}
+  </div>
   <div class="actions">
     <button class="pin-btn" class:pinned={skill.pinned} onclick={togglePin} disabled={togglingPin}>
-      {skill.pinned ? '★ Pinned' : '☆ Pin'}
+      {skill.pinned ? '★ Đã ghim' : '☆ Ghim'}
     </button>
     <button
       class="switch"
       class:on={skill.enabled}
       role="switch"
       aria-checked={skill.enabled}
-      aria-label={skill.enabled ? 'Disable skill' : 'Enable skill'}
+      aria-label={skill.enabled ? 'Tắt kỹ năng' : 'Bật kỹ năng'}
       disabled={togglingEnabled}
       onclick={toggleEnabled}
     >
       <span class="knob"></span>
     </button>
   </div>
+  {#if skill.source === 'synthesized'}
+    <SkillSynthesizedActions name={skill.name} onChanged={onChanged} />
+  {/if}
   {#if error}<div class="status-error">⚠️ {error}</div>{/if}
 </div>
 
@@ -85,6 +115,9 @@
     border: 1px solid #23233a;
     border-radius: 8px;
   }
+
+  .row-main { display: flex; flex-direction: column; gap: 6px; cursor: pointer; }
+  .row-main:focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; border-radius: 4px; }
 
   .head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .name { font-size: 12px; font-weight: 600; color: #e0dff5; }
@@ -101,6 +134,7 @@
   .badge.source-synthesized { color: #c084fc; }
   .badge.activated { color: #4ade80; border-color: #166534; }
   .badge.off { color: #6b6b8a; }
+  .badge.recovered { color: #fbbf24; border-color: #7f5a1d; }
 
   .desc { font-size: 11px; color: #8884aa; line-height: 1.5; }
 
