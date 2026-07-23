@@ -4,6 +4,9 @@
   import { cancelTurn } from '$lib/tauri';
   import type { PendingApproval } from '$lib/tauri';
   import type { Message } from './ChatStream.svelte';
+  import SlashPalette from './SlashPalette.svelte';
+  import { spliceCommand } from '$lib/slash-insert';
+  import { createSlashPaletteState } from '$lib/chat-palette-state.svelte';
 
   interface Props {
     /** Same reactive array `ChatStream` renders — mutated in place (push), never
@@ -35,18 +38,33 @@
   let sending = $state(false);
   let textarea: HTMLTextAreaElement;
 
+  // Slash palette (P03, D6): both entry paths ("/" inline trigger + ＋ button) read
+  // from the same `palette` state so behavior can't diverge — see `chat-palette-state`.
+  const palette = createSlashPaletteState(() => input);
+
+  /** Selecting a row inserts `/<name> ` and returns focus to the input — never sends. */
+  function insertCommand(name: string) {
+    const start = palette.usingPlus ? (textarea?.selectionStart ?? input.length) : 0;
+    const end = palette.usingPlus ? (textarea?.selectionEnd ?? input.length) : input.length;
+    const spliced = spliceCommand(input, name, start, end);
+    input = spliced.text;
+    palette.close();
+    requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(spliced.caret, spliced.caret);
+      autoResize();
+    });
+  }
+
   onMount(() => {
     textarea?.focus();
   });
 
   async function send() {
     const text = input.trim();
-    // Block new turns while a tool approval is pending: the backend turn is paused
-    // waiting on the modal, and starting a second turn would overwrite the pending
-    // approval state (orphaning the first request to a silent 120s timeout-deny).
-    // Also block while a turn is already streaming (`activeSession` set) — the GUI
-    // is single-turn-at-a-time; a second concurrent send would overwrite the Stop
-    // button's target with no way back to the first turn's session id.
+    // Block while an approval is pending (would orphan it to a silent 120s timeout-deny)
+    // or a turn is already streaming (single-turn-at-a-time GUI; a second send would
+    // overwrite the Stop button's target session).
     if (!text || sending || pendingApproval || activeSession) return;
 
     input = '';
@@ -73,30 +91,34 @@
     }
   }
 
-  /** Stop the currently streaming turn. Backend still emits a terminal `Complete`
-   * chunk after cancellation, so the bubble closes out via `ChatStream`'s normal
-   * chunk-handling path rather than being mutated here — this only fires the
-   * cancellation and tracks the transient "stopping…" state for the button label. */
+  /** Stop the streaming turn. Backend still emits a terminal `Complete` chunk after
+   * cancellation, so the bubble closes via `ChatStream`'s normal handling, not here. */
   async function stop() {
     if (!activeSession || stopping) return;
     stopping = true;
     try {
       await cancelTurn(activeSession);
     } catch (e) {
-      // Cancellation is best-effort from the UI's perspective — if the IPC call
-      // itself fails (not "no turn found", which resolves false, but a genuine
-      // invoke error), leave the bubble streaming rather than silently losing the
-      // failure; the console log gives a debugging trail without a modal.
+      // Best-effort: a genuine invoke error (not the "no turn found" false result)
+      // leaves the bubble streaming rather than silently losing the failure.
       console.error('cancelTurn failed', e);
       stopping = false;
     }
   }
 
+  // ↑/↓/Enter/Tab/Esc are owned by `SlashPalette` (capture-phase listener) while it's
+  // open — this guard stops the same keystroke from ALSO sending the message here.
   function onKeydown(e: KeyboardEvent) {
+    if (palette.open && ['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
     }
+  }
+
+  function onInput() {
+    palette.onTyped();
+    autoResize();
   }
 
   function autoResize() {
@@ -107,12 +129,20 @@
 </script>
 
 <div class="input-area">
+  <SlashPalette open={palette.open} filter={palette.filter} onSelect={insertCommand} onClose={palette.close} />
+  <button
+    class="plus"
+    onclick={palette.togglePlus}
+    title="Danh sách lệnh"
+    aria-label="Danh sách lệnh"
+    aria-expanded={palette.usingPlus}
+  >＋</button>
   <textarea
     bind:this={textarea}
     bind:value={input}
     onkeydown={onKeydown}
-    oninput={autoResize}
-    placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
+    oninput={onInput}
+    placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng, / để xem lệnh)'}
     rows="1"
     disabled={sending || pendingApproval !== null || activeSession !== null}
   ></textarea>
@@ -129,6 +159,7 @@
 
 <style>
   .input-area {
+    position: relative;
     display: flex;
     gap: 8px;
     padding: 10px 12px;
@@ -180,4 +211,8 @@
 
   button.stop { background: #3a1f2e; color: #f87171; font-size: 15px; }
   button.stop:hover:not(:disabled) { background: #4a2436; }
+
+  button.plus { background: #2a2a45; color: #c084fc; font-size: 20px; font-weight: 700; }
+  button.plus:hover { background: #35355a; }
+  button.plus[aria-expanded='true'] { background: #4c1d95; color: #fff; }
 </style>
