@@ -5,8 +5,8 @@ mod models;
 
 use haily_app::connector_config::{self, ConnectorSummary};
 use haily_app::{
-    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, SlashCommand,
-    SlashRegistry, TurnRegistry, WorkspaceView,
+    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, RunControlRegistry, SkillView,
+    SlashCommand, SlashRegistry, TurnRegistry, WorkspaceView,
 };
 use haily_core::view::ViewStore;
 use haily_db::{
@@ -84,6 +84,14 @@ struct AppState {
     /// backed handle the orchestrator gates on. Cloned out of `app` at setup, mirroring
     /// `kill`/`routing_enabled` exactly, so `set_approval_mode` doesn't need to lock `app`.
     approval_mode: haily_core::permission_mode::ApprovalModeHandle,
+    /// Per-run kill/pause/resume control (Unified Chat UI phase 6, D3) — the SAME registry
+    /// every launch path (`start_coding_run`, a slash command, an auto-detected chat intent)
+    /// registers into. Cloned out of `app` at setup, mirroring `turns`/`kill`, so `kill_run`/
+    /// `pause_run` don't need to lock `app`. LOCAL-GUI-ONLY: these commands take a bare
+    /// `run_id` with no session/ownership binding and MUST NEVER be exposed over the
+    /// mobile/remote bridge (`ClientFrame`/`ServerFrame`) — a paired device could otherwise
+    /// control arbitrary runs.
+    run_control: Arc<RunControlRegistry>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -553,6 +561,50 @@ async fn start_coding_run(
 }
 
 // ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3) — per-run kill/pause/resume. LOCAL-GUI-ONLY: these three
+// commands take a bare `run_id` with no session/ownership binding and MUST NEVER be exposed over
+// the mobile/remote bridge (`ClientFrame`/`ServerFrame`) — see `AppState.run_control`'s doc.
+// None of the three touch `safety.disable_writes`; a resumed run re-enters normal approval
+// gating with no elevated permission.
+// ---------------------------------------------------------------------------
+
+/// Cancel a run immediately (its registered token, if live) and soft-delete its row as a
+/// checkpoint fallback for a run with no live registry entry. Returns `false` (not an error) if
+/// `run_id` was already terminal or unknown.
+#[tauri::command]
+async fn kill_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    haily_app::run_control::kill_run(&state.db, &state.run_control, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Set a run's pause flag (best-effort, honored at the run's next stage boundary). Returns
+/// `false` (not an error) if `run_id` has no live registered entry.
+#[tauri::command]
+fn pause_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(haily_app::run_control::pause_run(
+        &state.run_control,
+        &run_id,
+    ))
+}
+
+/// Resume an `interrupted` run, or a `paused` run whose reason is retries-exhausted or
+/// explicit-stop — re-entering via a fresh relaunch bound to the run's OWN (reused) session,
+/// with its own chunk-forwarding wiring (`haily_app::run_control::resume_run` mirrors
+/// `start_coding_run`'s pattern internally). Returns `false` (not an error) for any
+/// ineligible/unknown `run_id` (already terminal/live, an approval-wait pause, or a row with no
+/// resume context). Returns an error only when the owning workspace was already reclaimed or
+/// its change already applied — a clear message the frontend should surface verbatim.
+#[tauri::command]
+async fn resume_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.app.lock().await;
+    let app = guard.as_ref().ok_or("app is shutting down")?;
+    haily_app::run_control::resume_run(app, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // View Engine Phase A (phase 3) — `get_view` is the reconcile/transport for a
 // `ResponseChunk::ViewRef` handle (the command IS the fetch; there is no per-view streaming
 // channel, so a view opened before the pane mounts is simply fetched on mount). Telemetry
@@ -834,6 +886,7 @@ pub fn run() {
             let credential_store = Arc::clone(&app_handle.credential_store);
             let view_store = app_handle.orchestrator.view_store();
             let slash_registry = Arc::clone(&app_handle.slash_registry);
+            let run_control = app_handle.run_control_registry();
             app.manage(AppState {
                 gui_req_tx,
                 db,
@@ -848,6 +901,7 @@ pub fn run() {
                 mobile: mobile_state,
                 slash_registry,
                 approval_mode,
+                run_control,
                 app: Mutex::new(Some(app_handle)),
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
@@ -905,6 +959,9 @@ pub fn run() {
             archive_skill_manual,
             list_recovered_skills,
             set_approval_mode,
+            kill_run,
+            pause_run,
+            resume_run,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

@@ -754,6 +754,166 @@ async fn kill_mid_run_finalize_commits_and_reconciles_worktree() {
 }
 
 // ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3): a user-initiated pause flag pauses the run at the same
+// between-stages checkpoint as kill/cancel, stamping `ExplicitStop`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pause_flag_pauses_the_run_with_explicit_stop_class() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec![]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    )
+    .with_pause_handle(Arc::new(AtomicBool::new(true))); // pause set BEFORE the run starts
+
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "the pause flag must pause the run at the next stage boundary"
+    );
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.status, "paused");
+    assert_eq!(
+        run.pause_reason_class.as_deref(),
+        Some("explicit_stop"),
+        "a user pause must be stamped ExplicitStop, not re-derived from a free-text reason"
+    );
+}
+
+#[tokio::test]
+async fn gate_retries_exhausted_pause_is_stamped_with_retries_exhausted_class() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec!["s1 attempt".to_string()]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    // max_retries = 0 → the FIRST gate failure exhausts retries and pauses immediately.
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], fail_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(report.status, RunStatus::Paused);
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.pause_reason_class.as_deref(), Some("retries_exhausted"));
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3): `seed_launch` persists the resume context onto the row.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn seed_launch_persists_run_id_and_resume_context_onto_the_row() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec!["done".to_string()]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+    let seeded_id = Uuid::new_v4().to_string();
+    runner.seed_launch(Some(seeded_id.clone()), "do the thing", "build", "normal");
+
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(
+        report.run_id, seeded_id,
+        "the one-shot seeded id must be consumed by the FIRST run() call"
+    );
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.task.as_deref(), Some("do the thing"));
+    assert_eq!(run.run_kind.as_deref(), Some("build"));
+    assert_eq!(run.depth.as_deref(), Some("normal"));
+
+    // A SECOND run() call within the same launch must NOT reuse the (already-consumed) id, but
+    // the sticky task/run_kind/depth context still applies.
+    let base2 = spawn_scripted(vec!["done again".to_string()]).await;
+    let llm2 = build_router(base2).await;
+    let runner2 = make_runner(
+        &fx,
+        llm2,
+        Arc::new(ToolRegistry::new()),
+        Arc::new(ApprovalBroker::new()),
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        tokio::sync::mpsc::channel(64).0,
+        tokio::sync::mpsc::channel(512).0,
+    );
+    let seeded_id2 = Uuid::new_v4().to_string();
+    runner2.seed_launch(Some(seeded_id2.clone()), "do the thing", "build", "normal");
+    let pipeline2 = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report2 = runner2.run(spec(&fx, pipeline2)).await.expect("run");
+    assert_eq!(
+        report2.run_id, seeded_id2,
+        "the FIRST call on runner2 must consume its own seed"
+    );
+
+    let pipeline3 = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report3 = runner2.run(spec(&fx, pipeline3)).await.expect("run");
+    assert_ne!(
+        report3.run_id, seeded_id2,
+        "a SECOND internal run() call must mint its own fresh id, never reuse the launch's"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Restart mid-run: a `running` pipeline_run is reset to `interrupted` on boot (never
 // auto-resumed).
 // ---------------------------------------------------------------------------
@@ -777,6 +937,7 @@ async fn restart_resets_running_runs_to_interrupted() {
             backend_used: None,
             egress: None,
             gate_output_digest: None,
+            pause_reason_class: None,
         },
     )
     .await

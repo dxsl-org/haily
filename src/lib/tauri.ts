@@ -858,3 +858,26 @@ export type ApprovalMode = 'manual' | 'accept_edits' | 'auto';
 export async function setApprovalMode(mode: ApprovalMode): Promise<void> {
   return invoke('set_approval_mode', { mode });
 }
+
+/** Per-run kill/pause/resume control (Unified Chat UI phase 6, D3). Local-GUI-only — never
+ * exposed on the mobile/remote bridge; `run_id` carries no session-ownership check of its own. */
+
+/** Cancel a run immediately. Returns `false` (not an error) if the run was already
+ * terminal/unknown — nothing to do. */
+export async function killRun(runId: string): Promise<boolean> {
+  return invoke('kill_run', { runId });
+}
+
+/** Best-effort, stage-boundary pause. Returns `false` (not an error) if the run has no live
+ * entry (already terminal/paused, or unknown). */
+export async function pauseRun(runId: string): Promise<boolean> {
+  return invoke('pause_run', { runId });
+}
+
+/** Resume an `interrupted` run, or a `paused` run whose reason is retries-exhausted or
+ * explicit-stop — never an approval-wait pause (that resolves through its approval card).
+ * Returns `false` (not an error) for any ineligible/unknown run. Throws if the run's workspace
+ * was already reclaimed or its change already applied — surface that message verbatim. */
+export async function resumeRun(runId: string): Promise<boolean> {
+  return invoke('resume_run', { runId });
+}

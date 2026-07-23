@@ -1,6 +1,7 @@
 //! Work-item watcher and proactive daemon startup — spawned identically for every
 //! mode (this phase's fix for F6: GUI previously lacked the watcher, CLI lacked the
 //! daemon; both are now unconditional, gated only by `BootstrapOptions`).
+use crate::run_control::RunControlRegistry;
 use haily_db::{queries::journal, queries::run_events, queries::work_items, DbHandle};
 use haily_io::{AdapterManager, Notification, RunEvent, WorkItemStatus};
 use haily_kms::KmsHandle;
@@ -100,11 +101,20 @@ pub fn spawn_work_item_watcher(
 /// `run_id`, so concurrent runs never contend on each other's rows. `StageOutput` carries no
 /// `stage` field of its own (`haily_types::RunEvent`), so `current_stage` tracks the most
 /// recently seen `StageStarted` for THIS run and keys the marker upsert with it.
+///
+/// Unified Chat UI phase 6 (D3): this is ALSO the one place `registry.remove(run_id)` fires, on
+/// ANY terminal-or-paused transition (`RunComplete` — which covers Done/Failed/Interrupted, since
+/// the runner reports Interrupted as a `RunComplete{outcome:"interrupted"}` — and `RunPaused`).
+/// Removing only on `RunComplete` would leak a token/pause pair for every paused run; a resumed
+/// run re-registers under the SAME `run_id` (`RunControlRegistry::register` overwrites), so a
+/// stale entry here could never be mistaken for the live one even without this cleanup, but
+/// leaving it around would still leak memory for the registry's lifetime.
 pub fn spawn_run_event_bridge(
     session_id: Uuid,
     mut events: mpsc::Receiver<RunEvent>,
     am: AdapterManager,
     db: Arc<DbHandle>,
+    registry: Arc<RunControlRegistry>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 ) {
@@ -124,6 +134,11 @@ pub fn spawn_run_event_bridge(
 
                     if let RunEvent::StageStarted { ref stage, .. } = event {
                         current_stage = stage.clone();
+                    }
+                    if let RunEvent::RunComplete { ref run_id, .. }
+                    | RunEvent::RunPaused { ref run_id, .. } = event
+                    {
+                        registry.remove(run_id);
                     }
                     // Captured BEFORE delivery moves `event`: StageOutput needs only `run_id`/
                     // `seq` (its `chunk` text is never cloned just for marker bookkeeping);
@@ -343,7 +358,8 @@ mod tests {
         let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
-        spawn_run_event_bridge(session, ev_rx, am, db, shutdown, tasks.clone());
+        let registry = Arc::new(RunControlRegistry::new());
+        spawn_run_event_bridge(session, ev_rx, am, db, registry, shutdown, tasks.clone());
 
         for seq in 0..3u64 {
             ev_tx
@@ -401,7 +417,16 @@ mod tests {
         let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
-        spawn_run_event_bridge(session, ev_rx, am, Arc::clone(&db), shutdown, tasks.clone());
+        let registry = Arc::new(RunControlRegistry::new());
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            Arc::clone(&db),
+            registry,
+            shutdown,
+            tasks.clone(),
+        );
 
         let run_id = "r1".to_string();
         ev_tx
@@ -462,6 +487,84 @@ mod tests {
         );
         assert_eq!(markers[0].count, 1);
         assert_eq!(markers[0].last_seq, 7);
+    }
+
+    /// Unified Chat UI phase 6 (D3): the bridge removes a run's registry entry on ANY
+    /// terminal-or-paused transition — `RunComplete` (covers Done/Failed/Interrupted) AND
+    /// `RunPaused` — never leaking a token for a paused/interrupted run.
+    #[tokio::test]
+    async fn bridge_removes_the_registry_entry_on_run_complete_and_run_paused() {
+        let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
+        let am = AdapterManager::builder().register(adapter).build();
+        let session = Uuid::new_v4();
+        am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
+
+        let registry = Arc::new(RunControlRegistry::new());
+        registry.register(
+            "run-complete",
+            CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        registry.register(
+            "run-paused",
+            CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            Arc::clone(&db),
+            Arc::clone(&registry),
+            shutdown,
+            tasks.clone(),
+        );
+
+        ev_tx
+            .send(RunEvent::RunComplete {
+                run_id: "run-complete".into(),
+                outcome: "done".into(),
+            })
+            .await
+            .unwrap();
+        ev_tx
+            .send(RunEvent::RunPaused {
+                run_id: "run-paused".into(),
+                reason: "paused".into(),
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        for _ in 0..2 {
+            seen_rx
+                .recv()
+                .await
+                .expect("event forwarded before cleanup");
+        }
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("bridge task must exit");
+
+        assert!(
+            !registry.cancel("run-complete"),
+            "RunComplete must remove the registry entry"
+        );
+        assert!(
+            !registry.cancel("run-paused"),
+            "RunPaused must remove the registry entry"
+        );
     }
 
     /// The distillation bridge forwards a proposal to every adapter via `notify_all` and exits

@@ -96,8 +96,12 @@ fn sandbox_kind_name(kind: SandboxKind) -> &'static str {
 /// first within a name tie. A DB read failure for the synthesized set or the prefs yields
 /// an empty/default contribution rather than an error — the browser must still render.
 pub async fn list_skills(db: &DbHandle, kms: &KmsHandle) -> Result<Vec<SkillView>> {
-    let enabled_prefs = meta::list_by_prefix(db, SKILL_ENABLED_PREFIX).await.unwrap_or_default();
-    let pinned_prefs = meta::list_by_prefix(db, SKILL_PINNED_PREFIX).await.unwrap_or_default();
+    let enabled_prefs = meta::list_by_prefix(db, SKILL_ENABLED_PREFIX)
+        .await
+        .unwrap_or_default();
+    let pinned_prefs = meta::list_by_prefix(db, SKILL_PINNED_PREFIX)
+        .await
+        .unwrap_or_default();
 
     // A skill is enabled UNLESS an explicit `false` pref exists (default-on); pinned only
     // when an explicit `true` pref exists (default-off).
@@ -296,6 +300,9 @@ pub fn start_coding_run(
     });
 
     let spec = CodingRunSpec {
+        // Overwritten by `launch_coding_run` with a fresh id before registration (Unified Chat
+        // UI phase 6, D3) — this placeholder is never observed.
+        run_id: Uuid::new_v4(),
         kind,
         task,
         session_id,

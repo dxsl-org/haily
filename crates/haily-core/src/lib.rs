@@ -494,6 +494,9 @@ impl Orchestrator {
     pub async fn launch_coding_run(
         &self,
         spec: pipeline::CodingRunSpec,
+        // Unified Chat UI phase 6 (D3): the caller-constructed pause handle for `pause_run` —
+        // registered into the run-control registry BEFORE this call, mirroring `cancel`.
+        pause: Arc<AtomicBool>,
         user_tx: mpsc::Sender<ResponseChunk>,
         events_tx: mpsc::Sender<RunEvent>,
         distillation_tx: Option<mpsc::Sender<Notification>>,
@@ -507,7 +510,16 @@ impl Orchestrator {
             kill: Arc::clone(&self.kill),
             approval_mode: Arc::clone(&self.approval_mode),
         };
-        pipeline::launch_coding_run(deps, spec, user_tx, events_tx, distillation_tx, cancel).await
+        pipeline::launch_coding_run(
+            deps,
+            spec,
+            pause,
+            user_tx,
+            events_tx,
+            distillation_tx,
+            cancel,
+        )
+        .await
     }
 
     pub fn llm_provider(&self) -> String {

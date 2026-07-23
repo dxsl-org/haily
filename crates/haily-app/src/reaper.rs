@@ -44,12 +44,18 @@ const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// where that synchronous discard itself failed.
 const TERMINAL_GRACE: Duration = Duration::hours(1);
 
-/// TTL for a workspace whose owning run is `Paused` or has no `run_id` at all (opened but the
-/// driving run crashed before reaching any status, or paused with no resume mechanism wired
-/// yet — `finalize_workspace` never discards either case, on the theory a follow-up trigger
-/// might resume them; today nothing implements that follow-up, so both classes are abandoned
-/// after this TTL rather than held forever).
+/// TTL for a workspace whose owning run has no `run_id` at all (opened but the driving run
+/// crashed before reaching any status) or is `Paused` for a reason `resume_run` does NOT accept
+/// (an approval-wait pause, or an unclassified/legacy row) — such a workspace is abandoned after
+/// this TTL rather than held forever, since nothing will ever relaunch it via `resume_run`.
 const NULL_RUN_TTL: Duration = Duration::hours(24);
+
+/// TTL for a workspace whose owning run is genuinely RESUMABLE via `resume_run` (Unified Chat UI
+/// phase 6, D3): `Interrupted`, or `Paused` with a `retries_exhausted`/`explicit_stop` reason
+/// class. Far longer than [`NULL_RUN_TTL`] — a user may reasonably come back to a Stop/pause days
+/// later, and `resume_run` itself verifies the worktree still exists before relaunching, so this
+/// TTL only bounds disk usage for a run that was NEVER resumed, not a correctness boundary.
+const RESUMABLE_TTL: Duration = Duration::days(7);
 
 /// Minimum on-disk age before a rowless directory under `worktrees_root` is treated as a crash
 /// orphan. `CodingWorkspace::open` runs `git worktree add` (workspace.rs:63) before inserting the
@@ -136,22 +142,36 @@ async fn reap_rows(db: &DbHandle) {
         }
     };
     let live_sessions: HashSet<String> = live_runs.iter().map(|r| r.session_id.clone()).collect();
-    let live_work_items: HashSet<String> =
-        live_runs.iter().filter_map(|r| r.work_item_id.clone()).collect();
+    let live_work_items: HashSet<String> = live_runs
+        .iter()
+        .filter_map(|r| r.work_item_id.clone())
+        .collect();
 
     for row in &rows {
-        let run_status = match &row.run_id {
-            Some(run_id) => match pipeline_runs::status_of(db, run_id).await {
-                Ok(s) => s,
+        // Unified Chat UI phase 6 (D3): the FULL row (not just `status_of`) is needed so
+        // `is_reapable` can read `pause_reason_class` — a `Paused` run's TTL now depends on
+        // whether `resume_run` would actually accept it.
+        let run = match &row.run_id {
+            Some(run_id) => match pipeline_runs::get(db, run_id).await {
+                Ok(r) => r,
                 Err(e) => {
-                    warn!(workspace = %row.id, "reaper: status_of failed: {e:#}");
+                    warn!(workspace = %row.id, "reaper: get pipeline_run failed: {e:#}");
                     continue;
                 }
             },
             None => None,
         };
+        let run_status = run.as_ref().map(|r| r.status.as_str());
+        let pause_class = run.as_ref().and_then(|r| r.pause_reason_class.as_deref());
 
-        if is_reapable(row, run_status.as_deref(), &live_sessions, &live_work_items, Utc::now()) {
+        if is_reapable(
+            row,
+            run_status,
+            pause_class,
+            &live_sessions,
+            &live_work_items,
+            Utc::now(),
+        ) {
             let ws = CodingWorkspace { row: row.clone() };
             match ws.discard(db).await {
                 Ok(()) => info!(workspace = %row.id, "reaper: reaped abandoned workspace"),
@@ -161,11 +181,25 @@ async fn reap_rows(db: &DbHandle) {
     }
 }
 
+/// A `paused` run whose reason class `resume_run` would actually accept (Unified Chat UI phase
+/// 6, D3) — mirrors `haily-core::pipeline::runner::PauseReasonClass`'s `RetriesExhausted`/
+/// `ExplicitStop` (this crate cannot depend on that private-module enum, so the two accepted
+/// string literals are duplicated here; `haily-db`'s `resume_reset` query enforces the SAME set
+/// atomically at resume time, so a drift here only ever makes the reaper MORE conservative, never
+/// less).
+fn is_resumable_pause(pause_class: Option<&str>) -> bool {
+    matches!(
+        pause_class,
+        Some("retries_exhausted") | Some("explicit_stop")
+    )
+}
+
 /// Pure classification (unit-testable without a DB or git). Fails CLOSED — never reaps — on
 /// any ambiguity: an unparsable timestamp, an unknown/vanished run, or a non-terminal run.
 fn is_reapable(
     row: &CodingWorkspaceRow,
     run_status: Option<&str>,
+    pause_class: Option<&str>,
     live_sessions: &HashSet<String>,
     live_work_items: &HashSet<String>,
     now: DateTime<Utc>,
@@ -177,22 +211,29 @@ fn is_reapable(
 
     match &row.run_id {
         Some(_) => match run_status.and_then(RunStatus::parse) {
-            // Done/Failed are `is_terminal()`; Interrupted (a user Stop) never resumes either
-            // but is deliberately NOT `is_terminal()` at the `RunStatus` level (that flag means
-            // "pipeline logic treats this as finished", which Interrupted isn't — a cancelled
-            // run's stage state is just abandoned, not concluded). The reaper only cares that
-            // nothing will ever touch this workspace again, which is true for both.
-            Some(RunStatus::Done | RunStatus::Failed | RunStatus::Interrupted) => {
-                age >= TERMINAL_GRACE
+            Some(RunStatus::Done | RunStatus::Failed) => age >= TERMINAL_GRACE,
+            // Interrupted is resumable via `resume_run` (Unified Chat UI phase 6, D3) — a user
+            // may Stop a run and come back to it days later, so this gets the long resumable
+            // TTL, not the short terminal grace a Done/Failed run gets.
+            Some(RunStatus::Interrupted) => age >= RESUMABLE_TTL,
+            // A `Paused` run is resumable ONLY for a `retries_exhausted`/`explicit_stop` reason
+            // class — an approval-wait pause or an unclassified/legacy row gets the SHORT
+            // null-run TTL instead, since `resume_run` would refuse it anyway.
+            Some(RunStatus::Paused) => {
+                if is_resumable_pause(pause_class) {
+                    age >= RESUMABLE_TTL
+                } else {
+                    age >= NULL_RUN_TTL
+                }
             }
-            // Paused implies "might resume" but no resume trigger exists yet — bound it with
-            // the same long TTL as a run_id-less row rather than holding it forever.
-            Some(RunStatus::Paused) => age >= NULL_RUN_TTL,
             Some(RunStatus::Queued | RunStatus::Running) | None => false,
         },
         None => {
             let has_live_run = live_sessions.contains(&row.session_id)
-                || row.work_item_id.as_ref().is_some_and(|w| live_work_items.contains(w));
+                || row
+                    .work_item_id
+                    .as_ref()
+                    .is_some_and(|w| live_work_items.contains(w));
             age >= NULL_RUN_TTL && !has_live_run
         }
     }
@@ -228,7 +269,9 @@ async fn reconcile_filesystem(db: &DbHandle, worktrees_root: &Path, grace: std::
                 break;
             }
         };
-        let Ok(file_type) = entry.file_type().await else { continue };
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
         if !file_type.is_dir() {
             continue;
         }
@@ -269,7 +312,10 @@ async fn reconcile_filesystem(db: &DbHandle, worktrees_root: &Path, grace: std::
 /// derive the repo path from the worktree's own `.git` file instead.
 async fn remove_orphan_worktree(path: &Path, id: &str) {
     let Some(path_str) = path.to_str() else {
-        warn!(id, "reaper: orphan worktree path is not valid UTF-8, skipping");
+        warn!(
+            id,
+            "reaper: orphan worktree path is not valid UTF-8, skipping"
+        );
         return;
     };
 
@@ -281,7 +327,10 @@ async fn remove_orphan_worktree(path: &Path, id: &str) {
         }
     };
     let Some(repo_dir) = common_dir.parent().and_then(Path::to_str) else {
-        warn!(id, "reaper: orphan's resolved git-common-dir has no valid parent, skipping");
+        warn!(
+            id,
+            "reaper: orphan's resolved git-common-dir has no valid parent, skipping"
+        );
         return;
     };
 
@@ -351,13 +400,27 @@ mod tests {
     #[test]
     fn terminal_run_past_grace_is_reapable() {
         let r = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
-        assert!(is_reapable(&r, Some("failed"), &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(is_reapable(
+            &r,
+            Some("failed"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn terminal_run_within_grace_is_not_yet_reapable() {
         let r = row(Some("run1"), None, Duration::minutes(1));
-        assert!(!is_reapable(&r, Some("done"), &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            Some("done"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
@@ -367,52 +430,124 @@ mod tests {
         let r = row(Some("run1"), None, Duration::days(30));
         for status in ["queued", "running"] {
             assert!(
-                !is_reapable(&r, Some(status), &HashSet::new(), &HashSet::new(), Utc::now()),
+                !is_reapable(
+                    &r,
+                    Some(status),
+                    None,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    Utc::now()
+                ),
                 "status {status} must never be reaped"
             );
         }
     }
 
     #[test]
-    fn interrupted_run_is_reaped_like_failed_once_past_grace() {
-        // A user Stop never resumes, same as Failed — just via a different code path
-        // (RunStatus::is_terminal() intentionally excludes Interrupted at the pipeline-status
-        // level, but the reaper's concern is "will anything ever touch this again", not that flag).
-        let fresh = row(Some("run1"), None, Duration::minutes(1));
-        assert!(!is_reapable(&fresh, Some("interrupted"), &HashSet::new(), &HashSet::new(), Utc::now()));
-
-        let aged = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
-        assert!(is_reapable(&aged, Some("interrupted"), &HashSet::new(), &HashSet::new(), Utc::now()));
-    }
-
-    #[test]
-    fn paused_run_is_reaped_after_the_long_ttl_not_the_short_grace() {
-        // Paused nominally means "might resume" — no resume trigger exists yet, so it must not
-        // be held forever, but it gets the same long runway as a run_id-less row rather than
-        // the short terminal grace (a paused run is likelier to still be actionable soon).
-        let within_terminal_grace_but_not_ttl = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
+    fn interrupted_run_is_resumable_and_gets_the_long_ttl() {
+        // Unified Chat UI phase 6 (D3): Interrupted is resumable via `resume_run`, so it must
+        // NOT be reaped at the short terminal grace like Failed/Done — a user may Stop a run
+        // and come back to it days later.
+        let past_terminal_grace = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
         assert!(!is_reapable(
-            &within_terminal_grace_but_not_ttl,
-            Some("paused"),
+            &past_terminal_grace,
+            Some("interrupted"),
+            None,
             &HashSet::new(),
             &HashSet::new(),
             Utc::now()
         ));
 
-        let past_ttl = row(Some("run1"), None, NULL_RUN_TTL + Duration::minutes(5));
-        assert!(is_reapable(&past_ttl, Some("paused"), &HashSet::new(), &HashSet::new(), Utc::now()));
+        let past_resumable_ttl = row(Some("run1"), None, RESUMABLE_TTL + Duration::minutes(5));
+        assert!(is_reapable(
+            &past_resumable_ttl,
+            Some("interrupted"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
+    }
+
+    #[test]
+    fn paused_with_resumable_class_gets_the_long_ttl() {
+        let within_resumable_ttl = row(Some("run1"), None, NULL_RUN_TTL + Duration::minutes(5));
+        for class in ["retries_exhausted", "explicit_stop"] {
+            assert!(
+                !is_reapable(
+                    &within_resumable_ttl,
+                    Some("paused"),
+                    Some(class),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    Utc::now()
+                ),
+                "class {class} must survive past the short null-run TTL"
+            );
+        }
+
+        let past_resumable_ttl = row(Some("run1"), None, RESUMABLE_TTL + Duration::minutes(5));
+        assert!(is_reapable(
+            &past_resumable_ttl,
+            Some("paused"),
+            Some("retries_exhausted"),
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
+    }
+
+    #[test]
+    fn paused_with_a_non_resumable_class_gets_the_short_ttl() {
+        // An approval-wait pause or an unclassified/legacy row is never accepted by
+        // `resume_run` — it must not be held for the long resumable TTL.
+        for class in [None, Some("awaiting_approval"), Some("other")] {
+            let within_null_ttl = row(Some("run1"), None, TERMINAL_GRACE + Duration::minutes(5));
+            assert!(!is_reapable(
+                &within_null_ttl,
+                Some("paused"),
+                class,
+                &HashSet::new(),
+                &HashSet::new(),
+                Utc::now()
+            ));
+
+            let past_null_ttl = row(Some("run1"), None, NULL_RUN_TTL + Duration::minutes(5));
+            assert!(is_reapable(
+                &past_null_ttl,
+                Some("paused"),
+                class,
+                &HashSet::new(),
+                &HashSet::new(),
+                Utc::now()
+            ));
+        }
     }
 
     #[test]
     fn unknown_or_vanished_run_status_is_never_reapable() {
         let r = row(Some("run1"), None, Duration::days(30));
-        assert!(!is_reapable(&r, None, &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            None,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn null_run_aged_past_ttl_with_no_live_run_is_reapable() {
         let r = row(None, None, NULL_RUN_TTL + Duration::minutes(5));
-        assert!(is_reapable(&r, None, &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(is_reapable(
+            &r,
+            None,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
@@ -420,7 +555,14 @@ mod tests {
         let r = row(None, None, NULL_RUN_TTL + Duration::minutes(5));
         let mut live = HashSet::new();
         live.insert("sess1".to_string());
-        assert!(!is_reapable(&r, None, &live, &HashSet::new(), Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            None,
+            None,
+            &live,
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
@@ -428,20 +570,41 @@ mod tests {
         let r = row(None, Some("wi1"), NULL_RUN_TTL + Duration::minutes(5));
         let mut live_wi = HashSet::new();
         live_wi.insert("wi1".to_string());
-        assert!(!is_reapable(&r, None, &HashSet::new(), &live_wi, Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            None,
+            None,
+            &HashSet::new(),
+            &live_wi,
+            Utc::now()
+        ));
     }
 
     #[test]
     fn null_run_not_yet_past_ttl_is_not_reapable() {
         let r = row(None, None, Duration::hours(1));
-        assert!(!is_reapable(&r, None, &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            None,
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     #[test]
     fn unparsable_timestamp_fails_closed() {
         let mut r = row(Some("run1"), None, Duration::days(30));
         r.updated_at = "not-a-timestamp".into();
-        assert!(!is_reapable(&r, Some("done"), &HashSet::new(), &HashSet::new(), Utc::now()));
+        assert!(!is_reapable(
+            &r,
+            Some("done"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            Utc::now()
+        ));
     }
 
     // -----------------------------------------------------------------------------------
@@ -456,7 +619,11 @@ mod tests {
             .output()
             .await
             .expect("git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     async fn init_repo() -> tempfile::TempDir {
@@ -464,7 +631,9 @@ mod tests {
         git(dir.path(), &["init", "-b", "main"]).await;
         git(dir.path(), &["config", "user.email", "t@haily.test"]).await;
         git(dir.path(), &["config", "user.name", "Test"]).await;
-        tokio::fs::write(dir.path().join("README.md"), "hello\n").await.unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "hello\n")
+            .await
+            .unwrap();
         git(dir.path(), &["add", "."]).await;
         git(dir.path(), &["commit", "-m", "init"]).await;
         dir
@@ -493,7 +662,9 @@ mod tests {
     }
 
     async fn make_run(db: &DbHandle, session_id: &str, status: &str) -> String {
-        let run = pipeline_runs::create(db, session_id, None, 5).await.unwrap();
+        let run = pipeline_runs::create(db, session_id, None, 5)
+            .await
+            .unwrap();
         pipeline_runs::transition(
             db,
             &run.id,
@@ -506,6 +677,7 @@ mod tests {
                 backend_used: None,
                 egress: None,
                 gate_output_digest: None,
+                pause_reason_class: None,
             },
         )
         .await
@@ -522,26 +694,41 @@ mod tests {
         let (_dbdir, db, session_id) = test_db().await;
         let wt_root = tempfile::tempdir().unwrap();
 
-        let ws_failed =
-            CodingWorkspace::open(&db, &session_id, repo.path(), wt_root.path(), None)
-                .await
-                .unwrap();
+        let ws_failed = CodingWorkspace::open(&db, &session_id, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
         let run_failed = make_run(&db, &session_id, "failed").await;
-        coding_workspaces::set_run_id(&db, &ws_failed.row.id, &run_failed).await.unwrap();
-        backdate_workspace(&db, &ws_failed.row.id, TERMINAL_GRACE + Duration::minutes(5)).await;
+        coding_workspaces::set_run_id(&db, &ws_failed.row.id, &run_failed)
+            .await
+            .unwrap();
+        backdate_workspace(
+            &db,
+            &ws_failed.row.id,
+            TERMINAL_GRACE + Duration::minutes(5),
+        )
+        .await;
 
-        let ws_running =
-            CodingWorkspace::open(&db, &session_id, repo.path(), wt_root.path(), None)
-                .await
-                .unwrap();
+        let ws_running = CodingWorkspace::open(&db, &session_id, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
         let run_running = make_run(&db, &session_id, "running").await;
-        coding_workspaces::set_run_id(&db, &ws_running.row.id, &run_running).await.unwrap();
-        backdate_workspace(&db, &ws_running.row.id, TERMINAL_GRACE + Duration::minutes(5)).await;
+        coding_workspaces::set_run_id(&db, &ws_running.row.id, &run_running)
+            .await
+            .unwrap();
+        backdate_workspace(
+            &db,
+            &ws_running.row.id,
+            TERMINAL_GRACE + Duration::minutes(5),
+        )
+        .await;
 
         reap_rows(&db).await;
 
         assert!(
-            coding_workspaces::get(&db, &ws_failed.row.id).await.unwrap().is_none(),
+            coding_workspaces::get(&db, &ws_failed.row.id)
+                .await
+                .unwrap()
+                .is_none(),
             "terminal+aged workspace row must be soft-deleted"
         );
         assert!(
@@ -550,7 +737,10 @@ mod tests {
         );
 
         assert!(
-            coding_workspaces::get(&db, &ws_running.row.id).await.unwrap().is_some(),
+            coding_workspaces::get(&db, &ws_running.row.id)
+                .await
+                .unwrap()
+                .is_some(),
             "an in-flight run's workspace row must never be reaped"
         );
         assert!(
@@ -578,19 +768,38 @@ mod tests {
         let orphan_path_str = orphan_path.to_str().unwrap();
         git(
             repo.path(),
-            &["worktree", "add", "-b", &format!("haily/orphan-{orphan_id}"), orphan_path_str, "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("haily/orphan-{orphan_id}"),
+                orphan_path_str,
+                "HEAD",
+            ],
         )
         .await;
-        assert!(orphan_path.is_dir(), "fixture setup: orphan worktree must exist before reconcile");
+        assert!(
+            orphan_path.is_dir(),
+            "fixture setup: orphan worktree must exist before reconcile"
+        );
 
         // grace=ZERO: this test asserts the STEADY-STATE orphan case (dir has existed for a
         // while with no row) — the grace window itself is covered separately below.
         reconcile_filesystem(&db, wt_root.path(), std::time::Duration::ZERO).await;
 
-        assert!(!orphan_path.exists(), "crash-orphan worktree must be removed");
-        assert!(ws_live.worktree_root().is_dir(), "a live worktree with an active row must survive");
         assert!(
-            coding_workspaces::get(&db, &ws_live.row.id).await.unwrap().is_some(),
+            !orphan_path.exists(),
+            "crash-orphan worktree must be removed"
+        );
+        assert!(
+            ws_live.worktree_root().is_dir(),
+            "a live worktree with an active row must survive"
+        );
+        assert!(
+            coding_workspaces::get(&db, &ws_live.row.id)
+                .await
+                .unwrap()
+                .is_some(),
             "the live workspace's row must be untouched"
         );
     }
@@ -610,10 +819,20 @@ mod tests {
         let fresh_path_str = fresh_path.to_str().unwrap();
         git(
             repo.path(),
-            &["worktree", "add", "-b", &format!("haily/fresh-{fresh_id}"), fresh_path_str, "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("haily/fresh-{fresh_id}"),
+                fresh_path_str,
+                "HEAD",
+            ],
         )
         .await;
-        assert!(fresh_path.is_dir(), "fixture setup: fresh worktree must exist before reconcile");
+        assert!(
+            fresh_path.is_dir(),
+            "fixture setup: fresh worktree must exist before reconcile"
+        );
 
         // Default grace (FS_ORPHAN_GRACE) — the dir is milliseconds old, nowhere near 5 minutes.
         reconcile_filesystem(&db, wt_root.path(), FS_ORPHAN_GRACE).await;

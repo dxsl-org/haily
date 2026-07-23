@@ -7,6 +7,7 @@
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
 use crate::credential_store::{is_keyring_marker, CredentialPolicy, CredentialStore};
+use crate::run_control::RunControlRegistry;
 use crate::slash_registry::SlashRegistry;
 use crate::turns::TurnRegistry;
 use crate::{dispatch, reaper, watchers};
@@ -87,6 +88,10 @@ pub struct AppHandle {
     /// launch task on this SAME tracker, so `AppHandle::shutdown`'s drain covers them too.
     pub(crate) tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    /// Per-run kill/pause/resume control handles (Unified Chat UI phase 6, D3). `pub(crate)`
+    /// (not private): `run_control::control::resume_run` (same crate, different module) reaches
+    /// `app.shutdown`/`app.tasks` directly, mirroring `launch.rs`'s existing access.
+    pub(crate) run_control: Arc<RunControlRegistry>,
     /// Data-driven slash-command registry (Unified Chat UI phase 2, D1) — built-ins +
     /// authored + gate-filtered synthesized skills, unioned. `pub` (mirrors `db`/`kms`) so the
     /// mode layer (`src-tauri`) can clone the SAME handle into its own `AppState` for
@@ -106,6 +111,10 @@ impl AppHandle {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let turns = Arc::new(TurnRegistry::new());
+        // Unified Chat UI phase 6 (D3): constructed here (mirrors `turns`) so it can be handed
+        // into `spawn_dispatch_loop` for `trigger.rs`'s launch path AND stored on `AppHandle` for
+        // `launch.rs`/the mode layer — one registry shared by every launch path.
+        let run_control = Arc::new(RunControlRegistry::new());
 
         let db_path = data_dir.join("haily.db");
         info!("DB: {}", db_path.display());
@@ -245,6 +254,7 @@ impl AppHandle {
             tasks.clone(),
             Arc::clone(&turns),
             Arc::clone(&slash_registry),
+            Arc::clone(&run_control),
         )
         .await?;
 
@@ -312,6 +322,7 @@ impl AppHandle {
             shutdown,
             tasks,
             turns,
+            run_control,
             slash_registry,
         })
     }
@@ -331,6 +342,13 @@ impl AppHandle {
     /// pattern.
     pub fn turn_registry(&self) -> Arc<TurnRegistry> {
         Arc::clone(&self.turns)
+    }
+
+    /// Shared handle to the run-control registry (Unified Chat UI phase 6, D3), for callers
+    /// (e.g. the Tauri command layer) that want their own `Arc` clone — mirrors
+    /// `turn_registry()`.
+    pub fn run_control_registry(&self) -> Arc<RunControlRegistry> {
+        Arc::clone(&self.run_control)
     }
 
     /// Snapshot of every in-flight tool approval across all channels (phase 11a) for the

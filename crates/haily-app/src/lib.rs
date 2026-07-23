@@ -8,11 +8,15 @@ mod auto_approve;
 pub mod cockpit;
 mod config;
 pub mod connector_config;
-pub mod eval;
 pub mod credential_store;
 mod dispatch;
+pub mod eval;
 mod launch;
-mod reaper;
+/// Desktop GUI's mobile pairing/devices command backing (Mobile Thin-Client plan phase 2b) —
+/// pure delegation onto P2a's public `haily_io::mobile` API, no new persistence. Same feature
+/// gate as the two modules above, for the same reason (references `haily_io::mobile::*` types).
+#[cfg(feature = "mobile-server")]
+pub mod mobile_admin;
 /// Mobile-server config loader + DB-backed device store (Mobile Thin-Client plan phase 2a).
 /// Gated behind the `mobile-server` feature (which forwards to `haily-io/mobile-server`, see
 /// Cargo.toml) since both files reference `haily_io::mobile::*` types that only exist under
@@ -24,11 +28,11 @@ mod reaper;
 pub mod mobile_config;
 #[cfg(feature = "mobile-server")]
 pub mod mobile_device_store;
-/// Desktop GUI's mobile pairing/devices command backing (Mobile Thin-Client plan phase 2b) —
-/// pure delegation onto P2a's public `haily_io::mobile` API, no new persistence. Same feature
-/// gate as the two modules above, for the same reason (references `haily_io::mobile::*` types).
-#[cfg(feature = "mobile-server")]
-pub mod mobile_admin;
+mod reaper;
+/// Per-run kill/pause/resume control (Unified Chat UI phase 6, D3). `pub` so the mode layer
+/// (`src-tauri`) can name `RunControlRegistry` for its own `AppState` field and call
+/// `kill_run`/`pause_run`/`resume_run` directly.
+pub mod run_control;
 mod session_transcript;
 /// Data-driven slash-command registry (Unified Chat UI phase 2, D1). `pub` so the mode layer
 /// (`src-tauri`) can name `SlashRegistry`/`SlashCommand` for its own `AppState` field and the
@@ -50,17 +54,18 @@ pub use cockpit::{
     start_coding_run, workspace_diff, SkillView, WorkspaceView,
 };
 pub use config::{load_llm_config, load_odoo_api_key, ODOO_API_KEY_PREF};
+pub use credential_store::{CredentialPolicy, CredentialStore};
+pub use eval::run_coding_eval_all;
+/// Re-exported so the mode layer (`src-tauri`) can name the approvals-queue snapshot type
+/// without a direct `haily-core` dependency (phase 11a).
+pub use haily_core::PendingApproval;
+pub use launch::launch_coding_run;
 #[cfg(feature = "mobile-server")]
 pub use mobile_admin::{
     confirm_pair, list_devices, mobile_status, pairing_qr, pending_pairs, regenerate_cert,
     revoke_device, DeviceView, MobileStatusView, PendingPairView,
 };
-/// Re-exported so the mode layer (`src-tauri`) can name the approvals-queue snapshot type
-/// without a direct `haily-core` dependency (phase 11a).
-pub use haily_core::PendingApproval;
-pub use credential_store::{CredentialPolicy, CredentialStore};
-pub use eval::run_coding_eval_all;
-pub use launch::launch_coding_run;
+pub use run_control::RunControlRegistry;
 pub use slash_registry::{SlashCommand, SlashRegistry};
 pub use turns::TurnRegistry;
 pub use watchers::{list_work_items_status, spawn_distillation_bridge, spawn_run_event_bridge};

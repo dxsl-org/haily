@@ -1,5 +1,6 @@
 //! Request dispatch loop — pulls requests from adapter channels, fans out to the
 //! orchestrator, and forwards response chunks back to the originating adapter.
+use crate::run_control::RunControlRegistry;
 use crate::slash_registry::SlashRegistry;
 use crate::trigger::{self, TriggerAction};
 use crate::turns::TurnRegistry;
@@ -25,6 +26,7 @@ pub async fn spawn_dispatch_loop(
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
     slash_registry: Arc<SlashRegistry>,
+    run_control: Arc<RunControlRegistry>,
 ) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Request>(64);
     am.start_all(req_tx).await?;
@@ -39,6 +41,7 @@ pub async fn spawn_dispatch_loop(
         dispatch_tasks,
         turns,
         slash_registry,
+        run_control,
     ));
     Ok(())
 }
@@ -50,6 +53,7 @@ pub async fn spawn_dispatch_loop(
 /// spawned on `tasks` (not bare `tokio::spawn`) — otherwise `AppHandle::shutdown`
 /// would drain the watcher/daemon tasks while silently abandoning whatever turn was
 /// in flight, which defeats the entire point of a drain.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_loop(
     am: AdapterManager,
     orc: Arc<Orchestrator>,
@@ -58,6 +62,7 @@ async fn dispatch_loop(
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
     slash_registry: Arc<SlashRegistry>,
+    run_control: Arc<RunControlRegistry>,
 ) {
     loop {
         let req = tokio::select! {
@@ -101,6 +106,9 @@ async fn dispatch_loop(
         // registry itself is a cheap `Arc<RwLock<..>>` snapshot holder, shared (not rebuilt)
         // across every request.
         let registry_clone = Arc::clone(&slash_registry);
+        // Unified Chat UI phase 6 (D3): cloned per-iteration like `registry_clone` — the ONE
+        // run-control registry every chat-triggered launch (`trigger::launch`) registers into.
+        let run_control_clone = Arc::clone(&run_control);
 
         tasks.spawn(async move {
             // Re-bind mutable: `req` needs a mutable borrow below (a `SkillTurn` slash command
@@ -143,6 +151,7 @@ async fn dispatch_loop(
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
                     };
                     trigger::launch(
                         handles,
@@ -161,6 +170,7 @@ async fn dispatch_loop(
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
                     };
                     trigger::launch(
                         handles,
@@ -178,6 +188,7 @@ async fn dispatch_loop(
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
                     };
                     trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx)
                         .await;

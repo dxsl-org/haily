@@ -346,6 +346,7 @@ mod tests {
                 backend_used: None,
                 egress: None,
                 gate_output_digest: None,
+                pause_reason_class: None,
             },
         )
         .await

@@ -30,6 +30,19 @@ pub struct PipelineRun {
     pub findings: Option<String>,
     /// P8 forward column (nullable JSON) — per-attempt token accounting; unused until P8.
     pub per_attempt_tokens: Option<String>,
+    /// Unified Chat UI phase 6 (D3) forward column — the original `CodingRunSpec.task` this
+    /// row's launch was driving, so `resume_run` can reconstruct a relaunch. `None` for a row
+    /// with no resume context (pre-migration, eval/test runs).
+    pub task: Option<String>,
+    /// Unified Chat UI phase 6 (D3) — `"plan"` or `"build"` (never `"plan_then_build"`; a
+    /// composite launch re-stamps this per portion — see `PipelineRunner::seed_launch`).
+    pub run_kind: Option<String>,
+    /// Unified Chat UI phase 6 (D3) — the originating `DepthMode` label (`quick`/`normal`/`deep`).
+    pub depth: Option<String>,
+    /// Unified Chat UI phase 6 (D3) — set only when `status = "paused"`; see
+    /// `haily-core::pipeline::runner::PauseReasonClass`. `resume_run` reads ONLY this column,
+    /// never the free-text `RunEvent::RunPaused.reason` string.
+    pub pause_reason_class: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
@@ -49,6 +62,20 @@ pub struct RunTransition<'a> {
     pub backend_used: Option<&'a str>,
     pub egress: Option<&'a str>,
     pub gate_output_digest: Option<&'a str>,
+    /// Unified Chat UI phase 6 (D3) — set (via [`PauseReasonClass::as_str`]) only on the
+    /// transition that pauses a run; every other transition passes `None`, which clears any
+    /// stale class left over from an earlier pause on a since-resumed row.
+    pub pause_reason_class: Option<&'a str>,
+}
+
+/// The original `CodingRunSpec` context needed to relaunch a paused/interrupted row (Unified
+/// Chat UI phase 6, D3) — see [`create_resumable`].
+pub struct ResumeCtx<'a> {
+    pub task: &'a str,
+    /// `"plan"` or `"build"` (never `"plan_then_build"`).
+    pub run_kind: &'a str,
+    /// The originating `DepthMode` label.
+    pub depth: &'a str,
 }
 
 /// Create a new run in `queued` state at stage 0.
@@ -65,19 +92,53 @@ pub async fn create(
     work_item_id: Option<&str>,
     attempts_remaining: i64,
 ) -> Result<PipelineRun> {
-    let id = Uuid::new_v4().to_string();
+    create_resumable(db, None, session_id, work_item_id, attempts_remaining, None).await
+}
+
+/// [`create`] plus the Unified Chat UI phase 6 (D3) resume context: an optional caller-supplied
+/// `id` (the pre-generated launch `run_id`, keyed synchronously into the run-control registry
+/// before this row exists — a fresh `Uuid` is minted when `None`) and an optional [`ResumeCtx`]
+/// (persisted so `resume_run` can reconstruct a relaunch; `None` for a caller with no resume
+/// context, e.g. the eval harness or a test fixture).
+///
+/// # Errors
+/// Returns an error if `session_id`/`work_item_id` do not reference valid rows, `id` collides
+/// with an existing non-deleted row, or the insert fails.
+pub async fn create_resumable(
+    db: &DbHandle,
+    id: Option<&str>,
+    session_id: &str,
+    work_item_id: Option<&str>,
+    attempts_remaining: i64,
+    resume_ctx: Option<ResumeCtx<'_>>,
+) -> Result<PipelineRun> {
+    let owned_id;
+    let id: &str = match id {
+        Some(v) => v,
+        None => {
+            owned_id = Uuid::new_v4().to_string();
+            &owned_id
+        }
+    };
     let now = chrono::Utc::now().to_rfc3339();
+    let (task, run_kind, depth) = match resume_ctx {
+        Some(c) => (Some(c.task), Some(c.run_kind), Some(c.depth)),
+        None => (None, None, None),
+    };
     Ok(sqlx::query_as::<_, PipelineRun>(
         "INSERT INTO pipeline_runs
              (id, work_item_id, session_id, stage_index, status, attempt,
-              attempts_remaining, created_at, updated_at)
-         VALUES (?, ?, ?, 0, 'queued', 0, ?, ?, ?)
+              attempts_remaining, task, run_kind, depth, created_at, updated_at)
+         VALUES (?, ?, ?, 0, 'queued', 0, ?, ?, ?, ?, ?, ?)
          RETURNING *",
     )
-    .bind(&id)
+    .bind(id)
     .bind(work_item_id)
     .bind(session_id)
     .bind(attempts_remaining)
+    .bind(task)
+    .bind(run_kind)
+    .bind(depth)
     .bind(&now)
     .bind(&now)
     .fetch_one(db.pool())
@@ -98,7 +159,7 @@ where
         "UPDATE pipeline_runs
          SET stage_index = ?, status = ?, attempt = ?, attempts_remaining = ?,
              tier_used = ?, backend_used = ?, egress = ?, gate_output_digest = ?,
-             updated_at = ?
+             pause_reason_class = ?, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(t.stage_index)
@@ -109,6 +170,7 @@ where
     .bind(t.backend_used)
     .bind(t.egress)
     .bind(t.gate_output_digest)
+    .bind(t.pause_reason_class)
     .bind(&now)
     .bind(id)
     .execute(exec)
@@ -231,6 +293,43 @@ pub async fn reset_stale_running(db: &DbHandle) -> Result<u64> {
     .await?
     .rows_affected();
     Ok(rows)
+}
+
+/// Atomically flip a resumable row back to `running` at stage 0 with a fresh attempts budget,
+/// clearing any pause class (Unified Chat UI phase 6, D3) — the one write `resume_run` performs
+/// before relaunching. The `WHERE` guard re-verifies eligibility in the SAME statement that
+/// mutates the row, closing the TOCTOU window between an earlier read-only guard check and this
+/// write (a concurrent reaper reap or a second `resume_run` call cannot both "win"). Eligible
+/// iff `status = 'interrupted'`, or `status = 'paused'` with a `pause_reason_class` of
+/// `retries_exhausted`/`explicit_stop` — never `awaiting_approval`/`other`, and never a
+/// terminal/live status.
+///
+/// Returns the reset row, or `None` if `id` does not reference an active, eligible row — the
+/// caller (`resume_run`) treats that as "not resumable", never an error.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn resume_reset(
+    db: &DbHandle,
+    id: &str,
+    attempts_remaining: i64,
+) -> Result<Option<PipelineRun>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    Ok(sqlx::query_as::<_, PipelineRun>(
+        "UPDATE pipeline_runs
+         SET stage_index = 0, status = 'running', attempt = 0, attempts_remaining = ?,
+             pause_reason_class = NULL, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL
+           AND (status = 'interrupted'
+                OR (status = 'paused'
+                    AND pause_reason_class IN ('retries_exhausted', 'explicit_stop')))
+         RETURNING *",
+    )
+    .bind(attempts_remaining)
+    .bind(&now)
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await?)
 }
 
 /// Get a single non-deleted run by id. `None` if no active run with that id exists.

@@ -11,12 +11,14 @@
 //! [`launch`] cannot call `haily_app::launch_coding_run(&AppHandle, ..)` (Phase 1's entrypoint)
 //! directly: `dispatch_loop` is spawned INSIDE `AppHandle::bootstrap`, before `AppHandle` itself
 //! is constructed — there is no `&AppHandle` to hand it at this call site. [`launch`] instead
-//! reimplements `launch.rs::launch_coding_run`'s bridge-wiring over the raw handles
-//! (`AdapterManager`, `Arc<Orchestrator>`, `TaskTracker`, [`CancellationToken`]) `dispatch_loop`
-//! already owns. Deliberate difference: the cancel token is the CALLER's already-registered
-//! per-turn `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered
-//! launch stays cancellable by the same "Stop" action a normal turn already is. See the phase's
+//! calls the shared [`crate::run_control::spawn_launch`] helper (Unified Chat UI phase 6, D3)
+//! over the raw handles (`AdapterManager`, `Arc<Orchestrator>`, `TaskTracker`,
+//! [`CancellationToken`], the run-control registry) `dispatch_loop` already owns. Deliberate
+//! difference from `launch.rs`: the cancel token is the CALLER's already-registered per-turn
+//! `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered launch
+//! stays cancellable by the same "Stop" action a normal turn already is. See the phase's
 //! Deviation Log.
+use crate::run_control::{LaunchCtx, RunControlRegistry};
 use crate::slash_registry::SlashRegistry;
 use haily_core::{classify_coding_intent, CodingRunSpec, Orchestrator, RunKind};
 use haily_db::DbHandle;
@@ -28,13 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-/// Mirrors `launch.rs::RUN_EVENTS_CAPACITY` — generous headroom above a typical run's event
-/// count so a stage-output burst never blocks the runner mid-stage waiting on a slow adapter.
-const RUN_EVENTS_CAPACITY: usize = 1024;
-/// Mirrors `launch.rs::DISTILLATION_CAPACITY` — at most a handful of proposals per run.
-const DISTILLATION_CAPACITY: usize = 16;
-
-/// The three raw handles `launch`/`confirm_then_launch` need, bundled to keep both functions'
+/// The raw handles `launch`/`confirm_then_launch` need, bundled to keep both functions'
 /// argument count under clippy's `too_many_arguments` threshold (mirrors `pipeline::LaunchDeps`'s
 /// own "bundle the caller's cloned handles into a plain struct" convention).
 pub struct LaunchHandles {
@@ -44,6 +40,9 @@ pub struct LaunchHandles {
     /// Threaded into `spawn_run_event_bridge` (Unified Chat UI phase 5, D2) so this run's
     /// events persist. Callers extract it from `orc.db` before moving `orc` into this struct.
     pub db: Arc<DbHandle>,
+    /// Unified Chat UI phase 6 (D3) — the SAME registry `launch.rs`/the mode layer share, so a
+    /// chat-triggered launch is kill/pause/resume-able identically to a GUI-initiated one.
+    pub run_control: Arc<RunControlRegistry>,
 }
 
 /// What a dispatch-layer trigger decides to do with one incoming [`Request`].
@@ -200,8 +199,18 @@ pub fn launch(
     depth: DepthMode,
     resp_tx: mpsc::Sender<ResponseChunk>,
 ) {
-    let LaunchHandles { orc, am, tasks, db } = handles;
+    let LaunchHandles {
+        orc,
+        am,
+        tasks,
+        db,
+        run_control,
+    } = handles;
     let spec = CodingRunSpec {
+        // Unified Chat UI phase 6 (D3): pre-generated here, before `spawn_launch` registers it —
+        // a `kill_run` issued the instant after this function returns still has a token to
+        // cancel.
+        run_id: Uuid::new_v4(),
         kind,
         task,
         session_id,
@@ -210,31 +219,14 @@ pub fn launch(
         depth,
     };
 
-    let (events_tx, events_rx) = mpsc::channel(RUN_EVENTS_CAPACITY);
-    let (dist_tx, dist_rx) = mpsc::channel(DISTILLATION_CAPACITY);
-
-    crate::watchers::spawn_run_event_bridge(
-        session_id,
-        events_rx,
-        am.clone(),
+    let ctx = LaunchCtx {
+        orc,
+        am,
+        tasks,
         db,
-        run_cancel.clone(),
-        tasks.clone(),
-    );
-    crate::watchers::spawn_distillation_bridge(dist_rx, am, run_cancel.clone(), tasks.clone());
-
-    tasks.spawn(async move {
-        let result = orc
-            .launch_coding_run(spec, resp_tx.clone(), events_tx, Some(dist_tx), run_cancel)
-            .await;
-        if let Err(e) = result {
-            tracing::error!("coding run launch failed: {e:#}");
-            let _ = resp_tx
-                .send(ResponseChunk::Error(format!("⚠️ {e:#}")))
-                .await;
-            let _ = resp_tx.send(ResponseChunk::Complete).await;
-        }
-    });
+        registry: run_control,
+    };
+    crate::run_control::spawn_launch(ctx, spec, run_cancel, resp_tx);
 }
 
 #[cfg(test)]
