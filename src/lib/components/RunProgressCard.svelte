@@ -6,7 +6,6 @@
   // window observed it, or while the user was on a different route, will not appear here.
   // Accepted interim gap (plan.md D6 / phase-04 Overview): this card is the ONLY run-detail
   // surface in Track A.
-  import { onMount, onDestroy } from 'svelte';
   import { cancelTurn } from '$lib/tauri';
   import { escalationCount, formatElapsed, retryCount, type Job } from '$lib/run-events';
   import { narrate } from '$lib/run-narration';
@@ -17,18 +16,19 @@
   let expanded = $state(false);
   let stopping = $state(false);
 
-  // Ticks once a second so the elapsed label stays live while running — cheap (one
-  // component-scoped interval per visible card) and stops advancing once `completedAt`
-  // is set (see `elapsedMs` below), so a finished run's card doesn't keep counting up.
+  // Ticks once a second so the elapsed label stays live while running. Review fix
+  // LOW-4: an `$effect` (not a plain `onMount` interval) so the ticker actually STOPS
+  // once `job.completedAt` is set, rather than continuing to fire uselessly for the rest
+  // of the card's (potentially long-lived) mounted lifetime — with `jobsState` now
+  // page-lifetime (MED-1), a session can accumulate many finished cards, each of which
+  // would otherwise carry its own dead interval for as long as the app runs.
   let now = $state(Date.now());
-  let tickHandle: ReturnType<typeof setInterval> | undefined;
-  onMount(() => {
-    tickHandle = setInterval(() => {
+  $effect(() => {
+    if (job.completedAt !== null) return;
+    const handle = setInterval(() => {
       now = Date.now();
     }, 1000);
-  });
-  onDestroy(() => {
-    if (tickHandle) clearInterval(tickHandle);
+    return () => clearInterval(handle);
   });
 
   const STATUS_LABEL: Record<Job['status'], string> = {

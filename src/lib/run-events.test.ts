@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyRunEvent, escalationCount, retryCount, type Job } from './run-events';
+import { applyRunEvent, describeEvent, escalationCount, retryCount, type Job } from './run-events';
 import type { RunEvent } from './tauri';
 
 function fold(events: RunEvent[]): Job {
@@ -49,5 +49,13 @@ describe('retryCount / escalationCount', () => {
     const job = fold([{ type: 'RunStarted', data: { run_id: 'r1', work_item_id: 'w1' } }]);
     expect(retryCount(job)).toBe(0);
     expect(escalationCount(job)).toBe(0);
+  });
+});
+
+describe('describeEvent — total, never throws (review fix)', () => {
+  it('degrades to a generic descriptor for an unrecognized future variant instead of throwing', () => {
+    const unknown = { type: 'SomethingNewFromTheFuture', data: { run_id: 'r1' } } as unknown as RunEvent;
+    expect(() => describeEvent(unknown)).not.toThrow();
+    expect(describeEvent(unknown).text.length).toBeGreaterThan(0);
   });
 });

@@ -111,10 +111,16 @@ export interface EventDescriptor {
   tone: 'info' | 'pass' | 'fail' | 'warn';
 }
 
-/** Render one `RunEvent` as an inert text line for `RunJobCard`. `text` is built from
- * UNTRUSTED, already tag-stripped repo/tool content (`StageOutput.chunk`, `GateResult.decisive`,
- * `DiffAvailable.file`, `PlanReady.plan_path`) — callers MUST bind this via `{text}`, never
- * `{@html}`. */
+/** Render one `RunEvent` as an inert text line for `RunJobCard`/`RunEventLog`. `text` is
+ * built from UNTRUSTED, already tag-stripped repo/tool content (`StageOutput.chunk`,
+ * `GateResult.decisive`, `DiffAvailable.file`, `PlanReady.plan_path`) — callers MUST bind
+ * this via `{text}`, never `{@html}`.
+ *
+ * TOTAL, never throws (review fix, phase-04): an unrecognized future variant (frontend
+ * build older than the backend that emitted it) degrades to a generic descriptor rather
+ * than throwing — a throw here would crash the WHOLE expanded event list around one
+ * unmapped row, defeating the same deploy-skew resilience `narrate()` already provides
+ * for the collapsed card's last-action line in the exact same view. */
 export function describeEvent(e: RunEvent): EventDescriptor {
   switch (e.type) {
     case 'RunStarted':
@@ -149,9 +155,7 @@ export function describeEvent(e: RunEvent): EventDescriptor {
       const failed = /fail|error/i.test(e.data.outcome);
       return { icon: failed ? '✗' : '✓', text: `Run complete — ${e.data.outcome}`, tone: failed ? 'fail' : 'pass' };
     }
-    default: {
-      const _exhaustive: never = e;
-      throw new Error(`unhandled RunEvent variant: ${JSON.stringify(_exhaustive)}`);
-    }
+    default:
+      return { icon: '•', text: 'Sự kiện chưa được hỗ trợ', tone: 'info' };
   }
 }

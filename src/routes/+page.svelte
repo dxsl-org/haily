@@ -12,8 +12,9 @@
   import WorkspacesScreen from '$lib/components/WorkspacesScreen.svelte';
   import SkillsScreen from '$lib/components/SkillsScreen.svelte';
   import WorkspacePane from '$lib/components/view/WorkspacePane.svelte';
-  import type { ChunkPayload, PendingApproval } from '$lib/tauri';
+  import { listApprovals, onRunEvents, type ChunkPayload, type PendingApproval, type RunEventPayload } from '$lib/tauri';
   import { toolVerb } from '$lib/tool-verbs';
+  import { createRunJobsState } from '$lib/run-jobs-state.svelte';
 
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
@@ -81,6 +82,12 @@
   // it always reads the live array rather than a snapshot taken when the drawer opened.
   const seenSessionIds: string[] = [];
   const getSessionIds = () => seenSessionIds;
+
+  // Page-lifetime pipeline-run job state (P04 review-fix MED-1) — lives here, NOT inside
+  // the route-gated `ChatStream`, so switching away from chat and back doesn't tear down
+  // the run-event fold and misreport elapsed/retry counts on return. See
+  // `run-jobs-state.svelte.ts`'s module doc for the full incident this fixes.
+  const jobsState = createRunJobsState(() => sessionIndex, () => messages.length);
 
   function scrollToBottom() {
     requestAnimationFrame(() => bottomAnchor?.scrollIntoView({ behavior: 'smooth' }));
@@ -170,6 +177,44 @@
     return () => { unlistenPromise.then(fn => fn()); };
   });
 
+  // Page-lifetime run-event subscription (P04 review-fix MED-1) — folds into `jobsState`
+  // above, NOT a route-gated component, for the same reason the chunk listener above
+  // stays at page level: `ChatStream` only mounts while `route === 'chat'`.
+  onMount(() => {
+    const unlistenPromise = onRunEvents(({ session_id, event }: RunEventPayload) => {
+      jobsState.ingest(session_id, event);
+    });
+    return () => { unlistenPromise.then((fn) => fn()); };
+  });
+
+  // Prunes the shared approval queue (and the out-of-session modal) against the
+  // backend's own pending set (P04 review-fix MED-2): there is no `ApprovalResolved`/
+  // `ApprovalExpired` chunk, so a server-side 120s auto-deny would otherwise leave a
+  // stale entry — and an inflated header badge — sitting client-side until the user
+  // happens to click it (idempotent no-op self-heal). Runs on a 30s interval WHILE the
+  // queue is non-empty (torn down the instant it drains, restarted the instant it's
+  // non-empty again) and once immediately on that transition, covering both "on an
+  // interval" and "on queue-open" per the review's fix guidance.
+  $effect(() => {
+    if (approvalQueue.length === 0) return;
+    reconcileApprovals();
+    const handle = setInterval(reconcileApprovals, 30_000);
+    return () => clearInterval(handle);
+  });
+
+  async function reconcileApprovals() {
+    try {
+      const live = await listApprovals();
+      const liveIds = new Set(live.map((a) => a.approval_id));
+      approvalQueue = approvalQueue.filter((a) => liveIds.has(a.approvalId));
+      if (pendingApproval && !liveIds.has(pendingApproval.approvalId)) {
+        pendingApproval = null;
+      }
+    } catch (e) {
+      console.error('listApprovals reconcile failed', e);
+    }
+  }
+
   // Keeps the two approval surfaces (out-of-session modal, in-session inline queue) from
   // showing a stale entry for something already decided on the OTHER surface. Resolving
   // via `ApprovalModal` only nulls `pendingApproval` (that component's own contract,
@@ -215,7 +260,7 @@
           <ProactivePanel />
           <ChatStream
             {messages}
-            {sessionIndex}
+            {jobsState}
             approvals={approvalQueue}
             onApprovalResolved={removeFromQueue}
             bind:bottomAnchor

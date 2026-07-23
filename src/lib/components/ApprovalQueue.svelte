@@ -18,23 +18,28 @@
   let { approvals, onResolved }: { approvals: PendingApproval[]; onResolved: (approvalId: string) => void } =
     $props();
 
-  // Mirrors `ApprovalModal.svelte`'s own two badge strings verbatim (kept in sync by
-  // hand — not exported from that file, which P04 does not own/modify) so the same
-  // approval reads identically whichever surface renders it.
+  // Mirrors `ApprovalModal.svelte:27-28`'s own two badge strings VERBATIM (kept in sync
+  // by hand — not exported from that file, which this phase does not own/modify) so the
+  // same approval reads identically whichever surface renders it. Review fix LOW-7: this
+  // previously drifted ("cần bạn xác nhận" was dropped from the reversible-case wording).
   const FINAL_BADGE = 'Không thể hoàn tác';
-  const CAPPED_BADGE = 'Đã đạt giới hạn — vẫn hoàn tác được';
+  const CAPPED_BADGE = 'Đã đạt giới hạn — cần bạn xác nhận (vẫn hoàn tác được)';
 
-  let resolvingId = $state<string | null>(null);
+  // Review fix LOW-5: `resolving` (not a single `resolvingId`) disables EVERY row's
+  // buttons while any one approval is in flight — the previous `resolvingId === a.id`
+  // check only visually disabled the row actually resolving, silently swallowing a click
+  // on a different row via the `if (resolvingId) return;` guard with no feedback.
+  let resolving = $state(false);
 
   async function decide(a: PendingApproval, approved: boolean) {
-    if (resolvingId) return;
-    resolvingId = a.approvalId;
+    if (resolving) return;
+    resolving = true;
     try {
       await resolveApproval(a.sessionId, a.approvalId, approved);
     } catch (e) {
       console.error('resolveApproval failed', e);
     } finally {
-      resolvingId = null;
+      resolving = false;
       onResolved(a.approvalId);
     }
   }
@@ -57,8 +62,8 @@
           <p class="origin">Yêu cầu bởi: <code>{a.origin}</code></p>
         {/if}
         <div class="actions">
-          <button class="deny" onclick={() => decide(a, false)} disabled={resolvingId === a.approvalId}>❌ Không</button>
-          <button class="approve" onclick={() => decide(a, true)} disabled={resolvingId === a.approvalId}>✅ Có</button>
+          <button class="deny" onclick={() => decide(a, false)} disabled={resolving}>❌ Không</button>
+          <button class="approve" onclick={() => decide(a, true)} disabled={resolving}>✅ Có</button>
         </div>
       </div>
     {/each}

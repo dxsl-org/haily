@@ -31,16 +31,14 @@
   // `ToolApprovalRequest` silently stalls to its 120s deny). This file stays route-scoped
   // on purpose; only the subscription had to move.
   //
-  // The run-event subscription below is DIFFERENT (P04): it owns its own `onRunEvents`
-  // listener, scoped to this component's mount lifetime same as the former
-  // `RunTimeline.svelte`. This IS route-gated on purpose — a run's progress card is only
-  // ever shown "in the chat flow of the session that launched it" (phase-04 spec), and
-  // the accepted interim gap (no persisted reconcile until P05/P07) means a run's events
-  // that arrive while the user is off the chat route are missed, same tradeoff
-  // `RunTimeline` always had.
-  import { onMount, onDestroy } from 'svelte';
-  import { sendMessage, onRunEvents, type PendingApproval, type RunEventPayload } from '$lib/tauri';
-  import { applyRunEvent, orderedJobs, type Job } from '$lib/run-events';
+  // `jobsState` (P04 review-fix MED-1) is the SAME reason, corrected: it used to be a
+  // component-local `onRunEvents` subscription here, which tore down on every route
+  // switch away from chat and re-created each job from scratch on return (elapsed reset
+  // to ~00:00, retry/escalation counts undercounted — only post-remount events folded).
+  // `+page.svelte` now owns one instance for the app's lifetime; this component only
+  // reads from it, exactly like it reads `messages`.
+  import { sendMessage, type PendingApproval } from '$lib/tauri';
+  import type { RunJobsState } from '$lib/run-jobs-state.svelte';
   import ChatBubble from './ChatBubble.svelte';
   import RunProgressCard from './RunProgressCard.svelte';
   import ApprovalQueue from './ApprovalQueue.svelte';
@@ -50,10 +48,9 @@
      * listener mutates in place — passed by reference, never reassigned here. */
     messages: Message[];
     bottomAnchor: HTMLDivElement | undefined;
-    /** session_id → index in `messages[]`, read-only here — used to anchor a run's
-     * progress card to the message that launched it (P04). Never mutated by this
-     * component; `ChatInput`/`+page.svelte`'s chunk listener own writes/deletes. */
-    sessionIndex: Map<string, number>;
+    /** Page-lifetime pipeline-run job state — read-only here, `+page.svelte` is the sole
+     * writer via its own `onRunEvents` subscription (see `run-jobs-state.svelte.ts`). */
+    jobsState: RunJobsState;
     /** Shared approval queue (P04, D6) — `+page.svelte` owns the array (pushed to from
      * the `haily-chunk` listener); passed by reference like `messages`. */
     approvals: PendingApproval[];
@@ -63,54 +60,7 @@
     onApprovalResolved: (approvalId: string) => void;
   }
 
-  let { messages, bottomAnchor = $bindable(), sessionIndex, approvals, onApprovalResolved }: Props = $props();
-
-  // Per-run message anchor, captured ONCE the first time this component observes an
-  // event for a given run_id (never overwritten after) — `sessionIndex` entries are
-  // deleted once that turn's `Complete` chunk lands (often well before a long pipeline
-  // run finishes), so reading it live at render time would go stale; capturing at
-  // first-sight is the only correct moment.
-  const jobAnchors = new Map<string, number>();
-  let jobs = $state<Map<string, Job>>(new Map());
-  let showAllActive = $state(false);
-  let unlistenRuns: (() => void) | undefined;
-
-  onMount(() => {
-    const unlistenPromise = onRunEvents(({ session_id, event }: RunEventPayload) => {
-      const runId = event.data.run_id;
-      if (!jobAnchors.has(runId)) {
-        jobAnchors.set(runId, sessionIndex.get(session_id) ?? Math.max(messages.length - 1, 0));
-      }
-      jobs = applyRunEvent(jobs, session_id, event);
-    });
-    unlistenRuns = () => { unlistenPromise.then((fn) => fn()); };
-  });
-
-  onDestroy(() => unlistenRuns?.());
-
-  const jobList = $derived(orderedJobs(jobs));
-  const activeJobs = $derived(jobList.filter((j) => j.status === 'running' || j.status === 'paused'));
-  // Groups jobs by their anchor message index so the render loop below can splice a
-  // run's card in right after the bubble that launched it.
-  const jobsByAnchor = $derived.by(() => {
-    const map = new Map<number, Job[]>();
-    for (const job of jobList) {
-      const anchor = jobAnchors.get(job.runId) ?? Math.max(messages.length - 1, 0);
-      const arr = map.get(anchor) ?? [];
-      arr.push(job);
-      map.set(anchor, arr);
-    }
-    return map;
-  });
-
-  // Chat-overload mitigation (phase-04 risk assessment): a finished job always renders
-  // its own card (it's a result, not noise), but once MORE THAN ONE run is active at
-  // once, all active cards collapse behind a single "N running" chip until the user
-  // opts to expand — mirrors the Claude-Desktop background-tasks pattern.
-  function showCard(job: Job): boolean {
-    if (job.status !== 'running' && job.status !== 'paused') return true;
-    return activeJobs.length <= 1 || showAllActive;
-  }
+  let { messages, bottomAnchor = $bindable(), jobsState, approvals, onApprovalResolved }: Props = $props();
 
   // Mirrors `SafetyTab.svelte`'s `requestUndo` phrasing exactly so both undo entry points
   // (this inline button and the Safety tab's recent-actions list) produce identical
@@ -140,16 +90,25 @@
   <div class="messages">
     {#each messages as msg, i (msg.id)}
       <ChatBubble {msg} undoingId={undoing} onUndo={requestUndo} />
-      {#each jobsByAnchor.get(i) ?? [] as job (job.runId)}
-        {#if showCard(job)}
+      {#each jobsState.jobsByAnchor.get(i) ?? [] as job (job.runId)}
+        {#if jobsState.showCard(job)}
           <RunProgressCard {job} />
         {/if}
       {/each}
     {/each}
 
-    {#if activeJobs.length > 1 && !showAllActive}
-      <button class="active-chip" onclick={() => (showAllActive = true)}>
-        {activeJobs.length} tác vụ đang chạy nền ▸
+    <!-- Fallback for a run whose anchor doesn't land inside the current message list
+         (review fix LOW-6) — otherwise silently unrendered even though the ">N running"
+         chip below would still count it. -->
+    {#each jobsState.unanchoredJobs as job (job.runId)}
+      {#if jobsState.showCard(job)}
+        <RunProgressCard {job} />
+      {/if}
+    {/each}
+
+    {#if jobsState.activeJobs.length > 1 && !jobsState.showAllActive}
+      <button class="active-chip" onclick={() => jobsState.expandAllActive()}>
+        {jobsState.activeJobs.length} tác vụ đang chạy nền ▸
       </button>
     {/if}
 
