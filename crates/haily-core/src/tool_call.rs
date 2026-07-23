@@ -321,6 +321,20 @@ pub async fn dispatch(
                     tool = tool_name,
                     "tool call auto-approved via config allowlist"
                 );
+                // Review fix (LOW): an allowlisted bypass executes without a human prompt
+                // in EVERY mode, same as `auto` — it must leave the same RECORD-ONLY audit
+                // row `auto` mode does, or this path would be a silent gap in the "every
+                // irreversible write that executes without a prompt gets an audit row"
+                // contract. Unconditional (not mode-gated): the allowlist bypass already
+                // wins in every mode, so its audit trail must too. Best-effort, same as
+                // the `auto`-mode call below.
+                if let Err(e) = record_only_journal_write(ctx, tool_name, &args).await {
+                    warn!(
+                        tool = tool_name,
+                        error = %e,
+                        "record-only journal write failed for an allowlisted irreversible write"
+                    );
+                }
             } else if permission_mode::should_prompt(approval_mode, effective_tier) {
                 // The tool's OWN tier (pre-escalation) tells the UI whether this prompt
                 // exists only because M2's per-turn cap escalated a normally-reversible
@@ -2176,6 +2190,64 @@ mod tests {
             rows.len(),
             1,
             "exactly one record-only journal row expected"
+        );
+        assert_eq!(rows[0].tool_name, "delete_thing");
+        assert_eq!(
+            rows[0].compensability, "final",
+            "record-only row must be marked non-compensable"
+        );
+        assert!(
+            rows[0].compensation_plan.is_none(),
+            "record-only row must carry NO compensation plan — no undo promised"
+        );
+    }
+
+    /// Review fix (LOW): the pre-validated allowlist bypass (`is_auto_approved`) also
+    /// executes an `IrreversibleWrite` without a human prompt — it must leave the SAME
+    /// record-only audit row `auto` mode does, in EVERY mode (checked here under
+    /// `manual`, the strictest rung, to prove the bypass is unconditional on mode).
+    #[tokio::test]
+    async fn allowlisted_bypass_leaves_a_record_only_journal_row_even_under_manual() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::with_auto_approve(
+            ["delete_thing".to_string()].into_iter().collect(),
+        ));
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Manual);
+        let db = Arc::clone(&ctx.db);
+        let session_id = ctx.session_id.to_string();
+        let turn_id = ctx.turn_id.to_string();
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "allowlisted tool must auto-run with no prompt: {text}");
+        assert_eq!(text, "deleted");
+
+        let chunk = rx
+            .recv()
+            .await
+            .expect("dispatch must emit exactly one chunk");
+        assert!(
+            matches!(chunk, ResponseChunk::ToolResult { ok: true, .. }),
+            "the allowlist bypass must never raise a ToolApprovalRequest — got {chunk:?}"
+        );
+
+        let rows = journal::list_by_turn(&db, &turn_id, &session_id)
+            .await
+            .expect("query journal");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the allowlisted bypass must leave exactly one record-only journal row"
         );
         assert_eq!(rows[0].tool_name, "delete_thing");
         assert_eq!(
