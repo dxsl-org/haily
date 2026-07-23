@@ -158,6 +158,14 @@ impl KmsHandle {
         self.authored.get(name)
     }
 
+    /// Name-sorted list of authored skills currently served from a `skill_versions` recovery
+    /// snapshot rather than their on-disk file (phase 8 review MED-1) — a tampered or
+    /// interrupted-edit file was detected at the last load. Empty on a clean load. This is the
+    /// GUI-reachable surface for what would otherwise be an `error!`-only log line.
+    pub fn recovered_authored_skill_names(&self) -> Vec<String> {
+        self.authored.recovered_names()
+    }
+
     // ---------------------------------------------------------------------
     // Authored-skill API (phase-02) — thin wrappers over `self.authored`.
     // ---------------------------------------------------------------------

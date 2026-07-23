@@ -12,6 +12,22 @@ use crate::KmsHandle;
 use anyhow::{anyhow, bail, Result};
 use haily_db::queries::{skill_versions, skills as db_skills};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Serializes the on-disk kit-pack write path (review MED-2): `write_skill_atomic` reads the
+/// WHOLE `manifest.json`, adds/updates one entry, and renames the file back — two concurrent
+/// `edit_skill`/`revert_skill`/`promote_to_authored` calls on DIFFERENT skills would otherwise
+/// race that read-modify-write, and the second writer's commit (built from a manifest snapshot
+/// that predates the first writer's rename) would silently clobber the first writer's hash
+/// update, making its just-written file mismatch at next boot. One process-wide lock is
+/// sufficient — there is exactly one kit-pack directory per process (no multi-tenant kit-pack
+/// scenario exists), so this is equivalent in practice to a per-registry lock without needing a
+/// new `KmsHandle`/`AuthoredRegistry` field.
+fn authored_write_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -95,11 +111,19 @@ async fn snapshot_current(kms: &KmsHandle, name: &str, kind: SkillEditKind, note
 /// `skill_versions` FIRST (see `snapshot_current`), then writes the new content through the
 /// atomic path for `kind`, returning the full saved content.
 ///
+/// The filename-legality guard (`validate_skill_name`) applies ONLY to the authored path
+/// (review LOW: it is a filesystem-safety allowlist, and a synthesized `kms_skills` row is
+/// never a path — gating it here too would let a skill with an exotic LLM-authored name be
+/// opened via `get_skill_detail` but never saved). `write_authored_full` re-checks it anyway
+/// for defense in depth on every authored write (edit/revert/promote).
+///
 /// # Errors
-/// Returns an error if `name` is invalid, a field exceeds the size cap, the skill is unknown,
-/// the atomic write fails, or the version-snapshot insert fails.
+/// Returns an error if `kind == Authored` and `name` is filesystem-unsafe, a field exceeds the
+/// size cap, the skill is unknown, the atomic write fails, or the version-snapshot insert fails.
 pub async fn edit_skill(kms: &KmsHandle, name: &str, kind: SkillEditKind, draft: &SkillDraft) -> Result<String> {
-    validate_skill_name(name)?;
+    if kind == SkillEditKind::Authored {
+        validate_skill_name(name)?;
+    }
     validate_draft(draft)?;
     snapshot_current(kms, name, kind, None).await?;
 
@@ -139,6 +163,25 @@ pub async fn revert_skill(kms: &KmsHandle, name: &str, version_id: &str) -> Resu
 /// closest existing analogue), `kind` is `Playbook` (reusable how-to, not a pipeline stage).
 /// Archives the synthesized row in the same call so no duplicate stays active.
 ///
+/// # Ordering (review LOW — shrinking the cross-store duplicate window)
+/// Steps run file-write → version log → archive → REGISTRY RELOAD, deliberately deferring the
+/// reload (unlike `edit`/`revert`, which reload immediately via `write_authored_full`) until
+/// AFTER the synthesized row is archived. This means the in-memory `AuthoredRegistry` never
+/// advertises the promoted skill while the synthesized row is still active — the only window
+/// that remains is a crash between "authored file committed" and "row archived", where:
+///
+///   - the on-disk kit-pack has the new file (harmless: nothing has reloaded it into the
+///     registry yet, so no consumer sees it);
+///   - the synthesized row is still active, so `synthesized_playbooks_for`/`active_skills` keep
+///     injecting it exactly as before.
+///
+/// Neither side "wins" a race, because there is no race: only ONE store is ever live-reachable
+/// at a time from this function's own reload boundary. A retried `promote_to_authored` after
+/// such a crash simply overwrites the same (already-correct) file and completes the archive —
+/// idempotent, not a duplicate. The residual DB-only risk (crash between version-insert and
+/// archive, leaving an orphan version row with no matching archive) is pure bookkeeping — no
+/// injection-visible effect — and is accepted (see the phase's Risk Assessment).
+///
 /// # Errors
 /// Returns an error if `name` is invalid, the synthesized skill is unknown, an authored skill
 /// of the same name already exists (promote never overwrites), or either write fails.
@@ -160,8 +203,9 @@ pub async fn promote_to_authored(kms: &KmsHandle, name: &str) -> Result<String> 
         kind: SkillKind::Playbook,
         body: row.description.clone(),
         references: Vec::new(),
+        recovered: false,
     };
-    let full_md = write_authored_full(kms, name, &new_skill.to_markdown()).await?;
+    let full_md = write_authored_file(kms, name, &new_skill.to_markdown()).await?;
 
     let hash = sha256_hex(full_md.as_bytes());
     skill_versions::insert_version(
@@ -175,6 +219,7 @@ pub async fn promote_to_authored(kms: &KmsHandle, name: &str) -> Result<String> 
     .await?;
 
     db_skills::archive_skill(&kms.db, &row.id).await?;
+    kms.reload_authored().await?;
     Ok(full_md)
 }
 
@@ -200,16 +245,30 @@ async fn write_authored_body(kms: &KmsHandle, name: &str, new_body: &str) -> Res
 }
 
 /// Write `full_md` (frontmatter + body) as `name`'s authored file: atomic skill-file + manifest
-/// write (manifest rename is the commit point — see `kit_pack::write_skill_atomic`), then
-/// reload the in-memory registry so the change is visible without a restart.
-async fn write_authored_full(kms: &KmsHandle, name: &str, full_md: &str) -> Result<String> {
+/// write (manifest rename is the commit point — see `kit_pack::write_skill_atomic`). Does NOT
+/// reload the registry — `promote_to_authored` deliberately defers that (see its doc comment);
+/// every other caller goes through `write_authored_full` below, which reloads immediately.
+///
+/// The whole read-manifest→write-file→write-manifest sequence runs under
+/// `authored_write_lock()` (review MED-2) so two concurrent authored writes (to different
+/// skills) can't race the shared `manifest.json`.
+async fn write_authored_file(kms: &KmsHandle, name: &str, full_md: &str) -> Result<String> {
     validate_skill_name(name)?;
     let dir = kms.kit_pack_dir().ok_or_else(|| anyhow!("kit-pack not found — cannot write authored skill"))?;
     let kind = kms.authored_get(name).map(|s| s.kind).unwrap_or(SkillKind::Playbook);
+
+    let _guard = authored_write_lock().lock().await;
     let rel_path = kit_pack::skill_rel_path(&dir, name, kind);
     kit_pack::write_skill_atomic(&dir, &rel_path, full_md)?;
-    kms.reload_authored().await?;
     Ok(full_md.to_string())
+}
+
+/// Write + immediately reload the registry — the edit/revert path, where the caller needs the
+/// change visible right away (unlike `promote_to_authored`, see `write_authored_file`'s doc).
+async fn write_authored_full(kms: &KmsHandle, name: &str, full_md: &str) -> Result<String> {
+    let saved = write_authored_file(kms, name, full_md).await?;
+    kms.reload_authored().await?;
+    Ok(saved)
 }
 
 /// Replace a synthesized skill's `description` column with the rendered body.
@@ -359,6 +418,50 @@ mod tests {
         db_skills::insert_skill(&db, "to-archive", "d", "p", "[]").await.unwrap();
         archive_synthesized(&kms, "to-archive").await.unwrap();
         assert!(db_skills::get_skill_by_name(&db, "to-archive").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn synthesized_edit_accepts_a_name_that_would_fail_the_authored_filename_guard() {
+        // Review LOW: the filename-safety allowlist must gate ONLY the authored (filesystem)
+        // path — a synthesized row is never a path component.
+        let (kms, db, _root) = test_kms().await;
+        let exotic_name = "a synthesized skill (v2)!";
+        db_skills::insert_skill(&db, exotic_name, "old description", "p", "[]").await.unwrap();
+
+        // Precondition: this name would be rejected by the authored guard.
+        assert!(validate_skill_name(exotic_name).is_err());
+
+        edit_skill(&kms, exotic_name, SkillEditKind::Synthesized, &draft("SAVED")).await.unwrap();
+        let row = db_skills::get_skill_by_name(&db, exotic_name).await.unwrap().unwrap();
+        assert!(row.description.contains("SAVED"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_to_different_skills_do_not_clobber_the_shared_manifest() {
+        // Review MED-2 regression guard: two authored writes racing the SAME manifest.json
+        // must both land, not have the second's stale read-copy clobber the first's hash.
+        let (kms, db, root) = test_kms().await;
+        db_skills::insert_skill(&db, "second", "a second skill", "p", "[]").await.unwrap();
+        promote_to_authored(&kms, "second").await.unwrap();
+
+        let cook_draft = draft("COOK EDITED");
+        let second_draft = draft("SECOND EDITED");
+        let (r1, r2) = tokio::join!(
+            edit_skill(&kms, "cook", SkillEditKind::Authored, &cook_draft),
+            edit_skill(&kms, "second", SkillEditKind::Authored, &second_draft),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        // Reload straight from disk (bypassing the live registry) to prove the manifest ITSELF
+        // is consistent for both entries, not just whichever reload ran last.
+        let pack_dir = root.path().join("data/kit-pack");
+        let reloaded = kit_pack::load_with_versions_fallback(&pack_dir, &db).await.unwrap();
+        let cook = reloaded.iter().find(|s| s.name == "cook").unwrap();
+        let second = reloaded.iter().find(|s| s.name == "second").unwrap();
+        assert!(cook.body.contains("COOK EDITED"), "cook's write must survive second's concurrent write");
+        assert!(second.body.contains("SECOND EDITED"), "second's write must survive cook's concurrent write");
+        assert!(!cook.recovered && !second.recovered, "neither hash should mismatch under the write lock");
     }
 
     #[tokio::test]

@@ -104,6 +104,12 @@ pub struct AuthoredSkill {
     pub kind: SkillKind,
     pub body: String,
     pub references: Vec<ReferenceChunk>,
+    /// Set by `kit_pack::load_with_versions_fallback` (Unified Chat UI phase 8 review MED-1)
+    /// when this skill's on-disk file failed its manifest-hash check and was recovered from a
+    /// `skill_versions` snapshot instead of being silently dropped. `false` for every skill
+    /// loaded the normal way (including via `kit_pack::load`, which never recovers). This is
+    /// the GUI-reachable tamper/crash signal — see `AuthoredRegistry::recovered_names`.
+    pub recovered: bool,
 }
 
 impl AuthoredSkill {
@@ -149,6 +155,7 @@ impl AuthoredSkill {
             kind,
             body: body.trim().to_string(),
             references: Vec::new(),
+            recovered: false,
         })
     }
 
@@ -409,6 +416,18 @@ impl AuthoredRegistry {
         out
     }
 
+    /// Name-sorted list of currently-loaded skills flagged `recovered` — i.e. their on-disk
+    /// file failed the manifest-hash check at the last load and a `skill_versions` snapshot was
+    /// served instead (review MED-1: a GUI-reachable tamper/crash signal, not log-only). Empty
+    /// on a clean load, which is the overwhelming common case.
+    pub fn recovered_names(&self) -> Vec<String> {
+        let snap = self.snap();
+        let mut names: Vec<String> =
+            snap.by_name.values().filter(|s| s.recovered).map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
     /// Discovery: skills relevant to `query`, ranked by Jaccard, as `(name, when_to_use)`
     /// — the pair the model needs to decide whether to `skill_fetch` the body.
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, String)> {
@@ -546,6 +565,7 @@ mod tests {
             kind,
             body: format!("BODY OF {name}"),
             references: vec![],
+            recovered: false,
         }
     }
 
@@ -635,6 +655,15 @@ mod tests {
     // ------------------------------------------------------------------
     // Registry: precedence, routing, matching, sections
     // ------------------------------------------------------------------
+
+    #[test]
+    fn recovered_names_reports_only_flagged_skills() {
+        let clean = skill("clean", SkillKind::Playbook, Some("developer"), "fine");
+        let mut tampered = skill("tampered", SkillKind::Playbook, Some("developer"), "recovered");
+        tampered.recovered = true;
+        let reg = AuthoredRegistry::from_tiers(vec![vec![clean, tampered]]);
+        assert_eq!(reg.recovered_names(), vec!["tampered".to_string()]);
+    }
 
     #[test]
     fn higher_tier_overrides_lower_by_name() {

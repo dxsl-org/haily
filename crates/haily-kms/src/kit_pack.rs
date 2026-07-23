@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use haily_db::{queries::skill_versions, DbHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path};
 use uuid::Uuid;
 
@@ -88,20 +88,29 @@ pub fn load(dir: &Path) -> Result<Vec<AuthoredSkill>> {
 /// but `skill_editor::ops::snapshot_current` already recorded the pre-edit state as a version
 /// before the write began, so THIS loader recovers that instead of dropping the skill.
 ///
+/// The recovery itself does NOT silently swallow the tamper/crash signal (review MED-1): each
+/// recovered skill is logged at `error!` (not `warn!` — the old fail-closed drop was
+/// user-visible, so downgrading to a log line alone would be a real observability regression)
+/// AND flagged `recovered = true` on the returned [`AuthoredSkill`], which
+/// `AuthoredRegistry::recovered_names` surfaces for a GUI badge (P09) — the signal is reachable
+/// by the GUI, not log-only.
+///
 /// # Errors
 /// Returns an error only when the manifest itself is missing/unparseable (same as `load`).
 pub async fn load_with_versions_fallback(dir: &Path, db: &DbHandle) -> Result<Vec<AuthoredSkill>> {
     let manifest = read_manifest(dir)?;
 
     let mut verified: HashMap<String, String> = HashMap::new();
+    let mut recovered_names: HashSet<String> = HashSet::new();
     for (rel, expected) in &manifest.files {
         match verify_one(dir, rel, expected) {
             VerifyOutcome::Ok(text) => {
                 verified.insert(rel.clone(), text);
             }
             VerifyOutcome::HashMismatch => {
-                let recovered = match skill_name_from_rel(rel) {
-                    Some(name) => skill_versions::latest_version(db, &name)
+                let name = skill_name_from_rel(rel);
+                let recovered = match &name {
+                    Some(name) => skill_versions::latest_version(db, name)
                         .await
                         .ok()
                         .flatten()
@@ -110,10 +119,14 @@ pub async fn load_with_versions_fallback(dir: &Path, db: &DbHandle) -> Result<Ve
                 };
                 match recovered {
                     Some(version) => {
-                        tracing::warn!(
+                        tracing::error!(
                             file = %rel,
-                            "kit-pack file sha256 mismatch — recovered previous version from skill_versions"
+                            "kit-pack file sha256 mismatch (external tamper or an interrupted edit) — \
+                             recovered previous version from skill_versions"
                         );
+                        if let Some(name) = name {
+                            recovered_names.insert(name);
+                        }
                         verified.insert(rel.clone(), version.content_md);
                     }
                     None => tracing::warn!(
@@ -126,7 +139,13 @@ pub async fn load_with_versions_fallback(dir: &Path, db: &DbHandle) -> Result<Ve
         }
     }
 
-    Ok(build_skills(&verified, &manifest))
+    let mut skills = build_skills(&verified, &manifest);
+    for skill in &mut skills {
+        if recovered_names.contains(&skill.name) {
+            skill.recovered = true;
+        }
+    }
+    Ok(skills)
 }
 
 fn read_manifest(dir: &Path) -> Result<Manifest> {
@@ -536,6 +555,16 @@ mod tests {
         );
         // The unaffected reference-bearing file must still load normally.
         assert_eq!(cook.references.len(), 1, "other kit-pack content is unaffected");
+        // MED-1 review fix: the tamper/crash signal must be GUI-reachable, not log-only.
+        assert!(cook.recovered, "a recovered skill must be flagged, not just logged");
+    }
+
+    #[tokio::test]
+    async fn a_cleanly_loaded_skill_is_never_flagged_recovered() {
+        let dir = make_pack(false);
+        let (db, _db_dir) = test_db().await;
+        let skills = load_with_versions_fallback(dir.path(), &db).await.unwrap();
+        assert!(!skills[0].recovered, "a hash-verified skill must never be flagged recovered");
     }
 
     #[tokio::test]
