@@ -5,8 +5,8 @@
   import { listSkills, type SkillView } from '$lib/tauri';
   import SkillRow from './SkillRow.svelte';
 
-  // Rolling corpus of this session's `StageOutput` text, forwarded by `RunTimeline` via
-  // `CockpitView`. `RunEvent` has no `SkillActivated` variant (see tauri.ts), so
+  // Rolling corpus of this session's `StageOutput` text, forwarded by whichever parent
+  // also renders `RunTimeline`. `RunEvent` has no `SkillActivated` variant (see tauri.ts), so
   // "activated this run" is a best-effort substring match against skill names rather
   // than an authoritative backend field — documented in `activatedNames` below.
   let { runOutputText = '' }: { runOutputText?: string } = $props();

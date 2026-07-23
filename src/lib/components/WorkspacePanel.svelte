@@ -5,7 +5,8 @@
   import WorkspaceRow from './WorkspaceRow.svelte';
 
   // Best-effort correlation source for each row's embedded `DiffViewer` accept action —
-  // owned by the parent (`CockpitView`) since it's shared with `ApprovalsQueue`.
+  // passed down from whichever parent also renders `ApprovalsQueue`, since both need the
+  // same approvals snapshot.
   let { approvals = [] }: { approvals?: QueuedApproval[] } = $props();
 
   let workspaces = $state<WorkspaceView[]>([]);

@@ -23,40 +23,24 @@
 </script>
 
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { listen } from '@tauri-apps/api/event';
+  // Pure renderer of `+page.svelte`'s lifted `messages` state — the `haily-chunk`
+  // subscription that fills it lives at the page (see `+page.svelte`'s `onMount`), NOT
+  // here, because this component only mounts while `route === 'chat'`: a listener owned
+  // by a route-gated component would drop every chunk that arrives while the user is on
+  // another destination (missed `Complete` wedges `activeSession` forever, a missed
+  // `ToolApprovalRequest` silently stalls to its 120s deny). This file stays route-scoped
+  // on purpose; only the subscription had to move.
   import { sendMessage } from '$lib/tauri';
-  import type { ChunkPayload, PendingApproval } from '$lib/tauri';
-  import { toolVerb } from '$lib/tool-verbs';
   import ChatBubble from './ChatBubble.svelte';
 
-  const NIL_UUID = '00000000-0000-0000-0000-000000000000';
-
   interface Props {
-    /** Same reactive array `ChatInput` pushes new turns onto — passed by reference from
-     * `+page.svelte`, mutated in place (push/index-write), never reassigned here. */
+    /** Same reactive array `ChatInput` pushes new turns onto and `+page.svelte`'s
+     * listener mutates in place — passed by reference, never reassigned here. */
     messages: Message[];
-    /** session_id → index in `messages[]` of that turn's assistant bubble; shared with
-     * `ChatInput`'s `send()`, which is the only writer of new entries. */
-    sessionIndex: Map<string, number>;
-    pendingApproval: PendingApproval | null;
-    pendingWorkspaceView: { viewId: string; sessionId: string } | null;
-    activeSession: string | null;
-    stopping: boolean;
     bottomAnchor: HTMLDivElement | undefined;
-    scrollToBottom: () => void;
   }
 
-  let {
-    messages,
-    sessionIndex,
-    pendingApproval = $bindable(null),
-    pendingWorkspaceView = $bindable(null),
-    activeSession = $bindable(null),
-    stopping = $bindable(false),
-    bottomAnchor = $bindable(),
-    scrollToBottom,
-  }: Props = $props();
+  let { messages, bottomAnchor = $bindable() }: Props = $props();
 
   // Mirrors `SafetyTab.svelte`'s `requestUndo` phrasing exactly so both undo entry points
   // (this inline button and the Safety tab's recent-actions list) produce identical
@@ -75,82 +59,6 @@
       undoing = null;
     }
   }
-
-  onMount(() => {
-    const unlistenPromise = listen<ChunkPayload>('haily-chunk', ({ payload }) => {
-      const { session_id, chunk } = payload;
-
-      // A pending approval blocks the backend turn regardless of which bubble it's
-      // tied to, so it's handled before the bubble lookup (which requires an
-      // already-tracked session index).
-      if (chunk.type === 'ToolApprovalRequest') {
-        pendingApproval = {
-          sessionId: session_id,
-          approvalId: chunk.data.approval_id,
-          tool: chunk.data.tool,
-          args: chunk.data.args,
-          origin: chunk.data.origin,
-          reversible: chunk.data.reversible,
-        };
-        return;
-      }
-
-      // A presented view is a handle only — the bulk `DataView` payload never rides this
-      // stream (`WorkspacePane` fetches it separately via `getView`), so this never touches a
-      // message bubble, same early-return shape as `ToolApprovalRequest` above.
-      if (chunk.type === 'ViewRef') {
-        pendingWorkspaceView = { viewId: chunk.data.view_id, sessionId: session_id };
-        return;
-      }
-
-      // Determine which message bubble to update
-      let idx: number | undefined;
-      if (session_id === NIL_UUID) {
-        // Proactive notification — create a new system bubble
-        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true, undoable: [], badge: null });
-        idx = messages.length - 1;
-      } else {
-        idx = sessionIndex.get(session_id);
-      }
-
-      if (idx === undefined) return;
-
-      if (chunk.type === 'Text') {
-        messages[idx].content += chunk.data;
-      } else if (chunk.type === 'Error') {
-        // Append distinctly rather than silently folding into the running text —
-        // the GUI doesn't buffer-then-flush like Telegram, but a bare append would
-        // still visually run the error into whatever partial answer streamed first.
-        messages[idx].content += `\n⚠️ ${chunk.data}`;
-      } else if (chunk.type === 'ToolResult') {
-        // Buffer only — the [Undo] affordance itself is gated to render after `Complete`
-        // (M4 button gating: more writes may still land later in the same turn, and
-        // offering undo mid-stream would be misleading about what "this turn" did).
-        // `journal_id` is non-null only when `reversible` is true AND the write's
-        // `post_state_version` had already landed at emit time (M4 ordering) — trust
-        // that invariant here rather than re-deriving it client-side.
-        const { name, reversible, journal_id } = chunk.data;
-        if (reversible && journal_id) {
-          messages[idx].undoable.push({ journalId: journal_id, verb: toolVerb(name, '{}') });
-        }
-      } else if (chunk.type === 'TurnMeta') {
-        // Buffer only — rendered as a footer once `Complete` lands below, same gating
-        // as `undoable` (more of this turn could still be in flight).
-        messages[idx].badge = chunk.data.badge ?? null;
-      } else if (chunk.type === 'Complete') {
-        messages[idx].pending = false;
-        sessionIndex.delete(session_id);
-        if (activeSession === session_id) {
-          activeSession = null;
-          stopping = false;
-        }
-      }
-
-      scrollToBottom();
-    });
-
-    return () => { unlistenPromise.then(fn => fn()); };
-  });
 </script>
 
 <div class="messages">

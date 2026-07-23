@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
   import WorkItemsPanel from '$lib/components/WorkItemsPanel.svelte';
@@ -10,7 +12,10 @@
   import WorkspacesScreen from '$lib/components/WorkspacesScreen.svelte';
   import SkillsScreen from '$lib/components/SkillsScreen.svelte';
   import WorkspacePane from '$lib/components/view/WorkspacePane.svelte';
-  import type { PendingApproval } from '$lib/tauri';
+  import type { ChunkPayload, PendingApproval } from '$lib/tauri';
+  import { toolVerb } from '$lib/tool-verbs';
+
+  const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
   let settingsOpen = $state(false);
   // Left icon rail (Chat/Runs/Workspaces/Skills) replaces the former chat/cockpit
@@ -18,17 +23,19 @@
   // overlay behavior is unchanged.
   let route = $state<RouteId>('chat');
   let pendingApproval = $state<PendingApproval | null>(null);
-  // Set for one tick whenever a `ViewRef` chunk arrives (written by `ChatStream`);
-  // `WorkspacePane` consumes and clears it via `bind:pendingView` (mirrors
-  // `pendingApproval`'s `bind:pending` contract on `ApprovalModal`). The pane coexists
-  // with whichever destination is active — it is never the thing that hides a route.
+  // Set for one tick whenever a `ViewRef` chunk arrives (written by the `haily-chunk`
+  // listener below); `WorkspacePane` consumes and clears it via `bind:pendingView`
+  // (mirrors `pendingApproval`'s `bind:pending` contract on `ApprovalModal`). The pane
+  // coexists with whichever destination is active — it is never the thing that hides a
+  // route.
   let pendingWorkspaceView = $state<{ viewId: string; sessionId: string } | null>(null);
   // The session_id of the turn currently streaming, or null when idle. Written by
-  // `ChatInput` on send, cleared by `ChatStream` when that session's `Complete`/`Error`
-  // chunk arrives — shared between the two so each can gate/react independently.
+  // `ChatInput` on send, cleared by the `haily-chunk` listener below when that session's
+  // `Complete`/`Error` chunk arrives — shared with `ChatInput` so it can gate/swap its
+  // send/stop button regardless of which route is showing.
   let activeSession = $state<string | null>(null);
-  // Transient "stop requested" flag — set by `ChatInput`'s stop button, cleared by
-  // `ChatStream` once the cancelled turn's `Complete` chunk actually lands.
+  // Transient "stop requested" flag — set by `ChatInput`'s stop button, cleared by the
+  // `haily-chunk` listener below once the cancelled turn's `Complete` chunk actually lands.
   let stopping = $state(false);
   let bottomAnchor = $state<HTMLDivElement | undefined>(undefined);
 
@@ -44,7 +51,7 @@
   ]);
 
   // session_id → index in messages[] of the pending assistant bubble — written by
-  // `ChatInput.send()`, read/cleared by `ChatStream`'s chunk listener.
+  // `ChatInput.send()`, read/cleared by the `haily-chunk` listener below.
   const sessionIndex = new Map<string, number>();
 
   // Every session id this GUI instance has started, oldest first — each turn mints a
@@ -57,6 +64,86 @@
   function scrollToBottom() {
     requestAnimationFrame(() => bottomAnchor?.scrollIntoView({ behavior: 'smooth' }));
   }
+
+  // Page-lifetime subscription (NOT `ChatStream`'s — a route-gated component would drop
+  // every chunk that arrives while the user is on Runs/Workspaces/Skills, permanently
+  // wedging `activeSession`/a pending approval). `route` switches never tear this down;
+  // it lives exactly as long as the page did before the icon-rail split.
+  onMount(() => {
+    const unlistenPromise = listen<ChunkPayload>('haily-chunk', ({ payload }) => {
+      const { session_id, chunk } = payload;
+
+      // A pending approval blocks the backend turn regardless of which bubble it's
+      // tied to, so it's handled before the bubble lookup (which requires an
+      // already-tracked session index).
+      if (chunk.type === 'ToolApprovalRequest') {
+        pendingApproval = {
+          sessionId: session_id,
+          approvalId: chunk.data.approval_id,
+          tool: chunk.data.tool,
+          args: chunk.data.args,
+          origin: chunk.data.origin,
+          reversible: chunk.data.reversible,
+        };
+        return;
+      }
+
+      // A presented view is a handle only — the bulk `DataView` payload never rides this
+      // stream (`WorkspacePane` fetches it separately via `getView`), so this never touches a
+      // message bubble, same early-return shape as `ToolApprovalRequest` above.
+      if (chunk.type === 'ViewRef') {
+        pendingWorkspaceView = { viewId: chunk.data.view_id, sessionId: session_id };
+        return;
+      }
+
+      // Determine which message bubble to update
+      let idx: number | undefined;
+      if (session_id === NIL_UUID) {
+        // Proactive notification — create a new system bubble
+        messages.push({ id: crypto.randomUUID(), role: 'system', content: '', pending: true, undoable: [], badge: null });
+        idx = messages.length - 1;
+      } else {
+        idx = sessionIndex.get(session_id);
+      }
+
+      if (idx === undefined) return;
+
+      if (chunk.type === 'Text') {
+        messages[idx].content += chunk.data;
+      } else if (chunk.type === 'Error') {
+        // Append distinctly rather than silently folding into the running text —
+        // the GUI doesn't buffer-then-flush like Telegram, but a bare append would
+        // still visually run the error into whatever partial answer streamed first.
+        messages[idx].content += `\n⚠️ ${chunk.data}`;
+      } else if (chunk.type === 'ToolResult') {
+        // Buffer only — the [Undo] affordance itself is gated to render after `Complete`
+        // (M4 button gating: more writes may still land later in the same turn, and
+        // offering undo mid-stream would be misleading about what "this turn" did).
+        // `journal_id` is non-null only when `reversible` is true AND the write's
+        // `post_state_version` had already landed at emit time (M4 ordering) — trust
+        // that invariant here rather than re-deriving it client-side.
+        const { name, reversible, journal_id } = chunk.data;
+        if (reversible && journal_id) {
+          messages[idx].undoable.push({ journalId: journal_id, verb: toolVerb(name, '{}') });
+        }
+      } else if (chunk.type === 'TurnMeta') {
+        // Buffer only — rendered as a footer once `Complete` lands below, same gating
+        // as `undoable` (more of this turn could still be in flight).
+        messages[idx].badge = chunk.data.badge ?? null;
+      } else if (chunk.type === 'Complete') {
+        messages[idx].pending = false;
+        sessionIndex.delete(session_id);
+        if (activeSession === session_id) {
+          activeSession = null;
+          stopping = false;
+        }
+      }
+
+      scrollToBottom();
+    });
+
+    return () => { unlistenPromise.then(fn => fn()); };
+  });
 </script>
 
 <div class="app">
@@ -80,16 +167,7 @@
         {#if route === 'chat'}
           <WorkItemsPanel />
           <ProactivePanel />
-          <ChatStream
-            {messages}
-            {sessionIndex}
-            bind:pendingApproval
-            bind:pendingWorkspaceView
-            bind:activeSession
-            bind:stopping
-            bind:bottomAnchor
-            {scrollToBottom}
-          />
+          <ChatStream {messages} bind:bottomAnchor />
           <ChatInput
             {messages}
             {sessionIndex}

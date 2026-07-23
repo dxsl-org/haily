@@ -9,8 +9,9 @@
   import RunJobCard from './RunJobCard.svelte';
 
   // Forwards raw `StageOutput` text upward so `SkillsBrowser` can best-effort derive
-  // "activated this run" — see `CockpitView`'s doc comment for why this lives here
-  // rather than a backend field (no `SkillActivated` RunEvent variant exists).
+  // "activated this run" — no `SkillActivated` RunEvent variant exists (see tauri.ts),
+  // so this substring-friendly text feed is the least-bad substitute for an
+  // authoritative backend field.
   let { onOutputText }: { onOutputText?: (text: string) => void } = $props();
 
   let jobs = $state<Map<string, Job>>(new Map());
