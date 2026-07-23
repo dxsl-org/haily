@@ -81,7 +81,7 @@
             <button class="expand-btn" onclick={() => toggleExpand(v.id)}>
               {expandedId === v.id ? 'Ẩn nội dung' : 'Xem nội dung'}
             </button>
-            <button class="revert-btn" onclick={() => doRevert(v)} disabled={revertingId === v.id}>
+            <button class="revert-btn" onclick={() => doRevert(v)} disabled={revertingId !== null}>
               {revertingId === v.id ? 'Đang khôi phục…' : 'Khôi phục'}
             </button>
           </div>

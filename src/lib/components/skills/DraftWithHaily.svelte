@@ -7,7 +7,7 @@
   //
   // NEVER auto-saves: `onFill` only replaces the caller's in-memory draft fields. Saving is the
   // caller's own explicit `Lưu` action.
-  import { sendMessage, cancelTurn, onChunk, type SkillDraft } from '$lib/tauri';
+  import { sendMessage, cancelTurn, onChunk, type Chunk, type ChunkPayload, type SkillDraft } from '$lib/tauri';
   import { buildDraftPrompt, parseDraftMarkdown, stripCodeFence } from '$lib/skill-draft-format';
 
   let { onFill }: { onFill: (draft: SkillDraft) => void } = $props();
@@ -35,29 +35,49 @@
     sessionId = null;
   }
 
+  function applyChunk(chunk: Chunk) {
+    if (chunk.type === 'Text') {
+      accumulated += chunk.data;
+    } else if (chunk.type === 'Complete') {
+      finish();
+    } else if (chunk.type === 'Error') {
+      error = chunk.data;
+      finish();
+    }
+  }
+
   async function requestDraft() {
     if (drafting || description.trim().length === 0) return;
     drafting = true;
     error = '';
     accumulated = '';
+
+    // Subscribe BEFORE dispatching the turn: `sendMessage` can start emitting chunks the
+    // instant its underlying invoke lands, before its own promise resolves with the session
+    // id — subscribing only after `await sendMessage(...)` would drop that gap's Text chunks
+    // and yield a truncated draft. Chunks that arrive before we know our own session id are
+    // buffered and replayed once it's known, instead of being matched against `undefined`.
+    let targetSid: string | null = null;
+    const pending: ChunkPayload[] = [];
+    unlisten = await onChunk((payload) => {
+      if (targetSid === null) {
+        pending.push(payload);
+        return;
+      }
+      if (payload.session_id !== targetSid) return;
+      applyChunk(payload.chunk);
+    });
+
     try {
-      const sid = await sendMessage(buildDraftPrompt(description.trim()));
-      sessionId = sid;
-      unlisten = await onChunk((payload) => {
-        if (payload.session_id !== sid) return;
-        const chunk = payload.chunk;
-        if (chunk.type === 'Text') {
-          accumulated += chunk.data;
-        } else if (chunk.type === 'Complete') {
-          finish();
-        } else if (chunk.type === 'Error') {
-          error = chunk.data;
-          finish();
-        }
-      });
+      targetSid = await sendMessage(buildDraftPrompt(description.trim()));
+      sessionId = targetSid;
+      for (const payload of pending) {
+        if (payload.session_id === targetSid) applyChunk(payload.chunk);
+      }
     } catch (e) {
       error = String(e);
       drafting = false;
+      stopListening();
     }
   }
 

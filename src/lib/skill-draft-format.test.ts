@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildDraftPrompt, mapSkillSaveError, parseDraftMarkdown, stripCodeFence } from './skill-draft-format';
+import { buildDraftPrompt, draftsEqual, mapSkillSaveError, parseDraftMarkdown, stripCodeFence } from './skill-draft-format';
 
 describe('parseDraftMarkdown', () => {
   it('splits a well-formed reply into the 4 canonical sections', () => {
@@ -33,6 +33,13 @@ describe('parseDraftMarkdown', () => {
     expect(parsed.success_conditions).toBe('');
     expect(parsed.forbidden_actions).toBe('');
     expect(parsed.required_from_user).toBe('');
+  });
+
+  it('parses a CRLF-separated reply identically to an LF one (parity with Rust .lines())', () => {
+    const body = ['## Procedure', 'step 1', 'step 2', '', '## Success conditions', 'build is green'].join('\r\n');
+    const parsed = parseDraftMarkdown(body);
+    expect(parsed.procedure).toBe('step 1\nstep 2');
+    expect(parsed.success_conditions).toBe('build is green');
   });
 
   it('restores a defensively-escaped header line back to its literal form', () => {
@@ -76,6 +83,18 @@ describe('buildDraftPrompt', () => {
     expect(prompt).toContain('## Forbidden actions');
     expect(prompt).toContain('## Required from user');
     expect(prompt).toContain('a skill for exporting invoices');
+  });
+});
+
+describe('draftsEqual', () => {
+  const base = { procedure: 'a', success_conditions: 'b', forbidden_actions: 'c', required_from_user: 'd' };
+
+  it('is true for two drafts with identical field content', () => {
+    expect(draftsEqual(base, { ...base })).toBe(true);
+  });
+
+  it('is false when any single field differs', () => {
+    expect(draftsEqual(base, { ...base, required_from_user: 'changed' })).toBe(false);
   });
 });
 

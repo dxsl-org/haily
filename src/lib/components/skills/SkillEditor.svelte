@@ -3,7 +3,7 @@
   // editable surface; `render_markdown`/`parse_markdown` (server-side) own the markdown mapping,
   // including the section-injection defense (see Security Considerations in the phase file).
   import { editSkill, getSkillDetail, listRecoveredSkills, type SkillDraft, type SkillEditKind } from '$lib/tauri';
-  import { mapSkillSaveError, skillFieldLabel } from '$lib/skill-draft-format';
+  import { draftsEqual, mapSkillSaveError, skillFieldLabel } from '$lib/skill-draft-format';
   import SkillVersionPanel from './SkillVersionPanel.svelte';
   import DraftWithHaily from './DraftWithHaily.svelte';
   import SkillEditorHeader from './SkillEditorHeader.svelte';
@@ -13,6 +13,10 @@
   const EMPTY_DRAFT: SkillDraft = { procedure: '', success_conditions: '', forbidden_actions: '', required_from_user: '' };
 
   let draft = $state<SkillDraft>({ ...EMPTY_DRAFT });
+  // Snapshot of the last successfully loaded/saved content — compared against `draft` to warn
+  // before `onBack` silently discards in-progress edits (including an unsaved draft-with-Haily
+  // fill, which only ever touches `draft`, never this snapshot).
+  let loadedDraft = $state<SkillDraft>({ ...EMPTY_DRAFT });
   let loading = $state(true);
   let loadError = $state('');
   let saving = $state(false);
@@ -25,6 +29,7 @@
 
   const isRecovered = $derived(kind === 'authored' && recoveredNames.includes(name));
   const canSave = $derived(draft.procedure.trim().length > 0 && draft.success_conditions.trim().length > 0);
+  const isDirty = $derived(!draftsEqual(draft, loadedDraft));
 
   $effect(() => {
     load();
@@ -36,6 +41,7 @@
     try {
       const detail = await getSkillDetail(name, kind);
       draft = { ...detail.draft };
+      loadedDraft = { ...detail.draft };
       if (kind === 'authored') {
         recoveredNames = await listRecoveredSkills();
       }
@@ -81,10 +87,17 @@
     versionsKey += 1;
     load();
   }
+
+  function handleBack() {
+    if (isDirty && !confirm('Bạn có thay đổi chưa lưu ở kỹ năng này. Rời đi mà không lưu?')) {
+      return;
+    }
+    onBack();
+  }
 </script>
 
 <div class="editor">
-  <button class="back-btn" onclick={onBack}>← Danh sách kỹ năng</button>
+  <button class="back-btn" onclick={handleBack}>← Danh sách kỹ năng</button>
 
   {#if loading}
     <div class="empty">Đang tải…</div>
@@ -128,15 +141,7 @@
 <style>
   .editor { display: flex; flex-direction: column; gap: 12px; }
 
-  .back-btn {
-    align-self: flex-start;
-    padding: 4px 0;
-    border: none;
-    background: none;
-    color: #8884aa;
-    font-size: 12px;
-    cursor: pointer;
-  }
+  .back-btn { align-self: flex-start; padding: 4px 0; border: none; background: none; color: #8884aa; font-size: 12px; cursor: pointer; }
   .back-btn:hover { color: #c084fc; }
 
   .field { display: flex; flex-direction: column; gap: 4px; }

@@ -32,6 +32,18 @@ export function skillFieldLabel(field: keyof SkillDraft): string {
   return FIELD_LABELS[field];
 }
 
+/** Whether two drafts have identical field content — the editor's unsaved-changes guard compares
+ * the live `draft` against the last loaded/saved snapshot with this before letting `onBack`
+ * discard anything silently. */
+export function draftsEqual(a: SkillDraft, b: SkillDraft): boolean {
+  return (
+    a.procedure === b.procedure &&
+    a.success_conditions === b.success_conditions &&
+    a.forbidden_actions === b.forbidden_actions &&
+    a.required_from_user === b.required_from_user
+  );
+}
+
 /** Inverse of the server's `escape_field` — strips a defensive leading backslash from a line
  * that would otherwise exactly equal a canonical header, so a field round-trips unchanged. */
 function unescapeField(sectionBody: string): string {
@@ -57,7 +69,12 @@ export function parseDraftMarkdown(body: string): SkillDraft {
   const sections: [string, string, string, string] = ['', '', '', ''];
   let current = 0;
 
-  for (const line of body.split('\n')) {
+  // Mirror Rust's `.lines()`, which treats `\r\n` as one line break — without this, a
+  // CRLF-emitting model leaves every header line as `"## Procedure\r"` (never an exact match),
+  // so the whole reply silently folds into `procedure` instead of splitting into sections.
+  const normalized = body.replace(/\r\n/g, '\n');
+
+  for (const line of normalized.split('\n')) {
     const idx = CANONICAL_HEADERS.indexOf(line);
     if (idx !== -1) {
       current = idx;
