@@ -165,6 +165,9 @@ fn deps(
         llm,
         broker: broker as Arc<dyn haily_types::ApprovalGate>,
         kill,
+        approval_mode: crate::permission_mode::new_handle(
+            crate::permission_mode::ApprovalMode::AcceptEdits,
+        ),
     }
 }
 

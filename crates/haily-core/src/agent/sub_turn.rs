@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
-use crate::{budget, context, tool_call};
 use super::outcome::{pair_usage, record_outcome_and_update_skill, OutcomeMetricsInput};
+use crate::{budget, context, tool_call};
 
 /// Top-N synthesized skills to consider for the sub-turn playbook pool (phase 8). Kept small so
 /// learned skills augment — never crowd out — the curated authored playbooks ranked above them.
@@ -150,6 +150,9 @@ pub struct SubTurnRequest {
     /// (not read from a global) for the same reason the broker is — one runtime source of
     /// truth, live-toggleable, shared by every depth.
     pub kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): `approval.mode`, threaded
+    /// down so a sub-turn write at depth>0 observes it too — mirrors `kill` exactly.
+    pub approval_mode: crate::permission_mode::ApprovalModeHandle,
     /// Harness Completion phase 2: the PARENT turn's `turn_id`, reused (not re-minted) —
     /// a delegated sub-turn is part of the turn that requested it, so its journal rows
     /// must group with the parent's under one `undo_turn` call. See `ToolContext::turn_id`.
@@ -219,6 +222,7 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         cancel,
         approval_tx,
         kill,
+        approval_mode,
         turn_id,
         turn_deletes,
         max_tool_calls,
@@ -266,7 +270,12 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         .authored_playbooks_for(&task, Some(domain_name), 2, &skill_gates)
         // Strip the NAME too (P2 review MED2) — it becomes a `### {name}` heading in the prompt.
         .into_iter()
-        .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
+        .map(|(n, b)| {
+            (
+                tool_call::strip_tool_tags(&n),
+                tool_call::strip_tool_tags(&b),
+            )
+        })
         .collect();
     // Phase 8: SYNTHESIZED skills (confidence ≥0.6, pattern-matched, source-labeled) join the
     // ranked pool AFTER the curated authored playbooks — authored stays higher priority (kept
@@ -275,11 +284,12 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
     let synthesized = kms
         .synthesized_playbooks_for(&task, SUB_TURN_MAX_SYNTHESIZED_SKILLS, &skill_gates)
         .await;
-    playbooks.extend(
-        synthesized
-            .into_iter()
-            .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b))),
-    );
+    playbooks.extend(synthesized.into_iter().map(|(n, b)| {
+        (
+            tool_call::strip_tool_tags(&n),
+            tool_call::strip_tool_tags(&b),
+        )
+    }));
     // Standards only for the coding (developer) domain — a finance sub-turn must never
     // receive rust standards. Stack is detected from the CWD here (the standalone
     // fallback); P4's pipeline engine will detect against a real workspace root.
@@ -289,17 +299,23 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
         let mut s: Vec<(String, String)> = kms
             .authored_standards_for(&refs)
             .into_iter()
-            .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b)))
+            .map(|(n, b)| {
+                (
+                    tool_call::strip_tool_tags(&n),
+                    tool_call::strip_tool_tags(&b),
+                )
+            })
             .collect();
         // Phase 8: the distilled project-standards overlay is injected AFTER the kit standards
         // (so it augments, never shadows them) and — being last in the list — is trimmed FIRST
         // under budget pressure (`fit_titled_block` drops trailing items). Only approval-
         // provenanced, non-expired entries are returned (SEC-H / AD-m3); tag-stripped here too.
-        s.extend(
-            kms.overlay_standards()
-                .into_iter()
-                .map(|(n, b)| (tool_call::strip_tool_tags(&n), tool_call::strip_tool_tags(&b))),
-        );
+        s.extend(kms.overlay_standards().into_iter().map(|(n, b)| {
+            (
+                tool_call::strip_tool_tags(&n),
+                tool_call::strip_tool_tags(&b),
+            )
+        }));
         s
     } else {
         Vec::new()
@@ -413,10 +429,16 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
                 break tool_call::strip_tool_markup(&response);
             }
 
-            let (result, tool_ok) =
-                tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &kill)
-                    .await
-                    .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
+            let (result, tool_ok) = tool_call::dispatch(
+                &tool_name,
+                args.clone(),
+                &tools,
+                &tool_ctx,
+                &kill,
+                &approval_mode,
+            )
+            .await
+            .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
             tool_call_log.push(serde_json::json!({
                 "tool": &tool_name,
@@ -480,7 +502,8 @@ pub async fn run_sub_turn(req: SubTurnRequest) -> Result<String> {
             prompt_tokens,
             completion_tokens,
             delegate_overhead_ms: Some(delegate_overhead_ms),
-            confidence_update_failure_msg: "failed to update skill confidence from sub-turn outcome label",
+            confidence_update_failure_msg:
+                "failed to update skill confidence from sub-turn outcome label",
             // M3 review fix: a delegated sub-turn NEVER owns learning — the parent L0
             // turn's own end-of-turn call is the sole EMA driver for one user-visible
             // delegated action. See `OutcomeMetricsInput::owns_learning`'s doc comment.
@@ -662,6 +685,9 @@ mod sub_turn_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
@@ -749,8 +775,7 @@ mod sub_turn_tests {
     /// Copy the shipped `assets/kit-pack` into `<data>/kit-pack` so `KmsHandle::init`
     /// loads it. Returns false when the shipped pack is unavailable in this checkout.
     fn copy_kit_pack(data_dir: &std::path::Path) -> bool {
-        let src =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/kit-pack");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/kit-pack");
         if !src.join("manifest.json").is_file() {
             return false;
         }
@@ -837,8 +862,14 @@ mod sub_turn_tests {
         let req = dev_req("write some code".to_string(), db, kms, llm);
         let prompt = run_sub_turn(req).await.expect("run_sub_turn");
 
-        assert!(prompt.contains("## Standards"), "expected a ## Standards section, got: {prompt}");
-        assert!(prompt.contains("Rust Standards"), "expected the lang-rust standard body");
+        assert!(
+            prompt.contains("## Standards"),
+            "expected a ## Standards section, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Rust Standards"),
+            "expected the lang-rust standard body"
+        );
     }
 
     #[tokio::test]
@@ -879,8 +910,14 @@ mod sub_turn_tests {
         ];
         let mut remaining = budget::estimate("## T\n### a\n") + 8; // room for ~one item
         let block = fit_titled_block("T", &items, &mut remaining);
-        assert!(block.contains("### a"), "highest-priority item must survive");
-        assert!(!block.contains("### b"), "lowest-priority item must be dropped under pressure");
+        assert!(
+            block.contains("### a"),
+            "highest-priority item must survive"
+        );
+        assert!(
+            !block.contains("### b"),
+            "lowest-priority item must be dropped under pressure"
+        );
     }
 
     #[tokio::test]
@@ -956,7 +993,10 @@ mod sub_turn_tests {
             prompt.contains("(synthesized skill)"),
             "a matching ≥0.6 synthesized skill must reach the sub-turn prompt with visible provenance, got: {prompt}"
         );
-        assert!(prompt.contains("flight-booking"), "the skill name must appear");
+        assert!(
+            prompt.contains("flight-booking"),
+            "the skill name must appear"
+        );
     }
 
     #[tokio::test]
@@ -1019,7 +1059,9 @@ mod sub_turn_tests {
         let req = dev_req("write some rust code".to_string(), db, kms, llm);
         let prompt = run_sub_turn(req).await.expect("run_sub_turn");
 
-        let kit_pos = prompt.find("Rust Standards").expect("kit rust standard present");
+        let kit_pos = prompt
+            .find("Rust Standards")
+            .expect("kit rust standard present");
         let overlay_pos = prompt
             .find("always handle the None case")
             .expect("overlay standard present");
@@ -1064,8 +1106,8 @@ mod outcome_tests {
     //! this module before the file split now live in `agent::outcome::pure_helper_tests`
     //! alongside the functions they test.
     use super::*;
-    use async_trait::async_trait;
     use crate::approval::ApprovalBroker;
+    use async_trait::async_trait;
     use haily_db::queries::{sessions, skills as db_skills};
     use haily_db::DbHandle;
     use haily_kms::KmsHandle;
@@ -1225,6 +1267,9 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
@@ -1263,6 +1308,9 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,
@@ -1342,6 +1390,9 @@ mod outcome_tests {
             cancel: CancellationToken::new(),
             approval_tx,
             kill: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             turn_id: uuid::Uuid::new_v4(),
             turn_deletes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_tool_calls: None,

@@ -69,8 +69,16 @@ const SHIP_MAX_TOOL_CALLS: u32 = 4;
 /// cleanly when no server is installed, so the build stage falls back to the build gate + P1
 /// tree-sitter lint with no behavior change on a server-less host.
 const BUILD_TOOLS: &[&str] = &[
-    "fs_read", "fs_list", "fs_grep", "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec",
-    "lsp_diagnostics", "lsp_rename",
+    "fs_read",
+    "fs_list",
+    "fs_grep",
+    "fs_write",
+    "fs_edit",
+    "fs_move",
+    "fs_delete",
+    "shell_exec",
+    "lsp_diagnostics",
+    "lsp_rename",
 ];
 
 /// Review stage tool surface — READ-ONLY plus the synthetic findings emitter. The reviewer
@@ -92,10 +100,16 @@ pub struct VerifierCmd {
 
 impl VerifierCmd {
     pub fn new(program: impl Into<String>, args: &[&str]) -> Self {
-        Self { program: program.into(), args: args.iter().map(|s| s.to_string()).collect() }
+        Self {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
     }
     fn gate(&self) -> Gate {
-        Gate::Command { program: self.program.clone(), args: self.args.clone() }
+        Gate::Command {
+            program: self.program.clone(),
+            args: self.args.clone(),
+        }
     }
 }
 
@@ -141,7 +155,10 @@ fn scaffold_for(tier: Option<Tier>) -> Option<&'static str> {
 /// the Review stage, whose real signal is the persisted findings the wrapper reads back, not a
 /// pass/fail exit code. `git` is guaranteed: the workspace IS a git worktree.
 fn review_liveness_gate() -> Gate {
-    Gate::Command { program: "git".into(), args: vec!["--version".into()] }
+    Gate::Command {
+        program: "git".into(),
+        args: vec!["--version".into()],
+    }
 }
 
 /// Compose the Build+Test pipeline for one phase: `[build (Compile gate), test (Test gate)]`.
@@ -177,7 +194,9 @@ pub fn build_phase_pipeline(
         max_retries: 1,
         grammar: None,
     };
-    Pipeline { runs: vec![build, test] }
+    Pipeline {
+        runs: vec![build, test],
+    }
 }
 
 /// Compose the Review pipeline for one phase: a single independent-reviewer stage. `diff` is the

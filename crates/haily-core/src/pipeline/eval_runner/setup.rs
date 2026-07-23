@@ -23,7 +23,9 @@ const GATE_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 pub async fn stage_throwaway_repo(src: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
     let holder = tempfile::tempdir().context("creating throwaway repo dir")?;
     let repo = holder.path().join("repo");
-    copy_dir_recursive(src, &repo).await.context("copying fixture into throwaway repo")?;
+    copy_dir_recursive(src, &repo)
+        .await
+        .context("copying fixture into throwaway repo")?;
 
     git(&repo, &["init", "-b", "main"]).await?;
     git(&repo, &["config", "user.email", "eval@haily.test"]).await?;
@@ -111,7 +113,9 @@ async fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>
 
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     tokio::fs::create_dir_all(dst).await?;
-    let mut rd = tokio::fs::read_dir(src).await.context("reading source dir")?;
+    let mut rd = tokio::fs::read_dir(src)
+        .await
+        .context("reading source dir")?;
     while let Some(entry) = rd.next_entry().await? {
         let path = entry.path();
         let name = entry.file_name();
@@ -140,7 +144,10 @@ async fn git(dir: &Path, args: &[&str]) -> Result<()> {
         .await
         .context("spawning git")?;
     if !out.status.success() {
-        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }

@@ -20,7 +20,9 @@ async fn spawn_constant_server(content: &'static str) -> (String, Arc<AtomicUsiz
     let c2 = Arc::clone(&count);
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let c = Arc::clone(&c2);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -50,7 +52,9 @@ async fn spawn_system_echo_server() -> (String, Arc<AtomicUsize>) {
     let c2 = Arc::clone(&count);
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let c = Arc::clone(&c2);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
@@ -68,9 +72,8 @@ async fn spawn_system_echo_server() -> (String, Arc<AtomicUsize>) {
                     })
                     .unwrap_or_else(|| "no-system".to_string());
                 c.fetch_add(1, Ordering::SeqCst);
-                let payload =
-                    serde_json::json!({ "choices": [{ "message": { "content": sys } }] })
-                        .to_string();
+                let payload = serde_json::json!({ "choices": [{ "message": { "content": sys } }] })
+                    .to_string();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
@@ -92,10 +95,20 @@ fn cloud_config(base_url: String) -> LlmConfig {
     }
 }
 
-async fn judge_ctx(llm: Arc<LlmRouter>) -> (JudgeContext, mpsc::Receiver<ResponseChunk>, tempfile::TempDir) {
+async fn judge_ctx(
+    llm: Arc<LlmRouter>,
+) -> (
+    JudgeContext,
+    mpsc::Receiver<ResponseChunk>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(DbHandle::init(&dir.path().join("h.db")).await.expect("db"));
-    let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms"));
+    let kms = Arc::new(
+        KmsHandle::init((*db).clone(), dir.path())
+            .await
+            .expect("kms"),
+    );
     let session_id = Uuid::new_v4();
     sessions::create_session(&db, &session_id.to_string(), "judge-test", None)
         .await
@@ -107,6 +120,9 @@ async fn judge_ctx(llm: Arc<LlmRouter>) -> (JudgeContext, mpsc::Receiver<Respons
         llm,
         broker: Arc::new(ApprovalBroker::new()),
         kill: Arc::new(AtomicBool::new(false)),
+        approval_mode: crate::permission_mode::new_handle(
+            crate::permission_mode::ApprovalMode::AcceptEdits,
+        ),
         cancel: CancellationToken::new(),
         user_tx,
         session_id,
@@ -123,12 +139,28 @@ async fn deep_plan_design_runs_two_lenses_and_one_synthesis() {
 
     let out = plan_design(&jc, "add a rate limiter to the API", DepthMode::Deep).await;
 
-    assert_eq!(out.design_calls, 3, "Deep = 2 lens + 1 synthesis design calls");
-    assert_eq!(count.load(Ordering::SeqCst), 3, "exactly 3 LLM calls for the Deep panel");
+    assert_eq!(
+        out.design_calls, 3,
+        "Deep = 2 lens + 1 synthesis design calls"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        3,
+        "exactly 3 LLM calls for the Deep panel"
+    );
     assert_eq!(out.lens_designs.len(), 2, "both lens designs are retained");
-    assert!(out.lens_designs[0].contains("RISK-FIRST"), "first lens is risk-first");
-    assert!(out.lens_designs[1].contains("SIMPLICITY-FIRST"), "second lens is simplicity-first");
-    assert!(out.design.contains("synthesizer"), "final design came from the grafting synthesis");
+    assert!(
+        out.lens_designs[0].contains("RISK-FIRST"),
+        "first lens is risk-first"
+    );
+    assert!(
+        out.lens_designs[1].contains("SIMPLICITY-FIRST"),
+        "second lens is simplicity-first"
+    );
+    assert!(
+        out.design.contains("synthesizer"),
+        "final design came from the grafting synthesis"
+    );
 }
 
 #[tokio::test]
@@ -139,8 +171,15 @@ async fn normal_plan_design_runs_one_design() {
 
     let out = plan_design(&jc, "add a rate limiter to the API", DepthMode::Normal).await;
 
-    assert_eq!(out.design_calls, 1, "Normal = a single design call (cost delta vs Deep=3)");
-    assert_eq!(count.load(Ordering::SeqCst), 1, "exactly 1 LLM call for Normal");
+    assert_eq!(
+        out.design_calls, 1,
+        "Normal = a single design call (cost delta vs Deep=3)"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "exactly 1 LLM call for Normal"
+    );
     assert!(out.lens_designs.is_empty(), "Normal runs no lens fan-out");
 }
 
@@ -155,7 +194,10 @@ async fn refuter_majority_kills_a_planted_false_positive() {
     let (jc, _rx, _dir) = judge_ctx(llm).await;
 
     let survives = refuter_votes(&jc, "unwrap in prod path", "let x = maybe.unwrap();").await;
-    assert!(!survives, "a finding both refuters confidently refute must be killed");
+    assert!(
+        !survives,
+        "a finding both refuters confidently refute must be killed"
+    );
 }
 
 #[tokio::test]
@@ -168,20 +210,37 @@ async fn refuter_survives_when_not_refuted() {
     let llm = Arc::new(LlmRouter::init(cloud_config(url)).await);
     let (jc, _rx, _dir) = judge_ctx(llm).await;
 
-    let survives = refuter_votes(&jc, "SQL injection in query builder", "format!(\"...{}\", input)").await;
-    assert!(survives, "a genuine finding no refuter can refute must survive to the fix loop");
+    let survives = refuter_votes(
+        &jc,
+        "SQL injection in query builder",
+        "format!(\"...{}\", input)",
+    )
+    .await;
+    assert!(
+        survives,
+        "a genuine finding no refuter can refute must survive to the fix loop"
+    );
 }
 
 #[tokio::test]
 async fn ultra_unavailable_apex_falls_back_to_session_tier_with_warning() {
     // Local-only config: NO cloud keys → NoopClient primary, no fallback → Ultra unreachable.
-    let local_only = LlmConfig { cloud_api_keys: vec![], ..LlmConfig::default() };
+    let local_only = LlmConfig {
+        cloud_api_keys: vec![],
+        ..LlmConfig::default()
+    };
     let llm = Arc::new(LlmRouter::init(local_only).await);
-    assert!(!llm.ultra_reachable(), "a keyless local-only router must report Ultra unreachable");
+    assert!(
+        !llm.ultra_reachable(),
+        "a keyless local-only router must report Ultra unreachable"
+    );
     let (jc, mut rx, _dir) = judge_ctx(llm).await;
 
     let out = apex_judge(&jc, "A vs B", "some evidence", "pick the safer one").await;
-    assert!(out.warned_tier_fallback, "apex must report it fell back off Ultra");
+    assert!(
+        out.warned_tier_fallback,
+        "apex must report it fell back off Ultra"
+    );
 
     // An explicit warning chunk must have reached the user stream.
     let mut warned = false;
@@ -192,7 +251,10 @@ async fn ultra_unavailable_apex_falls_back_to_session_tier_with_warning() {
             }
         }
     }
-    assert!(warned, "an explicit Ultra-unavailable warning chunk must be emitted, not a silent collapse");
+    assert!(
+        warned,
+        "an explicit Ultra-unavailable warning chunk must be emitted, not a silent collapse"
+    );
 }
 
 #[test]

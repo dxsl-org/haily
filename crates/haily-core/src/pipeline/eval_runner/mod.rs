@@ -59,8 +59,16 @@ use crate::pipeline::runner::PipelineRunner;
 /// ship hard-block (SEC-H): the ship stage's whitelist snapshots from this registry, so it
 /// resolves to an empty tool set and the model literally cannot apply to a real repo.
 const EVAL_ALLOWED_TOOLS: &[&str] = &[
-    "fs_read", "fs_list", "fs_grep", "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec",
-    "git_status", "git_diff",
+    "fs_read",
+    "fs_list",
+    "fs_grep",
+    "fs_write",
+    "fs_edit",
+    "fs_move",
+    "fs_delete",
+    "shell_exec",
+    "git_status",
+    "git_diff",
 ];
 
 /// Privileged eval-mode witness (red-team SEC-H). Its presence authorizes the plan-gate
@@ -183,9 +191,14 @@ pub async fn run_coding_eval(
     let original_hash = setup::tree_hash(fixture_src).await?;
     let (_repo_holder, repo) = setup::stage_throwaway_repo(fixture_src).await?;
     let worktrees_holder = tempfile::tempdir()?;
-    let workspace =
-        CodingWorkspace::open(&deps.db, &session_id.to_string(), &repo, worktrees_holder.path(), None)
-            .await?;
+    let workspace = CodingWorkspace::open(
+        &deps.db,
+        &session_id.to_string(),
+        &repo,
+        worktrees_holder.path(),
+        None,
+    )
+    .await?;
 
     let base_tools = eval_base_registry(&workspace, &manifest.id, &manifest.description);
     let broker = Arc::new(ApprovalBroker::new());
@@ -203,6 +216,7 @@ pub async fn run_coding_eval(
             base_tools,
             Arc::clone(&broker) as Arc<dyn ApprovalGate>,
             Arc::new(AtomicBool::new(false)),
+            crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits),
             cancel.clone(),
             user_tx,
             ev_tx,
@@ -252,7 +266,8 @@ pub async fn run_coding_eval(
 
     // Deterministic gate scoring.
     let gate = manifest.gate_cmd()?;
-    let gate_exit = setup::run_gate_command(&gate.program, &gate.args, workspace.worktree_root()).await?;
+    let gate_exit =
+        setup::run_gate_command(&gate.program, &gate.args, workspace.worktree_root()).await?;
     let after_hash = setup::tree_hash(fixture_src).await?;
     let journal_rows = pipeline_runs::count_for_session(&deps.db, &session_id.to_string())
         .await
@@ -288,11 +303,7 @@ pub async fn run_coding_eval(
 
 /// Build the eval base registry: the coding tool surface MINUS ship tools (structural
 /// ship-block) + the three synthetic pipeline emitters (per-run, workspace-scoped).
-fn eval_base_registry(
-    workspace: &CodingWorkspace,
-    slug: &str,
-    task: &str,
-) -> Arc<ToolRegistry> {
+fn eval_base_registry(workspace: &CodingWorkspace, slug: &str, task: &str) -> Arc<ToolRegistry> {
     let mut reg = ToolRegistry::build_v1().sub_registry(EVAL_ALLOWED_TOOLS);
     let root = workspace.worktree_root().to_path_buf();
     reg.register(Arc::new(EmitPlanDraftTool::new(root.clone(), slug)));
@@ -314,7 +325,10 @@ fn spawn_eval_auto_responder(
     use haily_types::ApprovalResolver;
     tokio::spawn(async move {
         while let Some(chunk) = user_rx.recv().await {
-            if let ResponseChunk::ToolApprovalRequest { tool, approval_id, .. } = chunk {
+            if let ResponseChunk::ToolApprovalRequest {
+                tool, approval_id, ..
+            } = chunk
+            {
                 // SCOPED: only the plan/ship checkpoint is auto-approved; the ship's real write
                 // (worktree_apply) is separately hard-blocked (absent from the registry), so
                 // approving the checkpoint can never apply to a real repo. Everything else — any
@@ -340,14 +354,25 @@ fn drain_telemetry(
         match ev {
             RunEvent::StageStarted { stage, tier, .. } => {
                 let tier = tier.unwrap_or_else(|| "default".to_string());
-                egress.push(EgressTag { attempt, tier: tier.clone(), egress: tier_egress(&tier) });
-                per_stage.push(serde_json::json!({ "stage": stage, "attempt": attempt, "tier": tier }));
+                egress.push(EgressTag {
+                    attempt,
+                    tier: tier.clone(),
+                    egress: tier_egress(&tier),
+                });
+                per_stage
+                    .push(serde_json::json!({ "stage": stage, "attempt": attempt, "tier": tier }));
                 attempt += 1;
             }
             RunEvent::Escalation { to, .. } => {
                 escalations += 1;
-                egress.push(EgressTag { attempt, tier: to.clone(), egress: tier_egress(&to) });
-                per_stage.push(serde_json::json!({ "stage": "<escalated>", "attempt": attempt, "tier": to }));
+                egress.push(EgressTag {
+                    attempt,
+                    tier: to.clone(),
+                    egress: tier_egress(&to),
+                });
+                per_stage.push(
+                    serde_json::json!({ "stage": "<escalated>", "attempt": attempt, "tier": to }),
+                );
                 attempt += 1;
             }
             _ => {}

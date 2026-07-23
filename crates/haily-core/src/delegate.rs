@@ -61,6 +61,10 @@ pub struct DelegateTool {
     /// threaded into every `SubTurnRequest` so a sub-turn write observes
     /// `safety.disable_writes` too. Cloned into the request in `execute`.
     pub kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): the SAME `Arc<AtomicU8>`-
+    /// backed handle the Orchestrator holds, threaded into every `SubTurnRequest` so a
+    /// sub-turn write observes `approval.mode` too. Mirrors `kill` exactly.
+    pub approval_mode: crate::permission_mode::ApprovalModeHandle,
 }
 
 #[async_trait]
@@ -179,6 +183,7 @@ impl Tool for DelegateTool {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             // Harness Completion phase 2: reuse the CALLING context's turn identity/counter
             // rather than minting a fresh one. A delegated sub-turn is part of the turn that
             // requested it (the parent LLM chose to delegate mid-turn), not a new logical
@@ -456,6 +461,9 @@ mod reload_propagation_tests {
             max_depth: 1,
             model_tier: None,
             kill: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
         };
 
         let (approval_tx, _rx) = tokio::sync::mpsc::channel(8);

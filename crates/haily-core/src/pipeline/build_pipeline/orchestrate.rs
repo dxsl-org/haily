@@ -109,9 +109,12 @@ pub async fn run_build(
     for phase in &spec.phases {
         // Exemplars: same-extension recent neighbors, excluding the phase's own target files.
         let ext = exemplar::primary_ext(&phase.target_files).unwrap_or_default();
-        let exemplar_block =
-            exemplar::build_exemplar_block(spec.workspace.worktree_root(), &ext, &phase.target_files)
-                .await;
+        let exemplar_block = exemplar::build_exemplar_block(
+            spec.workspace.worktree_root(),
+            &ext,
+            &phase.target_files,
+        )
+        .await;
         // The commit before this phase's first build — the base for the phase diff shown to Review.
         let phase_base = diff::head_sha(spec.workspace).await;
 
@@ -128,8 +131,9 @@ pub async fn run_build(
                 &spec.test,
                 feedback.as_deref(),
             );
-            let bt_report =
-                runner.run(spec.run_spec(bt, BUILD_SYSTEM_PROMPT, BUILD_DOMAIN)).await?;
+            let bt_report = runner
+                .run(spec.run_spec(bt, BUILD_SYSTEM_PROMPT, BUILD_DOMAIN))
+                .await?;
             total_retries += bt_report.retries;
             if bt_report.status != RunStatus::Done {
                 // Compile/Test could not pass — honest failure, nothing shipped.
@@ -140,8 +144,9 @@ pub async fn run_build(
             // injected into the distinct reviewer sub-turn (reviewer ≠ builder).
             let phase_diff = diff::diff_since(spec.workspace, phase_base.as_deref()).await;
             let review = build_review_pipeline(phase, &phase_diff);
-            let rev_report =
-                runner.run(spec.run_spec(review, REVIEW_SYSTEM_PROMPT, BUILD_DOMAIN)).await?;
+            let rev_report = runner
+                .run(spec.run_spec(review, REVIEW_SYSTEM_PROMPT, BUILD_DOMAIN))
+                .await?;
             total_retries += rev_report.retries;
             if rev_report.status != RunStatus::Done {
                 return Ok(report(rev_report.run_id, RunStatus::Paused, total_retries));
@@ -159,8 +164,10 @@ pub async fn run_build(
             // Phase 8: persist every finding to the cross-run history so the Ship recurrence
             // detector can spot a class that keeps coming back (best-effort — never blocks build).
             persist_review_findings(db, &rev_report.run_id, &spec, &all_findings).await;
-            let mut criticals: Vec<Finding> =
-                all_findings.into_iter().filter(|f| f.is_critical()).collect();
+            let mut criticals: Vec<Finding> = all_findings
+                .into_iter()
+                .filter(|f| f.is_critical())
+                .collect();
             // Deep: run refuter votes on each model-reported Critical. A finding survives on at
             // least one non-refutation (uncertainty defaults to NOT refuted, so it stands) and
             // is dropped only when a majority of refuters confidently refute it — cutting the
@@ -197,9 +204,12 @@ pub async fn run_build(
             // against THIS round's own compile-gate output so the model never sees the same
             // error twice. Best-effort — a missing/degraded server yields no lines and the round
             // proceeds on reviewer findings alone.
-            let lsp_lines =
-                lsp_fix_signal(spec.workspace, &phase.target_files, &bt_report.last_gate_output)
-                    .await;
+            let lsp_lines = lsp_fix_signal(
+                spec.workspace,
+                &phase.target_files,
+                &bt_report.last_gate_output,
+            )
+            .await;
             feedback = Some(append_lsp_signal(render_feedback(&criticals), &lsp_lines));
             round += 1;
         }
@@ -212,10 +222,16 @@ pub async fn run_build(
     // Every phase built + reviewed clean → the ONLY write to the real repo.
     let summary = ship_summary(&spec.phases);
     let ship = ship_pipeline(&summary);
-    let ship_report = runner.run(spec.run_spec(ship, SHIP_SYSTEM_PROMPT, BUILD_DOMAIN)).await?;
+    let ship_report = runner
+        .run(spec.run_spec(ship, SHIP_SYSTEM_PROMPT, BUILD_DOMAIN))
+        .await?;
     total_retries += ship_report.retries;
     let ship_report = finalize_ship_report(ship_report, spec.workspace);
-    Ok(report(ship_report.run_id, ship_report.status, total_retries))
+    Ok(report(
+        ship_report.run_id,
+        ship_report.status,
+        total_retries,
+    ))
 }
 
 /// Filesystem evidence that `worktree_apply` actually completed. A successful apply
@@ -243,7 +259,10 @@ fn finalize_ship_report(report: RunReport, workspace: &CodingWorkspace) -> RunRe
             run = %report.run_id,
             "ship stage completed with no evidence worktree_apply ran — downgrading to paused"
         );
-        return RunReport { status: RunStatus::Paused, ..report };
+        return RunReport {
+            status: RunStatus::Paused,
+            ..report
+        };
     }
     report
 }
@@ -288,7 +307,12 @@ fn report(run_id: String, status: RunStatus, retries: u32) -> RunReport {
     // A synthetic terminal report for an early-exit path (build/test failed, review paused, or
     // the fix loop is unresolved) — there is no further round to enrich, so the gate-output
     // signal is irrelevant here (unlike the `RunReport` the runner itself returns).
-    RunReport { run_id, status, retries, last_gate_output: String::new() }
+    RunReport {
+        run_id,
+        status,
+        retries,
+        last_gate_output: String::new(),
+    }
 }
 
 /// Best-effort LSP-only semantic-diagnostic lines for the phase's changed files, deduplicated
@@ -379,7 +403,8 @@ async fn on_cooldown(db: &DbHandle, class_key: &str) -> bool {
     let Ok(Some(last)) = meta::get_preference(db, &cooldown_key(class_key)).await else {
         return false;
     };
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(DISTILLATION_COOLDOWN_DAYS)).to_rfc3339();
+    let cutoff =
+        (chrono::Utc::now() - chrono::Duration::days(DISTILLATION_COOLDOWN_DAYS)).to_rfc3339();
     // A marker NEWER than the cutoff means we proposed recently → still on cooldown.
     last.as_str() > cutoff.as_str()
 }
@@ -440,8 +465,13 @@ async fn emit_distillation_proposals(db: &DbHandle, spec: &BuildRunSpec<'_>) {
                 .await;
         }
         // Mark cooldown whether or not a sender was wired — a proposal was decided for this class.
-        if let Err(e) =
-            meta::upsert_preference(db, &cooldown_key(&ck), &chrono::Utc::now().to_rfc3339(), "system").await
+        if let Err(e) = meta::upsert_preference(
+            db,
+            &cooldown_key(&ck),
+            &chrono::Utc::now().to_rfc3339(),
+            "system",
+        )
+        .await
         {
             tracing::warn!("distillation cooldown marker write failed: {e:#}");
         }
@@ -461,7 +491,11 @@ mod tests {
             .output()
             .await
             .expect("git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     async fn workspace_fixture() -> (CodingWorkspace, Vec<tempfile::TempDir>) {
@@ -469,7 +503,9 @@ mod tests {
         git(repo.path(), &["init", "-b", "main"]).await;
         git(repo.path(), &["config", "user.email", "t@haily.test"]).await;
         git(repo.path(), &["config", "user.name", "Test"]).await;
-        tokio::fs::write(repo.path().join("README.md"), "hello\n").await.unwrap();
+        tokio::fs::write(repo.path().join("README.md"), "hello\n")
+            .await
+            .unwrap();
         git(repo.path(), &["add", "."]).await;
         git(repo.path(), &["commit", "-m", "init"]).await;
 
@@ -481,20 +517,34 @@ mod tests {
             .unwrap();
 
         let wt_root = tempfile::tempdir().unwrap();
-        let ws = CodingWorkspace::open(&db, &session_id.to_string(), repo.path(), wt_root.path(), None)
-            .await
-            .expect("open workspace");
+        let ws = CodingWorkspace::open(
+            &db,
+            &session_id.to_string(),
+            repo.path(),
+            wt_root.path(),
+            None,
+        )
+        .await
+        .expect("open workspace");
         (ws, vec![repo, dbdir, wt_root])
     }
 
     fn rr(status: RunStatus) -> RunReport {
-        RunReport { run_id: "r1".to_string(), status, retries: 0, last_gate_output: String::new() }
+        RunReport {
+            run_id: "r1".to_string(),
+            status,
+            retries: 0,
+            last_gate_output: String::new(),
+        }
     }
 
     #[tokio::test]
     async fn no_apply_evidence_downgrades_done_to_paused() {
         let (ws, _dirs) = workspace_fixture().await;
-        assert!(!apply_evidence_exists(&ws), "an intact worktree is NOT evidence of a completed apply");
+        assert!(
+            !apply_evidence_exists(&ws),
+            "an intact worktree is NOT evidence of a completed apply"
+        );
         let out = finalize_ship_report(rr(RunStatus::Done), &ws);
         assert_eq!(
             out.status,
@@ -509,9 +559,16 @@ mod tests {
         // Simulate a completed worktree_apply: it removes the ephemeral worktree directory as
         // its final step.
         tokio::fs::remove_dir_all(ws.worktree_root()).await.unwrap();
-        assert!(apply_evidence_exists(&ws), "a removed worktree root IS evidence of a completed apply");
+        assert!(
+            apply_evidence_exists(&ws),
+            "a removed worktree root IS evidence of a completed apply"
+        );
         let out = finalize_ship_report(rr(RunStatus::Done), &ws);
-        assert_eq!(out.status, RunStatus::Done, "real evidence must not be second-guessed");
+        assert_eq!(
+            out.status,
+            RunStatus::Done,
+            "real evidence must not be second-guessed"
+        );
     }
 
     #[tokio::test]
@@ -519,7 +576,10 @@ mod tests {
         let (ws, _dirs) = workspace_fixture().await;
         for status in [RunStatus::Paused, RunStatus::Failed, RunStatus::Interrupted] {
             let out = finalize_ship_report(rr(status), &ws);
-            assert_eq!(out.status, status, "an already-honest non-Done outcome must never be rewritten");
+            assert_eq!(
+                out.status, status,
+                "an already-honest non-Done outcome must never be rewritten"
+            );
         }
     }
 
@@ -549,14 +609,20 @@ mod tests {
             !feedback.contains("mismatched types"),
             "a diagnostic the build gate already reported must be dropped, not duplicated"
         );
-        assert!(feedback.starts_with(&base), "reviewer findings stay first; LSP lines are additive");
+        assert!(
+            feedback.starts_with(&base),
+            "reviewer findings stay first; LSP lines are additive"
+        );
     }
 
     #[test]
     fn append_lsp_signal_is_a_no_op_when_there_is_nothing_to_add() {
         let base = "The independent review found unresolved CRITICAL issues:\n1. bug".to_string();
         let feedback = append_lsp_signal(base.clone(), &[]);
-        assert_eq!(feedback, base, "no LSP lines means the fix feedback is left completely unaffected");
+        assert_eq!(
+            feedback, base,
+            "no LSP lines means the fix feedback is left completely unaffected"
+        );
     }
 
     #[tokio::test]
@@ -565,7 +631,8 @@ mod tests {
         // absent-server path through the REAL async collector, without requiring an actual
         // language server binary on the test host — the round must be unaffected, never fail.
         let (ws, _dirs) = workspace_fixture().await;
-        let lines = lsp_fix_signal(&ws, &["README.md".to_string()], "irrelevant build output").await;
+        let lines =
+            lsp_fix_signal(&ws, &["README.md".to_string()], "irrelevant build output").await;
         assert!(
             lines.is_empty(),
             "no server for the file's language must yield zero lines, never fail the round"

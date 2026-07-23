@@ -88,6 +88,9 @@ pub struct LaunchDeps {
     /// The session's real kill switch (`safety.disable_writes`) — honored identically to a
     /// normal turn.
     pub kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): the session's real
+    /// `approval.mode` live handle — honored identically to a normal turn.
+    pub approval_mode: crate::permission_mode::ApprovalModeHandle,
 }
 
 /// Drive `spec` to completion against a real target repo: resolve the repo, open an ephemeral
@@ -134,6 +137,7 @@ pub async fn launch_coding_run(
         base_tools,
         Arc::clone(&deps.broker),
         Arc::clone(&deps.kill),
+        Arc::clone(&deps.approval_mode),
         cancel,
         user_tx.clone(),
         events_tx,

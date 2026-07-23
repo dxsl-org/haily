@@ -131,7 +131,10 @@ mod tests {
         let mut i = clean_inputs();
         i.gate_exit = None;
         let r = score(&i);
-        assert!(!r.passed, "an absent verifier toolchain is scored as a fail (AD-M3)");
+        assert!(
+            !r.passed,
+            "an absent verifier toolchain is scored as a fail (AD-M3)"
+        );
         assert!(r.gates[0].detail.contains("absent"));
     }
 
@@ -141,7 +144,10 @@ mod tests {
         i.ship_applied = true;
         let r = score(&i);
         assert!(!r.passed, "a ship apply in eval must fail the run");
-        assert!(r.gates.iter().any(|g| g.gate == "ship_not_applied" && !g.pass));
+        assert!(r
+            .gates
+            .iter()
+            .any(|g| g.gate == "ship_not_applied" && !g.pass));
     }
 
     #[test]
@@ -149,7 +155,10 @@ mod tests {
         // CRITICAL (reproducibility): identical inputs → byte-identical serialized score.
         let a = score(&clean_inputs()).to_json();
         let b = score(&clean_inputs()).to_json();
-        assert_eq!(a, b, "scoring must be reproducible/bit-stable for the scripted suite");
+        assert_eq!(
+            a, b,
+            "scoring must be reproducible/bit-stable for the scripted suite"
+        );
         // And a different input set differs (the digest actually discriminates).
         let mut other = clean_inputs();
         other.gate_exit = Some(1);

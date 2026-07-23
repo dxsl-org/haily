@@ -28,7 +28,10 @@ async fn isolated_env(ws: &CodingWorkspace) -> Option<(String, String)> {
         return None;
     }
     let alt_rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let alt_abs = Path::new(&repo).join(alt_rel).to_string_lossy().into_owned();
+    let alt_abs = Path::new(&repo)
+        .join(alt_rel)
+        .to_string_lossy()
+        .into_owned();
     let obj = ws.object_dir().to_string_lossy().into_owned();
     Some((obj, alt_abs))
 }
@@ -55,8 +58,12 @@ pub async fn head_sha(ws: &CodingWorkspace) -> Option<String> {
 /// Empty string when `base` is `None`/unreadable, HEAD equals base, or git errors — a degraded
 /// (empty) diff never aborts the review.
 pub async fn diff_since(ws: &CodingWorkspace, base: Option<&str>) -> String {
-    let Some(base) = base else { return String::new() };
-    let Some(env) = isolated_env(ws).await else { return String::new() };
+    let Some(base) = base else {
+        return String::new();
+    };
+    let Some(env) = isolated_env(ws).await else {
+        return String::new();
+    };
     let out = Command::new("git")
         .args(["-C", &ws.row.worktree_path, "diff", base, "HEAD"])
         .env("GIT_OBJECT_DIRECTORY", &env.0)

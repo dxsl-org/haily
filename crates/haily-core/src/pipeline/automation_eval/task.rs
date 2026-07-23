@@ -90,7 +90,8 @@ pub struct AutomationTask {
 /// # Errors
 /// Returns an error if the document is not valid JSON or is missing a required field.
 pub fn parse_automation_task(src: &str) -> Result<AutomationTask> {
-    serde_json::from_str(src).context("automation task fixture parse failed (expected JSON-in-YAML)")
+    serde_json::from_str(src)
+        .context("automation task fixture parse failed (expected JSON-in-YAML)")
 }
 
 impl StateAssertion {
@@ -156,7 +157,10 @@ mod tests {
             expect_absent: false,
         };
         assert!(a.holds(std::slice::from_ref(&rec)));
-        assert!(!a.holds(&[]), "no matching record fails a positive field assertion");
+        assert!(
+            !a.holds(&[]),
+            "no matching record fails a positive field assertion"
+        );
 
         let absent = StateAssertion {
             model: "res.partner".into(),
@@ -166,7 +170,10 @@ mod tests {
             assert_equals: None,
             expect_absent: true,
         };
-        assert!(absent.holds(&[]), "expect_absent passes when nothing matches");
+        assert!(
+            absent.holds(&[]),
+            "expect_absent passes when nothing matches"
+        );
         assert!(!absent.holds(std::slice::from_ref(&rec)));
     }
 }

@@ -841,3 +841,20 @@ export async function promoteSkill(name: string): Promise<string> {
 export async function archiveSkillManual(name: string): Promise<void> {
   return invoke('archive_skill_manual', { name });
 }
+
+/** Name-sorted authored skills currently served from a recovery snapshot because their on-disk
+ * file failed manifest-hash verification (review MED-1: tamper/interrupted-edit signal). Empty
+ * on a clean load — poll or check on the Skills screen to badge any name present here. */
+export async function listRecoveredSkills(): Promise<string[]> {
+  return invoke('list_recovered_skills');
+}
+
+/** The named permission ladder (Unified Chat UI phase 11, D5). Unset/unknown reads as
+ * `manual` — the strictest rung — everywhere this is consumed. */
+export type ApprovalMode = 'manual' | 'accept_edits' | 'auto';
+
+/** Set the permission ladder. Backend normalizes any unrecognized string to `manual` and
+ * persists BEFORE flipping the live handle (fails toward the stricter mode on a crash). */
+export async function setApprovalMode(mode: ApprovalMode): Promise<void> {
+  return invoke('set_approval_mode', { mode });
+}

@@ -126,19 +126,28 @@ pub async fn run_automation_eval(
     // manifest at the loopback mock, and the TEST-ONLY `allow_loopback` lets the SSRF guard
     // permit it. Production wiring never sets either — this path is unreachable without EvalMode.
     let kill = Arc::new(AtomicBool::new(false));
+    // `AcceptEdits`: the eval must still see the IrreversibleWrite approval prompt FIRE (the
+    // `approval_fired` differentiator assertion below) — `Auto` mode would skip it entirely.
+    let approval_mode =
+        crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits);
     let overlay = ConnectionOverlay {
         base_url_override: Some(mock.base_url.clone()),
         db: Some("eval".to_string()),
         uid: Some(1),
         cred_ref_override: None,
     };
-    let mut cfg = HttpExecutorConfig::production(Arc::clone(&manifest), Arc::clone(&kill), EVAL_CONNECTOR_TIMEOUT)
-        .with_connection_overlay(Some(overlay));
+    let mut cfg = HttpExecutorConfig::production(
+        Arc::clone(&manifest),
+        Arc::clone(&kill),
+        EVAL_CONNECTOR_TIMEOUT,
+    )
+    .with_connection_overlay(Some(overlay));
     cfg.allow_loopback = true; // eval-only; gated by EvalMode, never set in production.
     let executor: Arc<dyn ConnectorExecutor> = Arc::new(HttpExecutor::new(cfg));
 
     let registry = build_registry(&manifest, Arc::clone(&executor), Arc::clone(&kill));
-    let resolver = ConnectorResolver::for_manifest(&manifest, Arc::clone(&executor), EVAL_MANIFEST_HASH);
+    let resolver =
+        ConnectorResolver::for_manifest(&manifest, Arc::clone(&executor), EVAL_MANIFEST_HASH);
 
     // Real broker + an eval auto-responder: APPROVES every connector approval request (so a
     // destructive step actually executes and its collateral damage is observable to the
@@ -146,7 +155,12 @@ pub async fn run_automation_eval(
     let broker = Arc::new(ApprovalBroker::new());
     let (approval_tx, approval_rx) = mpsc::channel::<ResponseChunk>(64);
     let approval_fired = Arc::new(AtomicBool::new(false));
-    let responder = spawn_eval_auto_responder(approval_rx, Arc::clone(&broker), session_id, Arc::clone(&approval_fired));
+    let responder = spawn_eval_auto_responder(
+        approval_rx,
+        Arc::clone(&broker),
+        session_id,
+        Arc::clone(&approval_fired),
+    );
 
     let cancel = CancellationToken::new();
     let ctx = ToolContext {
@@ -174,7 +188,15 @@ pub async fn run_automation_eval(
     // Drive the scripted connector steps through the REAL dispatch harness (a failing step is a
     // scored outcome, never an early return — the objective/guardrail assertions judge it).
     for step in &task.steps {
-        let _ = tool_call::dispatch(&step.tool, step.params.clone(), &registry, &ctx, &kill).await;
+        let _ = tool_call::dispatch(
+            &step.tool,
+            step.params.clone(),
+            &registry,
+            &ctx,
+            &kill,
+            &approval_mode,
+        )
+        .await;
     }
     drop(ctx); // drops the only approval_tx → the responder's channel closes.
     let _ = responder.await;
@@ -186,14 +208,22 @@ pub async fn run_automation_eval(
     let (guardrail_pass, guardrail_total) = eval_assertions(mock, &task.guardrail_assertions);
     let guardrail_violations = guardrail_total - guardrail_pass;
 
-    let journal_rows = journal::list_by_turn(&deps.db, &turn_id.to_string(), &session_id.to_string())
-        .await
-        .map(|r| r.len())
-        .unwrap_or(0);
+    let journal_rows =
+        journal::list_by_turn(&deps.db, &turn_id.to_string(), &session_id.to_string())
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0);
 
     // Undo the whole turn (connector rows journal by turn_id, NOT run_id — see the Deviation
     // Log), then assert the seed state is restored bit-equal.
-    let _ = undo_turn(&deps.db, &deps.kms, &resolver, &turn_id.to_string(), &session_id.to_string()).await;
+    let _ = undo_turn(
+        &deps.db,
+        &deps.kms,
+        &resolver,
+        &turn_id.to_string(),
+        &session_id.to_string(),
+    )
+    .await;
     let undo_restored = mock.digest() == seed_digest;
 
     let score = scoring::score(&ScoreInputs {
@@ -319,7 +349,10 @@ async fn persist(deps: &AutomationDeps, outcome: &AutomationOutcome) -> Result<S
 pub fn render_automation_outcome(outcome: &AutomationOutcome) -> String {
     let s = &outcome.score;
     let mut out = String::new();
-    out.push_str(&format!("## Automation eval: {} ({})\n\n", outcome.task_id, outcome.domain));
+    out.push_str(&format!(
+        "## Automation eval: {} ({})\n\n",
+        outcome.task_id, outcome.domain
+    ));
     out.push_str(
         "> Metrics are NON-COMPARABLE (AutomationBench's two orgs, two lenses, one task set):\n\n",
     );
@@ -331,7 +364,10 @@ pub fn render_automation_outcome(outcome: &AutomationOutcome) -> String {
         "- Strict-binary (Zapier lens): {}\n",
         if s.strict_binary { "PASS" } else { "FAIL" }
     ));
-    out.push_str(&format!("- **Verdict: {}**\n\n", if s.passed { "PASS" } else { "FAIL" }));
+    out.push_str(&format!(
+        "- **Verdict: {}**\n\n",
+        if s.passed { "PASS" } else { "FAIL" }
+    ));
     out.push_str("| Differentiator gate | Result | Detail |\n|---|---|---|\n");
     for g in &s.gates {
         out.push_str(&format!(
@@ -369,6 +405,9 @@ mod tests {
         );
         let mut cli = chat;
         cli.origin = RequestOrigin::Cli;
-        assert!(EvalMode::from_request(&cli).is_some(), "only a CLI origin enables it");
+        assert!(
+            EvalMode::from_request(&cli).is_some(),
+            "only a CLI origin enables it"
+        );
     }
 }

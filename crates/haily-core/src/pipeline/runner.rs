@@ -186,6 +186,9 @@ pub struct PipelineRunner {
     broker: Arc<dyn ApprovalGate>,
     /// Kill switch (`safety.disable_writes`) — observed between stages AND by dispatch.
     kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): `approval.mode`, threaded
+    /// into every stage sub-turn's dispatch — mirrors `kill` exactly.
+    approval_mode: crate::permission_mode::ApprovalModeHandle,
     /// Shutdown/cancel token for the run; a stage sub-turn gets a `child_token()`.
     cancel: CancellationToken,
     /// The real user response stream — where the forwarder relays a stage's approval requests
@@ -211,6 +214,7 @@ impl PipelineRunner {
         base_tools: Arc<ToolRegistry>,
         broker: Arc<dyn ApprovalGate>,
         kill: Arc<AtomicBool>,
+        approval_mode: crate::permission_mode::ApprovalModeHandle,
         cancel: CancellationToken,
         user_tx: mpsc::Sender<ResponseChunk>,
         events: mpsc::Sender<RunEvent>,
@@ -223,6 +227,7 @@ impl PipelineRunner {
             base_tools,
             broker,
             kill,
+            approval_mode,
             cancel,
             user_tx,
             events,
@@ -247,12 +252,16 @@ impl PipelineRunner {
         match db_skills::most_recent_trace(&self.db, &sid).await {
             Ok(Some(trace)) => {
                 let outcome = if pass { "success" } else { "failure" };
-                if let Err(e) = db_skills::apply_gate_result_label(&self.db, &trace.id, outcome).await {
+                if let Err(e) =
+                    db_skills::apply_gate_result_label(&self.db, &trace.id, outcome).await
+                {
                     tracing::warn!(run_session = %sid, "gate-result label write failed: {e:#}");
                 }
             }
             Ok(None) => tracing::debug!(run_session = %sid, "no trace to label with gate result"),
-            Err(e) => tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}"),
+            Err(e) => {
+                tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}")
+            }
         }
     }
 
@@ -347,6 +356,7 @@ impl PipelineRunner {
             llm,
             broker: Arc::clone(&self.broker),
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             cancel: self.cancel.clone(),
             user_tx: self.user_tx.clone(),
             session_id,
@@ -500,8 +510,10 @@ impl PipelineRunner {
         let llm_for_policy = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
         let egress = self.derive_egress(&llm_for_policy).await;
         let highest_local_tier = llm_for_policy.highest_local_tier();
-        let session_default_tier =
-            llm_for_policy.snapshot().session_tier(&[]).unwrap_or(Tier::Fast);
+        let session_default_tier = llm_for_policy
+            .snapshot()
+            .session_tier(&[])
+            .unwrap_or(Tier::Fast);
         let cost_quality = llm_for_policy.cost_quality();
         // ONE policy for the WHOLE run (config-sourced `enabled`/`max_tier`; `enabled` mirrors
         // the pre-existing `self.escalation_enabled` field so a disabled run is a total no-op —
@@ -633,19 +645,42 @@ impl PipelineRunner {
                                 Ok(GateVerdict::Pass) => {} // confirmed — fall through to `break true`
                                 Ok(_) => {
                                     // The confirming re-run disagreed — treat as a fail this attempt.
-                                    feedback = Some("flaky gate: confirming re-run failed".to_string());
+                                    feedback =
+                                        Some("flaky gate: confirming re-run failed".to_string());
                                     last_fail_hash = Some(cur_hash);
                                     attempts_remaining -= 1;
                                     // FMA-C1 review fix: persist the decrement INSIDE the retry
                                     // loop (see the Fail branch below for the full rationale).
                                     let _ = self
-                                        .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                                        .persist_progress(
+                                            &run_id,
+                                            idx as i64,
+                                            attempt,
+                                            attempts_remaining,
+                                            effective_tier,
+                                        )
                                         .await;
-                                    match decide(false, attempt, stage.max_retries, attempts_remaining, self.escalation_enabled && !escalated) {
-                                        StageDecision::Retry => { attempt += 1; total_retries += 1; continue; }
+                                    match decide(
+                                        false,
+                                        attempt,
+                                        stage.max_retries,
+                                        attempts_remaining,
+                                        self.escalation_enabled && !escalated,
+                                    ) {
+                                        StageDecision::Retry => {
+                                            attempt += 1;
+                                            total_retries += 1;
+                                            continue;
+                                        }
                                         StageDecision::Escalate => {
-                                            let current = effective_tier.unwrap_or(session_default_tier);
-                                            match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                            let current =
+                                                effective_tier.unwrap_or(session_default_tier);
+                                            match escalation_policy.next_tier(
+                                                current,
+                                                attempt,
+                                                egress,
+                                                highest_local_tier,
+                                            ) {
                                                 Some(to) => {
                                                     escalated = true;
                                                     // Review fix: the flaky-confirm escalation path
@@ -654,8 +689,10 @@ impl PipelineRunner {
                                                     // the tier change.
                                                     self.emit(RunEvent::Escalation {
                                                         run_id: run_id.clone(),
-                                                        from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                                        to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                                        from: tier_name(effective_tier)
+                                                            .unwrap_or_else(|| "default".into()),
+                                                        to: tier_name(Some(to))
+                                                            .unwrap_or_else(|| "default".into()),
                                                     })
                                                     .await;
                                                     effective_tier = Some(to);
@@ -675,7 +712,13 @@ impl PipelineRunner {
                                                 }
                                             }
                                         }
-                                        _ => { final_status = RunStatus::Paused; paused_reason = Some("flaky gate could not be confirmed".to_string()); break false; }
+                                        _ => {
+                                            final_status = RunStatus::Paused;
+                                            paused_reason = Some(
+                                                "flaky gate could not be confirmed".to_string(),
+                                            );
+                                            break false;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -703,10 +746,22 @@ impl PipelineRunner {
                         // just once at stage-loop exit) so a crash mid-retry-loop can't leave a
                         // future resume with a stale, too-high `attempts_remaining`.
                         let _ = self
-                            .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                            .persist_progress(
+                                &run_id,
+                                idx as i64,
+                                attempt,
+                                attempts_remaining,
+                                effective_tier,
+                            )
                             .await;
                         let escalate_ok = self.escalation_enabled && !escalated;
-                        match decide(false, attempt, stage.max_retries, attempts_remaining, escalate_ok) {
+                        match decide(
+                            false,
+                            attempt,
+                            stage.max_retries,
+                            attempts_remaining,
+                            escalate_ok,
+                        ) {
                             StageDecision::Retry => {
                                 feedback = Some(retry_feedback(&decisive));
                                 attempt += 1;
@@ -715,13 +770,20 @@ impl PipelineRunner {
                             }
                             StageDecision::Escalate => {
                                 let current = effective_tier.unwrap_or(session_default_tier);
-                                match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                match escalation_policy.next_tier(
+                                    current,
+                                    attempt,
+                                    egress,
+                                    highest_local_tier,
+                                ) {
                                     Some(to) => {
                                         escalated = true;
                                         self.emit(RunEvent::Escalation {
                                             run_id: run_id.clone(),
-                                            from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                            to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                            from: tier_name(effective_tier)
+                                                .unwrap_or_else(|| "default".into()),
+                                            to: tier_name(Some(to))
+                                                .unwrap_or_else(|| "default".into()),
                                         })
                                         .await;
                                         effective_tier = Some(to);
@@ -754,7 +816,9 @@ impl PipelineRunner {
                                 ));
                                 break false;
                             }
-                            StageDecision::Advance => unreachable!("Advance is only returned on pass"),
+                            StageDecision::Advance => {
+                                unreachable!("Advance is only returned on pass")
+                            }
                         }
                     }
                 }
@@ -781,7 +845,11 @@ impl PipelineRunner {
                 // retry of stage N would also wipe every earlier PASSED stage's (uncommitted)
                 // output. A commit failure is treated as fatal to the run (retry correctness
                 // downstream cannot be guaranteed without it).
-                if let Err(e) = spec.workspace.commit_stage(&format!("stage: {}", stage.name)).await {
+                if let Err(e) = spec
+                    .workspace
+                    .commit_stage(&format!("stage: {}", stage.name))
+                    .await
+                {
                     tracing::warn!(run = %run_id, stage = %stage.name, "stage-boundary commit failed: {e:#}");
                     final_status = RunStatus::Failed;
                     break 'run;
@@ -793,7 +861,13 @@ impl PipelineRunner {
             // signal — `false` means the run vanished/was cancelled/soft-deleted elsewhere, so
             // stop driving it here rather than silently continuing to the next stage.
             let stage_row_alive = self
-                .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                .persist_progress(
+                    &run_id,
+                    idx as i64,
+                    attempt,
+                    attempts_remaining,
+                    effective_tier,
+                )
                 .await;
             if !stage_row_alive {
                 final_status = RunStatus::Interrupted;
@@ -826,8 +900,16 @@ impl PipelineRunner {
             }
         }
 
-        self.finalize(&run_id, &session_str, last_stage_idx, attempts_remaining, final_status, paused_reason, spec.workspace)
-            .await?;
+        self.finalize(
+            &run_id,
+            &session_str,
+            last_stage_idx,
+            attempts_remaining,
+            final_status,
+            paused_reason,
+            spec.workspace,
+        )
+        .await?;
 
         Ok(RunReport {
             run_id,
@@ -877,6 +959,7 @@ impl PipelineRunner {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             // Per-attempt fresh turn_id (minted by the caller) but the SHARED turn_deletes
             // counter + one run_id span the whole run (DEP-C1).
             turn_id,
@@ -956,7 +1039,9 @@ impl PipelineRunner {
                     let lang = VerifierLang::detect(root);
                     let stdout = &stdout[..stdout.len().min(MAX_OUTPUT_BYTES)];
                     let stderr = &stderr[..stderr.len().min(MAX_OUTPUT_BYTES)];
-                    Ok(GateVerdict::Fail(parse_decisive(lang, stdout, stderr, status)))
+                    Ok(GateVerdict::Fail(parse_decisive(
+                        lang, stdout, stderr, status,
+                    )))
                 }
             }
             Gate::Artifact { path, parseable_as } => {
@@ -971,7 +1056,9 @@ impl PipelineRunner {
                         if ArtifactKind::parses(*kind, &content) {
                             Ok(GateVerdict::Pass)
                         } else {
-                            Ok(GateVerdict::Fail(format!("artifact does not parse as expected: {path:?}")))
+                            Ok(GateVerdict::Fail(format!(
+                                "artifact does not parse as expected: {path:?}"
+                            )))
                         }
                     }
                 }
@@ -993,10 +1080,16 @@ impl PipelineRunner {
                         reversible: false,
                     })
                     .await;
-                if self.broker.request(approval_id, session_id, &self.cancel).await {
+                if self
+                    .broker
+                    .request(approval_id, session_id, &self.cancel)
+                    .await
+                {
                     Ok(GateVerdict::Pass)
                 } else {
-                    Ok(GateVerdict::Fail("approval checkpoint declined".to_string()))
+                    Ok(GateVerdict::Fail(
+                        "approval checkpoint declined".to_string(),
+                    ))
                 }
             }
         }
@@ -1048,7 +1141,9 @@ impl PipelineRunner {
                 r = tokio::time::timeout(Duration::from_secs(GATE_TIMEOUT_SECS), child.wait_with_output()) => r??,
             };
             let status = out.status.code().unwrap_or(-1);
-            let cap = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(MAX_OUTPUT_BYTES)]).into_owned();
+            let cap = |b: &[u8]| {
+                String::from_utf8_lossy(&b[..b.len().min(MAX_OUTPUT_BYTES)]).into_owned()
+            };
             Ok((status, cap(&out.stdout), cap(&out.stderr), false))
         }
     }
