@@ -176,10 +176,7 @@ pub async fn insert_coding_audit(
 ///
 /// # Errors
 /// Returns an error if the query fails.
-pub async fn list_by_workspace(
-    db: &DbHandle,
-    workspace_id: &str,
-) -> Result<Vec<ActionJournalRow>> {
+pub async fn list_by_workspace(db: &DbHandle, workspace_id: &str) -> Result<Vec<ActionJournalRow>> {
     Ok(sqlx::query_as::<_, ActionJournalRow>(
         "SELECT * FROM action_journal WHERE workspace_id = ? ORDER BY created_at DESC",
     )

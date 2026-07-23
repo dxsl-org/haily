@@ -107,11 +107,10 @@ pub async fn upcoming(db: &DbHandle, from: &str, to: &str) -> Result<Vec<Calenda
 /// might still surface for the remainder of one `upcoming` call, never a correctness issue
 /// for the exception record itself.
 async fn fetch_exceptions(db: &DbHandle) -> Result<HashSet<(String, String)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT event_id, occurrence_start FROM calendar_exceptions",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT event_id, occurrence_start FROM calendar_exceptions")
+            .fetch_all(db.pool())
+            .await?;
     Ok(rows.into_iter().collect())
 }
 
@@ -127,14 +126,16 @@ pub async fn exception_exists_tx(
     event_id: &str,
     occurrence_start: &str,
 ) -> Result<bool> {
-    Ok(sqlx::query(
-        "SELECT 1 FROM calendar_exceptions WHERE event_id = ? AND occurrence_start = ?",
+    Ok(
+        sqlx::query(
+            "SELECT 1 FROM calendar_exceptions WHERE event_id = ? AND occurrence_start = ?",
+        )
+        .bind(event_id)
+        .bind(occurrence_start)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some(),
     )
-    .bind(event_id)
-    .bind(occurrence_start)
-    .fetch_optional(&mut **tx)
-    .await?
-    .is_some())
 }
 
 /// Record a single-occurrence delete as an exception, run inside the caller's transaction

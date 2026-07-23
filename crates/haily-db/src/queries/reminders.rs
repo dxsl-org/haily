@@ -165,9 +165,15 @@ mod tests {
     #[tokio::test]
     async fn mark_fired_and_reschedule_commits_both_writes_together() {
         let (db, _d) = db().await;
-        let r = insert(&db, "Water plants", "2026-01-01T07:00:00Z", Some("daily"), None)
-            .await
-            .unwrap();
+        let r = insert(
+            &db,
+            "Water plants",
+            "2026-01-01T07:00:00Z",
+            Some("daily"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let next = mark_fired_and_reschedule(
             &db,
@@ -199,10 +205,18 @@ mod tests {
     #[tokio::test]
     async fn mark_fired_and_reschedule_rolls_back_the_mark_when_the_reschedule_insert_fails() {
         let (db, _d) = db().await;
-        let r = insert(&db, "Water plants", "2026-01-01T07:00:00Z", Some("daily"), None)
+        let r = insert(
+            &db,
+            "Water plants",
+            "2026-01-01T07:00:00Z",
+            Some("daily"),
+            None,
+        )
+        .await
+        .unwrap();
+        let other = insert(&db, "Unrelated", "2026-01-01T08:00:00Z", None, None)
             .await
             .unwrap();
-        let other = insert(&db, "Unrelated", "2026-01-01T08:00:00Z", None, None).await.unwrap();
 
         let result = mark_fired_and_reschedule(
             &db,
@@ -215,7 +229,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_err(), "colliding id must fail the reschedule insert");
+        assert!(
+            result.is_err(),
+            "colliding id must fail the reschedule insert"
+        );
 
         let untouched = sqlx::query_as::<_, Reminder>("SELECT * FROM reminders WHERE id = ?")
             .bind(&r.id)

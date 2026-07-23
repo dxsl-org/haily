@@ -87,7 +87,13 @@ impl LocalTable {
                 "deleted_at",
             ],
             LocalTable::Notes => &[
-                "id", "title", "content", "tags", "wikilinks", "domain_id", "updated_at",
+                "id",
+                "title",
+                "content",
+                "tags",
+                "wikilinks",
+                "domain_id",
+                "updated_at",
                 "deleted_at",
             ],
             LocalTable::Reminders => &[
@@ -337,10 +343,7 @@ pub async fn snapshot_row(
         cols.join(", "),
         table.table_name()
     );
-    let row = sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?;
+    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
     Ok(row.map(|r| row_to_json(&r, cols)))
 }
 
@@ -488,10 +491,7 @@ async fn read_updated_at(
     id: &str,
 ) -> Result<Option<String>> {
     let sql = format!("SELECT updated_at FROM {} WHERE id = ?", table.table_name());
-    let row = sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?;
+    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
     Ok(row.and_then(|r| r.try_get::<Option<String>, _>("updated_at").ok().flatten()))
 }
 
@@ -834,9 +834,9 @@ pub async fn local_journaled_write(
         return Ok(None);
     }
 
-    let post_updated_at = read_updated_at(&mut tx, table, &id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("local_journaled_write: row '{id}' vanished after its own mutation"))?;
+    let post_updated_at = read_updated_at(&mut tx, table, &id).await?.ok_or_else(|| {
+        anyhow::anyhow!("local_journaled_write: row '{id}' vanished after its own mutation")
+    })?;
     journal::set_post_state_version_tx(&mut tx, &row.id, &post_updated_at).await?;
     // A local write that reaches COMMIT is, by construction, verified — it is the SAME
     // connection that just performed it, not a third-party system reached over the network.
@@ -932,6 +932,9 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(affected, 0, "stale updated_at must refuse via rows_affected==0");
+        assert_eq!(
+            affected, 0,
+            "stale updated_at must refuse via rows_affected==0"
+        );
     }
 }

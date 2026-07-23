@@ -195,7 +195,13 @@ mod tests {
         let (_dir, db) = db().await;
         let row = insert(&db, sample("x", true)).await.unwrap();
         assert!(soft_delete(&db, &row.id).await.unwrap());
-        assert!(get(&db, &row.id).await.unwrap().is_none(), "soft-deleted row is hidden");
-        assert!(!soft_delete(&db, &row.id).await.unwrap(), "double-delete is a no-op");
+        assert!(
+            get(&db, &row.id).await.unwrap().is_none(),
+            "soft-deleted row is hidden"
+        );
+        assert!(
+            !soft_delete(&db, &row.id).await.unwrap(),
+            "double-delete is a no-op"
+        );
     }
 }

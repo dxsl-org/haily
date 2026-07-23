@@ -81,10 +81,9 @@ pub async fn count_by_kind(db: &DbHandle, kind: &str) -> Result<i64> {
 /// # Errors
 /// Returns an error if the query fails.
 pub async fn count_active_sessions(db: &DbHandle) -> Result<i64> {
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(DISTINCT session_id) FROM view_events")
-            .fetch_one(db.pool())
-            .await?;
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(DISTINCT session_id) FROM view_events")
+        .fetch_one(db.pool())
+        .await?;
     Ok(count)
 }
 
@@ -158,10 +157,16 @@ mod tests {
         let view_id = Uuid::new_v4().to_string();
         let session_id = Uuid::new_v4().to_string();
 
-        let switched = insert_view_event(&db, "projection_switched", &view_id, &session_id, Some("cards"))
-            .await
-            .unwrap()
-            .expect("insert returns Some");
+        let switched = insert_view_event(
+            &db,
+            "projection_switched",
+            &view_id,
+            &session_id,
+            Some("cards"),
+        )
+        .await
+        .unwrap()
+        .expect("insert returns Some");
         assert_eq!(switched.detail.as_deref(), Some("cards"));
 
         let thumb = insert_view_event(&db, "usefulness", &view_id, &session_id, Some("up"))
@@ -177,18 +182,24 @@ mod tests {
         let view_id = Uuid::new_v4().to_string();
         let session_id = Uuid::new_v4().to_string();
 
-        assert!(insert_view_event(&db, "edit_demand", &view_id, &session_id, None)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(insert_view_event(&db, "edit_demand", &view_id, &session_id, Some(""))
-            .await
-            .unwrap()
-            .is_none());
-        assert!(insert_view_event(&db, "edit_demand", &view_id, &session_id, Some("   "))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            insert_view_event(&db, "edit_demand", &view_id, &session_id, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            insert_view_event(&db, "edit_demand", &view_id, &session_id, Some(""))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            insert_view_event(&db, "edit_demand", &view_id, &session_id, Some("   "))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             count_by_kind(&db, "edit_demand").await.unwrap(),
             0,
@@ -202,10 +213,16 @@ mod tests {
         let view_id = Uuid::new_v4().to_string();
         let session_id = Uuid::new_v4().to_string();
 
-        let row = insert_view_event(&db, "edit_demand", &view_id, &session_id, Some("let me rename this column"))
-            .await
-            .unwrap()
-            .expect("non-empty detail must insert");
+        let row = insert_view_event(
+            &db,
+            "edit_demand",
+            &view_id,
+            &session_id,
+            Some("let me rename this column"),
+        )
+        .await
+        .unwrap()
+        .expect("non-empty detail must insert");
         assert_eq!(row.detail.as_deref(), Some("let me rename this column"));
         assert_eq!(count_by_kind(&db, "edit_demand").await.unwrap(), 1);
     }
@@ -214,16 +231,30 @@ mod tests {
     async fn edit_demand_funnel_computes_ratios_and_handles_empty_denominators() {
         let (_dir, db) = db().await;
         let empty = edit_demand_funnel(&db).await.unwrap();
-        assert_eq!(empty.demand_per_view(), None, "no views presented yet — no ratio");
-        assert_eq!(empty.demand_per_session(), None, "no sessions yet — no ratio");
+        assert_eq!(
+            empty.demand_per_view(),
+            None,
+            "no views presented yet — no ratio"
+        );
+        assert_eq!(
+            empty.demand_per_session(),
+            None,
+            "no sessions yet — no ratio"
+        );
 
         let s1 = Uuid::new_v4().to_string();
         let s2 = Uuid::new_v4().to_string();
         let v1 = Uuid::new_v4().to_string();
         let v2 = Uuid::new_v4().to_string();
-        insert_view_event(&db, "presented", &v1, &s1, None).await.unwrap();
-        insert_view_event(&db, "presented", &v2, &s2, None).await.unwrap();
-        insert_view_event(&db, "edit_demand", &v1, &s1, Some("rename field")).await.unwrap();
+        insert_view_event(&db, "presented", &v1, &s1, None)
+            .await
+            .unwrap();
+        insert_view_event(&db, "presented", &v2, &s2, None)
+            .await
+            .unwrap();
+        insert_view_event(&db, "edit_demand", &v1, &s1, Some("rename field"))
+            .await
+            .unwrap();
 
         let funnel = edit_demand_funnel(&db).await.unwrap();
         assert_eq!(funnel.views_presented, 2);

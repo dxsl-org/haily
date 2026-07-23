@@ -296,7 +296,10 @@ mod tests {
         assert!(linked, "linking an active item must report a row updated");
 
         let after = get(&db, &item.id).await.unwrap().expect("row");
-        assert_eq!(after.plan_path.as_deref(), Some(".agents/260707-plan/plan.md"));
+        assert_eq!(
+            after.plan_path.as_deref(),
+            Some(".agents/260707-plan/plan.md")
+        );
     }
 
     #[tokio::test]
@@ -305,6 +308,9 @@ mod tests {
         let linked = link_plan(&db, "does-not-exist", ".agents/x/plan.md")
             .await
             .unwrap();
-        assert!(!linked, "linking a non-existent item must report no row updated");
+        assert!(
+            !linked,
+            "linking a non-existent item must report no row updated"
+        );
     }
 }
