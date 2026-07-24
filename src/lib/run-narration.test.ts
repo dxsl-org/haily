@@ -51,4 +51,11 @@ describe('narrate', () => {
     expect(narrate({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'ok' } })).toContain('thành công');
     expect(narrate({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'error: crash' } })).toContain('thất bại');
   });
+
+  it('narrates a synthesized/persisted interrupted outcome distinctly from success/failure (review MED fix)', () => {
+    const text = narrate({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'interrupted' } });
+    expect(text).toContain('gián đoạn');
+    expect(text).not.toContain('thành công');
+    expect(text).not.toContain('thất bại');
+  });
 });

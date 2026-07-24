@@ -49,6 +49,13 @@ export function narrate(event: RunEvent): string {
     case 'RunPaused':
       return `Đã tạm dừng (${event.data.reason})`;
     case 'RunComplete':
+      // "interrupted" is checked BEFORE the fail/error heuristic — same fix as
+      // `run-events.ts`'s `applyRunEvent` (review MED): a synthesized/persisted
+      // `RunComplete{outcome:"interrupted"}` must never narrate as a success, since this
+      // phrase feeds the SAME card whose status badge now correctly shows "Gián đoạn".
+      if (/^interrupted$/i.test(event.data.outcome)) {
+        return 'Đã gián đoạn — có thể tiếp tục';
+      }
       return /fail|error/i.test(event.data.outcome) ? 'Đã hoàn tất — thất bại' : 'Đã hoàn tất — thành công';
     default:
       return FALLBACK_VERB;

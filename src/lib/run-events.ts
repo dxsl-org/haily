@@ -5,7 +5,7 @@
 // derivation below is a best-effort heuristic, not an authoritative field.
 import type { RunEvent } from './tauri';
 
-export type JobStatus = 'running' | 'paused' | 'complete' | 'failed';
+export type JobStatus = 'running' | 'paused' | 'complete' | 'failed' | 'interrupted';
 
 /** One coding run as a long-lived job (not a chat bubble) — the ordered `events` log is
  * authoritative; the other fields are just a derived headline for the collapsed card. */
@@ -66,7 +66,16 @@ export function applyRunEvent(jobs: Map<string, Job>, sessionId: string, event: 
   } else if (event.type === 'Escalation') {
     job.currentTier = event.data.to;
   } else if (event.type === 'RunComplete') {
-    job.status = /fail|error/i.test(event.data.outcome) ? 'failed' : 'complete';
+    // "interrupted" is checked BEFORE the fail/error heuristic — the runner reports an
+    // interrupted run as `RunComplete{outcome:"interrupted"}` (see `pipeline_runs.status`'s
+    // reconcile in `list_run_events`), and a synthesized terminal marker must render
+    // distinctly from a genuine failure (review MED: it collapsed into 'complete' before,
+    // showing a green "Hoàn tất" for a run that never actually finished).
+    if (/^interrupted$/i.test(event.data.outcome)) {
+      job.status = 'interrupted';
+    } else {
+      job.status = /fail|error/i.test(event.data.outcome) ? 'failed' : 'complete';
+    }
     job.completedAt = Date.now();
   }
 
@@ -152,6 +161,9 @@ export function describeEvent(e: RunEvent): EventDescriptor {
     case 'RunPaused':
       return { icon: '⏸', text: `Paused — ${e.data.reason}`, tone: 'warn' };
     case 'RunComplete': {
+      if (/^interrupted$/i.test(e.data.outcome)) {
+        return { icon: '⏹', text: 'Run interrupted — can be resumed', tone: 'warn' };
+      }
       const failed = /fail|error/i.test(e.data.outcome);
       return { icon: failed ? '✗' : '✓', text: `Run complete — ${e.data.outcome}`, tone: failed ? 'fail' : 'pass' };
     }

@@ -40,6 +40,9 @@
     paused: 'Tạm dừng',
     complete: 'Hoàn tất',
     failed: 'Thất bại',
+    // A synthesized `RunComplete{outcome:"interrupted"}` marker must render distinctly from a
+    // genuine failure/success (review MED — the Runs-row already shows orange "Gián đoạn").
+    interrupted: 'Gián đoạn',
   };
 
   const isActive = $derived(job.status === 'running' || job.status === 'paused');
@@ -151,6 +154,7 @@
   .status-paused .status { color: #fbbf24; }
   .status-complete .status { color: #4ade80; }
   .status-failed .status { color: #f87171; }
+  .status-interrupted .status { color: #fb923c; }
 
   .title {
     color: #e0dff5;

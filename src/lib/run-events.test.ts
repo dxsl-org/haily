@@ -32,6 +32,23 @@ describe('applyRunEvent — startedAt/completedAt (P04 extension)', () => {
   });
 });
 
+describe('applyRunEvent — RunComplete{outcome:"interrupted"} (review MED fix)', () => {
+  it('derives a distinct "interrupted" status, never collapsing into "complete"', () => {
+    const job = fold([
+      { type: 'RunStarted', data: { run_id: 'r1', work_item_id: 'w1' } },
+      { type: 'RunComplete', data: { run_id: 'r1', outcome: 'interrupted' } },
+    ]);
+    expect(job.status).toBe('interrupted');
+    expect(job.status).not.toBe('complete');
+    expect(job.completedAt).not.toBeNull();
+  });
+
+  it('still classifies a genuine failure/success outcome unaffected by the interrupted branch', () => {
+    expect(fold([{ type: 'RunComplete', data: { run_id: 'r1', outcome: 'done' } }]).status).toBe('complete');
+    expect(fold([{ type: 'RunComplete', data: { run_id: 'r1', outcome: 'failed: gate' } }]).status).toBe('failed');
+  });
+});
+
 describe('retryCount / escalationCount', () => {
   it('counts Retry and Escalation events independently, ignoring other event types', () => {
     const job = fold([
@@ -57,5 +74,15 @@ describe('describeEvent — total, never throws (review fix)', () => {
     const unknown = { type: 'SomethingNewFromTheFuture', data: { run_id: 'r1' } } as unknown as RunEvent;
     expect(() => describeEvent(unknown)).not.toThrow();
     expect(describeEvent(unknown).text.length).toBeGreaterThan(0);
+  });
+
+  it('renders an interrupted RunComplete distinctly from a pass/fail outcome (review MED fix)', () => {
+    const interrupted = describeEvent({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'interrupted' } });
+    const passed = describeEvent({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'done' } });
+    const failed = describeEvent({ type: 'RunComplete', data: { run_id: 'r1', outcome: 'failed: gate' } });
+    expect(interrupted.tone).toBe('warn');
+    expect(interrupted.tone).not.toBe(passed.tone);
+    expect(interrupted.tone).not.toBe(failed.tone);
+    expect(interrupted.text).not.toContain('complete');
   });
 });
