@@ -14,9 +14,9 @@
     try {
       approvals = await listApprovals();
     } catch {
-      // Best-effort correlation source only — a failed poll just means Apply/Reject stay
-      // disabled on every row until the next tick; the row's own Discard/Continue actions are
-      // unaffected.
+      // Best-effort correlation source only — a failed poll just means the generic pending-
+      // approval notice stays hidden on every row until the next tick; the row's own Discard/
+      // Continue actions are unaffected.
     }
   }
 

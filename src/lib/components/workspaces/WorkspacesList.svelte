@@ -6,9 +6,10 @@
   import { listWorkspaces, type WorkspaceView, type QueuedApproval } from '$lib/tauri';
   import WorkspaceRow from './WorkspaceRow.svelte';
 
-  // Best-effort correlation source for each row's Apply/Reject actions — passed down from
-  // whichever parent also renders the shared approval queue, since both need the same
-  // approvals snapshot.
+  // Best-effort correlation source for each row's generic pending-approval notice — passed down
+  // from whichever parent also renders the shared approval queue, since both need the same
+  // approvals snapshot. Correlated by session_id only (no tool name), so a row never claims to
+  // identify WHICH approval matched — see `WorkspaceRow`'s own doc comment (review MED follow-up).
   let { approvals = [] }: { approvals?: QueuedApproval[] } = $props();
 
   let workspaces = $state<WorkspaceView[]>([]);

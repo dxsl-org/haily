@@ -243,10 +243,21 @@ pub async fn list_workspaces(db: &DbHandle) -> Result<Vec<WorkspaceView>> {
 
         // The workspace's own stamped `run_id` once its driving run is terminal/paused; while
         // still in flight (no `run_id` yet — see `set_run_id`'s doc), fall back to the
-        // session's currently-active run.
+        // session's currently-active run. Review LOW follow-up: fails SOFT (log + `None`) like
+        // the change-summary probe just above — a single bad row's run lookup must not blank
+        // the whole Workspaces screen; the row still renders with no run info (task/status
+        // fields `None`, `resumable` false) rather than the entire list erroring out.
         let run = match &ws.row.run_id {
-            Some(run_id) => pipeline_runs::get(db, run_id).await?,
-            None => pipeline_runs::find_active_by_session(db, &ws.row.session_id).await?,
+            Some(run_id) => pipeline_runs::get(db, run_id).await.unwrap_or_else(|e| {
+                tracing::warn!(workspace = %ws.row.id, run_id, "run lookup by id failed, omitting enrichment: {e:#}");
+                None
+            }),
+            None => pipeline_runs::find_active_by_session(db, &ws.row.session_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(workspace = %ws.row.id, "run lookup by session failed, omitting enrichment: {e:#}");
+                    None
+                }),
         };
         let resumable = run.as_ref().is_some_and(|r| {
             !worktree_reclaimed

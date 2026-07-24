@@ -1,13 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ROW_COPY,
   workspaceStatusHint,
   workspaceStatusLabel,
   workspaceTaskLabel,
+  type RunStatusRaw,
   type WorkspaceStatusLabel,
 } from './WorkspaceStatus';
 
 const ALL_LABELS: WorkspaceStatusLabel[] = ['đang chạy', 'chờ áp dụng', 'đã áp dụng', 'đã dọn dẹp'];
-const GIT_TERMS = ['worktree', 'branch', 'git', 'HEAD'];
+const SAMPLE_RUN_STATUSES: RunStatusRaw[] = [
+  null,
+  'queued',
+  'running',
+  'paused',
+  'interrupted',
+  'done',
+  'failed',
+];
+const GIT_TERMS = ['worktree', 'branch', 'git', 'HEAD', 'commit'];
 
 describe('workspaceStatusLabel', () => {
   it('reads as running for a queued or running linked run', () => {
@@ -33,8 +44,8 @@ describe('workspaceStatusLabel', () => {
 
   it('never emits a git term in any status label or hint', () => {
     for (const label of ALL_LABELS) {
-      for (const hasRun of [true, false]) {
-        const hint = workspaceStatusHint(label, hasRun);
+      for (const runStatus of SAMPLE_RUN_STATUSES) {
+        const hint = workspaceStatusHint(label, runStatus);
         for (const term of GIT_TERMS) {
           expect(label.toLowerCase()).not.toContain(term.toLowerCase());
           expect(hint.toLowerCase()).not.toContain(term.toLowerCase());
@@ -46,9 +57,22 @@ describe('workspaceStatusLabel', () => {
 
 describe('workspaceStatusHint', () => {
   it('surfaces the passive orphan note when no run is linked at all, without a new label', () => {
-    expect(workspaceStatusHint('đã áp dụng', false)).toContain('tự động được dọn dẹp');
-    expect(workspaceStatusHint('chờ áp dụng', false)).toContain('tự động được dọn dẹp');
-    expect(workspaceStatusHint('đã áp dụng', true)).not.toContain('tự động được dọn dẹp');
+    expect(workspaceStatusHint('đã áp dụng', null)).toContain('tự động được dọn dẹp');
+    expect(workspaceStatusHint('chờ áp dụng', null)).toContain('tự động được dọn dẹp');
+    expect(workspaceStatusHint('đã áp dụng', 'done')).not.toContain('tự động được dọn dẹp');
+  });
+
+  it('review LOW-3: disambiguates a stopped interrupted/failed run from a genuine apply', () => {
+    // A clean tree after `interrupted`/`failed` must never read as if a change actually landed.
+    const interruptedHint = workspaceStatusHint('đã áp dụng', 'interrupted');
+    const failedHint = workspaceStatusHint('đã áp dụng', 'failed');
+    expect(interruptedHint).not.toBe(workspaceStatusHint('đã áp dụng', 'done'));
+    expect(failedHint).toBe(interruptedHint);
+    expect(interruptedHint.toLowerCase()).toContain('tạm dừng');
+  });
+
+  it('a genuinely done run with a clean tree keeps the plain "no changes pending" hint', () => {
+    expect(workspaceStatusHint('đã áp dụng', 'done')).toBe('Không có thay đổi nào đang chờ.');
   });
 });
 
@@ -60,5 +84,24 @@ describe('workspaceTaskLabel', () => {
   it('falls back to a generic label for null/blank task text', () => {
     expect(workspaceTaskLabel(null)).toBe('một tác vụ');
     expect(workspaceTaskLabel('   ')).toBe('một tác vụ');
+  });
+});
+
+describe('ROW_COPY (review LOW-4: cover the actual rendered row/button copy, not just labels/hints)', () => {
+  it('never contains a git term in any static row/button string WorkspaceRow renders', () => {
+    for (const [key, value] of Object.entries(ROW_COPY)) {
+      for (const term of GIT_TERMS) {
+        expect(value.toLowerCase(), `ROW_COPY.${key} must not contain "${term}"`).not.toContain(
+          term.toLowerCase(),
+        );
+      }
+    }
+  });
+
+  it('never promises a specific approval action it cannot honestly back (review MED)', () => {
+    // The pending-approval notice must stay generic/session-scoped, never claim to be the
+    // diff-apply request specifically — no "Áp dụng"/"Từ chối" wording here.
+    expect(ROW_COPY.pendingApprovalNotice).not.toContain('Áp dụng');
+    expect(ROW_COPY.pendingApprovalNotice).not.toContain('Từ chối');
   });
 });

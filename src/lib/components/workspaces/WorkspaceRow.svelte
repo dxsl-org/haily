@@ -2,11 +2,17 @@
   // One coding-workspace row for the Workspaces screen (Unified Chat UI phase 10, D6). Reads in
   // plain language — no git vocabulary here; `branch`/`worktree_path` are carried on
   // `WorkspaceView` ONLY for the Settings → Advanced disclosure (`AdvancedTab.svelte`), never
-  // rendered by this component. `DiffViewer` is embedded inline (view-only) when expanded;
-  // Apply/Reject live at the row level so they act without requiring the diff to be open first.
-  import { discardWorkspace, resolveApproval, resumeRun, type WorkspaceView, type QueuedApproval } from '$lib/tauri';
+  // rendered by this component. `DiffViewer` is embedded inline (view-only) when expanded.
+  //
+  // Review MED follow-up: a matched approval is correlated by `session_id` ALONE (`QueuedApproval`
+  // carries no tool name), so it is never safe to label it as "the diff-apply request" — this row
+  // shows only the generic `ROW_COPY.pendingApprovalNotice` and points to Chat, where the real
+  // `ToolApprovalRequest` payload (tool name + args) is available. Apply/Reject are NOT offered
+  // here (dropped from the earlier row-level promotion — see the phase's Deviation Log).
+  import { discardWorkspace, resumeRun, type WorkspaceView, type QueuedApproval } from '$lib/tauri';
   import DiffViewer from '../DiffViewer.svelte';
   import {
+    ROW_COPY,
     workspaceStatusHint,
     workspaceStatusLabel,
     workspaceTaskLabel,
@@ -33,7 +39,6 @@
   let showDiff = $state(false);
   let discarding = $state(false);
   let resuming = $state(false);
-  let deciding = $state(false);
   let error = $state('');
 
   let status = $derived(
@@ -43,7 +48,7 @@
       reclaimed: workspace.worktree_reclaimed,
     }),
   );
-  let hint = $derived(workspaceStatusHint(status, workspace.run_id !== null));
+  let hint = $derived(workspaceStatusHint(status, workspace.run_status));
   let taskLabel = $derived(workspaceTaskLabel(workspace.task));
 
   async function discard() {
@@ -75,35 +80,22 @@
       resuming = false;
     }
   }
-
-  async function decide(approved: boolean) {
-    if (!matchedApproval || deciding) return;
-    deciding = true;
-    error = '';
-    try {
-      await resolveApproval(matchedApproval.session_id, matchedApproval.approval_id, approved);
-      onChanged();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      deciding = false;
-    }
-  }
 </script>
 
 <div class="row">
   <div class="head">
-    <span class="task">Bản làm việc riêng cho {taskLabel} — {workspace.changed_file_count} tệp thay đổi</span>
+    <span class="task">{ROW_COPY.taskPrefix} {taskLabel} — {workspace.changed_file_count} {ROW_COPY.changedFilesSuffix}</span>
     <span class="badge {STATUS_CLASS[status]}">{status}</span>
     <span class="badge sandbox">{workspace.sandbox_kind}</span>
   </div>
   <p class="status-hint">{hint}</p>
 
   {#if !workspace.sandbox_enforcing}
-    <div class="null-sandbox-warning">
-      ⚠ Không có lớp cách ly (sandbox) trên máy này — mọi lệnh chạy trực tiếp, cần bạn phê duyệt
-      thủ công cho mỗi hành động lần đầu.
-    </div>
+    <div class="null-sandbox-warning">{ROW_COPY.nullSandboxWarning}</div>
+  {/if}
+
+  {#if matchedApproval}
+    <p class="pending-approval-notice">{ROW_COPY.pendingApprovalNotice}</p>
   {/if}
 
   <div class="actions">
@@ -112,20 +104,14 @@
       onclick={() => (showDiff = !showDiff)}
       disabled={workspace.worktree_reclaimed}
     >
-      {showDiff ? 'Ẩn thay đổi' : 'Xem thay đổi'}
+      {showDiff ? ROW_COPY.hideDiff : ROW_COPY.showDiff}
     </button>
-    <button class="apply-btn" onclick={() => decide(true)} disabled={!matchedApproval || deciding}>
-      {deciding ? 'Đang áp dụng…' : 'Áp dụng'}
-    </button>
-    {#if matchedApproval}
-      <button class="reject-btn" onclick={() => decide(false)} disabled={deciding}>Từ chối</button>
-    {/if}
     <button class="discard-btn" onclick={discard} disabled={discarding}>
-      {discarding ? 'Đang huỷ…' : 'Huỷ'}
+      {discarding ? ROW_COPY.discarding : ROW_COPY.discard}
     </button>
     {#if workspace.resumable}
       <button class="resume-btn" onclick={resume} disabled={resuming}>
-        {resuming ? 'Đang tiếp tục…' : 'Tiếp tục'}
+        {resuming ? ROW_COPY.resuming : ROW_COPY.resume}
       </button>
     {/if}
   </div>
@@ -176,9 +162,20 @@
     border-radius: 7px;
   }
 
+  .pending-approval-notice {
+    margin: 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #fbbf24;
+    padding: 8px;
+    background: #2a1f0f;
+    border: 1px solid #7f5a1d;
+    border-radius: 7px;
+  }
+
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
-  .toggle-diff-btn, .apply-btn, .reject-btn, .discard-btn, .resume-btn {
+  .toggle-diff-btn, .discard-btn, .resume-btn {
     padding: 5px 12px;
     min-height: 32px;
     border-radius: 7px;
@@ -189,17 +186,10 @@
     cursor: pointer;
   }
   .toggle-diff-btn:hover:not(:disabled) { border-color: #7c3aed; background: #1e1e35; }
-  .toggle-diff-btn:disabled, .apply-btn:disabled, .reject-btn:disabled,
-  .discard-btn:disabled, .resume-btn:disabled { opacity: 0.5; cursor: default; }
+  .toggle-diff-btn:disabled, .discard-btn:disabled, .resume-btn:disabled { opacity: 0.5; cursor: default; }
 
-  .apply-btn { color: #4ade80; }
-  .apply-btn:hover:not(:disabled) { border-color: #1e4620; background: #0f1e13; }
-
-  .reject-btn, .discard-btn { color: #f87171; }
-  .reject-btn:hover:not(:disabled), .discard-btn:hover:not(:disabled) {
-    border-color: #7f1d1d;
-    background: #2a1017;
-  }
+  .discard-btn { color: #f87171; }
+  .discard-btn:hover:not(:disabled) { border-color: #7f1d1d; background: #2a1017; }
 
   .resume-btn { color: #60a5fa; }
   .resume-btn:hover:not(:disabled) { border-color: #1e3a5f; background: #101a2a; }
