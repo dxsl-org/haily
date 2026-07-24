@@ -464,8 +464,10 @@ async fn list_recovered_skills(state: State<'_, AppState>) -> Result<Vec<String>
     Ok(state.kms.recovered_authored_skill_names())
 }
 
-/// Active coding workspaces (phase 11a): branch, dirty status, and the host sandbox
-/// posture (incl. the non-enforcing `NullSandbox` warning flag). Read-only.
+/// Active coding workspaces (phase 11a; extended Unified Chat UI phase 10 with the linked
+/// run's status and the resume-eligibility flag): branch, change status, host sandbox posture
+/// (incl. the non-enforcing `NullSandbox` warning flag), and the plain-language Workspaces
+/// screen's status/resume inputs. Read-only.
 #[tauri::command]
 async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceView>, String> {
     haily_app::list_workspaces(&state.db)

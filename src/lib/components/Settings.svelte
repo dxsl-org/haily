@@ -5,13 +5,14 @@
   import SafetyTab from './settings/SafetyTab.svelte';
   import JournalBrowser from './JournalBrowser.svelte';
   import ConnectorConfig from './ConnectorConfig.svelte';
+  import AdvancedTab from './settings/AdvancedTab.svelte';
 
   let {
     open = $bindable(false),
     sessionIds = () => [] as string[],
   }: { open?: boolean; sessionIds?: () => string[] } = $props();
 
-  type Tab = 'model' | 'persona' | 'safety' | 'journal' | 'connectors';
+  type Tab = 'model' | 'persona' | 'safety' | 'journal' | 'connectors' | 'advanced';
   let tab = $state<Tab>('model');
   let prefs = $state<Record<string, string>>({});
   let loading = $state(false);
@@ -46,6 +47,7 @@
     { id: 'safety',     label: 'Safety' },
     { id: 'journal',    label: 'Nhật ký' },
     { id: 'connectors', label: 'Kết nối' },
+    { id: 'advanced',   label: 'Nâng cao' },
   ];
 </script>
 
@@ -83,8 +85,10 @@
         <SafetyTab {prefs} {save} />
       {:else if tab === 'journal'}
         <JournalBrowser {sessionIds} />
-      {:else}
+      {:else if tab === 'connectors'}
         <ConnectorConfig />
+      {:else}
+        <AdvancedTab />
       {/if}
     </div>
   </div>

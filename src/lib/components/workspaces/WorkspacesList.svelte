@@ -1,12 +1,14 @@
 <script lang="ts">
-  // Active CodingWorkspaces (P11b). `listWorkspaces` is a plain read-back, no push
-  // channel — refetch on mount + manual refresh, same pattern as `ConnectorConfig`.
+  // Fetch + render active coding workspaces for the Workspaces screen (Unified Chat UI phase
+  // 10). `listWorkspaces` is a plain read-back, no push channel — refetch on mount + manual
+  // refresh (mirrors `ConnectorConfig`'s own pattern). Absorbed from the Mobile Thin-Client
+  // plan's `WorkspacePanel.svelte`, which this file replaces.
   import { listWorkspaces, type WorkspaceView, type QueuedApproval } from '$lib/tauri';
   import WorkspaceRow from './WorkspaceRow.svelte';
 
-  // Best-effort correlation source for each row's embedded `DiffViewer` accept action —
-  // passed down from whichever parent also renders `ApprovalsQueue`, since both need the
-  // same approvals snapshot.
+  // Best-effort correlation source for each row's Apply/Reject actions — passed down from
+  // whichever parent also renders the shared approval queue, since both need the same
+  // approvals snapshot.
   let { approvals = [] }: { approvals?: QueuedApproval[] } = $props();
 
   let workspaces = $state<WorkspaceView[]>([]);
@@ -36,15 +38,15 @@
 
 <div class="section">
   <div class="list-header">
-    <span class="switch-title">Workspaces</span>
-    <button class="refresh-btn" onclick={load} disabled={loading} title="Refresh">↻</button>
+    <span class="switch-title">Không gian làm việc</span>
+    <button class="refresh-btn" onclick={load} disabled={loading} title="Làm mới">↻</button>
   </div>
   {#if loading}
-    <div class="empty">Loading…</div>
+    <div class="empty">Đang tải…</div>
   {:else if error}
     <div class="status-error">⚠️ {error}</div>
   {:else if workspaces.length === 0}
-    <div class="empty">No active coding workspaces.</div>
+    <div class="empty">Chưa có không gian làm việc nào đang hoạt động.</div>
   {:else}
     <div class="rows">
       {#each workspaces as w (w.id)}

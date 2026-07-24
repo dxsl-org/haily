@@ -27,6 +27,13 @@ pub struct CodingWorkspace {
     pub row: CodingWorkspaceRow,
 }
 
+/// See [`CodingWorkspace::change_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceChangeSummary {
+    pub changed_file_count: usize,
+    pub dirty: bool,
+}
+
 impl CodingWorkspace {
     /// Open a fresh workspace: cut a new git worktree (+ ephemeral branch) of `repo_path`
     /// under `worktrees_root`, and persist the lifecycle row.
@@ -56,11 +63,14 @@ impl CodingWorkspace {
         let wt_str = worktree_path
             .to_str()
             .context("worktree path is not valid UTF-8")?;
-        let repo_str = repo_path
-            .to_str()
-            .context("repo path is not valid UTF-8")?;
+        let repo_str = repo_path.to_str().context("repo path is not valid UTF-8")?;
 
-        let out = git(repo_path, &["worktree", "add", "-b", &branch, wt_str, "HEAD"], &[]).await?;
+        let out = git(
+            repo_path,
+            &["worktree", "add", "-b", &branch, wt_str, "HEAD"],
+            &[],
+        )
+        .await?;
         if !out.status.success() {
             bail!(
                 "git worktree add failed: {}",
@@ -68,16 +78,9 @@ impl CodingWorkspace {
             );
         }
 
-        let row = coding_workspaces::create(
-            db,
-            &id,
-            session_id,
-            repo_str,
-            &branch,
-            wt_str,
-            work_item_id,
-        )
-        .await?;
+        let row =
+            coding_workspaces::create(db, &id, session_id, repo_str, &branch, wt_str, work_item_id)
+                .await?;
         Ok(Self { row })
     }
 
@@ -234,6 +237,49 @@ impl CodingWorkspace {
         Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
     }
 
+    /// On-disk change summary for the Workspaces screen (Unified Chat UI phase 10). `None`
+    /// means the worktree DIRECTORY ITSELF no longer exists — already reclaimed by a completed
+    /// `worktree_apply` (which force-removes it as the last step of a successful apply) or a
+    /// crash-orphan GC — a state the caller must surface distinctly (e.g. "cleaned up"), never
+    /// swallow as an ordinary probe failure the way [`Self::is_dirty`]'s callers historically
+    /// have. `Some` uses the SAME isolated git env as `is_dirty`/`commit_stage` so a workspace
+    /// with stage-committed history (objects living only in the isolated store) still resolves
+    /// correctly; `changed_file_count` is one `git status --porcelain` line per changed path.
+    ///
+    /// # Errors
+    /// Returns an error if resolving the isolated git env or the `git status` call fails for a
+    /// reason OTHER than the worktree directory being absent.
+    pub async fn change_summary(&self) -> Result<Option<WorkspaceChangeSummary>> {
+        let root = self.worktree_root();
+        let exists = tokio::fs::metadata(root)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !exists {
+            return Ok(None);
+        }
+        let (obj_dir, alt_dir) = self.isolated_git_env().await?;
+        let env = [
+            ("GIT_OBJECT_DIRECTORY", obj_dir.as_str()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt_dir.as_str()),
+        ];
+        let out = git(root, &["status", "--porcelain"], &env).await?;
+        if !out.status.success() {
+            bail!(
+                "git status --porcelain failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let changed_file_count = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        Ok(Some(WorkspaceChangeSummary {
+            changed_file_count,
+            dirty: changed_file_count > 0,
+        }))
+    }
+
     /// The worktree's current unified diff against HEAD (phase 11a — the cockpit
     /// DiffViewer's read side; the ACCEPT side routes through the existing `worktree_apply`
     /// approval, not this). Capped at `max_bytes` so a huge generated diff cannot flood the
@@ -264,7 +310,10 @@ impl CodingWorkspace {
         while end > 0 && !diff.is_char_boundary(end) {
             end -= 1;
         }
-        Ok(format!("{}\n… [diff truncated at {max_bytes} bytes]\n", &diff[..end]))
+        Ok(format!(
+            "{}\n… [diff truncated at {max_bytes} bytes]\n",
+            &diff[..end]
+        ))
     }
 
     /// Full teardown: revert, remove the worktree + its isolated object store, delete the
@@ -301,11 +350,13 @@ pub fn object_dir_for(worktree_path: &str) -> String {
 /// Fail loud unless `repo_path` is inside a git work tree.
 async fn ensure_git_repo(repo_path: &Path) -> Result<()> {
     if !repo_path.is_dir() {
-        bail!("target repo path does not exist or is not a directory: {}", repo_path.display());
+        bail!(
+            "target repo path does not exist or is not a directory: {}",
+            repo_path.display()
+        );
     }
     let out = git(repo_path, &["rev-parse", "--is-inside-work-tree"], &[]).await?;
-    let ok = out.status.success()
-        && String::from_utf8_lossy(&out.stdout).trim() == "true";
+    let ok = out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true";
     if !ok {
         bail!(
             "target is not a git repository (required for a coding workspace): {}",
@@ -369,13 +420,23 @@ mod tests {
         ] {
             let a: Vec<&str> = args;
             let out = git(p, &a, &[]).await.unwrap();
-            assert!(out.status.success(), "git {a:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {a:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
-        tokio::fs::write(p.join("README.md"), "hello\n").await.unwrap();
+        tokio::fs::write(p.join("README.md"), "hello\n")
+            .await
+            .unwrap();
         let add = git(p, &["add", "."], &[]).await.unwrap();
         assert!(add.status.success());
         let commit = git(p, &["commit", "-m", "init"], &[]).await.unwrap();
-        assert!(commit.status.success(), "{}", String::from_utf8_lossy(&commit.stderr));
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
         dir
     }
 
@@ -409,7 +470,10 @@ mod tests {
             .await
             .expect("open");
         assert!(ws.worktree_root().is_dir(), "worktree dir created");
-        assert!(ws.worktree_root().join("README.md").is_file(), "checked out HEAD");
+        assert!(
+            ws.worktree_root().join("README.md").is_file(),
+            "checked out HEAD"
+        );
         let row = coding_workspaces::get(&db, &ws.row.id).await.unwrap();
         assert!(row.is_some(), "row persisted");
     }
@@ -425,20 +489,38 @@ mod tests {
         let root = ws.worktree_root().to_path_buf();
 
         // Mutate tracked, add untracked, add a gitignored artifact dir.
-        tokio::fs::write(root.join("README.md"), "TAMPERED\n").await.unwrap();
-        tokio::fs::write(root.join("scratch.txt"), "junk\n").await.unwrap();
-        tokio::fs::write(root.join(".gitignore"), "target/\n").await.unwrap();
-        tokio::fs::create_dir_all(root.join("target")).await.unwrap();
-        tokio::fs::write(root.join("target").join("build.bin"), "artifact").await.unwrap();
+        tokio::fs::write(root.join("README.md"), "TAMPERED\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("scratch.txt"), "junk\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(".gitignore"), "target/\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("target"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("target").join("build.bin"), "artifact")
+            .await
+            .unwrap();
 
         ws.compensate().await.expect("compensate");
 
         // Tracked reverted, untracked gone, gitignored dir gone (the -x/-ff proof, U1).
         // Normalize line endings — git may check out CRLF on Windows (autocrlf).
-        let readme = tokio::fs::read_to_string(root.join("README.md")).await.unwrap();
+        let readme = tokio::fs::read_to_string(root.join("README.md"))
+            .await
+            .unwrap();
         assert_eq!(readme.replace("\r\n", "\n"), "hello\n");
-        assert!(!root.join("scratch.txt").exists(), "untracked file must be removed");
-        assert!(!root.join("target").exists(), "gitignored target/ must be removed (-x)");
+        assert!(
+            !root.join("scratch.txt").exists(),
+            "untracked file must be removed"
+        );
+        assert!(
+            !root.join("target").exists(),
+            "gitignored target/ must be removed (-x)"
+        );
     }
 
     #[cfg(unix)]
@@ -455,12 +537,22 @@ mod tests {
         perm.set_mode(0o755);
         std::fs::set_permissions(&pre, perm).unwrap();
 
-        tokio::fs::write(repo.path().join("f.txt"), "x").await.unwrap();
+        tokio::fs::write(repo.path().join("f.txt"), "x")
+            .await
+            .unwrap();
         let add = git(repo.path(), &["add", "-A"], &[]).await.unwrap();
         assert!(add.status.success());
         let commit = git(
             repo.path(),
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "x"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "x",
+            ],
             &[],
         )
         .await
@@ -470,6 +562,48 @@ mod tests {
             "host git must neutralize the repo's pre-commit hook (it would exit 1): {}",
             String::from_utf8_lossy(&commit.stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn change_summary_reports_none_when_the_worktree_directory_is_gone() {
+        let repo = init_repo().await;
+        let (_dbdir, db, sess) = db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+        let ws = CodingWorkspace::open(&db, &sess, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(ws.worktree_root()).await.unwrap();
+
+        let summary = ws.change_summary().await.unwrap();
+        assert!(
+            summary.is_none(),
+            "an absent worktree directory must report None, not an error or a false 'clean'"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_summary_counts_changed_files_and_flags_dirty() {
+        let repo = init_repo().await;
+        let (_dbdir, db, sess) = db().await;
+        let wt_root = tempfile::tempdir().unwrap();
+        let ws = CodingWorkspace::open(&db, &sess, repo.path(), wt_root.path(), None)
+            .await
+            .unwrap();
+
+        let clean = ws.change_summary().await.unwrap().unwrap();
+        assert_eq!(clean.changed_file_count, 0);
+        assert!(!clean.dirty);
+
+        tokio::fs::write(ws.worktree_root().join("README.md"), "changed\n")
+            .await
+            .unwrap();
+        tokio::fs::write(ws.worktree_root().join("new.txt"), "new\n")
+            .await
+            .unwrap();
+
+        let dirty = ws.change_summary().await.unwrap().unwrap();
+        assert_eq!(dirty.changed_file_count, 2);
+        assert!(dirty.dirty);
     }
 
     #[tokio::test]
@@ -483,6 +617,9 @@ mod tests {
         let wt = ws.worktree_root().to_path_buf();
         ws.discard(&db).await.expect("discard");
         assert!(!wt.exists(), "worktree dir removed");
-        assert!(coding_workspaces::get(&db, &ws.row.id).await.unwrap().is_none());
+        assert!(coding_workspaces::get(&db, &ws.row.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

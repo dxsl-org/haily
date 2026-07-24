@@ -376,8 +376,9 @@ export async function acknowledgeConnectorVersion(connectorName: string, version
 
 // ---------------------------------------------------------------------------
 // Phase 11a — Channel Event Backbone (GUI cockpit read/action surface).
-// The Svelte components (RunTimeline, DiffViewer, SkillsBrowser, WorkspacePanel,
-// ApprovalsQueue, ChannelsPanel) that CONSUME these wrappers land in P11b.
+// The Svelte components (RunTimeline, DiffViewer, SkillsBrowser, ApprovalsQueue, ChannelsPanel)
+// that CONSUME these wrappers land in P11b. `WorkspacePanel` (its original name) was absorbed
+// into `components/workspaces/WorkspacesList.svelte` by Unified Chat UI phase 10.
 // ---------------------------------------------------------------------------
 
 /** Mirrors `haily_types::RunEvent`'s `#[serde(tag = "type", content = "data")]` envelope
@@ -584,7 +585,13 @@ export async function pinSkill(name: string, pinned: boolean): Promise<void> {
 
 /** One active coding workspace. Mirrors `haily_app::cockpit::WorkspaceView`.
  * `sandbox_enforcing === false` is the `NullSandbox` warning: execution is NOT isolated and
- * requires per-work-root first-exec approval — the panel must surface it prominently. */
+ * requires per-work-root first-exec approval — the panel must surface it prominently.
+ *
+ * `branch`/`worktree_path` are git-specific and MUST only ever be rendered under Settings →
+ * Advanced (Unified Chat UI phase 10, D6) — the default Workspaces screen's status/copy is a
+ * pure function of the other fields below, never these two. `resumable` is computed
+ * server-side from the SAME guard `resume_run` itself enforces (status/reason-class AND the
+ * worktree still existing) — never re-derive it from `run_status` alone. */
 export interface WorkspaceView {
   id: string;
   session_id: string;
@@ -594,8 +601,23 @@ export interface WorkspaceView {
   work_item_id: string | null;
   created_at: string;
   dirty: boolean;
+  /** Count of changed paths — `0` when clean or `worktree_reclaimed`. */
+  changed_file_count: number;
   sandbox_kind: string;
   sandbox_enforcing: boolean;
+  /** The pipeline run driving this workspace, if known yet. `null` before any run is linked. */
+  run_id: string | null;
+  /** Originating task text, for the row's "Bản làm việc riêng cho {task}" label. */
+  task: string | null;
+  /** Raw `pipeline_runs.status` of the linked run — `null` if none is linked yet. */
+  run_status: string | null;
+  /** Set only when `run_status === 'paused'`. */
+  pause_reason_class: string | null;
+  /** `true` when the worktree directory itself is gone (already applied+removed, or GC'd) while
+   * the workspace row is still active — the "đã dọn dẹp" state. */
+  worktree_reclaimed: boolean;
+  /** Whether "Tiếp tục" (`resumeRun`) should be offered — server-computed, see the interface doc. */
+  resumable: boolean;
 }
 
 /** Active coding workspaces with dirty status and host sandbox posture. Read-only. */
