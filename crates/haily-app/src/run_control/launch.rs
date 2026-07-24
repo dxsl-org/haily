@@ -3,6 +3,7 @@
 //! each used to duplicate. Registering the run's cancel/pause handles happens SYNCHRONOUSLY here,
 //! before the tracked task is spawned, so a `kill_run` issued the instant after this function
 //! returns still has a token to cancel.
+use crate::notify::{OsNotifier, ToastCoalescer};
 use crate::run_control::RunControlRegistry;
 use haily_core::{CodingRunSpec, Orchestrator};
 use haily_db::DbHandle;
@@ -29,6 +30,10 @@ pub struct LaunchCtx {
     pub tasks: TaskTracker,
     pub db: Arc<DbHandle>,
     pub registry: Arc<RunControlRegistry>,
+    /// Unified Chat UI phase 7 (D7) — threaded into `spawn_run_event_bridge` so this launch's
+    /// `RunComplete`/`RunPaused`/`ApprovalNeeded` events can fire an OS toast.
+    pub notifier: Arc<dyn OsNotifier>,
+    pub coalescer: Arc<ToastCoalescer>,
 }
 
 /// Register `spec.run_id`'s control handles and spawn the tracked task driving it to completion.
@@ -61,6 +66,8 @@ pub fn spawn_launch(
         ctx.am.clone(),
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.registry),
+        Arc::clone(&ctx.notifier),
+        Arc::clone(&ctx.coalescer),
         run_cancel.clone(),
         ctx.tasks.clone(),
     );

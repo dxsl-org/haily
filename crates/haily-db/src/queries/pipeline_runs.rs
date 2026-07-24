@@ -412,6 +412,33 @@ pub async fn find_active_by_session(
     .await?)
 }
 
+/// List runs for the Runs screen (Unified Chat UI phase 7, D6): every active row
+/// (queued/running/paused/interrupted, uncapped — there are never many concurrent runs) PLUS a
+/// bounded window of the most recent `terminal_limit` terminal (done/failed) rows, so history
+/// growth never makes this query unbounded (Risk Assessment: "load more" pagination deferred,
+/// YAGNI). Ordered active-first, newest-`updated_at`-first within each group, so a caller can
+/// render the result as-is with no client-side re-sort.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn list_runs(db: &DbHandle, terminal_limit: i64) -> Result<Vec<PipelineRun>> {
+    Ok(sqlx::query_as::<_, PipelineRun>(
+        "SELECT * FROM pipeline_runs
+         WHERE deleted_at IS NULL
+           AND (status IN ('queued', 'running', 'paused', 'interrupted')
+                OR id IN (
+                  SELECT id FROM pipeline_runs
+                  WHERE deleted_at IS NULL AND status IN ('done', 'failed')
+                  ORDER BY updated_at DESC
+                  LIMIT ?
+                ))
+         ORDER BY (status IN ('queued', 'running', 'paused', 'interrupted')) DESC, updated_at DESC",
+    )
+    .bind(terminal_limit)
+    .fetch_all(db.pool())
+    .await?)
+}
+
 /// List only `interrupted`, non-deleted runs — surfaced to the user on boot for explicit
 /// resume (never auto-resumed; FMA-m4).
 ///
@@ -586,6 +613,68 @@ mod tests {
         assert_eq!(created.id, fresh_id);
         assert_eq!(created.status, "queued");
         assert_eq!(created.stage_index, 0);
+    }
+
+    /// `list_runs` returns every active row plus only the bounded window of most-recent
+    /// terminal rows — an OLDER terminal row past the limit must not appear.
+    #[tokio::test]
+    async fn list_runs_returns_all_active_plus_bounded_recent_terminal() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+
+        let active = create(&db, &session, None, 5).await.unwrap();
+
+        let mut terminal_ids = Vec::new();
+        for _ in 0..3 {
+            let row = create(&db, &session, None, 5).await.unwrap();
+            transition(
+                &db,
+                &row.id,
+                RunTransition {
+                    stage_index: 0,
+                    status: "done",
+                    attempt: 1,
+                    attempts_remaining: 4,
+                    tier_used: None,
+                    backend_used: None,
+                    egress: None,
+                    gate_output_digest: None,
+                    pause_reason_class: None,
+                },
+            )
+            .await
+            .unwrap();
+            terminal_ids.push(row.id);
+            // Ensure a distinct `updated_at` ordering between iterations.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let runs = list_runs(&db, 2).await.unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&active.id.as_str()),
+            "the active (queued) row must always be included"
+        );
+        assert!(
+            !ids.contains(&terminal_ids[0].as_str()),
+            "the oldest terminal row must be excluded once past the bounded window"
+        );
+        assert!(ids.contains(&terminal_ids[1].as_str()));
+        assert!(ids.contains(&terminal_ids[2].as_str()));
+        assert_eq!(runs.len(), 3, "one active + two most-recent terminal rows");
+    }
+
+    /// A soft-deleted (killed) run must never appear in `list_runs`, active or terminal.
+    #[tokio::test]
+    async fn list_runs_excludes_soft_deleted_rows() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let row = create(&db, &session, None, 5).await.unwrap();
+        soft_delete(&db, &row.id).await.unwrap();
+
+        let runs = list_runs(&db, 50).await.unwrap();
+        assert!(runs.iter().all(|r| r.id != row.id));
     }
 
     /// `resume_reset` preserves `stage_index` (D3: "re-enter the CURRENT stage", not the whole

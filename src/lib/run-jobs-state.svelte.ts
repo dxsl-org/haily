@@ -75,6 +75,13 @@ export function createRunJobsState(getSessionIndex: () => Map<string, number>, g
   return {
     ingest,
     showCard,
+    /** Raw run-id-keyed job map (Unified Chat UI phase 7, D7) — the Runs screen overlays this
+     * onto the persisted `listRuns()` result so a live run shows its richer per-event status
+     * without a second `onRunEvents` subscription (P04 review-fix MED-1's whole point: one
+     * page-lifetime fold, every consumer reads from it). */
+    get jobs() {
+      return jobs;
+    },
     get jobsByAnchor() {
       return jobsByAnchor;
     },

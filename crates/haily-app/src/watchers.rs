@@ -1,8 +1,11 @@
 //! Work-item watcher and proactive daemon startup — spawned identically for every
 //! mode (this phase's fix for F6: GUI previously lacked the watcher, CLI lacked the
 //! daemon; both are now unconditional, gated only by `BootstrapOptions`).
+use crate::notify::{self, OsNotifier, ToastCoalescer};
 use crate::run_control::RunControlRegistry;
-use haily_db::{queries::journal, queries::run_events, queries::work_items, DbHandle};
+use haily_db::{
+    queries::journal, queries::meta, queries::run_events, queries::work_items, DbHandle,
+};
 use haily_io::{AdapterManager, Notification, RunEvent, WorkItemStatus};
 use haily_kms::KmsHandle;
 use haily_proactive::ProactiveDaemon;
@@ -109,12 +112,21 @@ pub fn spawn_work_item_watcher(
 /// run re-registers under the SAME `run_id` (`RunControlRegistry::register` overwrites), so a
 /// stale entry here could never be mistaken for the live one even without this cleanup, but
 /// leaving it around would still leak memory for the registry's lifetime.
+///
+/// Unified Chat UI phase 7 (D7): this is ALSO where an OS toast is considered for
+/// `RunComplete`/`RunPaused`/`ApprovalNeeded` — `notify::maybe_notify` itself fires (if at all)
+/// on a DETACHED `tokio::spawn` with its own timeout, so the pref read below (a small local
+/// query, same tolerance as the persistence write already accepted on this path) is the only
+/// thing that can add latency here, and only for these three rare event kinds.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_run_event_bridge(
     session_id: Uuid,
     mut events: mpsc::Receiver<RunEvent>,
     am: AdapterManager,
     db: Arc<DbHandle>,
     registry: Arc<RunControlRegistry>,
+    notifier: Arc<dyn OsNotifier>,
+    coalescer: Arc<ToastCoalescer>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 ) {
@@ -153,6 +165,14 @@ pub fn spawn_run_event_bridge(
                         RunEvent::StageOutput { run_id, seq, .. } => Some((run_id.clone(), *seq)),
                         _ => None,
                     };
+                    // Unified Chat UI phase 7 (D7): captured BEFORE delivery moves `event`, same
+                    // reason as `row_to_persist` above — cloned only for the 3 toast-worthy kinds.
+                    let toast_candidate = match &event {
+                        RunEvent::RunComplete { .. }
+                        | RunEvent::RunPaused { .. }
+                        | RunEvent::ApprovalNeeded { .. } => Some(event.clone()),
+                        _ => None,
+                    };
 
                     if let Err(e) = am.deliver_run_event(session_id, event).await {
                         // A closed adapter channel or an unbound session is not fatal to the
@@ -181,6 +201,19 @@ pub fn spawn_run_event_bridge(
                         {
                             tracing::warn!(%session_id, "run-event marker persist failed: {e:#}");
                         }
+                    }
+
+                    // Unified Chat UI phase 7 (D7): the actual toast (if any) fires on a
+                    // detached spawn inside `maybe_notify` itself — this pref read is the only
+                    // await here, and only for the 3 rare toast-worthy kinds.
+                    if let Some(ev) = toast_candidate {
+                        let enabled = meta::get_preference(&db, notify::NOTIFICATIONS_ENABLED_PREF)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|v| v != "false")
+                            .unwrap_or(true);
+                        notify::maybe_notify(&notifier, &coalescer, enabled, &ev);
                     }
                 }
             }
@@ -298,9 +331,16 @@ pub fn spawn_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::NoopNotifier;
     use anyhow::Result;
     use async_trait::async_trait;
     use haily_io::{Adapter, RequestSender, ResponseChunk};
+
+    /// A no-op notifier/coalescer pair for tests that don't exercise D7 notification behavior
+    /// themselves (they still must satisfy `spawn_run_event_bridge`'s widened signature).
+    fn noop_notifier() -> (Arc<dyn OsNotifier>, Arc<ToastCoalescer>) {
+        (Arc::new(NoopNotifier), Arc::new(ToastCoalescer::new()))
+    }
 
     /// Minimal adapter that echoes every delivered `RunEvent` onto a test-visible mpsc, so
     /// the bridge's drain→deliver forwarding + ordering can be asserted through a real
@@ -359,7 +399,18 @@ mod tests {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let registry = Arc::new(RunControlRegistry::new());
-        spawn_run_event_bridge(session, ev_rx, am, db, registry, shutdown, tasks.clone());
+        let (notifier, coalescer) = noop_notifier();
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            db,
+            registry,
+            notifier,
+            coalescer,
+            shutdown,
+            tasks.clone(),
+        );
 
         for seq in 0..3u64 {
             ev_tx
@@ -418,12 +469,15 @@ mod tests {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let registry = Arc::new(RunControlRegistry::new());
+        let (notifier, coalescer) = noop_notifier();
         spawn_run_event_bridge(
             session,
             ev_rx,
             am,
             Arc::clone(&db),
             registry,
+            notifier,
+            coalescer,
             shutdown,
             tasks.clone(),
         );
@@ -520,12 +574,15 @@ mod tests {
         let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
+        let (notifier, coalescer) = noop_notifier();
         spawn_run_event_bridge(
             session,
             ev_rx,
             am,
             Arc::clone(&db),
             Arc::clone(&registry),
+            notifier,
+            coalescer,
             shutdown,
             tasks.clone(),
         );
@@ -565,6 +622,211 @@ mod tests {
             !registry.cancel("run-paused"),
             "RunPaused must remove the registry entry"
         );
+    }
+
+    /// Spy `OsNotifier` that records every fired toast onto a test-visible mpsc (mirrors
+    /// `RecordingAdapter`'s own shape) — used to assert D7's fire-on-toast-worthy-events
+    /// contract through the real bridge, not `notify::maybe_notify` in isolation.
+    struct SpyNotifier {
+        tx: mpsc::Sender<(String, String)>,
+    }
+
+    #[async_trait]
+    impl OsNotifier for SpyNotifier {
+        async fn notify(&self, title: &str, body: &str) {
+            let _ = self.tx.send((title.to_string(), body.to_string())).await;
+        }
+    }
+
+    /// Unified Chat UI phase 7 (D7): a `RunComplete` fires a toast through the real bridge (not
+    /// just `notify::maybe_notify` in isolation) when the notifications pref is unset (default-on).
+    #[tokio::test]
+    async fn bridge_fires_a_toast_on_run_complete_when_notifications_enabled() {
+        let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
+        let am = AdapterManager::builder().register(adapter).build();
+        let session = Uuid::new_v4();
+        am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
+
+        let (toast_tx, mut toast_rx) = mpsc::channel(4);
+        let notifier: Arc<dyn OsNotifier> = Arc::new(SpyNotifier { tx: toast_tx });
+        let coalescer = Arc::new(ToastCoalescer::new());
+
+        let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let registry = Arc::new(RunControlRegistry::new());
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            db,
+            registry,
+            notifier,
+            coalescer,
+            shutdown,
+            tasks.clone(),
+        );
+
+        ev_tx
+            .send(RunEvent::RunComplete {
+                run_id: "r1".into(),
+                outcome: "done".into(),
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        seen_rx.recv().await.expect("event forwarded");
+        let (title, _body) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), toast_rx.recv())
+                .await
+                .expect("toast must fire")
+                .expect("channel open");
+        assert!(title.contains("hoàn tất"));
+
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("bridge task must exit");
+    }
+
+    /// Disabling `ui.notifications_enabled` suppresses the toast even for an otherwise
+    /// toast-worthy event — the delivery/registry-cleanup behavior is unaffected.
+    #[tokio::test]
+    async fn bridge_suppresses_the_toast_when_the_notifications_pref_is_disabled() {
+        let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
+        let am = AdapterManager::builder().register(adapter).build();
+        let session = Uuid::new_v4();
+        am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
+        meta::upsert_preference(&db, notify::NOTIFICATIONS_ENABLED_PREF, "false", "test")
+            .await
+            .unwrap();
+
+        let (toast_tx, mut toast_rx) = mpsc::channel(4);
+        let notifier: Arc<dyn OsNotifier> = Arc::new(SpyNotifier { tx: toast_tx });
+        let coalescer = Arc::new(ToastCoalescer::new());
+
+        let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let registry = Arc::new(RunControlRegistry::new());
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            db,
+            registry,
+            notifier,
+            coalescer,
+            shutdown,
+            tasks.clone(),
+        );
+
+        ev_tx
+            .send(RunEvent::RunComplete {
+                run_id: "r1".into(),
+                outcome: "done".into(),
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        seen_rx.recv().await.expect("event still delivered");
+        // A disabled pref means `maybe_notify` returns before ever cloning the notifier, so the
+        // bridge task's own `notifier` Arc is the LAST one alive — once the task exits (right
+        // after this single event, since `ev_tx` is dropped below), the sender drops and
+        // `recv()` returns `None` almost immediately rather than genuinely timing out. Either
+        // outcome (a timeout, or a closed channel with no message) proves no toast was sent;
+        // only an actual `Some(..)` would mean the suppression failed.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(300), toast_rx.recv()).await;
+        assert!(
+            !matches!(result, Ok(Some(_))),
+            "a disabled pref must suppress the toast entirely"
+        );
+
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("bridge task must exit");
+    }
+
+    /// `ApprovalNeeded` fires a toast but must NOT remove the run's registry entry (unlike
+    /// `RunComplete`/`RunPaused`) — an approval-wait pause is not a terminal-or-paused transition.
+    #[tokio::test]
+    async fn bridge_fires_a_toast_on_approval_needed_without_touching_the_registry() {
+        let (seen_tx, mut seen_rx) = mpsc::channel::<RunEvent>(16);
+        let (notify_tx, _notify_rx) = mpsc::channel::<Notification>(1);
+        let adapter = Arc::new(RecordingAdapter {
+            tx: seen_tx,
+            notify_tx,
+        });
+        let am = AdapterManager::builder().register(adapter).build();
+        let session = Uuid::new_v4();
+        am.bind_session(session, "rec");
+        let (db, _dir) = test_db().await;
+
+        let (toast_tx, mut toast_rx) = mpsc::channel(4);
+        let notifier: Arc<dyn OsNotifier> = Arc::new(SpyNotifier { tx: toast_tx });
+        let coalescer = Arc::new(ToastCoalescer::new());
+
+        let registry = Arc::new(RunControlRegistry::new());
+        registry.register(
+            "r1",
+            CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let (ev_tx, ev_rx) = mpsc::channel::<RunEvent>(16);
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        spawn_run_event_bridge(
+            session,
+            ev_rx,
+            am,
+            db,
+            Arc::clone(&registry),
+            notifier,
+            coalescer,
+            shutdown,
+            tasks.clone(),
+        );
+
+        ev_tx
+            .send(RunEvent::ApprovalNeeded {
+                run_id: "r1".into(),
+                approval_id: "a1".into(),
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+
+        seen_rx.recv().await.expect("event forwarded");
+        toast_rx
+            .recv()
+            .await
+            .expect("ApprovalNeeded must fire a toast");
+        assert!(
+            registry.cancel("r1"),
+            "ApprovalNeeded must NOT remove the registry entry"
+        );
+
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tasks.wait())
+            .await
+            .expect("bridge task must exit");
     }
 
     /// The distillation bridge forwards a proposal to every adapter via `notify_all` and exits

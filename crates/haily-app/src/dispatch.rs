@@ -1,5 +1,6 @@
 //! Request dispatch loop — pulls requests from adapter channels, fans out to the
 //! orchestrator, and forwards response chunks back to the originating adapter.
+use crate::notify::{OsNotifier, ToastCoalescer};
 use crate::run_control::RunControlRegistry;
 use crate::slash_registry::SlashRegistry;
 use crate::trigger::{self, TriggerAction};
@@ -19,6 +20,7 @@ use tracing::info;
 /// The loop itself runs for the lifetime of the app; this function only awaits
 /// `AdapterManager::start_all` (which starts each adapter's own event loop) before
 /// returning — it does not block on the dispatch loop finishing.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_dispatch_loop(
     am: AdapterManager,
     orc: Arc<Orchestrator>,
@@ -27,6 +29,8 @@ pub async fn spawn_dispatch_loop(
     turns: Arc<TurnRegistry>,
     slash_registry: Arc<SlashRegistry>,
     run_control: Arc<RunControlRegistry>,
+    notifier: Arc<dyn OsNotifier>,
+    toast_coalescer: Arc<ToastCoalescer>,
 ) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Request>(64);
     am.start_all(req_tx).await?;
@@ -42,6 +46,8 @@ pub async fn spawn_dispatch_loop(
         turns,
         slash_registry,
         run_control,
+        notifier,
+        toast_coalescer,
     ));
     Ok(())
 }
@@ -63,6 +69,8 @@ async fn dispatch_loop(
     turns: Arc<TurnRegistry>,
     slash_registry: Arc<SlashRegistry>,
     run_control: Arc<RunControlRegistry>,
+    notifier: Arc<dyn OsNotifier>,
+    toast_coalescer: Arc<ToastCoalescer>,
 ) {
     loop {
         let req = tokio::select! {
@@ -109,6 +117,10 @@ async fn dispatch_loop(
         // Unified Chat UI phase 6 (D3): cloned per-iteration like `registry_clone` — the ONE
         // run-control registry every chat-triggered launch (`trigger::launch`) registers into.
         let run_control_clone = Arc::clone(&run_control);
+        // Unified Chat UI phase 7 (D7): cloned per-iteration like `run_control_clone` — the ONE
+        // notifier/coalescer pair every chat-triggered launch threads into its `RunEvent` bridge.
+        let notifier_clone = Arc::clone(&notifier);
+        let toast_coalescer_clone = Arc::clone(&toast_coalescer);
 
         tasks.spawn(async move {
             // Re-bind mutable: `req` needs a mutable borrow below (a `SkillTurn` slash command
@@ -152,6 +164,8 @@ async fn dispatch_loop(
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                         run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
                     trigger::launch(
                         handles,
@@ -171,6 +185,8 @@ async fn dispatch_loop(
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                         run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
                     trigger::launch(
                         handles,
@@ -189,6 +205,8 @@ async fn dispatch_loop(
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
                         run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
                     trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx)
                         .await;

@@ -204,6 +204,8 @@ async fn confirm_then_launch_approve_attempts_the_launch_not_a_normal_turn() {
         tasks: handle.tasks.clone(),
         db: Arc::clone(&handle.db),
         run_control: handle.run_control_registry(),
+        notifier: handle.os_notifier(),
+        coalescer: handle.toast_coalescer(),
     };
     let turn_cancel = handle.shutdown.child_token();
 
@@ -276,6 +278,8 @@ async fn confirm_then_launch_deny_falls_through_to_a_normal_turn() {
         tasks: handle.tasks.clone(),
         db: Arc::clone(&handle.db),
         run_control: handle.run_control_registry(),
+        notifier: handle.os_notifier(),
+        coalescer: handle.toast_coalescer(),
     };
     let turn_cancel = handle.shutdown.child_token();
 

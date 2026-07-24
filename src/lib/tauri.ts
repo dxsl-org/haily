@@ -903,3 +903,44 @@ export async function pauseRun(runId: string): Promise<boolean> {
 export async function resumeRun(runId: string): Promise<boolean> {
   return invoke('resume_run', { runId });
 }
+
+/** One run row for the Runs screen (Unified Chat UI phase 7, D6). Mirrors
+ * `haily_app::runs_view::RunSummary`. Deliberately carries RAW status/reason fields rather
+ * than a pre-rendered sentence — VN narration is derived client-side (`run-summary.ts`),
+ * overlaid with the live reducer's richer per-event narration for an in-flight run.
+ * `resumable` is server-computed from the SAME guard `resumeRun` itself enforces — never
+ * re-derive it from `status` alone (mirrors `WorkspaceView.resumable`'s own contract). */
+export interface RunSummary {
+  id: string;
+  session_id: string;
+  work_item_id: string | null;
+  status: string;
+  pause_reason_class: string | null;
+  task: string | null;
+  stage_index: number;
+  attempt: number;
+  attempts_remaining: number;
+  tier_used: string | null;
+  backend_used: string | null;
+  /** Raw per-attempt token JSON array (`[{stage,attempt,tier,backend,prompt_tokens,
+   * completion_tokens}]`) — parsed by `RunTelemetry.svelte`; `null` until any attempt recorded
+   * one. */
+  per_attempt_tokens: string | null;
+  created_at: string;
+  updated_at: string;
+  resumable: boolean;
+}
+
+/** Runs for the Runs screen: every active run plus a bounded window of recent terminal
+ * history (server-side cap — see `haily_app::runs_view::list_runs`'s doc). Read-only,
+ * local-GUI-only. */
+export async function listRuns(): Promise<RunSummary[]> {
+  return invoke('list_runs');
+}
+
+/** Rehydrate one run's persisted timeline for the drill-in (Unified Chat UI phase 7, D6) — the
+ * backend ALSO reconciles a missing terminal event against `pipeline_runs.status`, so a
+ * crashed/restarted run's timeline never renders as permanently "running" here. */
+export async function listRunEvents(runId: string): Promise<RunEvent[]> {
+  return invoke('list_run_events', { runId });
+}

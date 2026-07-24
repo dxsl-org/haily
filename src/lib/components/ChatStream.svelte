@@ -58,9 +58,13 @@
      * can drop the entry — and, if the same id is still shown in the out-of-session
      * modal, clear that too (see `+page.svelte`'s sync effect). */
     onApprovalResolved: (approvalId: string) => void;
+    /** Navigates to the Runs screen's drill-in for a run (Unified Chat UI phase 7, D6) —
+     * threaded straight through to `RunProgressCard`'s "Chi tiết →". `undefined` leaves that
+     * affordance disabled, mirroring its pre-P07 inert state. */
+    onOpenRun?: (runId: string) => void;
   }
 
-  let { messages, bottomAnchor = $bindable(), jobsState, approvals, onApprovalResolved }: Props = $props();
+  let { messages, bottomAnchor = $bindable(), jobsState, approvals, onApprovalResolved, onOpenRun }: Props = $props();
 
   // Mirrors `SafetyTab.svelte`'s `requestUndo` phrasing exactly so both undo entry points
   // (this inline button and the Safety tab's recent-actions list) produce identical
@@ -92,7 +96,7 @@
       <ChatBubble {msg} undoingId={undoing} onUndo={requestUndo} />
       {#each jobsState.jobsByAnchor.get(i) ?? [] as job (job.runId)}
         {#if jobsState.showCard(job)}
-          <RunProgressCard {job} />
+          <RunProgressCard {job} {onOpenRun} />
         {/if}
       {/each}
     {/each}
@@ -102,7 +106,7 @@
          chip below would still count it. -->
     {#each jobsState.unanchoredJobs as job (job.runId)}
       {#if jobsState.showCard(job)}
-        <RunProgressCard {job} />
+        <RunProgressCard {job} {onOpenRun} />
       {/if}
     {/each}
 

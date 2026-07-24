@@ -337,6 +337,7 @@ async fn daemon_option_registers_additional_background_tasks() {
             enable_daemon: true,
             enable_watcher: true,
             attempt_keyring: true,
+            ..BootstrapOptions::default()
         },
     )
     .await
@@ -354,6 +355,7 @@ async fn daemon_option_registers_additional_background_tasks() {
             enable_daemon: false,
             enable_watcher: true,
             attempt_keyring: true,
+            ..BootstrapOptions::default()
         },
     )
     .await

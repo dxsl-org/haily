@@ -1,14 +1,44 @@
 <script lang="ts">
-  // Placeholder destination — Track B (P07) fills this with the run list, live status,
-  // and control actions (kill/pause/resume). Empty state only, no data fetch here.
+  // Runs management screen (Unified Chat UI phase 7, D6) — flat list (live + history from
+  // `pipeline_runs`) with a drill-in that mounts `RunTimeline`/`DiffViewer`/`RunTelemetry`.
+  // `initialRunId` lets a caller (the chat progress card's "Chi tiết →") deep-link straight
+  // into a run's drill-in on navigation; consumed once via `onInitialRunConsumed` so a later
+  // route switch back to Runs doesn't re-open it unexpectedly.
+  import type { RunJobsState } from '$lib/run-jobs-state.svelte';
+  import { listRuns, type RunSummary } from '$lib/tauri';
+  import RunsList from './RunsList.svelte';
+  import RunDrillIn from './RunDrillIn.svelte';
+
+  let {
+    jobsState,
+    initialRunId = null,
+    onInitialRunConsumed,
+  }: {
+    jobsState: RunJobsState;
+    initialRunId?: string | null;
+    onInitialRunConsumed?: () => void;
+  } = $props();
+
+  let selected = $state<RunSummary | null>(null);
+
+  $effect(() => {
+    if (!initialRunId) return;
+    const id = initialRunId;
+    listRuns()
+      .then((runs) => {
+        const match = runs.find((r) => r.id === id);
+        if (match) selected = match;
+      })
+      .finally(() => onInitialRunConsumed?.());
+  });
 </script>
 
 <div class="screen">
-  <div class="empty">
-    <span class="glyph">▶</span>
-    <p>Chưa có tác vụ nào.</p>
-    <p class="hint">Các tác vụ chạy pipeline sẽ xuất hiện ở đây.</p>
-  </div>
+  {#if selected}
+    <RunDrillIn run={selected} onClose={() => (selected = null)} />
+  {:else}
+    <RunsList {jobsState} onOpenRun={(run) => (selected = run)} />
+  {/if}
 </div>
 
 <style>
@@ -16,12 +46,6 @@
     flex: 1;
     min-height: 0;
     display: flex;
-    align-items: center;
-    justify-content: center;
+    flex-direction: column;
   }
-
-  .empty { text-align: center; color: #6b6b8a; }
-  .empty .glyph { display: block; font-size: 32px; margin-bottom: 10px; opacity: 0.6; }
-  .empty p { margin: 4px 0; font-size: 13px; }
-  .empty .hint { font-size: 12px; color: #4a4a6a; }
 </style>

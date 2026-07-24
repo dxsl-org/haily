@@ -51,6 +51,17 @@
   // coexists with whichever destination is active — it is never the thing that hides a
   // route.
   let pendingWorkspaceView = $state<{ viewId: string; sessionId: string } | null>(null);
+  // Deep-link target for the Runs screen's drill-in (Unified Chat UI phase 7, D6) — set by
+  // `openRun` (the chat progress card's "Chi tiết →"), consumed once by `RunsScreen` via
+  // `onInitialRunConsumed` so a later manual switch back to Runs doesn't re-open it.
+  let selectedRunId = $state<string | null>(null);
+
+  /** Navigates to the Runs screen and opens `runId`'s drill-in — passed to `ChatStream` as
+   * `onOpenRun`. */
+  function openRun(runId: string) {
+    route = 'runs';
+    selectedRunId = runId;
+  }
   // The session_id of the turn currently streaming, or null when idle. Written by
   // `ChatInput` on send, cleared by the `haily-chunk` listener below when that session's
   // `Complete`/`Error` chunk arrives — shared with `ChatInput` so it can gate/swap its
@@ -233,7 +244,14 @@
 </script>
 
 <div class="app">
-  <IconRail bind:route onSettings={() => (settingsOpen = true)} />
+  <!-- Runs badge (Unified Chat UI phase 7): live-run count (this window's own reducer, the
+       "live/reducer" source the phase calls for) + pending-approval count — a single combined
+       "needs attention" number on the Runs destination. -->
+  <IconRail
+    bind:route
+    onSettings={() => (settingsOpen = true)}
+    badges={{ runs: jobsState.activeJobs.length + approvalQueue.length }}
+  />
 
   <div class="shell">
     <header>
@@ -263,6 +281,7 @@
             {jobsState}
             approvals={approvalQueue}
             onApprovalResolved={removeFromQueue}
+            onOpenRun={openRun}
             bind:bottomAnchor
           />
           <ChatInput
@@ -275,7 +294,11 @@
             {scrollToBottom}
           />
         {:else if route === 'runs'}
-          <RunsScreen />
+          <RunsScreen
+            {jobsState}
+            initialRunId={selectedRunId}
+            onInitialRunConsumed={() => (selectedRunId = null)}
+          />
         {:else if route === 'workspaces'}
           <WorkspacesScreen />
         {:else if route === 'skills'}

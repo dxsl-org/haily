@@ -5,12 +5,12 @@ mod models;
 
 use haily_app::connector_config::{self, ConnectorSummary};
 use haily_app::{
-    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, RunControlRegistry, SkillView,
-    SlashCommand, SlashRegistry, TurnRegistry, WorkspaceView,
+    AppHandle, BootstrapOptions, CredentialStore, OsNotifier, PendingApproval, RunControlRegistry,
+    RunSummary, SkillView, SlashCommand, SlashRegistry, TurnRegistry, WorkspaceView,
 };
 use haily_core::view::ViewStore;
 use haily_db::{
-    queries::{journal, meta, skill_versions::SkillVersion, view_events},
+    queries::{journal, meta, run_events, skill_versions::SkillVersion, view_events},
     DbHandle,
 };
 use haily_io::{
@@ -20,11 +20,58 @@ use haily_io::{
 use haily_kms::skill_editor::{SkillDetail, SkillDraft, SkillEditKind};
 use haily_kms::KmsHandle;
 use haily_types::DataView;
+// Aliased: `tauri::RunEvent` (the app-lifecycle enum, e.g. `ExitRequested`) is already imported
+// below unaliased — this is the UNRELATED pipeline `RunEvent` (`haily_types`) `list_run_events`
+// returns.
+use haily_types::RunEvent as PipelineRunEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 use tauri::{AppHandle as TauriAppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// OS-toast implementation of `haily_app::OsNotifier` (Unified Chat UI phase 7, D7) — the ONLY
+/// place this crate touches `tauri_plugin_notification`. Constructed BEFORE `AppHandle::bootstrap`
+/// runs (a Tauri `AppHandle` already exists at that point in `setup()`) and handed in via
+/// `BootstrapOptions::os_notifier`; every launch path threads the SAME `Arc<dyn OsNotifier>`
+/// through from there (see `haily_app::bootstrap`'s doc).
+struct TauriOsNotifier {
+    app: TauriAppHandle,
+}
+
+#[async_trait::async_trait]
+impl OsNotifier for TauriOsNotifier {
+    /// Fires the actual OS toast ONLY when the main window is unfocused or minimized (D7) — a
+    /// missing window (never observed in practice, but not provably impossible) defaults to
+    /// "not focused" so a query failure can never permanently silence notifications. The
+    /// synchronous `NotificationBuilder::show` call is offloaded to `spawn_blocking` (a slow
+    /// WinRT IPC or first-run permission prompt must not stall a tokio worker thread) — the
+    /// CALLER (`notify::maybe_notify`) already wraps this whole method in a detached spawn with
+    /// its own timeout, so this method itself never needs to race anything.
+    async fn notify(&self, title: &str, body: &str) {
+        let focused = self
+            .app
+            .get_webview_window("main")
+            .map(|w| w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
+            .unwrap_or(false);
+        if focused {
+            return;
+        }
+        let app = self.app.clone();
+        let title = title.to_string();
+        let body = body.to_string();
+        match tokio::task::spawn_blocking(move || {
+            app.notification().builder().title(title).body(body).show()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("OS notification failed: {e:#}"),
+            Err(e) => tracing::warn!("OS notification task did not complete: {e:#}"),
+        }
+    }
+}
 
 /// Best-effort cleanup budget — Tauri's exit path has no guaranteed grace period.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -606,6 +653,32 @@ async fn resume_run(run_id: String, state: State<'_, AppState>) -> Result<bool, 
         .map_err(|e| e.to_string())
 }
 
+/// List runs for the Runs screen (Unified Chat UI phase 7, D6): every active row plus a bounded
+/// window of recent terminal history — see `haily_app::runs_view::list_runs`'s doc for the exact
+/// active+recent-terminal contract. Local-GUI-only (never bridged to mobile — a paired device
+/// seeing every run's task text would leak repo/task info across the trust boundary the plan's
+/// red-team drew for `kill_run`/`resume_run`).
+#[tauri::command]
+async fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunSummary>, String> {
+    haily_app::list_runs(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rehydrate one run's persisted timeline for the Runs drill-in (Unified Chat UI phase 7, D6) —
+/// wraps `run_events::list_run_events`, which ALSO reconciles a missing terminal event against
+/// `pipeline_runs.status` (see that function's doc) so a restarted/crashed run never renders as
+/// permanently "running" here. Same local-GUI-only boundary as `list_runs`.
+#[tauri::command]
+async fn list_run_events(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<PipelineRunEvent>, String> {
+    run_events::list_run_events(&state.db, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // View Engine Phase A (phase 3) — `get_view` is the reconcile/transport for a
 // `ResponseChunk::ViewRef` handle (the command IS the fetch; there is no per-view streaming
@@ -875,7 +948,20 @@ pub fn run() {
                 }
             };
 
-            let bootstrap = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default());
+            // Unified Chat UI phase 7 (D7): constructed BEFORE `bootstrap` — `app.handle()` is
+            // already a real Tauri `AppHandle` at this point in `setup()`, unlike the resolver/
+            // kill/transcript seams `bootstrap` injects AFTER construction (see its doc).
+            let os_notifier: Arc<dyn OsNotifier> = Arc::new(TauriOsNotifier {
+                app: app.handle().clone(),
+            });
+            let bootstrap = AppHandle::bootstrap(
+                &data_dir,
+                adapters,
+                BootstrapOptions {
+                    os_notifier,
+                    ..BootstrapOptions::default()
+                },
+            );
             let app_handle = tauri::async_runtime::block_on(bootstrap)
                 .map_err(|e| Box::new(std::io::Error::other(e.to_string())))?;
             let db = Arc::clone(&app_handle.db);
@@ -964,6 +1050,8 @@ pub fn run() {
             kill_run,
             pause_run,
             resume_run,
+            list_runs,
+            list_run_events,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

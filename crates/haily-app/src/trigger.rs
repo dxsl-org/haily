@@ -18,6 +18,7 @@
 //! `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered launch
 //! stays cancellable by the same "Stop" action a normal turn already is. See the phase's
 //! Deviation Log.
+use crate::notify::{OsNotifier, ToastCoalescer};
 use crate::run_control::{LaunchCtx, RunControlRegistry};
 use crate::slash_registry::SlashRegistry;
 use haily_core::{classify_coding_intent, CodingRunSpec, Orchestrator, RunKind};
@@ -43,6 +44,10 @@ pub struct LaunchHandles {
     /// Unified Chat UI phase 6 (D3) — the SAME registry `launch.rs`/the mode layer share, so a
     /// chat-triggered launch is kill/pause/resume-able identically to a GUI-initiated one.
     pub run_control: Arc<RunControlRegistry>,
+    /// Unified Chat UI phase 7 (D7) — the SAME notifier/coalescer pair `launch.rs`/the mode
+    /// layer share, so a chat-triggered launch toasts identically to a GUI-initiated one.
+    pub notifier: Arc<dyn OsNotifier>,
+    pub coalescer: Arc<ToastCoalescer>,
 }
 
 /// What a dispatch-layer trigger decides to do with one incoming [`Request`].
@@ -205,6 +210,8 @@ pub fn launch(
         tasks,
         db,
         run_control,
+        notifier,
+        coalescer,
     } = handles;
     let spec = CodingRunSpec {
         // Unified Chat UI phase 6 (D3): pre-generated here, before `spawn_launch` registers it —
@@ -225,6 +232,8 @@ pub fn launch(
         tasks,
         db,
         registry: run_control,
+        notifier,
+        coalescer,
     };
     crate::run_control::spawn_launch(ctx, spec, run_cancel, resp_tx);
 }

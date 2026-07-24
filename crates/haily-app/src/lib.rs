@@ -12,6 +12,9 @@ pub mod credential_store;
 mod dispatch;
 pub mod eval;
 mod launch;
+/// OS-toast notification seam (Unified Chat UI phase 7, D7). `pub` so the mode layer
+/// (`src-tauri`) can implement `OsNotifier` for its real Tauri-backed notifier.
+pub mod notify;
 /// Desktop GUI's mobile pairing/devices command backing (Mobile Thin-Client plan phase 2b) —
 /// pure delegation onto P2a's public `haily_io::mobile` API, no new persistence. Same feature
 /// gate as the two modules above, for the same reason (references `haily_io::mobile::*` types).
@@ -33,6 +36,9 @@ mod reaper;
 /// (`src-tauri`) can name `RunControlRegistry` for its own `AppState` field and call
 /// `kill_run`/`pause_run`/`resume_run` directly.
 pub mod run_control;
+/// Runs-screen read surface (Unified Chat UI phase 7, D6). `pub` so the mode layer
+/// (`src-tauri`) can name `RunSummary` for its own command return type.
+pub mod runs_view;
 mod session_transcript;
 /// Data-driven slash-command registry (Unified Chat UI phase 2, D1). `pub` so the mode layer
 /// (`src-tauri`) can name `SlashRegistry`/`SlashCommand` for its own `AppState` field and the
@@ -60,12 +66,14 @@ pub use eval::run_coding_eval_all;
 /// without a direct `haily-core` dependency (phase 11a).
 pub use haily_core::PendingApproval;
 pub use launch::launch_coding_run;
+pub use notify::{NoopNotifier, OsNotifier, ToastCoalescer};
 #[cfg(feature = "mobile-server")]
 pub use mobile_admin::{
     confirm_pair, list_devices, mobile_status, pairing_qr, pending_pairs, regenerate_cert,
     revoke_device, DeviceView, MobileStatusView, PendingPairView,
 };
 pub use run_control::RunControlRegistry;
+pub use runs_view::{list_runs, RunSummary};
 pub use slash_registry::{SlashCommand, SlashRegistry};
 pub use turns::TurnRegistry;
 pub use watchers::{list_work_items_status, spawn_distillation_bridge, spawn_run_event_bridge};

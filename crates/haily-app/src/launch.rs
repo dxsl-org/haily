@@ -35,6 +35,8 @@ pub fn launch_coding_run(
         tasks: app.tasks.clone(),
         db: Arc::clone(&app.db),
         registry: app.run_control_registry(),
+        notifier: app.os_notifier(),
+        coalescer: app.toast_coalescer(),
     };
     run_control::spawn_launch(ctx, spec, run_cancel, resp_tx);
 }

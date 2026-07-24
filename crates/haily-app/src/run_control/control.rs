@@ -188,6 +188,8 @@ pub async fn resume_run(app: &AppHandle, run_id: &str) -> Result<bool> {
         tasks: app.tasks.clone(),
         db: Arc::clone(&app.db),
         registry: Arc::clone(&app.run_control),
+        notifier: app.os_notifier(),
+        coalescer: app.toast_coalescer(),
     };
     super::spawn_launch(ctx, spec, app.shutdown.child_token(), resp_tx);
     Ok(true)

@@ -6,12 +6,16 @@
   // window observed it, or while the user was on a different route, will not appear here.
   // Accepted interim gap (plan.md D6 / phase-04 Overview): this card is the ONLY run-detail
   // surface in Track A.
-  import { cancelTurn } from '$lib/tauri';
+  import { killRun } from '$lib/tauri';
   import { escalationCount, formatElapsed, retryCount, type Job } from '$lib/run-events';
   import { narrate } from '$lib/run-narration';
   import RunEventLog from './RunEventLog.svelte';
 
-  let { job }: { job: Job } = $props();
+  // `onOpenRun` (Unified Chat UI phase 7): navigates to the Runs screen's drill-in for this
+  // run — provided by `+page.svelte` (the only place holding both `route` and `jobsState`).
+  // `undefined` (e.g. an isolated Storybook-style render) leaves "Chi tiết →" disabled, same
+  // as its pre-P07 inert state.
+  let { job, onOpenRun }: { job: Job; onOpenRun?: (runId: string) => void } = $props();
 
   let expanded = $state(false);
   let stopping = $state(false);
@@ -46,17 +50,17 @@
   const escalations = $derived(escalationCount(job));
   const title = $derived(job.workItemId || `tác vụ …${job.runId.slice(-8)}`);
 
-  // Stops the run via the session's cancellation token — the launching turn's own token
-  // is reused for the whole pipeline run (`trigger.rs:140`), so this is a coarse
-  // per-session stop, not yet run-id-addressed. P06 (`kill_run`) upgrades this to target
-  // only this run without touching anything else in the session.
+  // Stops THIS run specifically via `kill_run` (Unified Chat UI phase 6, D3) — run-id-
+  // addressed, unlike the earlier `cancelTurn(sessionId)` this replaces (P07 deferred
+  // rewiring, per P06's Deviation Log): a session can host only one pipeline run at a time
+  // in practice, but `kill_run` no longer relies on that being true.
   async function stop() {
     if (stopping || !isActive) return;
     stopping = true;
     try {
-      await cancelTurn(job.sessionId);
+      await killRun(job.runId);
     } catch (e) {
-      console.error('cancelTurn failed', e);
+      console.error('killRun failed', e);
     } finally {
       stopping = false;
     }
@@ -88,9 +92,16 @@
     {#if isActive}
       <button class="stop" onclick={stop} disabled={stopping}>{stopping ? 'Đang dừng…' : '■ Dừng'}</button>
     {/if}
-    <!-- Inert until P07 wires the Runs drill-in (plan.md D6) — rendered now so the
-         affordance's final position doesn't shift layout when it activates. -->
-    <button class="details-link" disabled title="Sắp có — xem đầy đủ trong màn hình Tác vụ">Chi tiết →</button>
+    <!-- Wired to the Runs drill-in (Unified Chat UI phase 7, D6) — disabled only when the
+         caller provided no navigation callback. -->
+    <button
+      class="details-link"
+      disabled={!onOpenRun}
+      onclick={() => onOpenRun?.(job.runId)}
+      title="Xem đầy đủ trong màn hình Tác vụ"
+    >
+      Chi tiết →
+    </button>
   </div>
 
   {#if expanded}
@@ -172,8 +183,8 @@
 
   .details-link {
     background: transparent;
-    color: #4a4a6a;
-    cursor: default;
+    color: #c084fc;
     margin-left: auto;
   }
+  .details-link:disabled { color: #4a4a6a; cursor: default; }
 </style>
