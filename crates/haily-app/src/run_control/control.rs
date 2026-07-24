@@ -26,6 +26,19 @@ const RESUME_ATTEMPTS_BUDGET: i64 = 8;
 /// (see `PipelineRunner::run`'s `stage_row_alive` handling) — the soft-delete is what makes that
 /// check fire. Never touches `safety.disable_writes`.
 ///
+/// CONTRACT (accepted ordering, review LOW): this soft-delete races the still-running task's own
+/// `finalize()` (FMA-C2's terminal-transition + audit-marker ONE-transaction commit). If
+/// `soft_delete` lands FIRST, `finalize`'s subsequent `transition` no-ops (`WHERE id = ? AND
+/// deleted_at IS NULL` matches 0 rows — see `pipeline_runs::finalize`'s doc) while its paired
+/// journal marker still inserts, so the audit trail ends up with a `pipeline_run` marker whose
+/// row reads `deleted_at`-cancelled rather than carrying the runner's own terminal status
+/// (`Interrupted`/`Failed`) — the exact status is lost, but the row genuinely IS stopped either
+/// way (soft-delete is itself a terminal state) and the marker's own `request_params` JSON still
+/// records the runner's intended status verbatim (`{"status": ...}`) for anyone reading the
+/// journal directly. Accepted rather than reordered: making `kill_run` wait for the live task's
+/// own finalize to land first would turn an "immediate" kill into a blocking one, defeating the
+/// token-cancel's whole purpose.
+///
 /// Returns `true` if EITHER the token fired or the row was soft-deleted; `false` if `run_id` was
 /// already terminal/unknown (nothing to do).
 ///
@@ -57,6 +70,21 @@ pub fn pause_run(registry: &RunControlRegistry, run_id: &str) -> bool {
     registry.set_pause(run_id)
 }
 
+/// Whether a run's `(status, pause_reason_class)` pair is one `resume_run` accepts (Unified Chat
+/// UI phase 6, D3): `interrupted`, or `paused` with a `retries_exhausted`/`explicit_stop` reason
+/// class — never an approval-wait pause or a terminal/live status. Extracted as its own function
+/// (phase 10) so the Workspaces screen's "Continue" eligibility flag is computed by calling THIS,
+/// never by re-deriving the rule from `pipeline_runs.status` alone in a second place (the exact
+/// drift the plan's red-team flagged).
+pub fn is_resumable(status: &str, pause_reason_class: Option<&str>) -> bool {
+    status == "interrupted"
+        || (status == "paused"
+            && matches!(
+                pause_reason_class,
+                Some("retries_exhausted") | Some("explicit_stop")
+            ))
+}
+
 /// Resume `run_id`: eligible iff `status = interrupted`, or `status = paused` with a
 /// `retries_exhausted`/`explicit_stop` reason class — never an approval-wait pause (resolves
 /// through its approval card) nor a terminal/live row. On pass: verifies the owning workspace
@@ -83,13 +111,7 @@ pub async fn resume_run(app: &AppHandle, run_id: &str) -> Result<bool> {
     let Some(row) = pipeline_runs::get(&app.db, run_id).await? else {
         return Ok(false);
     };
-    let resumable = row.status == "interrupted"
-        || (row.status == "paused"
-            && matches!(
-                row.pause_reason_class.as_deref(),
-                Some("retries_exhausted") | Some("explicit_stop")
-            ));
-    if !resumable {
+    if !is_resumable(&row.status, row.pause_reason_class.as_deref()) {
         return Ok(false);
     }
     let (Some(task), Some(run_kind), Some(depth)) = (

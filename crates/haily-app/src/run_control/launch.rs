@@ -72,6 +72,9 @@ pub fn spawn_launch(
     );
 
     let orc = Arc::clone(&ctx.orc);
+    let registry = Arc::clone(&ctx.registry);
+    let db = Arc::clone(&ctx.db);
+    let run_id_for_err = run_id.clone();
     ctx.tasks.spawn(async move {
         let result = orc
             .launch_coding_run(
@@ -85,10 +88,189 @@ pub fn spawn_launch(
             .await;
         if let Err(e) = result {
             tracing::error!("coding run launch failed: {e:#}");
+            reconcile_failed_launch(&db, &registry, &run_id_for_err).await;
             let _ = resp_tx
                 .send(ResponseChunk::Error(format!("⚠️ {e:#}")))
                 .await;
             let _ = resp_tx.send(ResponseChunk::Complete).await;
         }
     });
+}
+
+/// REVIEW FIX (MED, phase-06 review): a setup failure inside `launch_coding_run` means
+/// `PipelineRunner::run` never reached `finalize()` — no `RunComplete`/`RunPaused` was emitted,
+/// so the `run_events` bridge's own cleanup (`registry.remove` on those events) never fires,
+/// leaking this run's token/pause entry, and — if the failure happened AFTER a successful DB row
+/// create/reset (e.g. a downstream setup error, not the row-create itself) — the row is left at
+/// whatever status was last written (often still `running`/`queued`), unresumable because
+/// nothing else will ever retry it. Clean up both here: remove the registry entry directly
+/// (mirrors the bridge's own cleanup, just reached via a different exit path) and reset the row
+/// to `interrupted` so a later `resume_run` (or the boot-time `reset_stale_running` sweep) can
+/// still try again — best-effort, since the row may never have been created at all (an error
+/// before `pipeline_runs::create_resumable`, e.g. repo/workspace resolution). Extracted as its
+/// own function so the two outcomes (row exists and stuck live vs. no row at all) are directly
+/// unit-testable without forcing a genuine failure through the full orchestrator/LLM stack.
+async fn reconcile_failed_launch(db: &DbHandle, registry: &RunControlRegistry, run_id: &str) {
+    registry.remove(run_id);
+    match haily_db::queries::pipeline_runs::get(db, run_id).await {
+        Ok(Some(row)) if matches!(row.status.as_str(), "queued" | "running") => {
+            if let Err(e) = haily_db::queries::pipeline_runs::transition(
+                db,
+                run_id,
+                haily_db::queries::pipeline_runs::RunTransition {
+                    stage_index: row.stage_index,
+                    status: "interrupted",
+                    attempt: row.attempt,
+                    attempts_remaining: row.attempts_remaining,
+                    tier_used: row.tier_used.as_deref(),
+                    backend_used: row.backend_used.as_deref(),
+                    egress: row.egress.as_deref(),
+                    gate_output_digest: row.gate_output_digest.as_deref(),
+                    pause_reason_class: None,
+                },
+            )
+            .await
+            {
+                tracing::warn!(run_id, "failed-launch row cleanup transition failed: {e:#}");
+            }
+        }
+        // Already paused/interrupted/terminal (a genuine setup failure raced a stage outcome),
+        // or the row never existed (a pre-`create_resumable` setup failure) — nothing to
+        // reconcile.
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(run_id, "failed-launch row lookup failed: {e:#}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use haily_db::queries::pipeline_runs;
+
+    async fn db() -> (tempfile::TempDir, Arc<DbHandle>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DbHandle::init(&dir.path().join("t.db")).await.unwrap());
+        (dir, db)
+    }
+
+    async fn new_session(db: &DbHandle) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        haily_db::queries::sessions::create_session(db, &id, "coding", None)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A run left `running` by a setup failure (never reached `finalize()`) is reset to
+    /// `interrupted` — resumable by a later `resume_run`/boot sweep — and its registry entry
+    /// (token + pause flag) is removed so it can never leak.
+    #[tokio::test]
+    async fn reconcile_failed_launch_resets_a_stuck_running_row_and_clears_the_registry() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let run = pipeline_runs::create(&db, &session, None, 5).await.unwrap();
+        pipeline_runs::transition(
+            &db,
+            &run.id,
+            pipeline_runs::RunTransition {
+                stage_index: 1,
+                status: "running",
+                attempt: 2,
+                attempts_remaining: 4,
+                tier_used: None,
+                backend_used: None,
+                egress: None,
+                gate_output_digest: None,
+                pause_reason_class: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let registry = RunControlRegistry::new();
+        registry.register(
+            &run.id,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        reconcile_failed_launch(&db, &registry, &run.id).await;
+
+        let after = pipeline_runs::get(&db, &run.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "interrupted",
+            "must be reset to interrupted, not left running"
+        );
+        assert_eq!(
+            after.stage_index, 1,
+            "must preserve the stage the run was actually at"
+        );
+        assert!(
+            !registry.cancel(&run.id),
+            "the registry entry must be removed — no leaked token/pause pair"
+        );
+    }
+
+    /// A setup failure BEFORE any `pipeline_runs` row was ever created (e.g. repo resolution) is
+    /// a clean no-op on the DB side — registry cleanup still fires (never a leak either way).
+    #[tokio::test]
+    async fn reconcile_failed_launch_on_a_never_created_row_is_a_safe_no_op() {
+        let (_dir, db) = db().await;
+        let registry = RunControlRegistry::new();
+        let fake_run_id = uuid::Uuid::new_v4().to_string();
+        registry.register(
+            &fake_run_id,
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        reconcile_failed_launch(&db, &registry, &fake_run_id).await;
+
+        assert!(pipeline_runs::get(&db, &fake_run_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !registry.cancel(&fake_run_id),
+            "registry entry must still be removed"
+        );
+    }
+
+    /// A row already terminal/paused by the time the setup failure is handled (a race, not the
+    /// common case) must NOT be clobbered back to `interrupted` — only a genuinely stuck
+    /// `queued`/`running` row is reset.
+    #[tokio::test]
+    async fn reconcile_failed_launch_never_overwrites_an_already_terminal_row() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let run = pipeline_runs::create(&db, &session, None, 5).await.unwrap();
+        pipeline_runs::transition(
+            &db,
+            &run.id,
+            pipeline_runs::RunTransition {
+                stage_index: 0,
+                status: "done",
+                attempt: 0,
+                attempts_remaining: 5,
+                tier_used: None,
+                backend_used: None,
+                egress: None,
+                gate_output_digest: None,
+                pause_reason_class: None,
+            },
+        )
+        .await
+        .unwrap();
+        let registry = RunControlRegistry::new();
+
+        reconcile_failed_launch(&db, &registry, &run.id).await;
+
+        let after = pipeline_runs::get(&db, &run.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.status, "done",
+            "an already-terminal row must never be overwritten"
+        );
+    }
 }

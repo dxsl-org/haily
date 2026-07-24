@@ -101,9 +101,20 @@ pub async fn create(
 /// (persisted so `resume_run` can reconstruct a relaunch; `None` for a caller with no resume
 /// context, e.g. the eval harness or a test fixture).
 ///
+/// REVIEW FIX (CRITICAL, phase-06 review): idempotent when `id` already names an active row.
+/// `resume_run` UPDATEs a paused/interrupted row in place via [`resume_reset`] (same id,
+/// `deleted_at` still NULL) and THEN relaunches through the exact same code path a fresh launch
+/// uses — which calls this function with that SAME `id`. A plain INSERT would collide on the
+/// primary key (`UNIQUE constraint failed: pipeline_runs.id`), silently aborting the relaunch
+/// before a single stage runs. Since a fresh launch's pre-generated `id` (a random `Uuid::new_v4`)
+/// essentially never collides with an existing row, an existing-row hit here IS the resume case
+/// by construction — return that row as-is (already reset by `resume_reset`) rather than
+/// attempting a duplicate insert; `work_item_id`/`attempts_remaining`/`resume_ctx` are ignored in
+/// that branch (the existing row already carries the correct post-reset values).
+///
 /// # Errors
-/// Returns an error if `session_id`/`work_item_id` do not reference valid rows, `id` collides
-/// with an existing non-deleted row, or the insert fails.
+/// Returns an error if `session_id`/`work_item_id` do not reference valid rows or the insert
+/// fails (for a genuinely new `id`).
 pub async fn create_resumable(
     db: &DbHandle,
     id: Option<&str>,
@@ -120,6 +131,9 @@ pub async fn create_resumable(
             &owned_id
         }
     };
+    if let Some(existing) = get(db, id).await? {
+        return Ok(existing);
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let (task, run_kind, depth) = match resume_ctx {
         Some(c) => (Some(c.task), Some(c.run_kind), Some(c.depth)),
@@ -295,14 +309,26 @@ pub async fn reset_stale_running(db: &DbHandle) -> Result<u64> {
     Ok(rows)
 }
 
-/// Atomically flip a resumable row back to `running` at stage 0 with a fresh attempts budget,
-/// clearing any pause class (Unified Chat UI phase 6, D3) — the one write `resume_run` performs
-/// before relaunching. The `WHERE` guard re-verifies eligibility in the SAME statement that
-/// mutates the row, closing the TOCTOU window between an earlier read-only guard check and this
-/// write (a concurrent reaper reap or a second `resume_run` call cannot both "win"). Eligible
-/// iff `status = 'interrupted'`, or `status = 'paused'` with a `pause_reason_class` of
-/// `retries_exhausted`/`explicit_stop` — never `awaiting_approval`/`other`, and never a
-/// terminal/live status.
+/// Atomically flip a resumable row back to `running` at a FRESH per-stage attempt count (0) and
+/// pipeline-global attempts budget, clearing any pause class (Unified Chat UI phase 6, D3) — the
+/// one write `resume_run` performs before relaunching. The `WHERE` guard re-verifies eligibility
+/// in the SAME statement that mutates the row, closing the TOCTOU window between an earlier
+/// read-only guard check and this write (a concurrent reaper reap or a second `resume_run` call
+/// cannot both "win"). Eligible iff `status = 'interrupted'`, or `status = 'paused'` with a
+/// `pause_reason_class` of `retries_exhausted`/`explicit_stop` — never `awaiting_approval`/
+/// `other`, and never a terminal/live status.
+///
+/// REVIEW FIX (MED, phase-06 review): `stage_index` is DELIBERATELY NOT reset here — it is
+/// preserved at whatever value the row carried when it paused/was interrupted, so
+/// `PipelineRunner::run`'s stage loop re-enters at the SAME stage rather than replaying every
+/// earlier stage of the SAME `Pipeline` (the locked D3 semantic: "re-enter the CURRENT stage with
+/// a fresh attempt budget", not "replay the whole pipeline"). This is correct for the row that is
+/// actually registered/resumable (the FIRST `runner.run()` call of a launch, which
+/// `create_resumable`'s idempotent-return path hands the SAME `Pipeline` shape back to on
+/// relaunch — see that function's doc); a paused row from a LATER internal call within a
+/// multi-run wrapper (`run_build`'s review/fix-round/ship, `run_plan`'s revise pass) is not
+/// registered for a live resume at all today (a wrapper-level limitation predating this fix, not
+/// introduced by it — see the phase's Deviation Log).
 ///
 /// Returns the reset row, or `None` if `id` does not reference an active, eligible row — the
 /// caller (`resume_run`) treats that as "not resumable", never an error.
@@ -317,7 +343,7 @@ pub async fn resume_reset(
     let now = chrono::Utc::now().to_rfc3339();
     Ok(sqlx::query_as::<_, PipelineRun>(
         "UPDATE pipeline_runs
-         SET stage_index = 0, status = 'running', attempt = 0, attempts_remaining = ?,
+         SET status = 'running', attempt = 0, attempts_remaining = ?,
              pause_reason_class = NULL, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL
            AND (status = 'interrupted'
@@ -357,6 +383,32 @@ pub async fn list_active(db: &DbHandle) -> Result<Vec<PipelineRun>> {
          ORDER BY created_at ASC",
     )
     .fetch_all(db.pool())
+    .await?)
+}
+
+/// The most recent non-terminal (queued/running/paused/interrupted) run for `session_id`, if
+/// any (Unified Chat UI phase 10). A workspace's `coding_workspaces.run_id` is only stamped
+/// AFTER its driving run reaches a terminal/paused state (see `coding_workspaces::set_run_id`'s
+/// doc) — so a workspace whose launch is still genuinely in flight has no `run_id` to look up
+/// yet, and the Workspaces screen must fall back to this session-keyed lookup to show it as
+/// "running" at all. A launch opens at most one live run per session, so the most-recent match
+/// is unambiguous in practice.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn find_active_by_session(
+    db: &DbHandle,
+    session_id: &str,
+) -> Result<Option<PipelineRun>> {
+    Ok(sqlx::query_as::<_, PipelineRun>(
+        "SELECT * FROM pipeline_runs
+         WHERE session_id = ? AND deleted_at IS NULL
+           AND status IN ('queued', 'running', 'paused', 'interrupted')
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db.pool())
     .await?)
 }
 
@@ -426,4 +478,149 @@ pub async fn soft_delete(db: &DbHandle, id: &str) -> Result<bool> {
     .await?
     .rows_affected();
     Ok(rows > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queries::sessions;
+
+    async fn db() -> (tempfile::TempDir, DbHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        (dir, db)
+    }
+
+    async fn new_session(db: &DbHandle) -> String {
+        let id = Uuid::new_v4().to_string();
+        sessions::create_session(db, &id, "coding", None)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// REVIEW FIX (CRITICAL, phase-06 review): a relaunch's `create_resumable(Some(run_id))`
+    /// against an id `resume_reset` already reset to `running` in place must return that SAME
+    /// row rather than attempting a duplicate INSERT (which would collide on the primary key).
+    #[tokio::test]
+    async fn create_resumable_with_an_existing_active_id_returns_the_existing_row_not_a_collision()
+    {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let created = create(&db, &session, None, 5).await.unwrap();
+
+        let reset = resume_reset(&db, &created.id, 8).await;
+        // Not eligible from `queued` — force it into a resumable state directly to isolate the
+        // collision-repro path (this test's subject is `create_resumable`, not `resume_reset`'s
+        // own eligibility guard, covered separately below).
+        assert!(
+            reset.unwrap().is_none(),
+            "a queued row is not resume-eligible"
+        );
+
+        transition(
+            &db,
+            &created.id,
+            RunTransition {
+                stage_index: 1,
+                status: "interrupted",
+                attempt: 0,
+                attempts_remaining: 5,
+                tier_used: None,
+                backend_used: None,
+                egress: None,
+                gate_output_digest: None,
+                pause_reason_class: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let reset = resume_reset(&db, &created.id, 8).await.unwrap().unwrap();
+        assert_eq!(reset.status, "running");
+        assert_eq!(
+            reset.stage_index, 1,
+            "resume_reset must NOT reset stage_index to 0"
+        );
+
+        // This is the exact call `PipelineRunner::run` makes on relaunch — same id, resume_ctx
+        // Some (the runner always seeds one). Must succeed, not `UNIQUE constraint failed`.
+        let relaunched = create_resumable(
+            &db,
+            Some(&created.id),
+            &session,
+            None,
+            8,
+            Some(ResumeCtx {
+                task: "add a feature",
+                run_kind: "build",
+                depth: "normal",
+            }),
+        )
+        .await
+        .expect("must not collide on the primary key");
+
+        assert_eq!(relaunched.id, created.id);
+        assert_eq!(
+            relaunched.status, "running",
+            "must return the ALREADY-RESET row, not a fresh queued one"
+        );
+        assert_eq!(
+            relaunched.stage_index, 1,
+            "must preserve the resumed stage_index"
+        );
+    }
+
+    /// `create_resumable` with a genuinely new (non-colliding) id still inserts normally —
+    /// the existing-row short-circuit must not swallow the ordinary create path.
+    #[tokio::test]
+    async fn create_resumable_with_a_fresh_id_inserts_normally() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let fresh_id = Uuid::new_v4().to_string();
+
+        let created = create_resumable(&db, Some(&fresh_id), &session, None, 5, None)
+            .await
+            .unwrap();
+
+        assert_eq!(created.id, fresh_id);
+        assert_eq!(created.status, "queued");
+        assert_eq!(created.stage_index, 0);
+    }
+
+    /// `resume_reset` preserves `stage_index` (D3: "re-enter the CURRENT stage", not the whole
+    /// pipeline) while still resetting `attempt`/`attempts_remaining`/`pause_reason_class`.
+    #[tokio::test]
+    async fn resume_reset_preserves_stage_index_but_resets_attempt_state() {
+        let (_dir, db) = db().await;
+        let session = new_session(&db).await;
+        let created = create(&db, &session, None, 5).await.unwrap();
+        transition(
+            &db,
+            &created.id,
+            RunTransition {
+                stage_index: 2,
+                status: "paused",
+                attempt: 3,
+                attempts_remaining: 1,
+                tier_used: None,
+                backend_used: None,
+                egress: None,
+                gate_output_digest: None,
+                pause_reason_class: Some("retries_exhausted"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let reset = resume_reset(&db, &created.id, 8).await.unwrap().unwrap();
+        assert_eq!(
+            reset.stage_index, 2,
+            "stage_index must be preserved, not reset to 0"
+        );
+        assert_eq!(reset.attempt, 0, "the per-stage attempt count resets");
+        assert_eq!(reset.attempts_remaining, 8, "the global budget refreshes");
+        assert_eq!(reset.status, "running");
+        assert!(reset.pause_reason_class.is_none());
+    }
 }

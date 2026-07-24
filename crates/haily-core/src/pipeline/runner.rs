@@ -576,6 +576,16 @@ impl PipelineRunner {
         .await?;
         let run_id = run.id.clone();
         let wi_id = spec.work_item_id.clone().unwrap_or_else(|| run_id.clone());
+        // REVIEW FIX (MED, phase-06 review): re-enter the CURRENT stage on a resume, not the
+        // whole pipeline from scratch — `create_resumable`'s idempotent-return path hands back
+        // the SAME row `resume_reset` reset to `running` WITHOUT touching `stage_index` (see that
+        // function's doc), so a fresh launch's `run.stage_index` is always `0` (a brand-new row)
+        // while a resumed launch's is whatever position it paused/was interrupted at. Clamped
+        // defensively against a stale index outside today's pipeline shape (never observed in
+        // practice — see the Deviation Log for the one documented boundary this does NOT cover).
+        let start_stage_index = usize::try_from(run.stage_index)
+            .unwrap_or(0)
+            .min(spec.pipeline.runs.len().saturating_sub(1));
 
         // ONE shared destructive-delete counter for the WHOLE run (DEP-C1).
         let turn_deletes = Arc::new(AtomicUsize::new(0));
@@ -594,7 +604,9 @@ impl PipelineRunner {
             &self.db,
             &run_id,
             RunTransition {
-                stage_index: 0,
+                // A resumed run starts this transition already AT its re-entry stage (never
+                // reset to 0 here) — see `start_stage_index`'s doc just above.
+                stage_index: start_stage_index as i64,
                 status: RunStatus::Running.as_str(),
                 attempt: 0,
                 attempts_remaining,
@@ -618,7 +630,7 @@ impl PipelineRunner {
         // Unified Chat UI phase 6 (D3): the class stamped alongside `paused_reason` at every
         // site that sets it, so `resume_run` never re-parses the free-text reason.
         let mut pause_class: Option<PauseReasonClass> = None;
-        let mut last_stage_idx = 0i64;
+        let mut last_stage_idx = start_stage_index as i64;
         let mut seq: u64 = 0;
 
         // Phase 6 escalation-policy inputs — snapshotted ONCE per run (mirrors
@@ -648,7 +660,17 @@ impl PipelineRunner {
             ..EscalationPolicy::default()
         };
 
-        'run: for (idx, stage) in spec.pipeline.runs.iter().enumerate() {
+        // A resumed run skips every stage already passed (idx < start_stage_index) rather than
+        // replaying them — `.enumerate()` keeps `idx` as the stage's REAL position in
+        // `spec.pipeline.runs` (needed for `idx + 1 == stage_count` and the persisted
+        // `stage_index`), `.skip(...)` just advances the iterator's start point.
+        'run: for (idx, stage) in spec
+            .pipeline
+            .runs
+            .iter()
+            .enumerate()
+            .skip(start_stage_index)
+        {
             last_stage_idx = idx as i64;
             // Kill/cancel checkpoint BETWEEN stages (dispatch enforces it between tool calls).
             if self.kill.load(Ordering::Acquire) || self.cancel.is_cancelled() {

@@ -16,7 +16,7 @@
 mod control;
 mod launch;
 
-pub use control::{kill_run, pause_run, resume_run};
+pub use control::{is_resumable, kill_run, pause_run, resume_run};
 pub use launch::{spawn_launch, LaunchCtx};
 
 use dashmap::DashMap;
