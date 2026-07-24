@@ -37,7 +37,10 @@ pub struct EmitPlanDraftTool {
 
 impl EmitPlanDraftTool {
     pub fn new(worktree_root: impl Into<PathBuf>, slug: impl Into<String>) -> Self {
-        Self { worktree_root: worktree_root.into(), slug: slug.into() }
+        Self {
+            worktree_root: worktree_root.into(),
+            slug: slug.into(),
+        }
     }
 }
 
@@ -62,10 +65,14 @@ impl Tool for EmitPlanDraftTool {
         let draft = draft_from_args(&args)?;
         let path = self.worktree_root.join(draft_rel(&self.slug));
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.context("creating plan draft dir")?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("creating plan draft dir")?;
         }
         let canonical = serde_json::to_string_pretty(&draft).context("serializing plan draft")?;
-        tokio::fs::write(&path, canonical).await.context("writing plan draft")?;
+        tokio::fs::write(&path, canonical)
+            .await
+            .context("writing plan draft")?;
         Ok(format!(
             "plan draft recorded: {} phase(s), {} rejected alternative(s)",
             draft.phases.len(),
@@ -89,7 +96,11 @@ impl RenderPlanTool {
         slug: impl Into<String>,
         task: impl Into<String>,
     ) -> Self {
-        Self { worktree_root: worktree_root.into(), slug: slug.into(), task: task.into() }
+        Self {
+            worktree_root: worktree_root.into(),
+            slug: slug.into(),
+            task: task.into(),
+        }
     }
 }
 
@@ -117,9 +128,13 @@ impl Tool for RenderPlanTool {
         for (rel, content) in &artifacts {
             let path = self.worktree_root.join(rel);
             if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.context("creating plan artifact dir")?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("creating plan artifact dir")?;
             }
-            tokio::fs::write(&path, content).await.context("writing plan artifact")?;
+            tokio::fs::write(&path, content)
+                .await
+                .context("writing plan artifact")?;
         }
         Ok(format!("rendered {} plan artifact(s)", artifacts.len()))
     }

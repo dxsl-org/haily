@@ -152,7 +152,10 @@ pub(super) async fn stream_llm_response(
                     }
                 }
             }
-            Some(StreamChunk::Done { total_tokens, prompt_tokens }) => {
+            Some(StreamChunk::Done {
+                total_tokens,
+                prompt_tokens,
+            }) => {
                 // Any residual `pending` text at clean end-of-stream was never
                 // confirmed to close out a tag (a real closed tag would already have
                 // been drained above) — either an incomplete tag prefix (e.g. a lone
@@ -257,9 +260,10 @@ mod streaming_tests {
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let (full, _total_tokens, _prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
-            .await
-            .unwrap();
+        let (full, _total_tokens, _prompt_tokens) =
+            stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+                .await
+                .unwrap();
         drop(user_tx);
 
         let mut visible = String::new();
@@ -417,18 +421,25 @@ mod streaming_tests {
     #[tokio::test]
     async fn done_frame_prompt_tokens_some_is_threaded_through_unmodified() {
         let (llm_tx, mut llm_rx) = mpsc::channel(64);
-        llm_tx.send(StreamChunk::Token("hi".to_string())).await.unwrap();
         llm_tx
-            .send(StreamChunk::Done { total_tokens: 3, prompt_tokens: Some(42) })
+            .send(StreamChunk::Token("hi".to_string()))
+            .await
+            .unwrap();
+        llm_tx
+            .send(StreamChunk::Done {
+                total_tokens: 3,
+                prompt_tokens: Some(42),
+            })
             .await
             .unwrap();
         drop(llm_tx);
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let (_full, total_tokens, prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
-            .await
-            .unwrap();
+        let (_full, total_tokens, prompt_tokens) =
+            stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+                .await
+                .unwrap();
         drop(user_tx);
         while user_rx.recv().await.is_some() {}
 
@@ -446,18 +457,25 @@ mod streaming_tests {
     #[tokio::test]
     async fn done_frame_prompt_tokens_none_stays_none() {
         let (llm_tx, mut llm_rx) = mpsc::channel(64);
-        llm_tx.send(StreamChunk::Token("hi".to_string())).await.unwrap();
         llm_tx
-            .send(StreamChunk::Done { total_tokens: 3, prompt_tokens: None })
+            .send(StreamChunk::Token("hi".to_string()))
+            .await
+            .unwrap();
+        llm_tx
+            .send(StreamChunk::Done {
+                total_tokens: 3,
+                prompt_tokens: None,
+            })
             .await
             .unwrap();
         drop(llm_tx);
 
         let (user_tx, mut user_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
-        let (_full, _total_tokens, prompt_tokens) = stream_llm_response(&mut llm_rx, &user_tx, &cancel)
-            .await
-            .unwrap();
+        let (_full, _total_tokens, prompt_tokens) =
+            stream_llm_response(&mut llm_rx, &user_tx, &cancel)
+                .await
+                .unwrap();
         drop(user_tx);
         while user_rx.recv().await.is_some() {}
 

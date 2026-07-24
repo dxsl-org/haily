@@ -5,25 +5,73 @@ mod models;
 
 use haily_app::connector_config::{self, ConnectorSummary};
 use haily_app::{
-    AppHandle, BootstrapOptions, CredentialStore, PendingApproval, SkillView, TurnRegistry,
-    WorkspaceView,
+    AppHandle, BootstrapOptions, CredentialStore, OsNotifier, PendingApproval, RunControlRegistry,
+    RunSummary, SkillView, SlashCommand, SlashRegistry, TurnRegistry, WorkspaceView,
 };
 use haily_core::view::ViewStore;
 use haily_db::{
-    queries::{journal, meta, view_events},
+    queries::{journal, meta, run_events, skill_versions::SkillVersion, view_events},
     DbHandle,
 };
 use haily_io::{
     Adapter, ApprovalResolver, DepthMode, GuiProactiveReceiver, GuiRequestSender,
     GuiResponseReceiver, GuiRunEventReceiver, GuiWorkItemsReceiver, Request, WorkItemStatus,
 };
+use haily_kms::skill_editor::{SkillDetail, SkillDraft, SkillEditKind};
 use haily_kms::KmsHandle;
 use haily_types::DataView;
+// Aliased: `tauri::RunEvent` (the app-lifecycle enum, e.g. `ExitRequested`) is already imported
+// below unaliased — this is the UNRELATED pipeline `RunEvent` (`haily_types`) `list_run_events`
+// returns.
+use haily_types::RunEvent as PipelineRunEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 use tauri::{AppHandle as TauriAppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// OS-toast implementation of `haily_app::OsNotifier` (Unified Chat UI phase 7, D7) — the ONLY
+/// place this crate touches `tauri_plugin_notification`. Constructed BEFORE `AppHandle::bootstrap`
+/// runs (a Tauri `AppHandle` already exists at that point in `setup()`) and handed in via
+/// `BootstrapOptions::os_notifier`; every launch path threads the SAME `Arc<dyn OsNotifier>`
+/// through from there (see `haily_app::bootstrap`'s doc).
+struct TauriOsNotifier {
+    app: TauriAppHandle,
+}
+
+#[async_trait::async_trait]
+impl OsNotifier for TauriOsNotifier {
+    /// Fires the actual OS toast ONLY when the main window is unfocused or minimized (D7) — a
+    /// missing window (never observed in practice, but not provably impossible) defaults to
+    /// "not focused" so a query failure can never permanently silence notifications. The
+    /// synchronous `NotificationBuilder::show` call is offloaded to `spawn_blocking` (a slow
+    /// WinRT IPC or first-run permission prompt must not stall a tokio worker thread) — the
+    /// CALLER (`notify::maybe_notify`) already wraps this whole method in a detached spawn with
+    /// its own timeout, so this method itself never needs to race anything.
+    async fn notify(&self, title: &str, body: &str) {
+        let focused = self
+            .app
+            .get_webview_window("main")
+            .map(|w| w.is_focused().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
+            .unwrap_or(false);
+        if focused {
+            return;
+        }
+        let app = self.app.clone();
+        let title = title.to_string();
+        let body = body.to_string();
+        match tokio::task::spawn_blocking(move || {
+            app.notification().builder().title(title).body(body).show()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("OS notification failed: {e:#}"),
+            Err(e) => tracing::warn!("OS notification task did not complete: {e:#}"),
+        }
+    }
+}
 
 /// Best-effort cleanup budget — Tauri's exit path has no guaranteed grace period.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -75,6 +123,22 @@ struct AppState {
     view_store: Arc<ViewStore>,
     #[cfg(feature = "mobile-server")]
     mobile: MobileState,
+    /// Data-driven slash-command registry (Unified Chat UI phase 2, D1) — the SAME
+    /// `Arc<SlashRegistry>` `dispatch.rs` consults per-request. Cloned out of `app` at setup,
+    /// mirroring `kms`/`db`, so `list_slash_commands` doesn't need to lock `app`.
+    slash_registry: Arc<SlashRegistry>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): the SAME `Arc<AtomicU8>`-
+    /// backed handle the orchestrator gates on. Cloned out of `app` at setup, mirroring
+    /// `kill`/`routing_enabled` exactly, so `set_approval_mode` doesn't need to lock `app`.
+    approval_mode: haily_core::permission_mode::ApprovalModeHandle,
+    /// Per-run kill/pause/resume control (Unified Chat UI phase 6, D3) — the SAME registry
+    /// every launch path (`start_coding_run`, a slash command, an auto-detected chat intent)
+    /// registers into. Cloned out of `app` at setup, mirroring `turns`/`kill`, so `kill_run`/
+    /// `pause_run` don't need to lock `app`. LOCAL-GUI-ONLY: these commands take a bare
+    /// `run_id` with no session/ownership binding and MUST NEVER be exposed over the
+    /// mobile/remote bridge (`ClientFrame`/`ServerFrame`) — a paired device could otherwise
+    /// control arbitrary runs.
+    run_control: Arc<RunControlRegistry>,
     app: Mutex<Option<AppHandle>>,
 }
 
@@ -102,8 +166,13 @@ async fn send_message(message: String, state: State<'_, AppState>) -> Result<Str
         user_ref: None,
         depth,
         origin: Default::default(),
+        forced_skill: None,
     };
-    state.gui_req_tx.send(req).await.map_err(|e| e.to_string())?;
+    state
+        .gui_req_tx
+        .send(req)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(session_id.to_string())
 }
 
@@ -134,7 +203,9 @@ async fn approve_tool(
 ) -> Result<bool, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     let approval_id = Uuid::parse_str(&approval_id).map_err(|e| e.to_string())?;
-    Ok(state.approval_resolver.resolve(approval_id, session_id, approved))
+    Ok(state
+        .approval_resolver
+        .resolve(approval_id, session_id, approved))
 }
 
 /// Cancel the in-flight turn for `session_id`. Fires that turn's `CancellationToken`
@@ -164,9 +235,13 @@ async fn reload_llm(state: State<'_, AppState>) -> Result<String, String> {
 
 #[tauri::command]
 async fn get_preferences(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let prefs = meta::all_preferences(&state.db).await.map_err(|e| e.to_string())?;
-    let map: serde_json::Map<String, serde_json::Value> =
-        prefs.into_iter().map(|p| (p.key, serde_json::Value::String(p.value))).collect();
+    let prefs = meta::all_preferences(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let map: serde_json::Map<String, serde_json::Value> = prefs
+        .into_iter()
+        .map(|p| (p.key, serde_json::Value::String(p.value)))
+        .collect();
     Ok(serde_json::Value::Object(map))
 }
 
@@ -204,7 +279,11 @@ async fn list_journal(
 /// `set_preference` has no orchestrator access (the kill Arc was cloned into `AppState`
 /// at bootstrap for exactly this reason).
 #[tauri::command]
-async fn set_preference(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn set_preference(
+    key: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if key == "safety.disable_writes" {
         let on = value == "true" || value == "1";
         state.kill.store(on, Ordering::Release);
@@ -216,7 +295,28 @@ async fn set_preference(key: String, value: String, state: State<'_, AppState>) 
         let on = value == "true" || value == "1";
         state.routing_enabled.store(on, Ordering::Release);
     }
-    meta::upsert_preference(&state.db, &key, &value, "gui").await.map_err(|e| e.to_string())
+    meta::upsert_preference(&state.db, &key, &value, "gui")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Set the named permission ladder (Unified Chat UI phase 11, D5): `manual` | `accept_edits`
+/// | `auto`. `mode` is normalized via `ApprovalMode::parse` (fail-safe to `manual` on any
+/// unrecognized string) BEFORE either write, so the persisted row and the live handle can
+/// never diverge on what was actually set. DB-PERSISTS FIRST, then flips the live handle —
+/// a crash between the two leaves the persisted (next-boot) state no looser than the
+/// now-stale running state, i.e. fails toward the stricter pairing, mirroring
+/// `set_preference`'s `safety.disable_writes` ordering rationale but as its own command
+/// (not routed through the generic string preference setter) so this ordering is enforced
+/// in exactly one place.
+#[tauri::command]
+async fn set_approval_mode(mode: String, state: State<'_, AppState>) -> Result<(), String> {
+    let parsed = haily_core::permission_mode::ApprovalMode::parse(&mode);
+    meta::upsert_preference(&state.db, "approval.mode", parsed.as_str(), "gui")
+        .await
+        .map_err(|e| e.to_string())?;
+    haily_core::permission_mode::store(&state.approval_mode, parsed);
+    Ok(())
 }
 
 /// Manual "export database" action (Phase 6) — writes a consistent standalone copy to a
@@ -226,7 +326,11 @@ async fn set_preference(key: String, value: String, state: State<'_, AppState>) 
 /// contains all local data — this command performs no additional confirmation.
 #[tauri::command]
 async fn export_database(dest_path: String, state: State<'_, AppState>) -> Result<(), String> {
-    state.db.backup_to(std::path::Path::new(&dest_path)).await.map_err(|e| e.to_string())
+    state
+        .db
+        .backup_to(std::path::Path::new(&dest_path))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Current active work items (queued/running/paused/interrupted), for the work-items
@@ -234,14 +338,18 @@ async fn export_database(dest_path: String, state: State<'_, AppState>) -> Resul
 /// — this file stays glue-only, all conversion logic lives in the app layer.
 #[tauri::command]
 async fn list_work_items(state: State<'_, AppState>) -> Result<Vec<WorkItemStatus>, String> {
-    haily_app::list_work_items_status(&state.db).await.map_err(|e| e.to_string())
+    haily_app::list_work_items_status(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// List installed connectors for the config UI (Phase 7) — read-only, delegates entirely to
 /// the app layer; no manifest write path here.
 #[tauri::command]
 async fn list_connectors(state: State<'_, AppState>) -> Result<Vec<ConnectorSummary>, String> {
-    connector_config::list_connectors(&state.db).await.map_err(|e| e.to_string())
+    connector_config::list_connectors(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Set/rotate a connector's credential. HUMAN-only path — no registered `Tool` reaches this,
@@ -270,7 +378,9 @@ async fn set_connector_status(
     status: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    connector_config::set_connector_status(&state.db, &id, &status).await.map_err(|e| e.to_string())
+    connector_config::set_connector_status(&state.db, &id, &status)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Record that a human has explicitly reviewed and accepted a connector's live manifest
@@ -290,28 +400,126 @@ async fn acknowledge_connector_version(
 /// persisted enable/pin state. Read-only; pure delegation to the app layer.
 #[tauri::command]
 async fn list_skills(state: State<'_, AppState>) -> Result<Vec<SkillView>, String> {
-    haily_app::list_skills(&state.db, &state.kms).await.map_err(|e| e.to_string())
+    haily_app::list_skills(&state.db, &state.kms)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Enable/disable a skill (phase 11a). Persists the admin state; see the app layer's
 /// `cockpit` module doc for the deferred-enforcement contract (mirrors `set_connector_status`).
 #[tauri::command]
-async fn set_skill_enabled(name: String, enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
-    haily_app::set_skill_enabled(&state.db, &name, enabled).await.map_err(|e| e.to_string())
+async fn set_skill_enabled(
+    name: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    haily_app::set_skill_enabled(&state.db, &name, enabled)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Pin/unpin a skill (phase 11a). Persists the admin state; enforcement is deferred (see
 /// `list_skills`).
 #[tauri::command]
 async fn pin_skill(name: String, pinned: bool, state: State<'_, AppState>) -> Result<(), String> {
-    haily_app::pin_skill(&state.db, &name, pinned).await.map_err(|e| e.to_string())
+    haily_app::pin_skill(&state.db, &name, pinned)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-/// Active coding workspaces (phase 11a): branch, dirty status, and the host sandbox
-/// posture (incl. the non-enforcing `NullSandbox` warning flag). Read-only.
+/// Fetch one skill's structured-editor view (Unified Chat UI phase 8, D4) — the editor's
+/// "open" action. `kind` selects the authored (kit-pack) or synthesized (`kms_skills`) store.
+#[tauri::command]
+async fn get_skill_detail(
+    name: String,
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<SkillDetail, String> {
+    let kind = SkillEditKind::parse(&kind).map_err(|e| e.to_string())?;
+    haily_kms::skill_editor::get_skill_detail(&state.kms, &name, kind)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Save a skill's structured fields (phase 8, D4). The pre-edit content is snapshotted into
+/// `skill_versions` first (crash-safety + history), then written through the atomic path for
+/// `kind`. Returns the full saved content. Local-GUI-only — never bridged to mobile (a paired
+/// device must not rewrite a manifest-pinned skill file).
+#[tauri::command]
+async fn edit_skill(
+    name: String,
+    kind: String,
+    draft: SkillDraft,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let kind = SkillEditKind::parse(&kind).map_err(|e| e.to_string())?;
+    haily_kms::skill_editor::edit_skill(&state.kms, &name, kind, &draft)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Version history for one skill, newest first (phase 8, D4) — spans both authored and
+/// synthesized saves, since `skill_versions` is the one mechanism for both.
+#[tauri::command]
+async fn list_skill_versions(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillVersion>, String> {
+    haily_kms::skill_editor::list_versions(&state.kms, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Restore `name` to a prior recorded version (phase 8, D4) — dispatches by the version's OWN
+/// kind, not a caller-supplied one. Local-GUI-only, mirrors `edit_skill`.
+#[tauri::command]
+async fn revert_skill(
+    name: String,
+    version_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    haily_kms::skill_editor::revert_skill(&state.kms, &name, &version_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Promote a synthesized skill to an authored kit-pack file (phase 8, D4) — exits the
+/// confidence/decay lifecycle permanently; archives the synthesized row in the same operation.
+/// Local-GUI-only, mirrors `edit_skill`.
+#[tauri::command]
+async fn promote_skill(name: String, state: State<'_, AppState>) -> Result<String, String> {
+    haily_kms::skill_editor::promote_to_authored(&state.kms, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Manually archive a synthesized skill (phase 8, D4) — the editor's explicit Archive action,
+/// distinct from the automatic confidence-decay archival.
+#[tauri::command]
+async fn archive_skill_manual(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    haily_kms::skill_editor::archive_synthesized(&state.kms, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Name-sorted authored skills currently served from a `skill_versions` recovery snapshot
+/// because their on-disk file failed manifest-hash verification (phase 8 review MED-1) — the
+/// GUI-reachable tamper/interrupted-edit signal (previously an `error!`-only log line). Empty
+/// on a clean load, which is the overwhelming common case.
+#[tauri::command]
+async fn list_recovered_skills(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state.kms.recovered_authored_skill_names())
+}
+
+/// Active coding workspaces (phase 11a; extended Unified Chat UI phase 10 with the linked
+/// run's status and the resume-eligibility flag): branch, change status, host sandbox posture
+/// (incl. the non-enforcing `NullSandbox` warning flag), and the plain-language Workspaces
+/// screen's status/resume inputs. Read-only.
 #[tauri::command]
 async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceView>, String> {
-    haily_app::list_workspaces(&state.db).await.map_err(|e| e.to_string())
+    haily_app::list_workspaces(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Discard a coding workspace (phase 11a) — revert the worktree, remove it, delete the
@@ -324,7 +532,9 @@ async fn discard_workspace(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    haily_app::discard_workspace(&state.db, &id, &session_id).await.map_err(|e| e.to_string())
+    haily_app::discard_workspace(&state.db, &id, &session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The unified diff of a workspace's worktree against HEAD, for the DiffViewer's read side
@@ -338,7 +548,9 @@ async fn workspace_diff(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    haily_app::workspace_diff(&state.db, &id, &session_id).await.map_err(|e| e.to_string())
+    haily_app::workspace_diff(&state.db, &id, &session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The unified approvals queue's PENDING set (phase 11a): every in-flight tool approval
@@ -351,6 +563,20 @@ async fn list_approvals(state: State<'_, AppState>) -> Result<Vec<PendingApprova
     let guard = state.app.lock().await;
     let app = guard.as_ref().ok_or("app is shutting down")?;
     Ok(app.pending_approvals())
+}
+
+/// The current slash-command registry (Unified Chat UI phase 2, D1) — built-ins + enabled
+/// authored + enabled synthesized skills, name-sorted, for the palette/＋ menu. Rebuilds
+/// opportunistically before returning so the palette reflects a just-edited skill even if no
+/// chat message has been sent since (`dispatch_loop`'s own per-request `ensure_fresh` call is
+/// the OTHER place this same lazy-rebuild check runs — see `SlashRegistry::ensure_fresh`).
+#[tauri::command]
+async fn list_slash_commands(state: State<'_, AppState>) -> Result<Vec<SlashCommand>, String> {
+    state
+        .slash_registry
+        .ensure_fresh(&state.kms, &state.db)
+        .await;
+    Ok(state.slash_registry.snapshot())
 }
 
 /// Launch a coding-pipeline run from the GUI's "New run" form (Pipeline Activation & Wiring
@@ -372,8 +598,84 @@ async fn start_coding_run(
     let guard = state.app.lock().await;
     let app = guard.as_ref().ok_or("app is shutting down")?;
     let depth = DepthMode::from_label(&depth);
-    haily_app::start_coding_run(app, &kind, task, repo_path.map(std::path::PathBuf::from), depth)
-        .map(|_| ())
+    haily_app::start_coding_run(
+        app,
+        &kind,
+        task,
+        repo_path.map(std::path::PathBuf::from),
+        depth,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3) — per-run kill/pause/resume. LOCAL-GUI-ONLY: these three
+// commands take a bare `run_id` with no session/ownership binding and MUST NEVER be exposed over
+// the mobile/remote bridge (`ClientFrame`/`ServerFrame`) — see `AppState.run_control`'s doc.
+// None of the three touch `safety.disable_writes`; a resumed run re-enters normal approval
+// gating with no elevated permission.
+// ---------------------------------------------------------------------------
+
+/// Cancel a run immediately (its registered token, if live) and soft-delete its row as a
+/// checkpoint fallback for a run with no live registry entry. Returns `false` (not an error) if
+/// `run_id` was already terminal or unknown.
+#[tauri::command]
+async fn kill_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    haily_app::run_control::kill_run(&state.db, &state.run_control, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Set a run's pause flag (best-effort, honored at the run's next stage boundary). Returns
+/// `false` (not an error) if `run_id` has no live registered entry.
+#[tauri::command]
+fn pause_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(haily_app::run_control::pause_run(
+        &state.run_control,
+        &run_id,
+    ))
+}
+
+/// Resume an `interrupted` run, or a `paused` run whose reason is retries-exhausted or
+/// explicit-stop — re-entering via a fresh relaunch bound to the run's OWN (reused) session,
+/// with its own chunk-forwarding wiring (`haily_app::run_control::resume_run` mirrors
+/// `start_coding_run`'s pattern internally). Returns `false` (not an error) for any
+/// ineligible/unknown `run_id` (already terminal/live, an approval-wait pause, or a row with no
+/// resume context). Returns an error only when the owning workspace was already reclaimed or
+/// its change already applied — a clear message the frontend should surface verbatim.
+#[tauri::command]
+async fn resume_run(run_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.app.lock().await;
+    let app = guard.as_ref().ok_or("app is shutting down")?;
+    haily_app::run_control::resume_run(app, &run_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// List runs for the Runs screen (Unified Chat UI phase 7, D6): every active row plus a bounded
+/// window of recent terminal history — see `haily_app::runs_view::list_runs`'s doc for the exact
+/// active+recent-terminal contract. Local-GUI-only (never bridged to mobile — a paired device
+/// seeing every run's task text would leak repo/task info across the trust boundary the plan's
+/// red-team drew for `kill_run`/`resume_run`).
+#[tauri::command]
+async fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunSummary>, String> {
+    haily_app::list_runs(&state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rehydrate one run's persisted timeline for the Runs drill-in (Unified Chat UI phase 7, D6) —
+/// wraps `run_events::list_run_events`, which ALSO reconciles a missing terminal event against
+/// `pipeline_runs.status` (see that function's doc) so a restarted/crashed run never renders as
+/// permanently "running" here. Same local-GUI-only boundary as `list_runs`.
+#[tauri::command]
+async fn list_run_events(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<PipelineRunEvent>, String> {
+    run_events::list_run_events(&state.db, &run_id)
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -437,9 +739,14 @@ async fn mobile_pairing_qr(
     device_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<haily_types::PairingQr, String> {
-    haily_app::pairing_qr(&state.mobile.adapter, &state.mobile.data_dir, &state.mobile.cfg, device_name)
-        .await
-        .map_err(|e| e.to_string())
+    haily_app::pairing_qr(
+        &state.mobile.adapter,
+        &state.mobile.data_dir,
+        &state.mobile.cfg,
+        device_name,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Every pairing request still awaiting the desktop's OOB decision (M4). Polled by the GUI
@@ -447,7 +754,9 @@ async fn mobile_pairing_qr(
 /// push (P2a exposes no event channel for a newly-arrived pairing request).
 #[cfg(feature = "mobile-server")]
 #[tauri::command]
-fn mobile_pending_pairs(state: State<'_, AppState>) -> Result<Vec<haily_app::PendingPairView>, String> {
+fn mobile_pending_pairs(
+    state: State<'_, AppState>,
+) -> Result<Vec<haily_app::PendingPairView>, String> {
     Ok(haily_app::pending_pairs(&state.mobile.adapter))
 }
 
@@ -455,15 +764,27 @@ fn mobile_pending_pairs(state: State<'_, AppState>) -> Result<Vec<haily_app::Pen
 /// unknown/already-resolved code — the caller should treat that as a no-op.
 #[cfg(feature = "mobile-server")]
 #[tauri::command]
-fn mobile_confirm_pair(code: String, approve: bool, state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(haily_app::confirm_pair(&state.mobile.adapter, &code, approve))
+fn mobile_confirm_pair(
+    code: String,
+    approve: bool,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(haily_app::confirm_pair(
+        &state.mobile.adapter,
+        &code,
+        approve,
+    ))
 }
 
 /// Every non-revoked paired device, most-recently-paired first.
 #[cfg(feature = "mobile-server")]
 #[tauri::command]
-async fn mobile_list_devices(state: State<'_, AppState>) -> Result<Vec<haily_app::DeviceView>, String> {
-    haily_app::list_devices(&state.db).await.map_err(|e| e.to_string())
+async fn mobile_list_devices(
+    state: State<'_, AppState>,
+) -> Result<Vec<haily_app::DeviceView>, String> {
+    haily_app::list_devices(&state.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Revoke a paired device — soft-revokes the row AND ends its live connection immediately.
@@ -479,7 +800,9 @@ async fn mobile_revoke_device(device_id: String, state: State<'_, AppState>) -> 
 /// Status banners: enabled/running/tailnet-absent/LAN-opt-in (M2/M11, Tailscale prerequisite).
 #[cfg(feature = "mobile-server")]
 #[tauri::command]
-async fn mobile_server_status(state: State<'_, AppState>) -> Result<haily_app::MobileStatusView, String> {
+async fn mobile_server_status(
+    state: State<'_, AppState>,
+) -> Result<haily_app::MobileStatusView, String> {
     Ok(haily_app::mobile_status(&state.mobile.cfg).await)
 }
 
@@ -499,7 +822,8 @@ async fn mobile_regenerate_cert(state: State<'_, AppState>) -> Result<String, St
 fn spawn_chunk_bridge(ah: TauriAppHandle, mut rx: GuiResponseReceiver) {
     tauri::async_runtime::spawn(async move {
         while let Some((session_id, chunk)) = rx.recv().await {
-            let payload = serde_json::json!({ "session_id": session_id.to_string(), "chunk": chunk });
+            let payload =
+                serde_json::json!({ "session_id": session_id.to_string(), "chunk": chunk });
             let _ = ah.emit("haily-chunk", payload);
         }
     });
@@ -548,7 +872,8 @@ fn spawn_proactive_cards_bridge(ah: TauriAppHandle, mut rx: GuiProactiveReceiver
 fn spawn_run_events_bridge(ah: TauriAppHandle, mut rx: GuiRunEventReceiver) {
     tauri::async_runtime::spawn(async move {
         while let Some((session_id, event)) = rx.recv().await {
-            let payload = serde_json::json!({ "session_id": session_id.to_string(), "event": event });
+            let payload =
+                serde_json::json!({ "session_id": session_id.to_string(), "event": event });
             let _ = ah.emit("haily-run-events", payload);
         }
     });
@@ -566,11 +891,16 @@ fn handle_exit_requested(app_handle: &TauriAppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // Registered here (unified-chat-ui P01) so P07 can fire OS toasts with no further
+        // `Cargo.toml` churn — unused until then, no command exposes it yet.
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = haily_app::default_data_dir();
             std::fs::create_dir_all(&data_dir)?;
@@ -596,14 +926,12 @@ pub fn run() {
             #[cfg(feature = "mobile-server")]
             let mobile_state = {
                 let (adapter, cfg) = tauri::async_runtime::block_on(async {
-                    let mobile_db =
-                        Arc::new(DbHandle::init(&data_dir.join("haily.db")).await?);
+                    let mobile_db = Arc::new(DbHandle::init(&data_dir.join("haily.db")).await?);
                     let cfg = haily_app::mobile_config::load_mobile_config(&mobile_db).await;
-                    let device_store = Arc::new(
-                        haily_app::mobile_device_store::DbMobileDeviceStore::new(Arc::clone(
-                            &mobile_db,
-                        )),
-                    );
+                    let device_store =
+                        Arc::new(haily_app::mobile_device_store::DbMobileDeviceStore::new(
+                            Arc::clone(&mobile_db),
+                        ));
                     let adapter = Arc::new(haily_io::mobile::MobileAdapter::new(
                         cfg.clone(),
                         device_store,
@@ -620,7 +948,20 @@ pub fn run() {
                 }
             };
 
-            let bootstrap = AppHandle::bootstrap(&data_dir, adapters, BootstrapOptions::default());
+            // Unified Chat UI phase 7 (D7): constructed BEFORE `bootstrap` — `app.handle()` is
+            // already a real Tauri `AppHandle` at this point in `setup()`, unlike the resolver/
+            // kill/transcript seams `bootstrap` injects AFTER construction (see its doc).
+            let os_notifier: Arc<dyn OsNotifier> = Arc::new(TauriOsNotifier {
+                app: app.handle().clone(),
+            });
+            let bootstrap = AppHandle::bootstrap(
+                &data_dir,
+                adapters,
+                BootstrapOptions {
+                    os_notifier,
+                    ..BootstrapOptions::default()
+                },
+            );
             let app_handle = tauri::async_runtime::block_on(bootstrap)
                 .map_err(|e| Box::new(std::io::Error::other(e.to_string())))?;
             let db = Arc::clone(&app_handle.db);
@@ -629,8 +970,11 @@ pub fn run() {
             let turns = app_handle.turn_registry();
             let kill = app_handle.orchestrator.kill_handle();
             let routing_enabled = app_handle.orchestrator.routing_enabled_handle();
+            let approval_mode = app_handle.orchestrator.approval_mode_handle();
             let credential_store = Arc::clone(&app_handle.credential_store);
             let view_store = app_handle.orchestrator.view_store();
+            let slash_registry = Arc::clone(&app_handle.slash_registry);
+            let run_control = app_handle.run_control_registry();
             app.manage(AppState {
                 gui_req_tx,
                 db,
@@ -643,6 +987,9 @@ pub fn run() {
                 view_store,
                 #[cfg(feature = "mobile-server")]
                 mobile: mobile_state,
+                slash_registry,
+                approval_mode,
+                run_control,
                 app: Mutex::new(Some(app_handle)),
             });
             spawn_chunk_bridge(app.handle().clone(), gui_resp_rx);
@@ -677,6 +1024,7 @@ pub fn run() {
             start_coding_run,
             get_view,
             record_view_intent,
+            list_slash_commands,
             #[cfg(feature = "mobile-server")]
             mobile_pairing_qr,
             #[cfg(feature = "mobile-server")]
@@ -691,6 +1039,19 @@ pub fn run() {
             mobile_server_status,
             #[cfg(feature = "mobile-server")]
             mobile_regenerate_cert,
+            get_skill_detail,
+            edit_skill,
+            list_skill_versions,
+            revert_skill,
+            promote_skill,
+            archive_skill_manual,
+            list_recovered_skills,
+            set_approval_mode,
+            kill_run,
+            pause_run,
+            resume_run,
+            list_runs,
+            list_run_events,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Haily")

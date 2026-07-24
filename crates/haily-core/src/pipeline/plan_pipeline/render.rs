@@ -17,9 +17,16 @@ const MAX_SLUG_LEN: usize = 40;
 /// dir), so they are reverted by the worktree compensator like any workspace write.
 pub fn plan_artifacts(task: &str, slug: &str, draft: &PlanDraft) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(draft.phases.len() + 2);
-    out.push((format!(".agents/{slug}/plan.md"), render_plan_md(task, draft)));
+    out.push((
+        format!(".agents/{slug}/plan.md"),
+        render_plan_md(task, draft),
+    ));
     for p in &draft.phases {
-        let rel = format!(".agents/{slug}/phase-{:02}-{}.md", p.phase, slugify(&p.title));
+        let rel = format!(
+            ".agents/{slug}/phase-{:02}-{}.md",
+            p.phase,
+            slugify(&p.title)
+        );
         out.push((rel, render_phase_md(p)));
     }
     out.push((
@@ -50,7 +57,11 @@ pub fn render_plan_md(task: &str, draft: &PlanDraft) -> String {
         let deps = if p.dependencies.is_empty() {
             "none".to_string()
         } else {
-            p.dependencies.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            p.dependencies
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         s.push_str(&format!(
             "- **Phase {}: {}** — {} · {} · deps: {} · tier: {} → `phase-{:02}-{}.md`\n",
@@ -74,7 +85,12 @@ pub fn render_plan_md(task: &str, draft: &PlanDraft) -> String {
             } else {
                 format!(" (verify: {})", a.verification.trim())
             };
-            s.push_str(&format!("- {} [{}]{}\n", a.claim.trim(), a.confidence, verify));
+            s.push_str(&format!(
+                "- {} [{}]{}\n",
+                a.claim.trim(),
+                a.confidence,
+                verify
+            ));
         }
         s.push('\n');
     }
@@ -83,7 +99,12 @@ pub fn render_plan_md(task: &str, draft: &PlanDraft) -> String {
 
 /// Render ONE phase file with the exact 7-field frontmatter, then a minimal body.
 pub fn render_phase_md(p: &PhaseSpec) -> String {
-    let deps = p.dependencies.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    let deps = p
+        .dependencies
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "---\n\
          phase: {phase}\n\
@@ -191,8 +212,19 @@ mod tests {
     #[test]
     fn phase_frontmatter_has_exactly_the_seven_fields() {
         let md = render_phase_md(&draft().phases[1]);
-        for field in ["phase: 2", "title: \"Build It\"", "status: pending", "priority: P2", "effort: 3d", "dependencies: [1]", "tier: medium"] {
-            assert!(md.contains(field), "phase frontmatter missing `{field}`:\n{md}");
+        for field in [
+            "phase: 2",
+            "title: \"Build It\"",
+            "status: pending",
+            "priority: P2",
+            "effort: 3d",
+            "dependencies: [1]",
+            "tier: medium",
+        ] {
+            assert!(
+                md.contains(field),
+                "phase frontmatter missing `{field}`:\n{md}"
+            );
         }
         // Re-parseable as an authored-skill-style frontmatter block (opens + closes with ---).
         assert!(md.starts_with("---\n"));
@@ -213,15 +245,25 @@ mod tests {
     fn artifacts_cover_plan_all_phases_and_the_scout_report() {
         let arts = plan_artifacts("t", "251101-plan", &draft());
         assert!(arts.iter().any(|(p, _)| p == ".agents/251101-plan/plan.md"));
-        assert!(arts.iter().any(|(p, _)| p == ".agents/251101-plan/phase-01-scout-design.md"));
-        assert!(arts.iter().any(|(p, _)| p == ".agents/251101-plan/phase-02-build-it.md"));
-        assert!(arts.iter().any(|(p, _)| p == ".agents/251101-plan/reports/scout-report.md"));
+        assert!(arts
+            .iter()
+            .any(|(p, _)| p == ".agents/251101-plan/phase-01-scout-design.md"));
+        assert!(arts
+            .iter()
+            .any(|(p, _)| p == ".agents/251101-plan/phase-02-build-it.md"));
+        assert!(arts
+            .iter()
+            .any(|(p, _)| p == ".agents/251101-plan/reports/scout-report.md"));
     }
 
     #[test]
     fn slugify_is_filename_safe() {
         assert_eq!(slugify("Scout & Design!"), "scout-design");
         assert_eq!(slugify("  weird///name  "), "weird-name");
-        assert_eq!(slugify("???"), "phase", "an all-symbol title falls back to a stable stem");
+        assert_eq!(
+            slugify("???"),
+            "phase",
+            "an all-symbol title falls back to a stable stem"
+        );
     }
 }

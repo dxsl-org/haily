@@ -1,5 +1,8 @@
 //! Request dispatch loop — pulls requests from adapter channels, fans out to the
 //! orchestrator, and forwards response chunks back to the originating adapter.
+use crate::notify::{OsNotifier, ToastCoalescer};
+use crate::run_control::RunControlRegistry;
+use crate::slash_registry::SlashRegistry;
 use crate::trigger::{self, TriggerAction};
 use crate::turns::TurnRegistry;
 use anyhow::Result;
@@ -17,12 +20,17 @@ use tracing::info;
 /// The loop itself runs for the lifetime of the app; this function only awaits
 /// `AdapterManager::start_all` (which starts each adapter's own event loop) before
 /// returning — it does not block on the dispatch loop finishing.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_dispatch_loop(
     am: AdapterManager,
     orc: Arc<Orchestrator>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    slash_registry: Arc<SlashRegistry>,
+    run_control: Arc<RunControlRegistry>,
+    notifier: Arc<dyn OsNotifier>,
+    toast_coalescer: Arc<ToastCoalescer>,
 ) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Request>(64);
     am.start_all(req_tx).await?;
@@ -36,6 +44,10 @@ pub async fn spawn_dispatch_loop(
         shutdown,
         dispatch_tasks,
         turns,
+        slash_registry,
+        run_control,
+        notifier,
+        toast_coalescer,
     ));
     Ok(())
 }
@@ -47,6 +59,7 @@ pub async fn spawn_dispatch_loop(
 /// spawned on `tasks` (not bare `tokio::spawn`) — otherwise `AppHandle::shutdown`
 /// would drain the watcher/daemon tasks while silently abandoning whatever turn was
 /// in flight, which defeats the entire point of a drain.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_loop(
     am: AdapterManager,
     orc: Arc<Orchestrator>,
@@ -54,6 +67,10 @@ async fn dispatch_loop(
     shutdown: CancellationToken,
     tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    slash_registry: Arc<SlashRegistry>,
+    run_control: Arc<RunControlRegistry>,
+    notifier: Arc<dyn OsNotifier>,
+    toast_coalescer: Arc<ToastCoalescer>,
 ) {
     loop {
         let req = tokio::select! {
@@ -93,8 +110,23 @@ async fn dispatch_loop(
         // token above.
         turns.register(session_id, turn_cancel.clone());
         let turns_clone = Arc::clone(&turns);
+        // Unified Chat UI phase 2: cloned per-iteration like `orc_clone`/`am_clone` — the
+        // registry itself is a cheap `Arc<RwLock<..>>` snapshot holder, shared (not rebuilt)
+        // across every request.
+        let registry_clone = Arc::clone(&slash_registry);
+        // Unified Chat UI phase 6 (D3): cloned per-iteration like `registry_clone` — the ONE
+        // run-control registry every chat-triggered launch (`trigger::launch`) registers into.
+        let run_control_clone = Arc::clone(&run_control);
+        // Unified Chat UI phase 7 (D7): cloned per-iteration like `run_control_clone` — the ONE
+        // notifier/coalescer pair every chat-triggered launch threads into its `RunEvent` bridge.
+        let notifier_clone = Arc::clone(&notifier);
+        let toast_coalescer_clone = Arc::clone(&toast_coalescer);
 
         tasks.spawn(async move {
+            // Re-bind mutable: `req` needs a mutable borrow below (a `SkillTurn` slash command
+            // tags `forced_skill` on it) but every other branch still moves the original value
+            // where it needs to (the `NormalTurn` and `ConfirmThenLaunch`-denied-fallback paths).
+            let mut req = req;
             // Forward chunks from orchestrator → adapter while the agent loop runs.
             let delivery = {
                 let am = am_clone.clone();
@@ -109,40 +141,75 @@ async fn dispatch_loop(
                 })
             };
 
+            // Lazy rebuild (P02↔P08 interop contract): cheap no-op unless the authored-skill
+            // kit-pack version has moved since the last build.
+            registry_clone
+                .ensure_fresh(&orc_clone.kms, &orc_clone.db)
+                .await;
+
             // Pipeline Activation & Wiring phase 2: decide whether this request is a normal
             // chat turn, an explicit slash-triggered pipeline launch, or a confirm-gated
-            // chat-intent launch — `resolve` only borrows `req`, so every branch below can
-            // still move the original `req` where it needs to (the `NormalTurn` and
-            // `ConfirmThenLaunch`-denied-fallback paths both need it).
-            match trigger::resolve(&req) {
+            // chat-intent launch — `resolve` mutates `req` only for a `SkillTurn` slash command,
+            // so every branch below can still move the original `req` where it needs to (the
+            // `NormalTurn` and `ConfirmThenLaunch`-denied-fallback paths both need it).
+            match trigger::resolve(&mut req, &registry_clone) {
                 TriggerAction::NormalTurn => {
                     trigger::run_normal_turn(&orc_clone, req, resp_tx, turn_cancel).await;
                 }
                 TriggerAction::LaunchPlan(task) => {
                     let depth = req.depth;
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
-                    trigger::launch(handles, turn_cancel, RunKind::Plan, task, session_id, depth, resp_tx);
+                    trigger::launch(
+                        handles,
+                        turn_cancel,
+                        RunKind::Plan,
+                        task,
+                        session_id,
+                        depth,
+                        resp_tx,
+                    );
                 }
                 TriggerAction::LaunchBuild(task) => {
                     let depth = req.depth;
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
-                    trigger::launch(handles, turn_cancel, RunKind::Build, task, session_id, depth, resp_tx);
+                    trigger::launch(
+                        handles,
+                        turn_cancel,
+                        RunKind::Build,
+                        task,
+                        session_id,
+                        depth,
+                        resp_tx,
+                    );
                 }
                 TriggerAction::ConfirmThenLaunch(kind, task) => {
                     let handles = trigger::LaunchHandles {
+                        db: Arc::clone(&orc_clone.db),
                         orc: orc_clone,
                         am: am_clone.clone(),
                         tasks: tasks_for_launch,
+                        run_control: run_control_clone,
+                        notifier: notifier_clone,
+                        coalescer: toast_coalescer_clone,
                     };
-                    trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx).await;
+                    trigger::confirm_then_launch(handles, turn_cancel, kind, task, req, resp_tx)
+                        .await;
                 }
                 TriggerAction::PromptTask(kind) => {
                     let hint = trigger::task_prompt_hint(kind);

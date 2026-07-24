@@ -5,7 +5,7 @@
   // safety-toggle-only. Plain, non-technical copy throughout — no "RiskTier"/"kill
   // switch"/"compensation" jargon in anything the user reads (the code comments keep
   // those terms for devs).
-  import { exportDatabase } from '$lib/tauri';
+  import { exportDatabase, setApprovalMode, type ApprovalMode } from '$lib/tauri';
   import { save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 
   let {
@@ -28,6 +28,35 @@
       await save('safety.disable_writes', writesPaused() ? 'false' : 'true');
     } finally {
       toggling = false;
+    }
+  }
+
+  // Named permission ladder (Unified Chat UI phase 11, D5). Goes through the DEDICATED
+  // `set_approval_mode` command, not the generic `save()`/`set_preference` — the backend
+  // persists the DB row BEFORE flipping the live handle for THIS key specifically (fails
+  // toward the stricter mode on a crash between the two), an ordering the generic setter
+  // does not guarantee. Unset/unknown reads as `manual`, the safest rung.
+  const APPROVAL_MODE_KEY = 'approval.mode';
+  const currentApprovalMode = (): ApprovalMode => {
+    const v = prefs[APPROVAL_MODE_KEY];
+    return v === 'accept_edits' || v === 'auto' ? v : 'manual';
+  };
+
+  const APPROVAL_MODE_OPTIONS: { id: ApprovalMode; title: string; hint: string }[] = [
+    { id: 'manual', title: 'Luôn hỏi trước', hint: 'Hỏi bạn trước mọi thay đổi, dù nhỏ hay lớn. An toàn nhất — mặc định.' },
+    { id: 'accept_edits', title: 'Tự làm việc có thể hoàn tác', hint: 'Tự động thực hiện các thay đổi có thể hoàn tác; vẫn hỏi trước việc không thể hoàn tác.' },
+    { id: 'auto', title: 'Tự làm mọi việc', hint: 'Làm mọi việc mà không hỏi — kể cả việc không thể hoàn tác. Mọi hành động vẫn được ghi nhật ký, không tự hoàn tác. Công tắc tạm khóa ghi ở trên vẫn có tác dụng.' },
+  ];
+
+  let settingApprovalMode = $state(false);
+  async function chooseApprovalMode(mode: ApprovalMode) {
+    if (settingApprovalMode || currentApprovalMode() === mode) return;
+    settingApprovalMode = true;
+    try {
+      await setApprovalMode(mode);
+      prefs[APPROVAL_MODE_KEY] = mode;
+    } finally {
+      settingApprovalMode = false;
     }
   }
 
@@ -143,6 +172,26 @@
   </div>
 
   <div class="block">
+    <div class="switch-copy">
+      <span class="switch-title">Mức độ tự động</span>
+      <span class="hint">Chọn mức Haily được phép tự thực hiện thay đổi mà không cần hỏi bạn trước.</span>
+    </div>
+    <div class="ladder">
+      {#each APPROVAL_MODE_OPTIONS as opt (opt.id)}
+        <button
+          class="ladder-option"
+          class:active={currentApprovalMode() === opt.id}
+          disabled={settingApprovalMode}
+          onclick={() => chooseApprovalMode(opt.id)}
+        >
+          <span class="ladder-title">{opt.title}</span>
+          <span class="hint">{opt.hint}</span>
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <div class="block">
     <div class="switch-row">
       <div class="switch-copy">
         <span class="switch-title">Pause all writes</span>
@@ -218,6 +267,25 @@
   }
   .switch.on { background: #4c1d95; border-color: #7c3aed; }
   .switch.on .knob { transform: translateX(18px); background: #e0dff5; }
+
+  .ladder { display: flex; flex-direction: column; gap: 8px; }
+  .ladder-option {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-start;
+    text-align: left;
+    padding: 10px 12px;
+    border: 1px solid #2e2e4a;
+    border-radius: 10px;
+    background: #16162a;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .ladder-option:hover:not(:disabled) { border-color: #7c3aed; background: #1e1e35; }
+  .ladder-option:disabled { opacity: 0.6; cursor: default; }
+  .ladder-option.active { border-color: #7c3aed; background: #241a3d; }
+  .ladder-title { font-size: 12.5px; color: #e0dff5; font-weight: 600; }
 
   .undo-btn {
     align-self: flex-start;

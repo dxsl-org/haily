@@ -17,6 +17,7 @@ fn chat_request() -> Request {
         user_ref: None,
         depth: DepthMode::Normal,
         origin: RequestOrigin::Chat,
+        forced_skill: None,
     }
 }
 
@@ -54,7 +55,11 @@ fn a_wire_deserialized_request_is_always_chat_origin() {
     // payload can never carry a Cli origin.
     let injected = r#"{"session_id":"00000000-0000-0000-0000-000000000000","adapter_id":"telegram","message":"eval","user_ref":null,"origin":"cli"}"#;
     let req: Request = serde_json::from_str(injected).expect("deserialize");
-    assert_eq!(req.origin, RequestOrigin::Chat, "a wire payload can never inject a Cli origin");
+    assert_eq!(
+        req.origin,
+        RequestOrigin::Chat,
+        "a wire payload can never inject a Cli origin"
+    );
     assert!(EvalMode::from_request(&req).is_none());
 }
 
@@ -115,7 +120,10 @@ async fn auto_responder_approves_plan_checkpoint_but_denies_irreversible_write()
         });
         d
     };
-    assert!(!write_decision, "an IrreversibleWrite in eval must be denied → deterministic Failure");
+    assert!(
+        !write_decision,
+        "an IrreversibleWrite in eval must be denied → deterministic Failure"
+    );
 
     drop(user_tx);
     let _ = responder.await;
@@ -159,7 +167,10 @@ invariants:
 #[test]
 fn a_missing_required_field_fails_loud() {
     let src = "id: x\nlanguage: rust\n"; // missing kind/description/gate/...
-    assert!(parse_task_yaml(src).is_err(), "a malformed fixture must fail loud, never silently skip");
+    assert!(
+        parse_task_yaml(src).is_err(),
+        "a malformed fixture must fail loud, never silently skip"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -181,8 +192,16 @@ fn sample_outcome(passed: bool) -> EvalOutcome {
         escalation_count: 1,
         wall_clock_ms: 4200,
         egress: vec![
-            EgressTag { attempt: 0, tier: "fast".to_string(), egress: "local".to_string() },
-            EgressTag { attempt: 1, tier: "thinking".to_string(), egress: "cloud".to_string() },
+            EgressTag {
+                attempt: 0,
+                tier: "fast".to_string(),
+                egress: "local".to_string(),
+            },
+            EgressTag {
+                attempt: 1,
+                tier: "thinking".to_string(),
+                egress: "cloud".to_string(),
+            },
         ],
         per_stage_tokens: Vec::new(),
         eval_run_id: None,

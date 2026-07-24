@@ -156,7 +156,10 @@ fn extract_json_block(raw: &str) -> String {
     let s = raw.trim();
     let s = if let Some(rest) = s.strip_prefix("```") {
         let after_lang = rest.split_once('\n').map(|x| x.1).unwrap_or(rest);
-        after_lang.rsplit_once("```").map(|(body, _)| body).unwrap_or(after_lang)
+        after_lang
+            .rsplit_once("```")
+            .map(|(body, _)| body)
+            .unwrap_or(after_lang)
     } else {
         s
     };
@@ -177,7 +180,12 @@ fn extract_json_block(raw: &str) -> String {
 /// without needing to parse `#[cfg(test)]` boundaries out of a unified diff — the fix loop
 /// should never legitimately need to delete an assertion to pass a gate.
 const ASSERT_MACROS: &[&str] = &[
-    "assert!(", "assert_eq!(", "assert_ne!(", "debug_assert!(", "debug_assert_eq!(", "debug_assert_ne!(",
+    "assert!(",
+    "assert_eq!(",
+    "assert_ne!(",
+    "debug_assert!(",
+    "debug_assert_eq!(",
+    "debug_assert_ne!(",
 ];
 
 /// True iff an ADDED line is a trivially-true assertion (`assert!(true)`, `assert!(1==1)`,
@@ -214,7 +222,14 @@ pub fn detect_test_tampering(diff: &str) -> Option<Finding> {
     let mut added_trivial_assert = false;
     let mut removed_assert_line: Option<String> = None;
     const SUPPRESSIONS: &[&str] = &[
-        "#[ignore]", ".skip(", ".only(", "xfail", "pytest.mark.skip", "@Disabled", "it.skip", "test.skip",
+        "#[ignore]",
+        ".skip(",
+        ".only(",
+        "xfail",
+        "pytest.mark.skip",
+        "@Disabled",
+        "it.skip",
+        "test.skip",
     ];
 
     for line in diff.lines() {
@@ -224,7 +239,10 @@ pub fn detect_test_tampering(diff: &str) -> Option<Finding> {
             .or_else(|| line.strip_prefix("--- a/"))
         {
             let path = path.trim();
-            if path != "/dev/null" && is_test_path(path) && !touched_test_files.contains(&path.to_string()) {
+            if path != "/dev/null"
+                && is_test_path(path)
+                && !touched_test_files.contains(&path.to_string())
+            {
                 touched_test_files.push(path.to_string());
             }
             continue;
@@ -263,10 +281,16 @@ pub fn detect_test_tampering(diff: &str) -> Option<Finding> {
     }
     let mut summary = String::from("reward-hacking guard: the fix altered the TEST, not the code");
     if !touched_test_files.is_empty() {
-        summary.push_str(&format!(" — modified test file(s): {}", touched_test_files.join(", ")));
+        summary.push_str(&format!(
+            " — modified test file(s): {}",
+            touched_test_files.join(", ")
+        ));
     }
     if !suppression_hits.is_empty() {
-        summary.push_str(&format!(" — added test-suppression token(s): {}", suppression_hits.join(", ")));
+        summary.push_str(&format!(
+            " — added test-suppression token(s): {}",
+            suppression_hits.join(", ")
+        ));
     }
     if added_trivial_assert {
         summary.push_str(" — added a trivially-true assertion (e.g. `assert!(true)`)");
@@ -322,7 +346,9 @@ impl Tool for EmitFindingsTool {
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let findings = parse_findings(&args)?;
-        let doc = FindingsDoc { findings: findings.clone() };
+        let doc = FindingsDoc {
+            findings: findings.clone(),
+        };
         let serialized = serde_json::to_string(&doc).context("serializing findings")?;
         // Persist onto the run row (P6 LOCKED decision #3: the pre-allocated nullable column).
         // A review stage always carries a `run_id`; without one (a mis-wired call) we still
@@ -335,7 +361,11 @@ impl Tool for EmitFindingsTool {
             tracing::warn!("emit_findings called outside a pipeline run — findings not persisted");
         }
         let crit = findings.iter().filter(|f| f.is_critical()).count();
-        Ok(format!("recorded {} finding(s), {} critical", findings.len(), crit))
+        Ok(format!(
+            "recorded {} finding(s), {} critical",
+            findings.len(),
+            crit
+        ))
     }
 }
 
@@ -352,9 +382,12 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert!(f[0].is_critical());
 
-        let s = Value::String(r#"```json
+        let s = Value::String(
+            r#"```json
 {"findings":[{"severity":"low","summary":"nit"}]}
-``` trailing prose"#.to_string());
+``` trailing prose"#
+                .to_string(),
+        );
         let f2 = parse_findings(&s).expect("stringified repair");
         assert_eq!(f2[0].severity, Severity::Low);
     }
@@ -384,17 +417,34 @@ mod tests {
         ]});
         let findings =
             parse_findings(&v).expect("a capitalized/typo severity must not fail the whole array");
-        assert_eq!(findings.len(), 3, "every finding must survive, none silently dropped");
-        assert!(findings[0].is_critical(), "\"Critical\" (capitalized) must resolve to Critical");
-        assert!(findings[1].is_critical(), "\"crit\" synonym must resolve to Critical");
-        assert_eq!(findings[2].severity, Severity::Medium, "unknown token falls back, not dropped");
+        assert_eq!(
+            findings.len(),
+            3,
+            "every finding must survive, none silently dropped"
+        );
+        assert!(
+            findings[0].is_critical(),
+            "\"Critical\" (capitalized) must resolve to Critical"
+        );
+        assert!(
+            findings[1].is_critical(),
+            "\"crit\" synonym must resolve to Critical"
+        );
+        assert_eq!(
+            findings[2].severity,
+            Severity::Medium,
+            "unknown token falls back, not dropped"
+        );
     }
 
     #[test]
     fn findings_grammar_forces_the_emit_tool_envelope() {
         let g = findings_grammar().expect("grammar builds");
         assert!(g.contains("root ::="));
-        assert!(g.contains("emit_findings"), "grammar must fix the emit tool name");
+        assert!(
+            g.contains("emit_findings"),
+            "grammar must fix the emit tool name"
+        );
     }
 
     #[test]
@@ -424,7 +474,10 @@ mod tests {
 +#[ignore]
  fn t() {}
 ";
-        assert!(detect_test_tampering(diff).is_some(), "an added #[ignore] must be flagged");
+        assert!(
+            detect_test_tampering(diff).is_some(),
+            "an added #[ignore] must be flagged"
+        );
 
         let js = "\
 --- a/src/foo.js
@@ -432,7 +485,10 @@ mod tests {
 @@
 +it.skip('does the thing', () => {})
 ";
-        assert!(detect_test_tampering(js).is_some(), "an added .skip( must be flagged");
+        assert!(
+            detect_test_tampering(js).is_some(),
+            "an added .skip( must be flagged"
+        );
     }
 
     #[test]
@@ -444,7 +500,10 @@ mod tests {
 -    let x = risky.unwrap();
 +    let x = risky?;
 ";
-        assert!(detect_test_tampering(diff).is_none(), "a real code fix must not be flagged");
+        assert!(
+            detect_test_tampering(diff).is_none(),
+            "a real code fix must not be flagged"
+        );
     }
 
     #[test]
@@ -484,7 +543,8 @@ mod tests {
 -    assert_eq!(add(2, 2), 4);
 +    assert!(1==1);
 ";
-        let finding = detect_test_tampering(diff).expect("a hollowed assertion alone must be flagged");
+        let finding =
+            detect_test_tampering(diff).expect("a hollowed assertion alone must be flagged");
         assert!(finding.is_critical());
     }
 }

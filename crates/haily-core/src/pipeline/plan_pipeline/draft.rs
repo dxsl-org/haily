@@ -181,7 +181,10 @@ fn extract_json_block(raw: &str) -> String {
     // Strip a leading ```lang fence line + trailing ``` if present.
     let s = if let Some(rest) = s.strip_prefix("```") {
         let after_lang = rest.split_once('\n').map(|x| x.1).unwrap_or(rest);
-        after_lang.rsplit_once("```").map(|(body, _)| body).unwrap_or(after_lang)
+        after_lang
+            .rsplit_once("```")
+            .map(|(body, _)| body)
+            .unwrap_or(after_lang)
     } else {
         s
     };
@@ -214,7 +217,10 @@ mod tests {
 
     #[test]
     fn repairs_json_fence_and_trailing_prose() {
-        let raw = format!("Here is the plan:\n```json\n{}\n```\nLet me know!", valid_json());
+        let raw = format!(
+            "Here is the plan:\n```json\n{}\n```\nLet me know!",
+            valid_json()
+        );
         let d = parse_and_repair(&raw).expect("repair");
         assert_eq!(d.approach, "do it");
     }
@@ -223,7 +229,10 @@ mod tests {
     fn validate_rejects_empty_rejected_and_empty_phases() {
         let mut d = parse_and_repair(valid_json()).unwrap();
         d.rejected = vec!["  ".to_string()];
-        assert!(d.validate().is_err(), "blank rejected alternative must fail");
+        assert!(
+            d.validate().is_err(),
+            "blank rejected alternative must fail"
+        );
         let mut d2 = parse_and_repair(valid_json()).unwrap();
         d2.phases.clear();
         assert!(d2.validate().is_err(), "no phases must fail");
@@ -233,14 +242,23 @@ mod tests {
     fn design_grammar_forces_the_emit_tool_envelope() {
         let g = design_grammar().expect("grammar builds for the plan-draft schema");
         assert!(g.contains("root ::="));
-        assert!(g.contains("emit_plan_draft"), "grammar must fix the emit tool name");
+        assert!(
+            g.contains("emit_plan_draft"),
+            "grammar must fix the emit tool name"
+        );
     }
 
     #[test]
     fn draft_from_args_accepts_object_and_stringified_payload() {
         let obj: Value = serde_json::from_str(valid_json()).unwrap();
-        assert!(draft_from_args(&obj).is_ok(), "object args must deserialize");
+        assert!(
+            draft_from_args(&obj).is_ok(),
+            "object args must deserialize"
+        );
         let str_payload = Value::String(valid_json().to_string());
-        assert!(draft_from_args(&str_payload).is_ok(), "stringified args must be repaired");
+        assert!(
+            draft_from_args(&str_payload).is_ok(),
+            "stringified args must be repaired"
+        );
     }
 }

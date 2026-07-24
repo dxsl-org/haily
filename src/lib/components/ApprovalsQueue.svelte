@@ -6,8 +6,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { listApprovals, resolveApproval, type QueuedApproval } from '$lib/tauri';
 
-  // Lets the parent (`CockpitView`) mirror the freshest snapshot into sibling panels
-  // (e.g. `WorkspacePanel`'s diff-accept correlation) without a second fetch.
+  // Lets whichever parent mounts this alongside `WorkspacePanel` mirror the freshest
+  // snapshot into it (diff-accept correlation) without a second fetch.
   let { onUpdate }: { onUpdate?: (approvals: QueuedApproval[]) => void } = $props();
 
   let approvals = $state<QueuedApproval[]>([]);

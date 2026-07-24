@@ -543,6 +543,7 @@ async fn forward_user_message(
         user_ref: Some(device_id.to_string()),
         depth,
         origin: Default::default(),
+        forced_skill: None,
     };
     if tx.send(req).await.is_err() {
         tracing::warn!("mobile: orchestrator channel closed");

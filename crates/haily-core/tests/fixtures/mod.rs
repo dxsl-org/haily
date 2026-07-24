@@ -137,6 +137,17 @@ pub async fn run_golden_task(task: &GoldenTask) -> RunOutcome {
     let (db, kms, dir) = fresh_db_kms().await;
     let base_url = spawn_scripted_sse_server(task.scripted_responses.clone()).await;
 
+    // Named permission ladder (Unified Chat UI phase 11, D5): the ship default
+    // (`approval.mode` unset ⇒ `manual`) prompts even a plain `ReversibleWrite` — this
+    // harness has no approval responder, so a `manual`-mode ReversibleWrite tool call
+    // would hang until the broker's own timeout and be scored a false `failure`. Seed
+    // `accept_edits` explicitly so every golden task keeps testing the SAME "journaled,
+    // no prompt" ReversibleWrite behavior its doc comments describe — this harness is not
+    // itself testing the ladder (see `tool_call::tests` for that).
+    haily_db::queries::meta::upsert_preference(&db, "approval.mode", "accept_edits", "test")
+        .await
+        .expect("seed approval.mode");
+
     let shutdown = CancellationToken::new();
     let tasks = TaskTracker::new();
     let orchestrator = Orchestrator::init(
@@ -159,6 +170,7 @@ pub async fn run_golden_task(task: &GoldenTask) -> RunOutcome {
         user_ref: None,
         depth: Default::default(),
         origin: Default::default(),
+        forced_skill: None,
     };
 
     let (tx, mut rx) = mpsc::channel(64);

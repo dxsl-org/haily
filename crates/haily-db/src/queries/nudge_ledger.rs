@@ -45,17 +45,29 @@ mod tests {
     #[tokio::test]
     async fn first_claim_succeeds_second_claim_same_day_is_suppressed() {
         let (db, _d) = db().await;
-        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-07").await.unwrap());
-        assert!(!try_claim(&db, "cond_a", "entity-1", "2026-07-07").await.unwrap());
+        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
+        assert!(!try_claim(&db, "cond_a", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn distinct_condition_or_entity_or_day_claims_independently() {
         let (db, _d) = db().await;
-        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-07").await.unwrap());
-        assert!(try_claim(&db, "cond_b", "entity-1", "2026-07-07").await.unwrap());
-        assert!(try_claim(&db, "cond_a", "entity-2", "2026-07-07").await.unwrap());
-        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-08").await.unwrap());
+        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
+        assert!(try_claim(&db, "cond_b", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
+        assert!(try_claim(&db, "cond_a", "entity-2", "2026-07-07")
+            .await
+            .unwrap());
+        assert!(try_claim(&db, "cond_a", "entity-1", "2026-07-08")
+            .await
+            .unwrap());
     }
 
     /// Restart-survival: a fresh `DbHandle` opened against the same file (simulating a
@@ -66,10 +78,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let db1 = DbHandle::init(&path).await.unwrap();
-        assert!(try_claim(&db1, "cond_a", "entity-1", "2026-07-07").await.unwrap());
+        assert!(try_claim(&db1, "cond_a", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
         drop(db1);
 
         let db2 = DbHandle::init(&path).await.unwrap();
-        assert!(!try_claim(&db2, "cond_a", "entity-1", "2026-07-07").await.unwrap());
+        assert!(!try_claim(&db2, "cond_a", "entity-1", "2026-07-07")
+            .await
+            .unwrap());
     }
 }

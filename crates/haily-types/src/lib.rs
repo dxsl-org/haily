@@ -48,6 +48,21 @@ pub struct Request {
     /// entrypoint) sets `Cli`; every adapter leaves it `Chat`.
     #[serde(skip)]
     pub origin: RequestOrigin,
+    /// Force-inject a named skill's body into this turn's system prompt (Unified Chat UI
+    /// phase 2, the slash-registry `SkillTurn` action). Set by the dispatch-layer trigger
+    /// resolver when a `/<skill-name>` slash command resolves to an authored or synthesized
+    /// skill, never by the LLM or a tool result.
+    ///
+    /// UNLIKE `origin`, this field is `#[serde(default)]` — NOT `#[serde(skip)]` — because a
+    /// GUI/Telegram/mobile adapter must be able to round-trip it across the wire the way
+    /// `depth` does. That means, unlike `origin`, a crafted/replayed payload CAN set this
+    /// field directly. The injection site (`haily-kms::KmsHandle::build_life_context`) is
+    /// the actual security boundary: it re-validates the name against `SkillGates` (enabled?)
+    /// before ever reading a skill's body, and silently ignores any disabled/unknown name —
+    /// so a forged `forced_skill` can at most name a skill that is already admin-enabled and
+    /// gate-visible, never resurrect a disabled/archived one.
+    #[serde(default)]
+    pub forced_skill: Option<String>,
 }
 
 /// Request transport origin — the SEC-H structural gate for eval mode (phase 9). See
@@ -667,11 +682,40 @@ mod tests {
             user_ref: None,
             depth: DepthMode::Deep,
             origin: RequestOrigin::Chat,
+            forced_skill: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("\"depth\":\"deep\""));
         let round: Request = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round.depth, DepthMode::Deep);
+    }
+
+    /// ADDITIVE guarantee (mirrors `depth`'s own test): a `Request` payload minted before
+    /// `forced_skill` existed (no key at all) must still deserialize, defaulting to `None`.
+    #[test]
+    fn request_without_forced_skill_deserializes_to_none() {
+        let legacy = r#"{"session_id":"00000000-0000-0000-0000-000000000000","adapter_id":"cli","message":"hi","user_ref":null}"#;
+        let req: Request = serde_json::from_str(legacy).expect("legacy Request must deserialize");
+        assert_eq!(req.forced_skill, None, "absent forced_skill must default to None");
+    }
+
+    /// A payload WITH `forced_skill` round-trips faithfully — the dispatch-layer trigger
+    /// resolver depends on this surviving serialization across the GUI/Telegram/mobile wire.
+    #[test]
+    fn request_with_forced_skill_roundtrips() {
+        let req = Request {
+            session_id: Uuid::nil(),
+            adapter_id: "gui".into(),
+            message: "/fix-bug".into(),
+            user_ref: None,
+            depth: DepthMode::Normal,
+            origin: RequestOrigin::Chat,
+            forced_skill: Some("fix-bug".to_string()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"forced_skill\":\"fix-bug\""));
+        let round: Request = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round.forced_skill, Some("fix-bug".to_string()));
     }
 
     #[test]

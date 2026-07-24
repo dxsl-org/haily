@@ -55,11 +55,26 @@ fn persisted_attempt_counter_bounds_retries_even_with_stage_retries_left() {
 #[test]
 fn stage_exit_codes_drive_control_flow() {
     // AbortRun / BreakLoop / Continue as an explicit table.
-    assert_eq!(stage_outcome(StageDecision::Pause, false), StageOutcome::AbortRun);
-    assert_eq!(stage_outcome(StageDecision::Advance, true), StageOutcome::BreakLoop);
-    assert_eq!(stage_outcome(StageDecision::Advance, false), StageOutcome::Continue);
-    assert_eq!(stage_outcome(StageDecision::Retry, false), StageOutcome::Continue);
-    assert_eq!(stage_outcome(StageDecision::Escalate, false), StageOutcome::Continue);
+    assert_eq!(
+        stage_outcome(StageDecision::Pause, false),
+        StageOutcome::AbortRun
+    );
+    assert_eq!(
+        stage_outcome(StageDecision::Advance, true),
+        StageOutcome::BreakLoop
+    );
+    assert_eq!(
+        stage_outcome(StageDecision::Advance, false),
+        StageOutcome::Continue
+    );
+    assert_eq!(
+        stage_outcome(StageDecision::Retry, false),
+        StageOutcome::Continue
+    );
+    assert_eq!(
+        stage_outcome(StageDecision::Escalate, false),
+        StageOutcome::Continue
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +97,11 @@ async fn git(dir: &std::path::Path, args: &[&str]) {
         .output()
         .await
         .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 async fn fixture() -> Fixture {
@@ -90,7 +109,9 @@ async fn fixture() -> Fixture {
     git(repo.path(), &["init", "-b", "main"]).await;
     git(repo.path(), &["config", "user.email", "t@haily.test"]).await;
     git(repo.path(), &["config", "user.name", "Test"]).await;
-    tokio::fs::write(repo.path().join("README.md"), "hello\n").await.unwrap();
+    tokio::fs::write(repo.path().join("README.md"), "hello\n")
+        .await
+        .unwrap();
     git(repo.path(), &["add", "."]).await;
     git(repo.path(), &["commit", "-m", "init"]).await;
 
@@ -132,14 +153,19 @@ async fn spawn_scripted(responses: Vec<String>) -> String {
     let counter = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let responses = Arc::clone(&responses);
             let counter = Arc::clone(&counter);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf).await;
                 let i = counter.fetch_add(1, Ordering::SeqCst);
-                let content = responses.get(i).cloned().unwrap_or_else(|| "done".to_string());
+                let content = responses
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "done".to_string());
                 let payload = serde_json::json!({
                     "choices": [{ "message": { "content": content } }]
                 })
@@ -206,10 +232,18 @@ struct CreateArtifactTool {
 }
 #[async_trait]
 impl Tool for CreateArtifactTool {
-    fn name(&self) -> &str { "create_artifact" }
-    fn description(&self) -> &str { "writes a JSON artifact" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier { RiskTier::Read }
+    fn name(&self) -> &str {
+        "create_artifact"
+    }
+    fn description(&self) -> &str {
+        "writes a JSON artifact"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier {
+        RiskTier::Read
+    }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolContext) -> anyhow::Result<String> {
         tokio::fs::write(&self.path, r#"{"ok":true}"#).await?;
         Ok("artifact written".to_string())
@@ -224,10 +258,18 @@ struct WriteMarkerTool {
 }
 #[async_trait]
 impl Tool for WriteMarkerTool {
-    fn name(&self) -> &str { "write_marker" }
-    fn description(&self) -> &str { "writes a marker file" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier { RiskTier::Read }
+    fn name(&self) -> &str {
+        "write_marker"
+    }
+    fn description(&self) -> &str {
+        "writes a marker file"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier {
+        RiskTier::Read
+    }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolContext) -> anyhow::Result<String> {
         tokio::fs::write(&self.path, "marker\n").await?;
         Ok("marker written".to_string())
@@ -241,10 +283,18 @@ struct RunIdProbeTool {
 }
 #[async_trait]
 impl Tool for RunIdProbeTool {
-    fn name(&self) -> &str { "run_id_probe" }
-    fn description(&self) -> &str { "records ctx.run_id" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier { RiskTier::Read }
+    fn name(&self) -> &str {
+        "run_id_probe"
+    }
+    fn description(&self) -> &str {
+        "records ctx.run_id"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier {
+        RiskTier::Read
+    }
     async fn execute(&self, _a: serde_json::Value, c: &ToolContext) -> anyhow::Result<String> {
         *self.seen.lock().unwrap() = c.run_id.clone();
         Ok("ok".to_string())
@@ -258,10 +308,18 @@ struct TurnDeletesProbeTool {
 }
 #[async_trait]
 impl Tool for TurnDeletesProbeTool {
-    fn name(&self) -> &str { "turn_deletes_probe" }
-    fn description(&self) -> &str { "records the turn_deletes Arc pointer" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier { RiskTier::Read }
+    fn name(&self) -> &str {
+        "turn_deletes_probe"
+    }
+    fn description(&self) -> &str {
+        "records the turn_deletes Arc pointer"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier {
+        RiskTier::Read
+    }
     async fn execute(&self, _a: serde_json::Value, c: &ToolContext) -> anyhow::Result<String> {
         let ptr = Arc::as_ptr(&c.turn_deletes) as usize;
         self.seen.lock().unwrap().push(ptr);
@@ -274,10 +332,18 @@ impl Tool for TurnDeletesProbeTool {
 struct DeleteThingTool;
 #[async_trait]
 impl Tool for DeleteThingTool {
-    fn name(&self) -> &str { "delete_thing" }
-    fn description(&self) -> &str { "destructive" }
-    fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier { RiskTier::IrreversibleWrite }
+    fn name(&self) -> &str {
+        "delete_thing"
+    }
+    fn description(&self) -> &str {
+        "destructive"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn risk_tier(&self, _a: &serde_json::Value) -> RiskTier {
+        RiskTier::IrreversibleWrite
+    }
     async fn execute(&self, _a: serde_json::Value, _c: &ToolContext) -> anyhow::Result<String> {
         Ok("deleted".to_string())
     }
@@ -301,6 +367,7 @@ fn make_runner(
         base_tools,
         broker,
         kill,
+        crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits),
         cancel,
         user_tx,
         events,
@@ -327,6 +394,7 @@ fn make_runner_escalating(
         base_tools,
         broker,
         kill,
+        crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits),
         cancel,
         user_tx,
         events,
@@ -377,9 +445,17 @@ async fn ad_c1_runner_rejects_a_stage_that_can_delegate() {
     );
 
     let pipeline = Pipeline {
-        runs: vec![stage("bad", &["fs_read", "delegate_to_developer"], pass_gate(), 0)],
+        runs: vec![stage(
+            "bad",
+            &["fs_read", "delegate_to_developer"],
+            pass_gate(),
+            0,
+        )],
     };
-    let err = runner.run(spec(&fx, pipeline)).await.expect_err("must reject");
+    let err = runner
+        .run(spec(&fx, pipeline))
+        .await
+        .expect_err("must reject");
     assert!(
         format!("{err:#}").contains("delegation"),
         "AD-C1: a stage that can delegate must be rejected, got: {err:#}"
@@ -405,7 +481,9 @@ async fn dep_c1_all_stages_share_one_turn_deletes_arc() {
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(TurnDeletesProbeTool { seen: Arc::clone(&seen) }));
+    reg.register(Arc::new(TurnDeletesProbeTool {
+        seen: Arc::clone(&seen),
+    }));
 
     let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
@@ -507,7 +585,9 @@ async fn stage_subturn_tool_context_carries_the_run_id() {
 
     let seen = Arc::new(Mutex::new(None));
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(RunIdProbeTool { seen: Arc::clone(&seen) }));
+    reg.register(Arc::new(RunIdProbeTool {
+        seen: Arc::clone(&seen),
+    }));
 
     let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
@@ -523,7 +603,9 @@ async fn stage_subturn_tool_context_carries_the_run_id() {
         ev_tx,
     );
 
-    let pipeline = Pipeline { runs: vec![stage("s1", &["run_id_probe"], pass_gate(), 0)] };
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &["run_id_probe"], pass_gate(), 0)],
+    };
     let report = runner.run(spec(&fx, pipeline)).await.expect("run");
     assert_eq!(
         *seen.lock().unwrap(),
@@ -576,7 +658,10 @@ async fn scripted_three_stage_pipeline_completes_with_one_retry() {
             stage(
                 "implement",
                 &["create_artifact"],
-                Gate::Artifact { path: "artifact.json".to_string(), parseable_as: Some(ArtifactKind::Json) },
+                Gate::Artifact {
+                    path: "artifact.json".to_string(),
+                    parseable_as: Some(ArtifactKind::Json),
+                },
                 1,
             ),
             stage("verify", &[], pass_gate(), 0),
@@ -615,7 +700,9 @@ async fn kill_mid_run_finalize_commits_and_reconciles_worktree() {
     // Pre-modify a tracked file so we can prove finalize's compensate reverted it.
     let readme = fx.workspace.worktree_root().join("README.md");
     tokio::fs::write(&readme, "TAMPERED\n").await.unwrap();
-    tokio::fs::write(fx.workspace.worktree_root().join("junk.txt"), "x").await.unwrap();
+    tokio::fs::write(fx.workspace.worktree_root().join("junk.txt"), "x")
+        .await
+        .unwrap();
 
     let base = spawn_scripted(vec![]).await;
     let llm = build_router(base).await;
@@ -635,10 +722,16 @@ async fn kill_mid_run_finalize_commits_and_reconciles_worktree() {
         ev_tx,
     );
 
-    let pipeline = Pipeline { runs: vec![stage("s1", &[], pass_gate(), 0)] };
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
     let report = runner.run(spec(&fx, pipeline)).await.expect("run");
 
-    assert_eq!(report.status, RunStatus::Interrupted, "a killed run must finalize as interrupted");
+    assert_eq!(
+        report.status,
+        RunStatus::Interrupted,
+        "a killed run must finalize as interrupted"
+    );
 
     // The terminal transition committed.
     let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
@@ -649,10 +742,174 @@ async fn kill_mid_run_finalize_commits_and_reconciles_worktree() {
 
     // The worktree was reconciled to entry: tracked file reverted, untracked removed.
     let content = tokio::fs::read_to_string(&readme).await.unwrap();
-    assert_eq!(content.replace("\r\n", "\n"), "hello\n", "tracked file must be reverted");
+    assert_eq!(
+        content.replace("\r\n", "\n"),
+        "hello\n",
+        "tracked file must be reverted"
+    );
     assert!(
         !fx.workspace.worktree_root().join("junk.txt").exists(),
         "untracked file must be removed by finalize reconcile"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3): a user-initiated pause flag pauses the run at the same
+// between-stages checkpoint as kill/cancel, stamping `ExplicitStop`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pause_flag_pauses_the_run_with_explicit_stop_class() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec![]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    )
+    .with_pause_handle(Arc::new(AtomicBool::new(true))); // pause set BEFORE the run starts
+
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "the pause flag must pause the run at the next stage boundary"
+    );
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.status, "paused");
+    assert_eq!(
+        run.pause_reason_class.as_deref(),
+        Some("explicit_stop"),
+        "a user pause must be stamped ExplicitStop, not re-derived from a free-text reason"
+    );
+}
+
+#[tokio::test]
+async fn gate_retries_exhausted_pause_is_stamped_with_retries_exhausted_class() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec!["s1 attempt".to_string()]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+
+    // max_retries = 0 → the FIRST gate failure exhausts retries and pauses immediately.
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], fail_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(report.status, RunStatus::Paused);
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.pause_reason_class.as_deref(), Some("retries_exhausted"));
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 6 (D3): `seed_launch` persists the resume context onto the row.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn seed_launch_persists_run_id_and_resume_context_onto_the_row() {
+    let fx = fixture().await;
+    let base = spawn_scripted(vec!["done".to_string()]).await;
+    let llm = build_router(base).await;
+    let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
+    let broker = Arc::new(ApprovalBroker::new());
+
+    let runner = make_runner(
+        &fx,
+        llm,
+        Arc::new(ToolRegistry::new()),
+        broker,
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        user_tx,
+        ev_tx,
+    );
+    let seeded_id = Uuid::new_v4().to_string();
+    runner.seed_launch(Some(seeded_id.clone()), "do the thing", "build", "normal");
+
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect("run");
+
+    assert_eq!(
+        report.run_id, seeded_id,
+        "the one-shot seeded id must be consumed by the FIRST run() call"
+    );
+    let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
+        .await
+        .unwrap()
+        .expect("run row");
+    assert_eq!(run.task.as_deref(), Some("do the thing"));
+    assert_eq!(run.run_kind.as_deref(), Some("build"));
+    assert_eq!(run.depth.as_deref(), Some("normal"));
+
+    // A SECOND run() call within the same launch must NOT reuse the (already-consumed) id, but
+    // the sticky task/run_kind/depth context still applies.
+    let base2 = spawn_scripted(vec!["done again".to_string()]).await;
+    let llm2 = build_router(base2).await;
+    let runner2 = make_runner(
+        &fx,
+        llm2,
+        Arc::new(ToolRegistry::new()),
+        Arc::new(ApprovalBroker::new()),
+        Arc::new(AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
+        tokio::sync::mpsc::channel(64).0,
+        tokio::sync::mpsc::channel(512).0,
+    );
+    let seeded_id2 = Uuid::new_v4().to_string();
+    runner2.seed_launch(Some(seeded_id2.clone()), "do the thing", "build", "normal");
+    let pipeline2 = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report2 = runner2.run(spec(&fx, pipeline2)).await.expect("run");
+    assert_eq!(
+        report2.run_id, seeded_id2,
+        "the FIRST call on runner2 must consume its own seed"
+    );
+
+    let pipeline3 = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
+    let report3 = runner2.run(spec(&fx, pipeline3)).await.expect("run");
+    assert_ne!(
+        report3.run_id, seeded_id2,
+        "a SECOND internal run() call must mint its own fresh id, never reuse the launch's"
     );
 }
 
@@ -680,15 +937,24 @@ async fn restart_resets_running_runs_to_interrupted() {
             backend_used: None,
             egress: None,
             gate_output_digest: None,
+            pause_reason_class: None,
         },
     )
     .await
     .unwrap();
 
-    let n = haily_db::queries::pipeline_runs::reset_stale_running(&fx.db).await.unwrap();
+    let n = haily_db::queries::pipeline_runs::reset_stale_running(&fx.db)
+        .await
+        .unwrap();
     assert_eq!(n, 1, "the running run must be reset");
-    let after = haily_db::queries::pipeline_runs::get(&fx.db, &run.id).await.unwrap().unwrap();
-    assert_eq!(after.status, "interrupted", "a crashed running run must resume-block as interrupted");
+    let after = haily_db::queries::pipeline_runs::get(&fx.db, &run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.status, "interrupted",
+        "a crashed running run must resume-block as interrupted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -739,11 +1005,12 @@ async fn gate_cancelled_mid_stage_still_finalizes_committing_txn_and_reconciling
     #[cfg(not(windows))]
     let gate = command_gate("sh", &["-c", "sleep 30"]);
 
-    let pipeline = Pipeline { runs: vec![stage("slow", &[], gate, 0)] };
-    let report = runner
-        .run(spec(&fx, pipeline))
-        .await
-        .expect("a gate error during a stage must NOT propagate out of run() — finalize must always run");
+    let pipeline = Pipeline {
+        runs: vec![stage("slow", &[], gate, 0)],
+    };
+    let report = runner.run(spec(&fx, pipeline)).await.expect(
+        "a gate error during a stage must NOT propagate out of run() — finalize must always run",
+    );
 
     assert_eq!(
         report.status,
@@ -756,7 +1023,10 @@ async fn gate_cancelled_mid_stage_still_finalizes_committing_txn_and_reconciling
         .await
         .unwrap()
         .expect("run row");
-    assert_eq!(run.status, "interrupted", "the terminal transition must have committed");
+    assert_eq!(
+        run.status, "interrupted",
+        "the terminal transition must have committed"
+    );
 
     // The worktree was reconciled even though the gate itself errored.
     let content = tokio::fs::read_to_string(&readme).await.unwrap();
@@ -781,7 +1051,10 @@ fn retry_feedback_strips_tool_call_tags_from_gate_output() {
         "a live tool_call tag from gate output must never reach the retry prompt: {out}"
     );
     // The informational content (minus the tag tokens) must still be present.
-    assert!(out.contains("file.rs"), "non-tag content must survive stripping: {out}");
+    assert!(
+        out.contains("file.rs"),
+        "non-tag content must survive stripping: {out}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -811,8 +1084,12 @@ async fn retry_reset_preserves_earlier_passed_stage_output() {
     let llm = build_router(base).await;
 
     let mut reg = ToolRegistry::new();
-    reg.register(Arc::new(WriteMarkerTool { path: marker.clone() }));
-    reg.register(Arc::new(CreateArtifactTool { path: artifact.clone() }));
+    reg.register(Arc::new(WriteMarkerTool {
+        path: marker.clone(),
+    }));
+    reg.register(Arc::new(CreateArtifactTool {
+        path: artifact.clone(),
+    }));
 
     let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
@@ -833,13 +1110,19 @@ async fn retry_reset_preserves_earlier_passed_stage_output() {
             stage(
                 "stage1",
                 &["write_marker"],
-                Gate::Artifact { path: "stage1.marker".to_string(), parseable_as: None },
+                Gate::Artifact {
+                    path: "stage1.marker".to_string(),
+                    parseable_as: None,
+                },
                 0,
             ),
             stage(
                 "stage2",
                 &["create_artifact"],
-                Gate::Artifact { path: "stage2.json".to_string(), parseable_as: Some(ArtifactKind::Json) },
+                Gate::Artifact {
+                    path: "stage2.json".to_string(),
+                    parseable_as: Some(ArtifactKind::Json),
+                },
                 1,
             ),
         ],
@@ -855,7 +1138,10 @@ async fn retry_reset_preserves_earlier_passed_stage_output() {
         marker.exists(),
         "stage1's marker file must survive stage2's retry-triggered worktree reset"
     );
-    assert!(artifact.exists(), "stage2's artifact must exist after the retry succeeded");
+    assert!(
+        artifact.exists(),
+        "stage2's artifact must exist after the retry succeeded"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -883,7 +1169,9 @@ async fn every_stage_writes_one_routing_decision_row_even_when_escalation_disabl
         ev_tx,
     );
 
-    let pipeline = Pipeline { runs: vec![stage("s1", &[], pass_gate(), 0)] };
+    let pipeline = Pipeline {
+        runs: vec![stage("s1", &[], pass_gate(), 0)],
+    };
     let report = runner.run(spec(&fx, pipeline)).await.expect("run");
     assert_eq!(report.status, RunStatus::Done);
 
@@ -896,14 +1184,27 @@ async fn every_stage_writes_one_routing_decision_row_even_when_escalation_disabl
         .into_iter()
         .filter(|r| r.run_id.as_deref() == Some(report.run_id.as_str()))
         .collect();
-    assert_eq!(rows.len(), 1, "exactly one routing_decisions row for the one stage");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one routing_decisions row for the one stage"
+    );
     let row = &rows[0];
     assert_eq!(row.context_kind, "pipeline_stage");
     assert_eq!(row.stage_kind.as_deref(), Some("s1"));
-    assert!(row.chosen_tier.is_none(), "the test stage declares no tier override");
-    assert!(row.escalated_to.is_none(), "escalation is disabled by default — must never fire");
+    assert!(
+        row.chosen_tier.is_none(),
+        "the test stage declares no tier override"
+    );
+    assert!(
+        row.escalated_to.is_none(),
+        "escalation is disabled by default — must never fire"
+    );
     assert!(row.escalation_trigger.is_none());
-    assert_eq!(row.prior_failures, 0, "the stage passed on its first attempt");
+    assert_eq!(
+        row.prior_failures, 0,
+        "the stage passed on its first attempt"
+    );
 }
 
 #[tokio::test]
@@ -965,7 +1266,10 @@ async fn escalation_ceiling_reached_pauses_without_burning_an_extra_retry() {
             escalations += 1;
         }
     }
-    assert_eq!(escalations, 0, "a ceiling-blocked escalation must never emit RunEvent::Escalation");
+    assert_eq!(
+        escalations, 0,
+        "a ceiling-blocked escalation must never emit RunEvent::Escalation"
+    );
 
     let run = haily_db::queries::pipeline_runs::get(&fx.db, &report.run_id)
         .await
@@ -1021,7 +1325,10 @@ async fn per_stage_failure_counter_does_not_leak_into_the_next_stage() {
             stage(
                 "s1",
                 &["create_artifact"],
-                Gate::Artifact { path: "s1.json".to_string(), parseable_as: Some(ArtifactKind::Json) },
+                Gate::Artifact {
+                    path: "s1.json".to_string(),
+                    parseable_as: Some(ArtifactKind::Json),
+                },
                 2,
             ),
             stage("s2", &[], fail_gate(), 0),
@@ -1046,7 +1353,10 @@ async fn per_stage_failure_counter_does_not_leak_into_the_next_stage() {
         "stage2 must Pause on its very FIRST failure (below the policy's threshold) — a \
          run-global counter would instead inherit stage1's 2 failures and wrongly escalate"
     );
-    assert_eq!(report.retries, 2, "only stage1's two retries — stage2 must not retry/escalate");
+    assert_eq!(
+        report.retries, 2,
+        "only stage1's two retries — stage2 must not retry/escalate"
+    );
 
     let mut escalations = 0;
     while let Ok(ev) = ev_rx.try_recv() {
@@ -1054,7 +1364,10 @@ async fn per_stage_failure_counter_does_not_leak_into_the_next_stage() {
             escalations += 1;
         }
     }
-    assert_eq!(escalations, 0, "stage2's single failure must never trigger an escalation");
+    assert_eq!(
+        escalations, 0,
+        "stage2's single failure must never trigger an escalation"
+    );
 
     let rows: Vec<_> = routing_decisions::list_recent(&fx.db, 50)
         .await
@@ -1119,7 +1432,11 @@ async fn escalation_fires_once_within_ceiling_then_pauses_via_single_escalation_
         .await
         .expect("run");
 
-    assert_eq!(report.status, RunStatus::Paused, "the single-escalation guard must pause after one bump");
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "the single-escalation guard must pause after one bump"
+    );
     assert_eq!(report.retries, 3, "2 plain retries + 1 escalated retry");
 
     let mut escalations = Vec::new();
@@ -1128,7 +1445,11 @@ async fn escalation_fires_once_within_ceiling_then_pauses_via_single_escalation_
             escalations.push((from, to));
         }
     }
-    assert_eq!(escalations.len(), 1, "exactly ONE escalation must fire (single-step, R1 design)");
+    assert_eq!(
+        escalations.len(),
+        1,
+        "exactly ONE escalation must fire (single-step, R1 design)"
+    );
     assert_eq!(escalations[0], ("fast".to_string(), "medium".to_string()));
 
     let rows: Vec<_> = routing_decisions::list_recent(&fx.db, 50)
@@ -1138,12 +1459,19 @@ async fn escalation_fires_once_within_ceiling_then_pauses_via_single_escalation_
         .filter(|r| r.run_id.as_deref() == Some(report.run_id.as_str()))
         .collect();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].chosen_tier.as_deref(), Some("fast"), "chosen_tier is the STAGE's base tier");
+    assert_eq!(
+        rows[0].chosen_tier.as_deref(),
+        Some("fast"),
+        "chosen_tier is the STAGE's base tier"
+    );
     assert_eq!(rows[0].escalated_to.as_deref(), Some("medium"));
     assert_eq!(rows[0].escalation_trigger.as_deref(), Some("gate_failure"));
     // The row is written at the stage's TERMINAL decision (the Pause after the single escalated
     // retry also failed), not at the moment escalation fired — attempt 3, not attempt 2.
-    assert_eq!(rows[0].prior_failures, 3, "the per-stage attempt count at the terminal decision");
+    assert_eq!(
+        rows[0].prior_failures, 3,
+        "the per-stage attempt count at the terminal decision"
+    );
 }
 
 #[tokio::test]

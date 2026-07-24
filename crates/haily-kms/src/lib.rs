@@ -4,6 +4,7 @@ pub mod feedback;
 pub mod hnsw;
 pub mod kit_pack;
 pub mod search;
+pub mod skill_editor;
 pub mod skill_gates;
 pub mod skills;
 pub mod system_prompt;
@@ -12,7 +13,7 @@ pub mod voice_check;
 #[cfg(feature = "embeddings")]
 pub mod embedder;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use haily_db::{queries::facts, queries::meta, queries::skills as db_skills, DbHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,7 +70,7 @@ impl KmsHandle {
 
         // Phase-02: load the authored-skill kit-pack (tolerant of absence — a missing or
         // unverifiable pack logs and yields an empty registry, never fails boot).
-        let authored = Self::load_authored(data_dir);
+        let authored = Self::load_authored(&db, data_dir).await;
 
         #[cfg(feature = "embeddings")]
         let embedder = {
@@ -94,13 +95,15 @@ impl KmsHandle {
     /// Source precedence: `<data_dir>/kit-pack` (the shipped/packaged location) first,
     /// else a CWD-relative `assets/kit-pack` (dev/`cargo run` from the repo root). Only
     /// the kit-pack tier is populated today; the merge supports the full 5-tier order.
-    /// Any absence or load failure yields an empty registry (logged, never fatal).
-    fn load_authored(data_dir: &Path) -> authored_skills::AuthoredRegistry {
+    /// Any absence or load failure yields an empty registry (logged, never fatal). Uses the
+    /// version-fallback loader (phase 8, D4) so a boot right after a crashed edit recovers the
+    /// pre-edit content instead of silently dropping the skill.
+    async fn load_authored(db: &DbHandle, data_dir: &Path) -> authored_skills::AuthoredRegistry {
         let Some(dir) = Self::kit_pack_source(data_dir) else {
             tracing::debug!("no kit-pack found — authored-skill registry is empty");
             return authored_skills::AuthoredRegistry::new();
         };
-        match kit_pack::load(&dir) {
+        match kit_pack::load_with_versions_fallback(&dir, db).await {
             Ok(skills) => {
                 tracing::info!(count = skills.len(), path = %dir.display(), "kit-pack loaded");
                 // kit-pack is the LOWEST precedence tier (user/project tiers, when they
@@ -125,6 +128,42 @@ impl KmsHandle {
             return Some(dev);
         }
         None
+    }
+
+    /// The kit-pack directory currently in use (same precedence as boot) — the skill editor's
+    /// (phase 8, D4) write-target resolver.
+    pub fn kit_pack_dir(&self) -> Option<PathBuf> {
+        Self::kit_pack_source(&self.data_dir)
+    }
+
+    /// Re-parse the kit-pack directory from disk and hot-swap it into the live registry
+    /// (phase 8, D4) — called after `skill_editor::ops` commits an atomic write so the edit is
+    /// visible without a restart. Idempotent; safe to call at any time.
+    ///
+    /// # Errors
+    /// Returns an error if no kit-pack directory can be located.
+    pub async fn reload_authored(&self) -> Result<()> {
+        let dir = self
+            .kit_pack_dir()
+            .ok_or_else(|| anyhow!("kit-pack not found — cannot reload authored skills"))?;
+        let skills = kit_pack::load_with_versions_fallback(&dir, &self.db).await?;
+        self.authored.reload(vec![skills]);
+        Ok(())
+    }
+
+    /// One authored skill's full parsed record (phase 8, D4) — unlike `fetch_skill_section`'s
+    /// single-section lazy-load, the editor needs the whole record to reconstruct a complete
+    /// file on save/revert.
+    pub fn authored_get(&self, name: &str) -> Option<authored_skills::AuthoredSkill> {
+        self.authored.get(name)
+    }
+
+    /// Name-sorted list of authored skills currently served from a `skill_versions` recovery
+    /// snapshot rather than their on-disk file (phase 8 review MED-1) — a tampered or
+    /// interrupted-edit file was detected at the last load. Empty on a clean load. This is the
+    /// GUI-reachable surface for what would otherwise be an `error!`-only log line.
+    pub fn recovered_authored_skill_names(&self) -> Vec<String> {
+        self.authored.recovered_names()
     }
 
     // ---------------------------------------------------------------------
@@ -228,6 +267,14 @@ impl KmsHandle {
     /// from `kms_skills` (they have the EMA/decay lifecycle authored skills do not).
     pub fn authored_skills_list(&self) -> Vec<authored_skills::AuthoredSkillInfo> {
         self.authored.list_all()
+    }
+
+    /// Version counter of the in-memory authored-skill registry, bumped on every `reload()`
+    /// (Unified Chat UI phase 2: `haily-app::SlashRegistry` polls this to detect a kit-pack
+    /// hot-reload and rebuild its own snapshot lazily — no push hook, per the P02↔P08 interop
+    /// contract).
+    pub fn authored_version(&self) -> u64 {
+        self.authored.version()
     }
 
     /// Attempt to load a valid dump; on any failure (including "no dump yet"), fall
@@ -575,7 +622,20 @@ impl KmsHandle {
 
     /// Build a LifeContext snapshot for a session.
     /// Loads agent identity, feedback preferences, corrections, and top active skills.
-    pub async fn build_life_context(&self, session_id: Uuid) -> Result<LifeContext> {
+    ///
+    /// `forced_skill` is `Request.forced_skill` (Unified Chat UI phase 2, the slash-registry
+    /// `SkillTurn` action) — a name the dispatch layer wants force-appended to this turn's
+    /// system prompt. This is the wire-injection defense chokepoint (SEC-CRITICAL, red team):
+    /// `forced_skill` is NOT `#[serde(skip)]` on `Request`, so a crafted/replayed payload can
+    /// set it directly. The name is therefore re-validated against the live [`skills::SkillGates`]
+    /// HERE, at read time, regardless of what the registry allowed at build time — a
+    /// disabled/unknown name is silently ignored (never injected), and an authored-skill lookup
+    /// is tried before a synthesized one (mirrors the registry's own precedence).
+    pub async fn build_life_context(
+        &self,
+        session_id: Uuid,
+        forced_skill: Option<&str>,
+    ) -> Result<LifeContext> {
         let _ = session_id; // will be used in Phase 07 for per-session soul overrides
 
         let agent_name = meta::get_preference(&self.db, "agent.name")
@@ -626,6 +686,11 @@ impl KmsHandle {
             })
             .collect();
 
+        let forced_skill = match forced_skill {
+            Some(name) => self.resolve_forced_skill(name).await,
+            None => None,
+        };
+
         Ok(LifeContext {
             agent_name,
             soul,
@@ -637,7 +702,35 @@ impl KmsHandle {
             // Phase-02: the authored-skill index (progressive-disclosure level 1) that
             // the `## Skills` system-prompt section renders. Empty when no kit-pack.
             skill_routing_table: self.authored_routing_table(),
+            forced_skill,
         })
+    }
+
+    /// Re-validate `name` against the live [`skills::SkillGates`] and, if enabled, fetch its
+    /// body — authored first (kit-pack, via `fetch_skill_section`), else a synthesized skill
+    /// from `kms_skills` (already excludes archived/deleted rows, so an archived name simply
+    /// yields `None` here with no separate archived check needed). Never errors the caller —
+    /// any lookup failure (disabled, unknown, DB error) yields `None`, the safe "don't inject"
+    /// reading (Unified Chat UI phase 2 wire-injection defense).
+    async fn resolve_forced_skill(&self, name: &str) -> Option<ForcedSkill> {
+        let gates = self.load_skill_gates().await;
+        if gates.is_disabled(name) {
+            tracing::warn!(skill = %name, "forced_skill names a gate-disabled skill — not injected");
+            return None;
+        }
+        if let Ok(body) = self.fetch_skill_section(name, authored_skills::BODY_SECTION) {
+            return Some(ForcedSkill { name: name.to_string(), body });
+        }
+        match db_skills::active_skills(&self.db).await {
+            Ok(active) => active.into_iter().find(|s| s.name == name).map(|s| ForcedSkill {
+                body: skills::synthesized_skill_body(&s),
+                name: s.name,
+            }),
+            Err(e) => {
+                tracing::warn!("forced_skill lookup failed reading active_skills: {e:#}");
+                None
+            }
+        }
     }
 
     /// Build a system prompt string for the given LifeContext.
@@ -670,6 +763,15 @@ pub struct SkillSummary {
     pub pattern: String,
 }
 
+/// A named skill's body, force-appended to one turn's system prompt (Unified Chat UI phase 2,
+/// the slash-registry `SkillTurn` action). `name` is the skill's own name (authored or
+/// synthesized), not the slugified slash-command token the registry surfaced.
+#[derive(Debug, Clone)]
+pub struct ForcedSkill {
+    pub name: String,
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LifeContext {
     pub agent_name: String,
@@ -685,6 +787,9 @@ pub struct LifeContext {
     /// Phase-02: compact authored-skill routing table (name + when_to_use, one line
     /// each) rendered as the L0 `## Skills` section. Empty when no kit-pack is loaded.
     pub skill_routing_table: String,
+    /// Unified Chat UI phase 2: a `Request.forced_skill` name that passed the `SkillGates`
+    /// re-validation, with its body already fetched. `None` on every normal turn.
+    pub forced_skill: Option<ForcedSkill>,
 }
 
 #[derive(Debug, Clone, Default)]

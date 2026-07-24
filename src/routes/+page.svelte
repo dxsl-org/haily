@@ -1,62 +1,76 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import Settings from '$lib/components/Settings.svelte';
   import ApprovalModal from '$lib/components/ApprovalModal.svelte';
   import WorkItemsPanel from '$lib/components/WorkItemsPanel.svelte';
   import ProactivePanel from '$lib/components/ProactivePanel.svelte';
-  import CockpitView from '$lib/components/CockpitView.svelte';
+  import IconRail, { type RouteId } from '$lib/components/IconRail.svelte';
+  import ChatStream, { type Message } from '$lib/components/ChatStream.svelte';
+  import ChatInput from '$lib/components/ChatInput.svelte';
+  import RunsScreen from '$lib/components/RunsScreen.svelte';
+  import WorkspacesScreen from '$lib/components/WorkspacesScreen.svelte';
+  import SkillsScreen from '$lib/components/SkillsScreen.svelte';
   import WorkspacePane from '$lib/components/view/WorkspacePane.svelte';
-  import { cancelTurn, sendMessage } from '$lib/tauri';
-  import type { ChunkPayload, PendingApproval } from '$lib/tauri';
+  import { listApprovals, onRunEvents, type ChunkPayload, type PendingApproval, type RunEventPayload } from '$lib/tauri';
   import { toolVerb } from '$lib/tool-verbs';
-
-  type Role = 'user' | 'assistant' | 'system';
-
-  /** One reversible write completed this turn, buffered until `Complete` lands (M4 button
-   * gating — more writes may still land in the same turn while it streams). `journalId` is
-   * always non-null here: only `ToolResult` chunks with a non-null `journal_id` are buffered
-   * (see the chunk handler below). */
-  interface UndoableAction {
-    journalId: string;
-    verb: string;
-  }
-
-  interface Message {
-    id: string;
-    role: Role;
-    content: string;
-    pending: boolean;
-    /** Reversible actions completed during this turn, revealed only once `pending` flips
-     * false (the turn's `Complete` chunk arrived) — see `UndoableAction`. */
-    undoable: UndoableAction[];
-    /** "tier · model" (or bare model name for a `None`-tier turn) from a `TurnMeta`
-     * chunk — `null` until it arrives (a legacy/routing-disabled turn never sets it, and
-     * a `system`/`user` bubble never receives one). Rendered as a footer once the turn
-     * completes, mirroring `undoable`'s "arrives mid-stream, shown at Complete" gating. */
-    badge: string | null;
-  }
+  import { createRunJobsState } from '$lib/run-jobs-state.svelte';
 
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
 
   let settingsOpen = $state(false);
-  // Cockpit (P11b) is the primary run-watching surface — a second top-level view
-  // toggled next to Settings, not a route (this app has no client router). Chat state
-  // (messages, streaming) is untouched while cockpit is shown; switching back reveals it
-  // exactly as left.
-  let view = $state<'chat' | 'cockpit'>('chat');
+  // Left icon rail (Chat/Runs/Workspaces/Skills) replaces the former chat/cockpit
+  // toggle — Settings stays a drawer opened by the rail's gear, not a route, so its
+  // overlay behavior is unchanged.
+  let route = $state<RouteId>('chat');
+  // Single latest-wins approval — feeds `ApprovalModal`, the OUT-OF-SESSION fallback
+  // (P04, D6): rendered only while `route !== 'chat'`, since the in-session surface is
+  // `ChatStream`'s inline `ApprovalQueue` below.
   let pendingApproval = $state<PendingApproval | null>(null);
-  // Set for one tick whenever a `ViewRef` chunk arrives; `WorkspacePane` consumes and clears
-  // it via `bind:pendingView` (mirrors `pendingApproval`'s `bind:pending` contract on
-  // `ApprovalModal`). The pane itself owns the view-id back-stack and coexists with chat/
-  // cockpit (see the `.body` wrapper below) — it is never the thing that hides either view.
+  // Every approval this GUI window has observed and not yet resolved, oldest first —
+  // the shared queue `ChatStream`'s `ApprovalQueue` renders inline. Populated from the
+  // SAME chunk as `pendingApproval` below (both structures see every approval; the two
+  // surfaces are simply gated to different routes, not to different data — see the sync
+  // effect further down for why a resolve on either side clears both).
+  let approvalQueue = $state<PendingApproval[]>([]);
+
+  /** Removes one approval from the shared queue — called by `ChatStream` once it (or a
+   * stale idempotent no-op) resolves an entry. Also clears `pendingApproval` when it's
+   * the same id: `ChatInput` gates sending on `pendingApproval` truthiness alone, so
+   * without this an approval resolved via the inline queue would leave the input
+   * permanently blocked (only `ApprovalModal`'s own resolve flow nulls it otherwise). */
+  function removeFromQueue(approvalId: string) {
+    approvalQueue = approvalQueue.filter((a) => a.approvalId !== approvalId);
+    if (pendingApproval?.approvalId === approvalId) {
+      pendingApproval = null;
+    }
+  }
+  // Set for one tick whenever a `ViewRef` chunk arrives (written by the `haily-chunk`
+  // listener below); `WorkspacePane` consumes and clears it via `bind:pendingView`
+  // (mirrors `pendingApproval`'s `bind:pending` contract on `ApprovalModal`). The pane
+  // coexists with whichever destination is active — it is never the thing that hides a
+  // route.
   let pendingWorkspaceView = $state<{ viewId: string; sessionId: string } | null>(null);
-  // The session_id of the turn currently streaming, or null when idle. Drives the
-  // send/Stop button swap — set when `send_message` returns, cleared when that
-  // session's `Complete`/`Error` chunk arrives (mirrors `sessionIndex`'s lifecycle).
+  // Deep-link target for the Runs screen's drill-in (Unified Chat UI phase 7, D6) — set by
+  // `openRun` (the chat progress card's "Chi tiết →"), consumed once by `RunsScreen` via
+  // `onInitialRunConsumed` so a later manual switch back to Runs doesn't re-open it.
+  let selectedRunId = $state<string | null>(null);
+
+  /** Navigates to the Runs screen and opens `runId`'s drill-in — passed to `ChatStream` as
+   * `onOpenRun`. */
+  function openRun(runId: string) {
+    route = 'runs';
+    selectedRunId = runId;
+  }
+  // The session_id of the turn currently streaming, or null when idle. Written by
+  // `ChatInput` on send, cleared by the `haily-chunk` listener below when that session's
+  // `Complete`/`Error` chunk arrives — shared with `ChatInput` so it can gate/swap its
+  // send/stop button regardless of which route is showing.
   let activeSession = $state<string | null>(null);
+  // Transient "stop requested" flag — set by `ChatInput`'s stop button, cleared by the
+  // `haily-chunk` listener below once the cancelled turn's `Complete` chunk actually lands.
   let stopping = $state(false);
+  let bottomAnchor = $state<HTMLDivElement | undefined>(undefined);
 
   let messages = $state<Message[]>([
     {
@@ -68,21 +82,32 @@
       badge: null,
     },
   ]);
-  let input = $state('');
-  let sending = $state(false);
-  let bottomAnchor: HTMLDivElement;
-  let textarea: HTMLTextAreaElement;
 
-  // session_id → index in messages[] of the pending assistant bubble
+  // session_id → index in messages[] of the pending assistant bubble — written by
+  // `ChatInput.send()`, read/cleared by the `haily-chunk` listener below.
   const sessionIndex = new Map<string, number>();
 
   // Every session id this GUI instance has started, oldest first — each turn mints a
-  // fresh UUID (see `send()`), so there is no single "current session" the Safety tab's
-  // recent-actions list could scope to. Passed to `Settings` as a getter so it always
-  // reads the live array rather than a snapshot taken when the drawer first opened.
+  // fresh UUID (see `ChatInput.send()`), so there is no single "current session" the
+  // Safety tab's recent-actions list could scope to. Passed to `Settings` as a getter so
+  // it always reads the live array rather than a snapshot taken when the drawer opened.
   const seenSessionIds: string[] = [];
   const getSessionIds = () => seenSessionIds;
 
+  // Page-lifetime pipeline-run job state (P04 review-fix MED-1) — lives here, NOT inside
+  // the route-gated `ChatStream`, so switching away from chat and back doesn't tear down
+  // the run-event fold and misreport elapsed/retry counts on return. See
+  // `run-jobs-state.svelte.ts`'s module doc for the full incident this fixes.
+  const jobsState = createRunJobsState(() => sessionIndex, () => messages.length);
+
+  function scrollToBottom() {
+    requestAnimationFrame(() => bottomAnchor?.scrollIntoView({ behavior: 'smooth' }));
+  }
+
+  // Page-lifetime subscription (NOT `ChatStream`'s — a route-gated component would drop
+  // every chunk that arrives while the user is on Runs/Workspaces/Skills, permanently
+  // wedging `activeSession`/a pending approval). `route` switches never tear this down;
+  // it lives exactly as long as the page did before the icon-rail split.
   onMount(() => {
     const unlistenPromise = listen<ChunkPayload>('haily-chunk', ({ payload }) => {
       const { session_id, chunk } = payload;
@@ -91,7 +116,7 @@
       // tied to, so it's handled before the bubble lookup (which requires an
       // already-tracked session index).
       if (chunk.type === 'ToolApprovalRequest') {
-        pendingApproval = {
+        const approval: PendingApproval = {
           sessionId: session_id,
           approvalId: chunk.data.approval_id,
           tool: chunk.data.tool,
@@ -99,6 +124,10 @@
           origin: chunk.data.origin,
           reversible: chunk.data.reversible,
         };
+        pendingApproval = approval;
+        if (!approvalQueue.some((a) => a.approvalId === approval.approvalId)) {
+          approvalQueue = [...approvalQueue, approval];
+        }
         return;
       }
 
@@ -156,202 +185,129 @@
       scrollToBottom();
     });
 
-    textarea?.focus();
     return () => { unlistenPromise.then(fn => fn()); };
   });
 
-  async function send() {
-    const text = input.trim();
-    // Block new turns while a tool approval is pending: the backend turn is paused
-    // waiting on the modal, and starting a second turn would overwrite the pending
-    // approval state (orphaning the first request to a silent 120s timeout-deny).
-    // Also block while a turn is already streaming (`activeSession` set) — the GUI
-    // is single-turn-at-a-time; a second concurrent send would overwrite the Stop
-    // button's target with no way back to the first turn's session id.
-    if (!text || sending || pendingApproval || activeSession) return;
+  // Page-lifetime run-event subscription (P04 review-fix MED-1) — folds into `jobsState`
+  // above, NOT a route-gated component, for the same reason the chunk listener above
+  // stays at page level: `ChatStream` only mounts while `route === 'chat'`.
+  onMount(() => {
+    const unlistenPromise = onRunEvents(({ session_id, event }: RunEventPayload) => {
+      jobsState.ingest(session_id, event);
+    });
+    return () => { unlistenPromise.then((fn) => fn()); };
+  });
 
-    input = '';
-    sending = true;
-    autoResize();
+  // Prunes the shared approval queue (and the out-of-session modal) against the
+  // backend's own pending set (P04 review-fix MED-2): there is no `ApprovalResolved`/
+  // `ApprovalExpired` chunk, so a server-side 120s auto-deny would otherwise leave a
+  // stale entry — and an inflated header badge — sitting client-side until the user
+  // happens to click it (idempotent no-op self-heal). Runs on a 30s interval WHILE the
+  // queue is non-empty (torn down the instant it drains, restarted the instant it's
+  // non-empty again) and once immediately on that transition, covering both "on an
+  // interval" and "on queue-open" per the review's fix guidance.
+  $effect(() => {
+    if (approvalQueue.length === 0) return;
+    reconcileApprovals();
+    const handle = setInterval(reconcileApprovals, 30_000);
+    return () => clearInterval(handle);
+  });
 
-    messages.push({ id: crypto.randomUUID(), role: 'user', content: text, pending: false, undoable: [], badge: null });
-
-    const assistantIdx = messages.length;
-    messages.push({ id: crypto.randomUUID(), role: 'assistant', content: '', pending: true, undoable: [], badge: null });
-    scrollToBottom();
-
+  async function reconcileApprovals() {
     try {
-      const sessionId = await invoke<string>('send_message', { message: text });
-      sessionIndex.set(sessionId, assistantIdx);
-      seenSessionIds.push(sessionId);
-      activeSession = sessionId;
+      const live = await listApprovals();
+      const liveIds = new Set(live.map((a) => a.approval_id));
+      approvalQueue = approvalQueue.filter((a) => liveIds.has(a.approvalId));
+      if (pendingApproval && !liveIds.has(pendingApproval.approvalId)) {
+        pendingApproval = null;
+      }
     } catch (e) {
-      messages[assistantIdx].content = `⚠️ Lỗi kết nối: ${e}`;
-      messages[assistantIdx].pending = false;
-    } finally {
-      sending = false;
-      textarea?.focus();
+      console.error('listApprovals reconcile failed', e);
     }
   }
 
-  /** Stop the currently streaming turn. Backend still emits a terminal `Complete`
-   * chunk after cancellation, so the bubble closes out via the normal chunk-handling
-   * path above rather than being mutated here — this only fires the cancellation and
-   * tracks the transient "stopping…" state for the button label. */
-  async function stop() {
-    if (!activeSession || stopping) return;
-    stopping = true;
-    try {
-      await cancelTurn(activeSession);
-    } catch (e) {
-      // Cancellation is best-effort from the UI's perspective — if the IPC call
-      // itself fails (not "no turn found", which resolves false, but a genuine
-      // invoke error), leave the bubble streaming rather than silently losing the
-      // failure; the console log gives a debugging trail without a modal.
-      console.error('cancelTurn failed', e);
-      stopping = false;
+  // Keeps the two approval surfaces (out-of-session modal, in-session inline queue) from
+  // showing a stale entry for something already decided on the OTHER surface. Resolving
+  // via `ApprovalModal` only nulls `pendingApproval` (that component's own contract,
+  // unowned by this phase) — this effect notices that null transition and drops the same
+  // id from `approvalQueue` too. The reverse direction (queue resolves first) is handled
+  // by `removeFromQueue` below, called from `ChatStream`'s `onApprovalResolved`.
+  let lastModalApprovalId: string | null = null;
+  $effect(() => {
+    if (pendingApproval) {
+      lastModalApprovalId = pendingApproval.approvalId;
+    } else if (lastModalApprovalId) {
+      removeFromQueue(lastModalApprovalId);
+      lastModalApprovalId = null;
     }
-  }
-
-  // Mirrors `SafetyTab.svelte`'s `requestUndo` phrasing exactly so both undo entry points
-  // (this inline button and the Safety tab's recent-actions list) produce identical
-  // downstream LLM behavior — same sentence in, same `journal_undo` tool call out. This is
-  // UI sugar over the normal chat flow, NOT a new write seam: `journal_undo` still prompts
-  // for approval (M4 lock, unchanged) and is session-scoped (M1), enforced server-side.
-  let undoing = $state<string | null>(null);
-  async function requestUndo(journalId: string) {
-    if (undoing) return;
-    undoing = journalId;
-    try {
-      await sendMessage(`Undo the action with journal id "${journalId}".`);
-    } catch (e) {
-      console.error('undo sendMessage failed', e);
-    } finally {
-      undoing = null;
-    }
-  }
-
-  function onKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
-  }
-
-  function autoResize() {
-    if (!textarea) return;
-    textarea.style.height = 'auto';
-    textarea.style.height = Math.min(textarea.scrollHeight, 160) + 'px';
-  }
-
-  function scrollToBottom() {
-    requestAnimationFrame(() => bottomAnchor?.scrollIntoView({ behavior: 'smooth' }));
-  }
+  });
 </script>
 
 <div class="app">
-  <header>
-    <span class="logo">Haily</span>
-    <span class="subtitle">trợ lý ảo</span>
-    <div class="view-toggle" role="tablist" aria-label="Chuyển chế độ xem">
-      <button
-        role="tab"
-        aria-selected={view === 'chat'}
-        class:active={view === 'chat'}
-        onclick={() => (view = 'chat')}
-      >Chat</button>
-      <button
-        role="tab"
-        aria-selected={view === 'cockpit'}
-        class:active={view === 'cockpit'}
-        onclick={() => (view = 'cockpit')}
-      >Cockpit</button>
+  <!-- Runs badge (Unified Chat UI phase 7): live-run count (this window's own reducer, the
+       "live/reducer" source the phase calls for) + pending-approval count — a single combined
+       "needs attention" number on the Runs destination. -->
+  <IconRail
+    bind:route
+    onSettings={() => (settingsOpen = true)}
+    badges={{ runs: jobsState.activeJobs.length + approvalQueue.length }}
+  />
+
+  <div class="shell">
+    <header>
+      <span class="logo">Haily</span>
+      <span class="subtitle">trợ lý ảo</span>
+    </header>
+
+    <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
+    <!-- Out-of-session fallback ONLY (P04, D6): while the chat route is mounted, the
+         in-session surface is `ChatStream`'s inline `ApprovalQueue` instead — this modal
+         must not double up with it. -->
+    {#if route !== 'chat'}
+      <ApprovalModal bind:pending={pendingApproval} />
+    {/if}
+
+    <!-- The workspace pane (View Engine Phase A) coexists with whichever destination is
+         active — it is a side region, never a replacement for the main content (Creative
+         Director HIGH: a presented view must not become a chat bubble or hide the
+         conversation). -->
+    <div class="body">
+      <div class="main-content">
+        {#if route === 'chat'}
+          <WorkItemsPanel />
+          <ProactivePanel />
+          <ChatStream
+            {messages}
+            {jobsState}
+            approvals={approvalQueue}
+            onApprovalResolved={removeFromQueue}
+            onOpenRun={openRun}
+            bind:bottomAnchor
+          />
+          <ChatInput
+            {messages}
+            {sessionIndex}
+            {seenSessionIds}
+            {pendingApproval}
+            bind:activeSession
+            bind:stopping
+            {scrollToBottom}
+          />
+        {:else if route === 'runs'}
+          <RunsScreen
+            {jobsState}
+            initialRunId={selectedRunId}
+            onInitialRunConsumed={() => (selectedRunId = null)}
+          />
+        {:else if route === 'workspaces'}
+          <WorkspacesScreen />
+        {:else if route === 'skills'}
+          <SkillsScreen />
+        {/if}
+      </div>
+
+      <WorkspacePane bind:pendingView={pendingWorkspaceView} />
     </div>
-    <button class="gear" onclick={() => settingsOpen = true} aria-label="Cài đặt" title="Cài đặt">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-      </svg>
-    </button>
-  </header>
-
-  <Settings bind:open={settingsOpen} sessionIds={getSessionIds} />
-  <ApprovalModal bind:pending={pendingApproval} />
-
-  <!-- The workspace pane (View Engine Phase A) coexists with whichever main view is active —
-       it is a side region, never a replacement for chat or cockpit (Creative Director HIGH:
-       a presented view must not become a chat bubble or hide the conversation). -->
-  <div class="body">
-    <div class="main-content">
-      {#if view === 'cockpit'}
-        <CockpitView />
-      {:else}
-        <WorkItemsPanel />
-        <ProactivePanel />
-
-        <div class="messages">
-          {#each messages as msg (msg.id)}
-            <div class="bubble {msg.role}" class:pending={msg.pending}>
-              {#if msg.role === 'assistant' && msg.pending && !msg.content}
-                <span class="typing"><span></span><span></span><span></span></span>
-              {:else}
-                <span class="text">{msg.content}</span>
-                {#if msg.pending}
-                  <span class="cursor">▋</span>
-                {/if}
-              {/if}
-              <!-- Gated on `!msg.pending` (the turn's Complete chunk landed) per M4 button
-                   gating — undo affordances for this turn's writes only appear once nothing
-                   else from this turn can still land. -->
-              {#if !msg.pending && msg.undoable.length > 0}
-                <div class="undo-list">
-                  {#each msg.undoable as action (action.journalId)}
-                    <button
-                      class="undo-inline"
-                      onclick={() => requestUndo(action.journalId)}
-                      disabled={undoing === action.journalId}
-                      title={action.verb}
-                    >
-                      {undoing === action.journalId ? 'Đang hoàn tác…' : '↩ Hoàn tác'}
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-              <!-- Same `!msg.pending` gate as the undo list: a badge is only meaningful once
-                   the turn it describes has actually finished. `routing_enabled=false` or a
-                   non-assistant bubble never sets `badge`, so this renders nothing then. -->
-              {#if !msg.pending && msg.badge}
-                <div class="turn-badge">{msg.badge}</div>
-              {/if}
-            </div>
-          {/each}
-          <div bind:this={bottomAnchor}></div>
-        </div>
-
-        <div class="input-area">
-          <textarea
-            bind:this={textarea}
-            bind:value={input}
-            onkeydown={onKeydown}
-            oninput={autoResize}
-            placeholder={pendingApproval ? 'Đang chờ bạn duyệt một hành động…' : 'Nhắn tin với Haily… (Enter để gửi, Shift+Enter xuống dòng)'}
-            rows="1"
-            disabled={sending || pendingApproval !== null || activeSession !== null}
-          ></textarea>
-          {#if activeSession}
-            <button class="stop" onclick={stop} disabled={stopping} title="Dừng phản hồi" aria-label="Dừng phản hồi">
-              {stopping ? '…' : '■'}
-            </button>
-          {:else}
-            <button onclick={send} disabled={sending || !input.trim() || pendingApproval !== null}>
-              {sending ? '…' : '↑'}
-            </button>
-          {/if}
-        </div>
-      {/if}
-    </div>
-
-    <WorkspacePane bind:pendingView={pendingWorkspaceView} />
   </div>
 </div>
 
@@ -369,7 +325,15 @@
 
   .app {
     display: flex;
+    flex-direction: row;
+    height: 100dvh;
+  }
+
+  .shell {
+    display: flex;
     flex-direction: column;
+    flex: 1;
+    min-width: 0;
     height: 100dvh;
   }
 
@@ -382,9 +346,9 @@
     flex-shrink: 0;
   }
 
-  /* Horizontal row: main view (chat/cockpit) + the workspace pane side region. Only takes
-     the space below the header; each child manages its own vertical layout/scrolling as
-     before this wrapper was introduced. */
+  /* Horizontal row: the active destination's content + the workspace pane side region.
+     Only takes the space below the header; each child manages its own vertical
+     layout/scrolling as before this wrapper was introduced. */
   .body {
     display: flex;
     flex: 1;
@@ -400,45 +364,6 @@
     min-height: 0;
   }
 
-  .view-toggle {
-    margin-left: auto;
-    display: flex;
-    gap: 2px;
-    border: 1px solid #2e2e4a;
-    border-radius: 8px;
-    padding: 2px;
-  }
-
-  .view-toggle button {
-    padding: 4px 12px;
-    min-height: 28px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: #6b6b8a;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: color 0.15s, background 0.15s;
-  }
-  .view-toggle button.active { background: #2a2a45; color: #c084fc; }
-  .view-toggle button:hover:not(.active) { color: #a09ac0; }
-
-  .gear {
-    width: 30px;
-    height: 30px;
-    border: none;
-    border-radius: 8px;
-    background: transparent;
-    color: #4a4a6a;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.15s, background 0.15s;
-  }
-  .gear:hover { color: #c084fc; background: #1a1a2e; }
-
   .logo {
     font-weight: 700;
     font-size: 16px;
@@ -451,173 +376,4 @@
     color: #6b6b8a;
     align-self: baseline;
   }
-
-  .messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    scroll-behavior: smooth;
-  }
-
-  .messages::-webkit-scrollbar { width: 4px; }
-  .messages::-webkit-scrollbar-thumb { background: #2e2e45; border-radius: 2px; }
-
-  .bubble {
-    max-width: 80%;
-    padding: 9px 13px;
-    border-radius: 14px;
-    line-height: 1.55;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-size: 14px;
-  }
-
-  .undo-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 8px;
-  }
-
-  /* min-height 44px meets the WCAG 2.1 AA (2.5.5) minimum touch target size. */
-  .undo-inline {
-    padding: 8px 12px;
-    min-height: 44px;
-    border: 1px solid #3a2a5a;
-    border-radius: 999px;
-    background: #1e1638;
-    color: #c084fc;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: normal;
-    transition: border-color 0.15s, background 0.15s;
-  }
-
-  .undo-inline:hover:not(:disabled) { border-color: #7c3aed; background: #271a4a; }
-  .undo-inline:disabled { opacity: 0.5; cursor: default; }
-
-  .turn-badge {
-    margin-top: 6px;
-    font-size: 11px;
-    color: #7c7c9a;
-    opacity: 0.8;
-  }
-
-  .bubble.user {
-    background: #7c3aed;
-    color: #f3f0ff;
-    align-self: flex-end;
-    border-bottom-right-radius: 4px;
-  }
-
-  .bubble.assistant {
-    background: #1a1a2e;
-    color: #ddd8f5;
-    align-self: flex-start;
-    border-bottom-left-radius: 4px;
-    min-width: 40px;
-    min-height: 36px;
-  }
-
-  .bubble.system {
-    background: transparent;
-    border: 1px solid #2a2a45;
-    color: #8884aa;
-    align-self: center;
-    font-size: 12px;
-    border-radius: 8px;
-    max-width: 90%;
-  }
-
-  .cursor {
-    display: inline-block;
-    animation: blink 1s step-end infinite;
-    opacity: 0.8;
-    color: #c084fc;
-    margin-left: 1px;
-  }
-
-  @keyframes blink {
-    50% { opacity: 0; }
-  }
-
-  .typing {
-    display: inline-flex;
-    gap: 4px;
-    align-items: center;
-    padding: 4px 0;
-  }
-
-  .typing span {
-    width: 6px;
-    height: 6px;
-    background: #6b6b9a;
-    border-radius: 50%;
-    animation: bounce 1.2s ease-in-out infinite;
-  }
-
-  .typing span:nth-child(2) { animation-delay: 0.15s; }
-  .typing span:nth-child(3) { animation-delay: 0.3s; }
-
-  @keyframes bounce {
-    0%, 60%, 100% { transform: translateY(0); }
-    30% { transform: translateY(-5px); }
-  }
-
-  .input-area {
-    display: flex;
-    gap: 8px;
-    padding: 10px 12px;
-    border-top: 1px solid #1e1e2e;
-    align-items: flex-end;
-    flex-shrink: 0;
-  }
-
-  textarea {
-    flex: 1;
-    background: #16162a;
-    border: 1px solid #2e2e4a;
-    border-radius: 12px;
-    color: #e0dff5;
-    font: inherit;
-    padding: 9px 12px;
-    resize: none;
-    outline: none;
-    line-height: 1.5;
-    min-height: 40px;
-    max-height: 160px;
-    transition: border-color 0.15s;
-  }
-
-  textarea:focus { border-color: #7c3aed; }
-
-  textarea::placeholder { color: #4a4a6a; }
-
-  textarea:disabled { opacity: 0.5; }
-
-  button {
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
-    border: none;
-    background: #7c3aed;
-    color: #fff;
-    font-size: 18px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background 0.15s, opacity 0.15s;
-  }
-
-  button:hover:not(:disabled) { background: #8b5cf6; }
-  button:disabled { opacity: 0.4; cursor: default; }
-
-  button.stop { background: #3a1f2e; color: #f87171; font-size: 15px; }
-  button.stop:hover:not(:disabled) { background: #4a2436; }
 </style>

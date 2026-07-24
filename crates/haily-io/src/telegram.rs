@@ -186,6 +186,7 @@ async fn forward_text(
         user_ref,
         depth: Default::default(),
         origin: Default::default(),
+        forced_skill: None,
     };
     if tx.send(req).await.is_err() {
         tracing::warn!("telegram: orchestrator channel closed");

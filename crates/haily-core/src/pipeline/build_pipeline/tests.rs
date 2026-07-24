@@ -37,12 +37,24 @@ fn cmd() -> VerifierCmd {
 
 #[test]
 fn phase_pipeline_has_build_then_test_with_the_right_gates_and_no_delegation() {
-    let p = build_phase_pipeline(&phase("cache", Some(Tier::Medium)), "", &cmd(), &cmd(), None);
+    let p = build_phase_pipeline(
+        &phase("cache", Some(Tier::Medium)),
+        "",
+        &cmd(),
+        &cmd(),
+        None,
+    );
     assert_eq!(p.runs.len(), 2, "build then test");
     assert_eq!(p.runs[0].name, "build:cache");
     assert_eq!(p.runs[1].name, "test:cache");
-    assert!(matches!(p.runs[0].gate, Gate::Command { .. }), "build gate is the compile command");
-    assert!(matches!(p.runs[1].gate, Gate::Command { .. }), "test gate is the test command");
+    assert!(
+        matches!(p.runs[0].gate, Gate::Command { .. }),
+        "build gate is the compile command"
+    );
+    assert!(
+        matches!(p.runs[1].gate, Gate::Command { .. }),
+        "test gate is the test command"
+    );
     // Build/Test may write in the workspace but must NOT reach the real repo or delegate.
     for stage in &p.runs {
         assert!(stage.whitelist_excludes_delegation(), "stages are leaves");
@@ -64,16 +76,32 @@ fn reviewer_is_a_distinct_read_only_stage_never_the_builder() {
 
     assert!(build_prompt.contains("BUILD stage"));
     assert!(review_prompt.contains("INDEPENDENT reviewer"));
-    assert_ne!(build_prompt, review_prompt, "reviewer prompt must differ from builder prompt");
+    assert_ne!(
+        build_prompt, review_prompt,
+        "reviewer prompt must differ from builder prompt"
+    );
 
     // Reviewer is read-only: no write tool, only read + emit_findings.
     let rw = &review.runs[0].tool_whitelist;
     for write_tool in ["fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec"] {
-        assert!(!rw.iter().any(|t| t == write_tool), "reviewer must not be able to {write_tool}");
+        assert!(
+            !rw.iter().any(|t| t == write_tool),
+            "reviewer must not be able to {write_tool}"
+        );
     }
-    assert!(rw.iter().any(|t| t == EMIT_FINDINGS_TOOL), "reviewer emits findings");
-    assert!(review.runs[0].grammar.is_some(), "review forces the emit_findings grammar");
-    assert!(review.runs[0].grammar.as_deref().unwrap().contains(EMIT_FINDINGS_TOOL));
+    assert!(
+        rw.iter().any(|t| t == EMIT_FINDINGS_TOOL),
+        "reviewer emits findings"
+    );
+    assert!(
+        review.runs[0].grammar.is_some(),
+        "review forces the emit_findings grammar"
+    );
+    assert!(review.runs[0]
+        .grammar
+        .as_deref()
+        .unwrap()
+        .contains(EMIT_FINDINGS_TOOL));
     // Review runs at Thinking regardless of the phase's build tier.
     assert_eq!(review.runs[0].tier, Some(Tier::Thinking));
 }
@@ -82,10 +110,22 @@ fn reviewer_is_a_distinct_read_only_stage_never_the_builder() {
 fn build_stage_exposes_the_lsp_hint_tools_and_prompt_routes_rename() {
     // Phase 10: the build stage can call the semantic hint tools, and the prompt routes a
     // symbol rename to lsp_rename over string edits. Both degrade cleanly when no server exists.
-    let build = build_phase_pipeline(&phase("cache", Some(Tier::Medium)), "", &cmd(), &cmd(), None);
+    let build = build_phase_pipeline(
+        &phase("cache", Some(Tier::Medium)),
+        "",
+        &cmd(),
+        &cmd(),
+        None,
+    );
     let wl = &build.runs[0].tool_whitelist;
-    assert!(wl.iter().any(|t| t == "lsp_diagnostics"), "build stage exposes lsp_diagnostics");
-    assert!(wl.iter().any(|t| t == "lsp_rename"), "build stage exposes lsp_rename");
+    assert!(
+        wl.iter().any(|t| t == "lsp_diagnostics"),
+        "build stage exposes lsp_diagnostics"
+    );
+    assert!(
+        wl.iter().any(|t| t == "lsp_rename"),
+        "build stage exposes lsp_rename"
+    );
     assert!(
         build.runs[0].prompt_ref.contains("lsp_rename"),
         "build prompt must route rename/refactor to lsp_rename"
@@ -100,10 +140,14 @@ fn additional_lsp_signal_dedups_against_the_authoritative_build_gate() {
         "  [error] 3:4 mismatched types: expected u32, found String".to_string(),
         "  [warning] 9:1 unused import: std::io".to_string(),
     ];
-    let build_output = "error[E0308]: mismatched types: expected u32, found String\n --> src/a.rs:3:4";
+    let build_output =
+        "error[E0308]: mismatched types: expected u32, found String\n --> src/a.rs:3:4";
     let extra = additional_lsp_signal(build_output, &lsp);
     assert_eq!(extra.len(), 1, "the duplicate type error must be elided");
-    assert!(extra[0].contains("unused import"), "the LSP-only warning survives");
+    assert!(
+        extra[0].contains("unused import"),
+        "the LSP-only warning survives"
+    );
     // Server-less host: no diagnostics collected → no-op, build gate is the sole signal.
     assert!(additional_lsp_signal(build_output, &[]).is_empty());
 }
@@ -111,7 +155,10 @@ fn additional_lsp_signal_dedups_against_the_authoritative_build_gate() {
 #[test]
 fn scaffold_is_present_below_ultra_and_absent_at_ultra() {
     let below = build_phase_pipeline(&phase("c", Some(Tier::Thinking)), "", &cmd(), &cmd(), None);
-    assert!(below.runs[0].prompt_ref.contains("Reasoning scaffold"), "scaffold at thinking tier");
+    assert!(
+        below.runs[0].prompt_ref.contains("Reasoning scaffold"),
+        "scaffold at thinking tier"
+    );
     let at_ultra = build_phase_pipeline(&phase("c", Some(Tier::Ultra)), "", &cmd(), &cmd(), None);
     assert!(
         !at_ultra.runs[0].prompt_ref.contains("Reasoning scaffold"),
@@ -132,9 +179,16 @@ fn exemplar_block_flows_into_the_build_prompt_and_greenfield_is_clean() {
         &cmd(),
         None,
     );
-    assert!(with_ex.runs[0].prompt_ref.contains("## Exemplars"), "exemplars injected");
-    let greenfield = build_phase_pipeline(&phase("c", Some(Tier::Medium)), "", &cmd(), &cmd(), None);
-    assert!(!greenfield.runs[0].prompt_ref.contains("## Exemplars"), "no empty exemplar heading");
+    assert!(
+        with_ex.runs[0].prompt_ref.contains("## Exemplars"),
+        "exemplars injected"
+    );
+    let greenfield =
+        build_phase_pipeline(&phase("c", Some(Tier::Medium)), "", &cmd(), &cmd(), None);
+    assert!(
+        !greenfield.runs[0].prompt_ref.contains("## Exemplars"),
+        "no empty exemplar heading"
+    );
 }
 
 #[test]
@@ -149,7 +203,10 @@ fn fix_feedback_is_appended_and_tag_stripped_in_the_build_prompt() {
     let prompt = &p.runs[0].prompt_ref;
     assert!(prompt.contains("Review findings to fix"));
     assert!(prompt.contains("fix the unwrap"));
-    assert!(!prompt.contains("<tool_call>"), "untrusted feedback must be tag-stripped");
+    assert!(
+        !prompt.contains("<tool_call>"),
+        "untrusted feedback must be tag-stripped"
+    );
 }
 
 #[test]
@@ -157,8 +214,14 @@ fn ship_is_the_only_real_repo_write_path_and_gated_by_approval() {
     let ship = ship_pipeline("done");
     assert_eq!(ship.runs.len(), 1);
     let s = &ship.runs[0];
-    assert!(s.tool_whitelist.iter().any(|t| t == "worktree_apply"), "ship applies to the repo");
-    assert!(matches!(s.gate, Gate::Approval { .. }), "ship is gated by user approval");
+    assert!(
+        s.tool_whitelist.iter().any(|t| t == "worktree_apply"),
+        "ship applies to the repo"
+    );
+    assert!(
+        matches!(s.gate, Gate::Approval { .. }),
+        "ship is gated by user approval"
+    );
     assert!(s.whitelist_excludes_delegation());
 }
 
@@ -182,7 +245,11 @@ async fn git(dir: &std::path::Path, args: &[&str]) {
         .output()
         .await
         .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 async fn fixture() -> Fixture {
@@ -190,7 +257,9 @@ async fn fixture() -> Fixture {
     git(repo.path(), &["init", "-b", "main"]).await;
     git(repo.path(), &["config", "user.email", "t@haily.test"]).await;
     git(repo.path(), &["config", "user.name", "Test"]).await;
-    tokio::fs::write(repo.path().join("README.md"), "hello\n").await.unwrap();
+    tokio::fs::write(repo.path().join("README.md"), "hello\n")
+        .await
+        .unwrap();
     git(repo.path(), &["add", "."]).await;
     git(repo.path(), &["commit", "-m", "init"]).await;
 
@@ -203,12 +272,23 @@ async fn fixture() -> Fixture {
         .unwrap();
 
     let wt_root = tempfile::tempdir().unwrap();
-    let workspace =
-        CodingWorkspace::open(&db, &session_id.to_string(), repo.path(), wt_root.path(), None)
-            .await
-            .expect("open workspace");
+    let workspace = CodingWorkspace::open(
+        &db,
+        &session_id.to_string(),
+        repo.path(),
+        wt_root.path(),
+        None,
+    )
+    .await
+    .expect("open workspace");
 
-    Fixture { db, kms, session_id, workspace, _dirs: vec![repo, dbdir, wt_root] }
+    Fixture {
+        db,
+        kms,
+        session_id,
+        workspace,
+        _dirs: vec![repo, dbdir, wt_root],
+    }
 }
 
 /// Scripted OpenAI-compatible responder: `responses[i]` for the i-th completion, then "done".
@@ -219,14 +299,19 @@ async fn spawn_scripted(responses: Vec<String>) -> String {
     let counter = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let responses = Arc::clone(&responses);
             let counter = Arc::clone(&counter);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf).await;
                 let i = counter.fetch_add(1, Ordering::SeqCst);
-                let content = responses.get(i).cloned().unwrap_or_else(|| "done".to_string());
+                let content = responses
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "done".to_string());
                 let payload =
                     serde_json::json!({ "choices": [{ "message": { "content": content } }] })
                         .to_string();
@@ -272,6 +357,7 @@ fn make_runner(
         build_tools(),
         broker,
         Arc::new(AtomicBool::new(false)),
+        crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits),
         tokio_util::sync::CancellationToken::new(),
         user_tx,
         events,
@@ -346,19 +432,19 @@ async fn scripted_two_phase_build_fixes_a_critical_but_ship_without_apply_stays_
     // Phase 2: build, test, review(clean). Then ship (no worktree_apply call).
     let llm = build_router(
         spawn_scripted(vec![
-            "built p1".into(),      // build:p1
-            "tested p1".into(),     // test:p1
-            critical_finding(),     // review:p1 emit (round 0)
-            "reviewed p1".into(),   // review:p1 final
-            "fixed p1".into(),      // build:p1 (fix round 1)
+            "built p1".into(),        // build:p1
+            "tested p1".into(),       // test:p1
+            critical_finding(),       // review:p1 emit (round 0)
+            "reviewed p1".into(),     // review:p1 final
+            "fixed p1".into(),        // build:p1 (fix round 1)
             "tested p1 again".into(), // test:p1
-            clean_finding(),        // review:p1 emit (clean)
-            "reviewed p1 ok".into(), // review:p1 final
-            "built p2".into(),      // build:p2
-            "tested p2".into(),     // test:p2
-            clean_finding(),        // review:p2 emit (clean)
-            "reviewed p2 ok".into(), // review:p2 final
-            "shipping".into(),      // ship stage — NO worktree_apply tool call
+            clean_finding(),          // review:p1 emit (clean)
+            "reviewed p1 ok".into(),  // review:p1 final
+            "built p2".into(),        // build:p2
+            "tested p2".into(),       // test:p2
+            clean_finding(),          // review:p2 emit (clean)
+            "reviewed p2 ok".into(),  // review:p2 final
+            "shipping".into(),        // ship stage — NO worktree_apply tool call
         ])
         .await,
     )
@@ -368,8 +454,13 @@ async fn scripted_two_phase_build_fixes_a_critical_but_ship_without_apply_stays_
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
     let saw = Arc::new(AtomicBool::new(false));
-    let responder =
-        spawn_approver(user_rx, Arc::clone(&broker), fx.session_id, vec![true], Arc::clone(&saw));
+    let responder = spawn_approver(
+        user_rx,
+        Arc::clone(&broker),
+        fx.session_id,
+        vec![true],
+        Arc::clone(&saw),
+    );
 
     let runner = make_runner(
         &fx,
@@ -378,7 +469,13 @@ async fn scripted_two_phase_build_fixes_a_critical_but_ship_without_apply_stays_
         user_tx,
         ev_tx,
     );
-    let spec = spec_for(&fx, vec![phase("p1", Some(Tier::Medium)), phase("p2", Some(Tier::Medium))]);
+    let spec = spec_for(
+        &fx,
+        vec![
+            phase("p1", Some(Tier::Medium)),
+            phase("p2", Some(Tier::Medium)),
+        ],
+    );
     let report = run_build(&runner, &fx.db, spec).await.expect("run");
     let _ = responder.await;
 
@@ -387,7 +484,10 @@ async fn scripted_two_phase_build_fixes_a_critical_but_ship_without_apply_stays_
         RunStatus::Paused,
         "no evidence worktree_apply ran must downgrade the ship outcome — never a false Done"
     );
-    assert!(saw.load(Ordering::SeqCst), "the ship approval checkpoint still reached the user");
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "the ship approval checkpoint still reached the user"
+    );
     assert!(
         fx.workspace.worktree_root().is_dir(),
         "the workspace must remain untouched when the apply never happened"
@@ -425,8 +525,13 @@ async fn unresolved_critical_after_two_fix_rounds_pauses_without_shipping() {
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
     let saw = Arc::new(AtomicBool::new(false));
-    let responder =
-        spawn_approver(_user_rx, Arc::clone(&broker), fx.session_id, vec![], Arc::clone(&saw));
+    let responder = spawn_approver(
+        _user_rx,
+        Arc::clone(&broker),
+        fx.session_id,
+        vec![],
+        Arc::clone(&saw),
+    );
 
     let runner = make_runner(
         &fx,
@@ -444,7 +549,10 @@ async fn unresolved_critical_after_two_fix_rounds_pauses_without_shipping() {
         RunStatus::Paused,
         "an unresolved Critical after the bounded fix loop must pause, not ship"
     );
-    assert!(!saw.load(Ordering::SeqCst), "no ship approval must be raised on a failed build");
+    assert!(
+        !saw.load(Ordering::SeqCst),
+        "no ship approval must be raised on a failed build"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +580,13 @@ async fn review_runs_and_persists_findings_even_when_gates_pass() {
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
     let saw = Arc::new(AtomicBool::new(false));
-    let responder =
-        spawn_approver(user_rx, Arc::clone(&broker), fx.session_id, vec![true], Arc::clone(&saw));
+    let responder = spawn_approver(
+        user_rx,
+        Arc::clone(&broker),
+        fx.session_id,
+        vec![true],
+        Arc::clone(&saw),
+    );
 
     let runner = make_runner(
         &fx,

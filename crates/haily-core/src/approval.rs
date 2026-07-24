@@ -47,7 +47,14 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// what stops a foreign Telegram chat (or a forged GUI/CLI call) from resolving
 /// someone else's pending approval.
 pub struct ApprovalBroker {
-    pending: DashMap<Uuid, (Uuid /* session_id */, String /* created_at */, oneshot::Sender<bool>)>,
+    pending: DashMap<
+        Uuid,
+        (
+            Uuid,   /* session_id */
+            String, /* created_at */
+            oneshot::Sender<bool>,
+        ),
+    >,
     /// Tool names exempted from the interactive prompt. Populated once at bootstrap
     /// from validated config (`haily_app::validate_auto_approve` rejects any
     /// destructive/exfil tool name before this is ever built) — never mutated after
@@ -136,7 +143,8 @@ impl ApprovalBroker {
 
         let (tx, rx) = oneshot::channel();
         let created_at = chrono::Utc::now().to_rfc3339();
-        self.pending.insert(approval_id, (session_id, created_at, tx));
+        self.pending
+            .insert(approval_id, (session_id, created_at, tx));
 
         let decision = tokio::select! {
             result = rx => result.unwrap_or(false), // sender dropped without resolving → deny
@@ -411,13 +419,20 @@ mod tests {
         let snap = broker_ref.pending_snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].approval_id, approval_id);
-        assert_eq!(snap[0].session_id, owner, "snapshot must carry the owning session");
+        assert_eq!(
+            snap[0].session_id, owner,
+            "snapshot must carry the owning session"
+        );
         assert!(!snap[0].created_at.is_empty());
 
         // A foreign session cannot resolve it (session auth boundary preserved), and it
         // therefore stays in the queue.
         assert!(!broker_ref.resolve(approval_id, intruder, true));
-        assert_eq!(broker_ref.pending_snapshot().len(), 1, "a rejected foreign resolve leaves it queued");
+        assert_eq!(
+            broker_ref.pending_snapshot().len(),
+            1,
+            "a rejected foreign resolve leaves it queued"
+        );
 
         // The owner can, and the queue then empties.
         assert!(broker_ref.resolve(approval_id, owner, true));
@@ -425,7 +440,10 @@ mod tests {
             .await
             .expect("owner resolve unblocks request()");
         assert!(decision);
-        assert!(broker_ref.pending_snapshot().is_empty(), "resolved approval leaves the queue");
+        assert!(
+            broker_ref.pending_snapshot().is_empty(),
+            "resolved approval leaves the queue"
+        );
     }
 
     #[tokio::test]

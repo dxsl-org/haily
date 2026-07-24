@@ -11,13 +11,18 @@
 //! [`launch`] cannot call `haily_app::launch_coding_run(&AppHandle, ..)` (Phase 1's entrypoint)
 //! directly: `dispatch_loop` is spawned INSIDE `AppHandle::bootstrap`, before `AppHandle` itself
 //! is constructed — there is no `&AppHandle` to hand it at this call site. [`launch`] instead
-//! reimplements `launch.rs::launch_coding_run`'s bridge-wiring over the raw handles
-//! (`AdapterManager`, `Arc<Orchestrator>`, `TaskTracker`, [`CancellationToken`]) `dispatch_loop`
-//! already owns. Deliberate difference: the cancel token is the CALLER's already-registered
-//! per-turn `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered
-//! launch stays cancellable by the same "Stop" action a normal turn already is. See the phase's
+//! calls the shared [`crate::run_control::spawn_launch`] helper (Unified Chat UI phase 6, D3)
+//! over the raw handles (`AdapterManager`, `Arc<Orchestrator>`, `TaskTracker`,
+//! [`CancellationToken`], the run-control registry) `dispatch_loop` already owns. Deliberate
+//! difference from `launch.rs`: the cancel token is the CALLER's already-registered per-turn
+//! `turn_cancel`, not a fresh child of the root shutdown token — so a chat-triggered launch
+//! stays cancellable by the same "Stop" action a normal turn already is. See the phase's
 //! Deviation Log.
+use crate::notify::{OsNotifier, ToastCoalescer};
+use crate::run_control::{LaunchCtx, RunControlRegistry};
+use crate::slash_registry::SlashRegistry;
 use haily_core::{classify_coding_intent, CodingRunSpec, Orchestrator, RunKind};
+use haily_db::DbHandle;
 use haily_io::{slash, AdapterManager};
 use haily_types::{DepthMode, Request, RequestOrigin, ResponseChunk};
 use std::sync::Arc;
@@ -26,22 +31,27 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-/// Mirrors `launch.rs::RUN_EVENTS_CAPACITY` — generous headroom above a typical run's event
-/// count so a stage-output burst never blocks the runner mid-stage waiting on a slow adapter.
-const RUN_EVENTS_CAPACITY: usize = 1024;
-/// Mirrors `launch.rs::DISTILLATION_CAPACITY` — at most a handful of proposals per run.
-const DISTILLATION_CAPACITY: usize = 16;
-
-/// The three raw handles `launch`/`confirm_then_launch` need, bundled to keep both functions'
+/// The raw handles `launch`/`confirm_then_launch` need, bundled to keep both functions'
 /// argument count under clippy's `too_many_arguments` threshold (mirrors `pipeline::LaunchDeps`'s
 /// own "bundle the caller's cloned handles into a plain struct" convention).
 pub struct LaunchHandles {
     pub orc: Arc<Orchestrator>,
     pub am: AdapterManager,
     pub tasks: TaskTracker,
+    /// Threaded into `spawn_run_event_bridge` (Unified Chat UI phase 5, D2) so this run's
+    /// events persist. Callers extract it from `orc.db` before moving `orc` into this struct.
+    pub db: Arc<DbHandle>,
+    /// Unified Chat UI phase 6 (D3) — the SAME registry `launch.rs`/the mode layer share, so a
+    /// chat-triggered launch is kill/pause/resume-able identically to a GUI-initiated one.
+    pub run_control: Arc<RunControlRegistry>,
+    /// Unified Chat UI phase 7 (D7) — the SAME notifier/coalescer pair `launch.rs`/the mode
+    /// layer share, so a chat-triggered launch toasts identically to a GUI-initiated one.
+    pub notifier: Arc<dyn OsNotifier>,
+    pub coalescer: Arc<ToastCoalescer>,
 }
 
 /// What a dispatch-layer trigger decides to do with one incoming [`Request`].
+#[derive(Debug)]
 pub enum TriggerAction {
     /// No launch — route to the orchestrator's normal turn (`orc.process`).
     NormalTurn,
@@ -62,13 +72,19 @@ pub enum TriggerAction {
 }
 
 /// Decide the trigger action for one incoming request. Parses a leading slash command via
-/// `slash::parse`, or — for a no-slash [`RequestOrigin::Chat`] message — classifies chat intent
-/// via `classify_coding_intent`. `Cli`-origin requests never reach the intent classifier here
-/// (SEC-H: `Cli` is the eval bypass path and must stay unreachable from a chat message); the
-/// classifier itself re-checks the same gate as a defense-in-depth mirror.
-pub fn resolve(req: &Request) -> TriggerAction {
+/// `slash::parse` and resolves it against the data-driven [`SlashRegistry`] (Unified Chat UI
+/// phase 2, D1) — built-ins map to the same actions `resolve_slash` always produced; an
+/// authored/synthesized skill command tags `req.forced_skill` and routes as a normal turn (see
+/// `slash_registry::resolve`). For a no-slash [`RequestOrigin::Chat`] message, classifies chat
+/// intent via `classify_coding_intent`. `Cli`-origin requests never reach the intent classifier
+/// here (SEC-H: `Cli` is the eval bypass path and must stay unreachable from a chat message);
+/// the classifier itself re-checks the same gate as a defense-in-depth mirror.
+///
+/// `req` is mutated ONLY when the slash resolves to a `SkillTurn` action — every other branch
+/// leaves it untouched, so a caller does not need to guard against surprise mutation.
+pub fn resolve(req: &mut Request, registry: &SlashRegistry) -> TriggerAction {
     if let Some((name, arg)) = slash::parse(&req.message) {
-        return resolve_slash(&name, &arg);
+        return crate::slash_registry::resolve::resolve(req, &name, &arg, registry);
     }
 
     if req.origin == RequestOrigin::Chat {
@@ -78,17 +94,6 @@ pub fn resolve(req: &Request) -> TriggerAction {
     }
 
     TriggerAction::NormalTurn
-}
-
-fn resolve_slash(name: &str, arg: &str) -> TriggerAction {
-    match name {
-        "plan" if !arg.is_empty() => TriggerAction::LaunchPlan(arg.to_string()),
-        "code" | "build" if !arg.is_empty() => TriggerAction::LaunchBuild(arg.to_string()),
-        "plan" => TriggerAction::PromptTask(RunKind::Plan),
-        "code" | "build" => TriggerAction::PromptTask(RunKind::Build),
-        _ if slash::is_registered(name) => TriggerAction::NormalTurn,
-        _ => TriggerAction::UnknownSlashHint(name.to_string()),
-    }
 }
 
 /// User-facing text for [`TriggerAction::PromptTask`] — deterministic (never routed through the
@@ -134,7 +139,15 @@ pub async fn confirm_then_launch(
     resp_tx: mpsc::Sender<ResponseChunk>,
 ) {
     let session_id = req.session_id;
-    let approved = confirm(&handles.orc, &resp_tx, session_id, &turn_cancel, kind, &task).await;
+    let approved = confirm(
+        &handles.orc,
+        &resp_tx,
+        session_id,
+        &turn_cancel,
+        kind,
+        &task,
+    )
+    .await;
     if approved {
         let depth = req.depth;
         launch(handles, turn_cancel, kind, task, session_id, depth, resp_tx);
@@ -171,7 +184,9 @@ async fn confirm(
         // launch with no observable prompt.
         return false;
     }
-    orc.approval_gate().request(approval_id, session_id, cancel).await
+    orc.approval_gate()
+        .request(approval_id, session_id, cancel)
+        .await
 }
 
 /// Launch one coding-pipeline run bound to `resp_tx`, mirroring `haily_app::launch_coding_run`'s
@@ -189,8 +204,20 @@ pub fn launch(
     depth: DepthMode,
     resp_tx: mpsc::Sender<ResponseChunk>,
 ) {
-    let LaunchHandles { orc, am, tasks } = handles;
+    let LaunchHandles {
+        orc,
+        am,
+        tasks,
+        db,
+        run_control,
+        notifier,
+        coalescer,
+    } = handles;
     let spec = CodingRunSpec {
+        // Unified Chat UI phase 6 (D3): pre-generated here, before `spawn_launch` registers it —
+        // a `kill_run` issued the instant after this function returns still has a token to
+        // cancel.
+        run_id: Uuid::new_v4(),
         kind,
         task,
         session_id,
@@ -199,30 +226,16 @@ pub fn launch(
         depth,
     };
 
-    let (events_tx, events_rx) = mpsc::channel(RUN_EVENTS_CAPACITY);
-    let (dist_tx, dist_rx) = mpsc::channel(DISTILLATION_CAPACITY);
-
-    crate::watchers::spawn_run_event_bridge(
-        session_id,
-        events_rx,
-        am.clone(),
-        run_cancel.clone(),
-        tasks.clone(),
-    );
-    crate::watchers::spawn_distillation_bridge(dist_rx, am, run_cancel.clone(), tasks.clone());
-
-    tasks.spawn(async move {
-        let result = orc
-            .launch_coding_run(spec, resp_tx.clone(), events_tx, Some(dist_tx), run_cancel)
-            .await;
-        if let Err(e) = result {
-            tracing::error!("coding run launch failed: {e:#}");
-            let _ = resp_tx
-                .send(ResponseChunk::Error(format!("⚠️ {e:#}")))
-                .await;
-            let _ = resp_tx.send(ResponseChunk::Complete).await;
-        }
-    });
+    let ctx = LaunchCtx {
+        orc,
+        am,
+        tasks,
+        db,
+        registry: run_control,
+        notifier,
+        coalescer,
+    };
+    crate::run_control::spawn_launch(ctx, spec, run_cancel, resp_tx);
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 //! goclaw `context.WithoutCancel`).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -132,6 +132,56 @@ fn tier_name(t: Option<Tier>) -> Option<String> {
     })
 }
 
+/// Classification of a `paused` run's reason (Unified Chat UI phase 6, D3), stamped at the exact
+/// point the runner decides to pause rather than re-derived by string-matching `paused_reason`
+/// at resume time. `resume_run` accepts `RetriesExhausted`/`ExplicitStop`; `AwaitingApproval` and
+/// `Other` are refused (an approval-wait pause resolves through its approval card instead). No
+/// `Gate::Approval` decline in the runner today reaches a DISTINCT `AwaitingApproval` state (a
+/// decline is just another gate failure, indistinguishable from an exhausted retry/escalation
+/// budget) — the variant is kept for forward compatibility (a future distinct approval-wait pause
+/// state) and is never emitted by this file today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReasonClass {
+    RetriesExhausted,
+    ExplicitStop,
+    AwaitingApproval,
+    Other,
+}
+
+impl PauseReasonClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PauseReasonClass::RetriesExhausted => "retries_exhausted",
+            PauseReasonClass::ExplicitStop => "explicit_stop",
+            PauseReasonClass::AwaitingApproval => "awaiting_approval",
+            PauseReasonClass::Other => "other",
+        }
+    }
+
+    /// Parse a DB `pause_reason_class` string. Unknown/`None` input classifies as `Other`
+    /// (fail-closed for `resume_run`'s guard — a class this runner has never heard of never
+    /// grants a resume, but never panics on one either).
+    pub fn parse(s: Option<&str>) -> PauseReasonClass {
+        match s {
+            Some("retries_exhausted") => PauseReasonClass::RetriesExhausted,
+            Some("explicit_stop") => PauseReasonClass::ExplicitStop,
+            Some("awaiting_approval") => PauseReasonClass::AwaitingApproval,
+            _ => PauseReasonClass::Other,
+        }
+    }
+}
+
+/// Sticky per-launch context (Unified Chat UI phase 6, D3): the originating `CodingRunSpec`
+/// fields needed to reconstruct a relaunch on `resume_run`, persisted onto EVERY row a launch
+/// creates (not just its first) via [`PipelineRunner::seed_launch`] — any row within a
+/// multi-run launch may end up the one that pauses or is interrupted.
+#[derive(Debug, Clone)]
+struct LaunchContext {
+    task: String,
+    run_kind: String,
+    depth: String,
+}
+
 /// One gate evaluation outcome.
 enum GateVerdict {
     Pass,
@@ -186,6 +236,9 @@ pub struct PipelineRunner {
     broker: Arc<dyn ApprovalGate>,
     /// Kill switch (`safety.disable_writes`) — observed between stages AND by dispatch.
     kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): `approval.mode`, threaded
+    /// into every stage sub-turn's dispatch — mirrors `kill` exactly.
+    approval_mode: crate::permission_mode::ApprovalModeHandle,
     /// Shutdown/cancel token for the run; a stage sub-turn gets a `child_token()`.
     cancel: CancellationToken,
     /// The real user response stream — where the forwarder relays a stage's approval requests
@@ -199,6 +252,20 @@ pub struct PipelineRunner {
     escalation_enabled: bool,
     /// Runner-recursion depth (see [`MAX_PIPELINE_NESTING`]).
     nesting: usize,
+    /// User-initiated pause flag (Unified Chat UI phase 6, D3), checked at the same
+    /// between-stages checkpoint as `kill`/`cancel`. Defaults to a runner-owned flag nobody
+    /// outside ever flips; [`Self::with_pause_handle`] swaps in the caller-constructed handle
+    /// the run-control registry holds, mirroring how `cancel`/`kill` are always caller-supplied.
+    pause: Arc<AtomicBool>,
+    /// One-shot: the launch-time pre-generated `run_id` (kept registry-key parity with
+    /// `kill_run` issued between launch and the first `RunStarted`). Consumed (`take`n) by the
+    /// FIRST `run()` call this instance drives; every later internal call within the SAME
+    /// launch (a replan pass, or the Build portion of `PlanThenBuild`) mints its own id exactly
+    /// as before this phase.
+    next_run_id: Mutex<Option<String>>,
+    /// Sticky per-launch resume context — see [`LaunchContext`]. Read (not taken) by EVERY
+    /// `run()` call, so a later internal run of the SAME launch still carries resumable context.
+    launch_ctx: Mutex<Option<LaunchContext>>,
 }
 
 impl PipelineRunner {
@@ -211,6 +278,7 @@ impl PipelineRunner {
         base_tools: Arc<ToolRegistry>,
         broker: Arc<dyn ApprovalGate>,
         kill: Arc<AtomicBool>,
+        approval_mode: crate::permission_mode::ApprovalModeHandle,
         cancel: CancellationToken,
         user_tx: mpsc::Sender<ResponseChunk>,
         events: mpsc::Sender<RunEvent>,
@@ -223,13 +291,45 @@ impl PipelineRunner {
             base_tools,
             broker,
             kill,
+            approval_mode,
             cancel,
             user_tx,
             events,
             sandbox: Manager::default(),
             escalation_enabled,
             nesting: 0,
+            pause: Arc::new(AtomicBool::new(false)),
+            next_run_id: Mutex::new(None),
+            launch_ctx: Mutex::new(None),
         }
+    }
+
+    /// Swap in the caller-constructed pause handle (Unified Chat UI phase 6, D3) — mirrors
+    /// `cancel`/`kill` being caller-supplied rather than runner-owned, so `haily-app`'s
+    /// run-control registry can flip the SAME `Arc<AtomicBool>` this runner reads. Consuming
+    /// builder, called once right after [`Self::new`] by the launcher (every other caller —
+    /// eval harness, tests — never calls this and keeps the default, never-flipped flag).
+    #[must_use]
+    pub fn with_pause_handle(mut self, pause: Arc<AtomicBool>) -> Self {
+        self.pause = pause;
+        self
+    }
+
+    /// Seed the launch-time resume context (Unified Chat UI phase 6, D3): `run_id` is consumed
+    /// by the very next `run()` call ONLY (`None` leaves the next call to mint its own fresh
+    /// id, e.g. every internal call after a launch's first); `task`/`run_kind`/`depth` are
+    /// STICKY and apply to every subsequent `run()` call until re-seeded (the launcher re-seeds
+    /// `run_kind` between the Plan and Build portions of a `PlanThenBuild` launch — see
+    /// `launcher::launch_coding_run`).
+    pub fn seed_launch(&self, run_id: Option<String>, task: &str, run_kind: &str, depth: &str) {
+        if run_id.is_some() {
+            *self.next_run_id.lock().unwrap_or_else(|e| e.into_inner()) = run_id;
+        }
+        *self.launch_ctx.lock().unwrap_or_else(|e| e.into_inner()) = Some(LaunchContext {
+            task: task.to_string(),
+            run_kind: run_kind.to_string(),
+            depth: depth.to_string(),
+        });
     }
 
     async fn emit(&self, ev: RunEvent) {
@@ -247,12 +347,16 @@ impl PipelineRunner {
         match db_skills::most_recent_trace(&self.db, &sid).await {
             Ok(Some(trace)) => {
                 let outcome = if pass { "success" } else { "failure" };
-                if let Err(e) = db_skills::apply_gate_result_label(&self.db, &trace.id, outcome).await {
+                if let Err(e) =
+                    db_skills::apply_gate_result_label(&self.db, &trace.id, outcome).await
+                {
                     tracing::warn!(run_session = %sid, "gate-result label write failed: {e:#}");
                 }
             }
             Ok(None) => tracing::debug!(run_session = %sid, "no trace to label with gate result"),
-            Err(e) => tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}"),
+            Err(e) => {
+                tracing::warn!(run_session = %sid, "gate-label most_recent_trace failed: {e:#}")
+            }
         }
     }
 
@@ -347,6 +451,7 @@ impl PipelineRunner {
             llm,
             broker: Arc::clone(&self.broker),
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             cancel: self.cancel.clone(),
             user_tx: self.user_tx.clone(),
             session_id,
@@ -411,6 +516,7 @@ impl PipelineRunner {
                 backend_used: None,
                 egress: None,
                 gate_output_digest: None,
+                pause_reason_class: None,
             },
         )
         .await
@@ -442,15 +548,44 @@ impl PipelineRunner {
         }
 
         let session_str = spec.session_id.to_string();
-        let run = pipeline_runs::create(
+        // Unified Chat UI phase 6 (D3): the one-shot pre-generated launch id (if this is the
+        // FIRST run() call of the launch) and the sticky resume context — see `seed_launch`.
+        let seeded_id = self
+            .next_run_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let ctx = self
+            .launch_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let resume_ctx = ctx.as_ref().map(|c| pipeline_runs::ResumeCtx {
+            task: &c.task,
+            run_kind: &c.run_kind,
+            depth: &c.depth,
+        });
+        let run = pipeline_runs::create_resumable(
             &self.db,
+            seeded_id.as_deref(),
             &session_str,
             spec.work_item_id.as_deref(),
             spec.attempts_budget,
+            resume_ctx,
         )
         .await?;
         let run_id = run.id.clone();
         let wi_id = spec.work_item_id.clone().unwrap_or_else(|| run_id.clone());
+        // REVIEW FIX (MED, phase-06 review): re-enter the CURRENT stage on a resume, not the
+        // whole pipeline from scratch — `create_resumable`'s idempotent-return path hands back
+        // the SAME row `resume_reset` reset to `running` WITHOUT touching `stage_index` (see that
+        // function's doc), so a fresh launch's `run.stage_index` is always `0` (a brand-new row)
+        // while a resumed launch's is whatever position it paused/was interrupted at. Clamped
+        // defensively against a stale index outside today's pipeline shape (never observed in
+        // practice — see the Deviation Log for the one documented boundary this does NOT cover).
+        let start_stage_index = usize::try_from(run.stage_index)
+            .unwrap_or(0)
+            .min(spec.pipeline.runs.len().saturating_sub(1));
 
         // ONE shared destructive-delete counter for the WHOLE run (DEP-C1).
         let turn_deletes = Arc::new(AtomicUsize::new(0));
@@ -469,7 +604,9 @@ impl PipelineRunner {
             &self.db,
             &run_id,
             RunTransition {
-                stage_index: 0,
+                // A resumed run starts this transition already AT its re-entry stage (never
+                // reset to 0 here) — see `start_stage_index`'s doc just above.
+                stage_index: start_stage_index as i64,
                 status: RunStatus::Running.as_str(),
                 attempt: 0,
                 attempts_remaining,
@@ -477,6 +614,7 @@ impl PipelineRunner {
                 backend_used: None,
                 egress: None,
                 gate_output_digest: None,
+                pause_reason_class: None,
             },
         )
         .await;
@@ -489,7 +627,10 @@ impl PipelineRunner {
         let stage_count = spec.pipeline.runs.len();
         let mut final_status = RunStatus::Done;
         let mut paused_reason: Option<String> = None;
-        let mut last_stage_idx = 0i64;
+        // Unified Chat UI phase 6 (D3): the class stamped alongside `paused_reason` at every
+        // site that sets it, so `resume_run` never re-parses the free-text reason.
+        let mut pause_class: Option<PauseReasonClass> = None;
+        let mut last_stage_idx = start_stage_index as i64;
         let mut seq: u64 = 0;
 
         // Phase 6 escalation-policy inputs — snapshotted ONCE per run (mirrors
@@ -500,8 +641,10 @@ impl PipelineRunner {
         let llm_for_policy = Arc::clone(&*self.llm.read().unwrap_or_else(|e| e.into_inner()));
         let egress = self.derive_egress(&llm_for_policy).await;
         let highest_local_tier = llm_for_policy.highest_local_tier();
-        let session_default_tier =
-            llm_for_policy.snapshot().session_tier(&[]).unwrap_or(Tier::Fast);
+        let session_default_tier = llm_for_policy
+            .snapshot()
+            .session_tier(&[])
+            .unwrap_or(Tier::Fast);
         let cost_quality = llm_for_policy.cost_quality();
         // ONE policy for the WHOLE run (config-sourced `enabled`/`max_tier`; `enabled` mirrors
         // the pre-existing `self.escalation_enabled` field so a disabled run is a total no-op —
@@ -517,11 +660,30 @@ impl PipelineRunner {
             ..EscalationPolicy::default()
         };
 
-        'run: for (idx, stage) in spec.pipeline.runs.iter().enumerate() {
+        // A resumed run skips every stage already passed (idx < start_stage_index) rather than
+        // replaying them — `.enumerate()` keeps `idx` as the stage's REAL position in
+        // `spec.pipeline.runs` (needed for `idx + 1 == stage_count` and the persisted
+        // `stage_index`), `.skip(...)` just advances the iterator's start point.
+        'run: for (idx, stage) in spec
+            .pipeline
+            .runs
+            .iter()
+            .enumerate()
+            .skip(start_stage_index)
+        {
             last_stage_idx = idx as i64;
             // Kill/cancel checkpoint BETWEEN stages (dispatch enforces it between tool calls).
             if self.kill.load(Ordering::Acquire) || self.cancel.is_cancelled() {
                 final_status = RunStatus::Interrupted;
+                break 'run;
+            }
+            // Unified Chat UI phase 6 (D3): user-initiated `pause_run`, same checkpoint as
+            // kill/cancel — best-effort (stage-boundary only, never mid-stage). Stamps
+            // `ExplicitStop` so `resume_run` can re-enter this run later.
+            if self.pause.load(Ordering::Acquire) {
+                final_status = RunStatus::Paused;
+                pause_class = Some(PauseReasonClass::ExplicitStop);
+                paused_reason = Some("paused by user".to_string());
                 break 'run;
             }
             self.emit(RunEvent::StageStarted {
@@ -633,19 +795,42 @@ impl PipelineRunner {
                                 Ok(GateVerdict::Pass) => {} // confirmed — fall through to `break true`
                                 Ok(_) => {
                                     // The confirming re-run disagreed — treat as a fail this attempt.
-                                    feedback = Some("flaky gate: confirming re-run failed".to_string());
+                                    feedback =
+                                        Some("flaky gate: confirming re-run failed".to_string());
                                     last_fail_hash = Some(cur_hash);
                                     attempts_remaining -= 1;
                                     // FMA-C1 review fix: persist the decrement INSIDE the retry
                                     // loop (see the Fail branch below for the full rationale).
                                     let _ = self
-                                        .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                                        .persist_progress(
+                                            &run_id,
+                                            idx as i64,
+                                            attempt,
+                                            attempts_remaining,
+                                            effective_tier,
+                                        )
                                         .await;
-                                    match decide(false, attempt, stage.max_retries, attempts_remaining, self.escalation_enabled && !escalated) {
-                                        StageDecision::Retry => { attempt += 1; total_retries += 1; continue; }
+                                    match decide(
+                                        false,
+                                        attempt,
+                                        stage.max_retries,
+                                        attempts_remaining,
+                                        self.escalation_enabled && !escalated,
+                                    ) {
+                                        StageDecision::Retry => {
+                                            attempt += 1;
+                                            total_retries += 1;
+                                            continue;
+                                        }
                                         StageDecision::Escalate => {
-                                            let current = effective_tier.unwrap_or(session_default_tier);
-                                            match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                            let current =
+                                                effective_tier.unwrap_or(session_default_tier);
+                                            match escalation_policy.next_tier(
+                                                current,
+                                                attempt,
+                                                egress,
+                                                highest_local_tier,
+                                            ) {
                                                 Some(to) => {
                                                     escalated = true;
                                                     // Review fix: the flaky-confirm escalation path
@@ -654,8 +839,10 @@ impl PipelineRunner {
                                                     // the tier change.
                                                     self.emit(RunEvent::Escalation {
                                                         run_id: run_id.clone(),
-                                                        from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                                        to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                                        from: tier_name(effective_tier)
+                                                            .unwrap_or_else(|| "default".into()),
+                                                        to: tier_name(Some(to))
+                                                            .unwrap_or_else(|| "default".into()),
                                                     })
                                                     .await;
                                                     effective_tier = Some(to);
@@ -670,12 +857,21 @@ impl PipelineRunner {
                                                     // to a Retry that would burn attempts_remaining at
                                                     // a tier already proven to fail.
                                                     final_status = RunStatus::Paused;
+                                                    pause_class =
+                                                        Some(PauseReasonClass::RetriesExhausted);
                                                     paused_reason = Some("flaky gate could not be confirmed; escalation ceiling reached".to_string());
                                                     break false;
                                                 }
                                             }
                                         }
-                                        _ => { final_status = RunStatus::Paused; paused_reason = Some("flaky gate could not be confirmed".to_string()); break false; }
+                                        _ => {
+                                            final_status = RunStatus::Paused;
+                                            pause_class = Some(PauseReasonClass::RetriesExhausted);
+                                            paused_reason = Some(
+                                                "flaky gate could not be confirmed".to_string(),
+                                            );
+                                            break false;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -703,10 +899,22 @@ impl PipelineRunner {
                         // just once at stage-loop exit) so a crash mid-retry-loop can't leave a
                         // future resume with a stale, too-high `attempts_remaining`.
                         let _ = self
-                            .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                            .persist_progress(
+                                &run_id,
+                                idx as i64,
+                                attempt,
+                                attempts_remaining,
+                                effective_tier,
+                            )
                             .await;
                         let escalate_ok = self.escalation_enabled && !escalated;
-                        match decide(false, attempt, stage.max_retries, attempts_remaining, escalate_ok) {
+                        match decide(
+                            false,
+                            attempt,
+                            stage.max_retries,
+                            attempts_remaining,
+                            escalate_ok,
+                        ) {
                             StageDecision::Retry => {
                                 feedback = Some(retry_feedback(&decisive));
                                 attempt += 1;
@@ -715,13 +923,20 @@ impl PipelineRunner {
                             }
                             StageDecision::Escalate => {
                                 let current = effective_tier.unwrap_or(session_default_tier);
-                                match escalation_policy.next_tier(current, attempt, egress, highest_local_tier) {
+                                match escalation_policy.next_tier(
+                                    current,
+                                    attempt,
+                                    egress,
+                                    highest_local_tier,
+                                ) {
                                     Some(to) => {
                                         escalated = true;
                                         self.emit(RunEvent::Escalation {
                                             run_id: run_id.clone(),
-                                            from: tier_name(effective_tier).unwrap_or_else(|| "default".into()),
-                                            to: tier_name(Some(to)).unwrap_or_else(|| "default".into()),
+                                            from: tier_name(effective_tier)
+                                                .unwrap_or_else(|| "default".into()),
+                                            to: tier_name(Some(to))
+                                                .unwrap_or_else(|| "default".into()),
                                         })
                                         .await;
                                         effective_tier = Some(to);
@@ -738,6 +953,7 @@ impl PipelineRunner {
                                         // stage.max_retries would silently burn attempts_remaining
                                         // on a tier already proven to fail.
                                         final_status = RunStatus::Paused;
+                                        pause_class = Some(PauseReasonClass::RetriesExhausted);
                                         paused_reason = Some(format!(
                                             "stage '{}' gate failed; escalation ceiling reached (max_tier/egress)",
                                             stage.name
@@ -748,13 +964,16 @@ impl PipelineRunner {
                             }
                             StageDecision::Pause => {
                                 final_status = RunStatus::Paused;
+                                pause_class = Some(PauseReasonClass::RetriesExhausted);
                                 paused_reason = Some(format!(
                                     "stage '{}' gate failed; retries/attempts exhausted",
                                     stage.name
                                 ));
                                 break false;
                             }
-                            StageDecision::Advance => unreachable!("Advance is only returned on pass"),
+                            StageDecision::Advance => {
+                                unreachable!("Advance is only returned on pass")
+                            }
                         }
                     }
                 }
@@ -781,7 +1000,11 @@ impl PipelineRunner {
                 // retry of stage N would also wipe every earlier PASSED stage's (uncommitted)
                 // output. A commit failure is treated as fatal to the run (retry correctness
                 // downstream cannot be guaranteed without it).
-                if let Err(e) = spec.workspace.commit_stage(&format!("stage: {}", stage.name)).await {
+                if let Err(e) = spec
+                    .workspace
+                    .commit_stage(&format!("stage: {}", stage.name))
+                    .await
+                {
                     tracing::warn!(run = %run_id, stage = %stage.name, "stage-boundary commit failed: {e:#}");
                     final_status = RunStatus::Failed;
                     break 'run;
@@ -793,7 +1016,13 @@ impl PipelineRunner {
             // signal — `false` means the run vanished/was cancelled/soft-deleted elsewhere, so
             // stop driving it here rather than silently continuing to the next stage.
             let stage_row_alive = self
-                .persist_progress(&run_id, idx as i64, attempt, attempts_remaining, effective_tier)
+                .persist_progress(
+                    &run_id,
+                    idx as i64,
+                    attempt,
+                    attempts_remaining,
+                    effective_tier,
+                )
                 .await;
             if !stage_row_alive {
                 final_status = RunStatus::Interrupted;
@@ -826,8 +1055,17 @@ impl PipelineRunner {
             }
         }
 
-        self.finalize(&run_id, &session_str, last_stage_idx, attempts_remaining, final_status, paused_reason, spec.workspace)
-            .await?;
+        self.finalize(
+            &run_id,
+            &session_str,
+            last_stage_idx,
+            attempts_remaining,
+            final_status,
+            paused_reason,
+            pause_class,
+            spec.workspace,
+        )
+        .await?;
 
         Ok(RunReport {
             run_id,
@@ -877,6 +1115,7 @@ impl PipelineRunner {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             // Per-attempt fresh turn_id (minted by the caller) but the SHARED turn_deletes
             // counter + one run_id span the whole run (DEP-C1).
             turn_id,
@@ -956,7 +1195,9 @@ impl PipelineRunner {
                     let lang = VerifierLang::detect(root);
                     let stdout = &stdout[..stdout.len().min(MAX_OUTPUT_BYTES)];
                     let stderr = &stderr[..stderr.len().min(MAX_OUTPUT_BYTES)];
-                    Ok(GateVerdict::Fail(parse_decisive(lang, stdout, stderr, status)))
+                    Ok(GateVerdict::Fail(parse_decisive(
+                        lang, stdout, stderr, status,
+                    )))
                 }
             }
             Gate::Artifact { path, parseable_as } => {
@@ -971,7 +1212,9 @@ impl PipelineRunner {
                         if ArtifactKind::parses(*kind, &content) {
                             Ok(GateVerdict::Pass)
                         } else {
-                            Ok(GateVerdict::Fail(format!("artifact does not parse as expected: {path:?}")))
+                            Ok(GateVerdict::Fail(format!(
+                                "artifact does not parse as expected: {path:?}"
+                            )))
                         }
                     }
                 }
@@ -993,10 +1236,16 @@ impl PipelineRunner {
                         reversible: false,
                     })
                     .await;
-                if self.broker.request(approval_id, session_id, &self.cancel).await {
+                if self
+                    .broker
+                    .request(approval_id, session_id, &self.cancel)
+                    .await
+                {
                     Ok(GateVerdict::Pass)
                 } else {
-                    Ok(GateVerdict::Fail("approval checkpoint declined".to_string()))
+                    Ok(GateVerdict::Fail(
+                        "approval checkpoint declined".to_string(),
+                    ))
                 }
             }
         }
@@ -1048,7 +1297,9 @@ impl PipelineRunner {
                 r = tokio::time::timeout(Duration::from_secs(GATE_TIMEOUT_SECS), child.wait_with_output()) => r??,
             };
             let status = out.status.code().unwrap_or(-1);
-            let cap = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(MAX_OUTPUT_BYTES)]).into_owned();
+            let cap = |b: &[u8]| {
+                String::from_utf8_lossy(&b[..b.len().min(MAX_OUTPUT_BYTES)]).into_owned()
+            };
             Ok((status, cap(&out.stdout), cap(&out.stderr), false))
         }
     }
@@ -1066,6 +1317,7 @@ impl PipelineRunner {
         attempts_remaining: i64,
         status: RunStatus,
         paused_reason: Option<String>,
+        pause_class: Option<PauseReasonClass>,
         workspace: &CodingWorkspace,
     ) -> Result<()> {
         let idem = Uuid::new_v4().to_string();
@@ -1087,6 +1339,13 @@ impl PipelineRunner {
             retention_days: RUN_MARKER_RETENTION_DAYS,
             manifest_hash: None,
         };
+        // Unified Chat UI phase 6 (D3): the class rides ONLY on a Paused transition — any other
+        // terminal status clears a stale class from an earlier pause on a since-resumed row.
+        let class_str = if status == RunStatus::Paused {
+            pause_class.map(PauseReasonClass::as_str)
+        } else {
+            None
+        };
         let t = RunTransition {
             stage_index,
             status: status.as_str(),
@@ -1096,6 +1355,7 @@ impl PipelineRunner {
             backend_used: None,
             egress: None,
             gate_output_digest: None,
+            pause_reason_class: class_str,
         };
         pipeline_runs::finalize(&self.db, run_id, t, marker).await?;
 

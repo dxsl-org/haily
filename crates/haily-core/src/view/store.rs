@@ -132,11 +132,17 @@ mod tests {
         }
         // The first 5 inserted must have been evicted (FIFO, oldest-first).
         for id in &ids[..5] {
-            assert!(store.get(id).is_none(), "oldest entries must be evicted past cap");
+            assert!(
+                store.get(id).is_none(),
+                "oldest entries must be evicted past cap"
+            );
         }
         // The most recent MAX_STORED_VIEWS must still be present.
         for id in &ids[5..] {
-            assert!(store.get(id).is_some(), "recent entries must survive eviction");
+            assert!(
+                store.get(id).is_some(),
+                "recent entries must survive eviction"
+            );
         }
     }
 
@@ -148,7 +154,10 @@ mod tests {
         store.insert(v.clone());
         v.entity = "contact-updated".to_string();
         store.insert(v.clone());
-        assert_eq!(store.get(&id).map(|r| r.entity), Some("contact-updated".to_string()));
+        assert_eq!(
+            store.get(&id).map(|r| r.entity),
+            Some("contact-updated".to_string())
+        );
         // Re-inserting the same id must not consume two eviction slots — fill up to
         // exactly the cap using the same id repeatedly, then confirm a genuinely new
         // entry still evicts only the true oldest (a different, first-ever id), proving
@@ -156,7 +165,10 @@ mod tests {
         for _ in 0..(MAX_STORED_VIEWS * 2) {
             store.insert(v.clone());
         }
-        assert!(store.get(&id).is_some(), "repeatedly re-inserted id must survive");
+        assert!(
+            store.get(&id).is_some(),
+            "repeatedly re-inserted id must survive"
+        );
     }
 
     #[tokio::test]
@@ -176,7 +188,13 @@ mod tests {
         // Every inserted id (within the cap) must be independently readable — proves no
         // torn/corrupted state from concurrent access under the shared Mutex.
         let present = ids.iter().filter(|id| store.get(id).is_some()).count();
-        assert!(present > 0, "at least some concurrently inserted views must be retrievable");
-        assert!(present <= MAX_STORED_VIEWS, "store must never exceed its cap");
+        assert!(
+            present > 0,
+            "at least some concurrently inserted views must be retrievable"
+        );
+        assert!(
+            present <= MAX_STORED_VIEWS,
+            "store must never exceed its cap"
+        );
     }
 }

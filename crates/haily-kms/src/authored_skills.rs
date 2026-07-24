@@ -104,6 +104,12 @@ pub struct AuthoredSkill {
     pub kind: SkillKind,
     pub body: String,
     pub references: Vec<ReferenceChunk>,
+    /// Set by `kit_pack::load_with_versions_fallback` (Unified Chat UI phase 8 review MED-1)
+    /// when this skill's on-disk file failed its manifest-hash check and was recovered from a
+    /// `skill_versions` snapshot instead of being silently dropped. `false` for every skill
+    /// loaded the normal way (including via `kit_pack::load`, which never recovers). This is
+    /// the GUI-reachable tamper/crash signal — see `AuthoredRegistry::recovered_names`.
+    pub recovered: bool,
 }
 
 impl AuthoredSkill {
@@ -149,6 +155,7 @@ impl AuthoredSkill {
             kind,
             body: body.trim().to_string(),
             references: Vec::new(),
+            recovered: false,
         })
     }
 
@@ -175,6 +182,41 @@ impl AuthoredSkill {
     fn match_text(&self) -> String {
         format!("{} {} {}", self.name, self.description, self.when_to_use)
     }
+
+    /// Reconstruct this skill's file bytes (Unified Chat UI phase 8, D4) — a deterministic
+    /// re-serialization from the parsed fields, not a byte-exact copy of whatever formatting
+    /// the original file happened to use. Used by the skill editor's atomic write/version-
+    /// snapshot path when only `body` changed (frontmatter is carried through unchanged).
+    ///
+    /// Frontmatter scalars are single-line by this hand-rolled format's construction
+    /// (`split_once(':')` per line — see `parse_scalars`), so any embedded newline is
+    /// flattened to a space here to guarantee the written frontmatter block stays parseable
+    /// (a synthesized skill's `description`, which `promote_to_authored` maps into this
+    /// struct, has no such guarantee at its source).
+    pub fn to_markdown(&self) -> String {
+        let mut front = format!(
+            "---\nname: {}\ndescription: {}\nwhen_to_use: {}\n",
+            sanitize_scalar(&self.name),
+            sanitize_scalar(&self.description),
+            sanitize_scalar(&self.when_to_use),
+        );
+        if let Some(domain) = &self.domain {
+            front.push_str(&format!("domain: {}\n", sanitize_scalar(domain)));
+        }
+        front.push_str(&format!("kind: {}\n", self.kind.as_str()));
+        if !self.specialists.is_empty() {
+            let specialists = self.specialists.iter().map(|s| sanitize_scalar(s)).collect::<Vec<_>>();
+            front.push_str(&format!("specialists: [{}]\n", specialists.join(", ")));
+        }
+        front.push_str("---\n\n");
+        format!("{front}{}\n", self.body.trim())
+    }
+}
+
+/// Flatten a frontmatter scalar to one line — replaces any newline with a space and trims. See
+/// `to_markdown`'s doc comment for why this matters.
+fn sanitize_scalar(s: &str) -> String {
+    s.replace(['\n', '\r'], " ").trim().to_string()
 }
 
 /// An immutable point-in-time view of the merged registry. A hot-reload builds a fresh
@@ -245,6 +287,13 @@ impl AuthoredRegistry {
 
     fn snap(&self) -> Arc<Snapshot> {
         Arc::clone(&self.snapshot.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Full parsed record for `name`, cloned out of the current snapshot (Unified Chat UI phase
+    /// 8, D4) — unlike `fetch_section`'s single-section lazy-load, the editor needs the whole
+    /// record (frontmatter + body) to reconstruct a complete file on save/revert.
+    pub fn get(&self, name: &str) -> Option<AuthoredSkill> {
+        self.snap().by_name.get(name).cloned()
     }
 
     /// Compact routing table for the L0 system prompt: one `- **name** — when_to_use`
@@ -365,6 +414,18 @@ impl AuthoredRegistry {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Name-sorted list of currently-loaded skills flagged `recovered` — i.e. their on-disk
+    /// file failed the manifest-hash check at the last load and a `skill_versions` snapshot was
+    /// served instead (review MED-1: a GUI-reachable tamper/crash signal, not log-only). Empty
+    /// on a clean load, which is the overwhelming common case.
+    pub fn recovered_names(&self) -> Vec<String> {
+        let snap = self.snap();
+        let mut names: Vec<String> =
+            snap.by_name.values().filter(|s| s.recovered).map(|s| s.name.clone()).collect();
+        names.sort();
+        names
     }
 
     /// Discovery: skills relevant to `query`, ranked by Jaccard, as `(name, when_to_use)`
@@ -504,6 +565,7 @@ mod tests {
             kind,
             body: format!("BODY OF {name}"),
             references: vec![],
+            recovered: false,
         }
     }
 
@@ -556,6 +618,33 @@ mod tests {
     }
 
     #[test]
+    fn to_markdown_round_trips_through_from_markdown() {
+        let raw = "---\nname: plan\ndescription: plan things\nwhen_to_use: before coding\ndomain: developer\nkind: stage-prompt\nspecialists: [planner, reviewer]\n---\nbody text here\nsecond line\n";
+        let original = AuthoredSkill::from_markdown("fallback", raw).expect("parse original");
+        let regenerated = AuthoredSkill::from_markdown("fallback", &original.to_markdown()).expect("parse regenerated");
+
+        assert_eq!(regenerated.name, original.name);
+        assert_eq!(regenerated.description, original.description);
+        assert_eq!(regenerated.when_to_use, original.when_to_use);
+        assert_eq!(regenerated.domain, original.domain);
+        assert_eq!(regenerated.kind, original.kind);
+        assert_eq!(regenerated.specialists, original.specialists);
+        assert_eq!(regenerated.body, original.body);
+    }
+
+    #[test]
+    fn to_markdown_flattens_embedded_newlines_in_scalars() {
+        // A synthesized skill's `description` (promote_to_authored's source) has no
+        // single-line guarantee — a stray newline must not corrupt the frontmatter block.
+        let mut skill = skill("x", SkillKind::Playbook, None, "line one\nline two");
+        skill.when_to_use = "also\nmultiline".to_string();
+        let md = skill.to_markdown();
+        let reparsed = AuthoredSkill::from_markdown("x", &md).expect("frontmatter must stay parseable");
+        assert!(!reparsed.description.contains('\n'));
+        assert!(!reparsed.when_to_use.contains('\n'));
+    }
+
+    #[test]
     fn tolerates_crlf_line_endings() {
         let raw = "---\r\nname: x\r\ndescription: d\r\nwhen_to_use: w\r\ndomain: developer\r\nkind: standard\r\n---\r\nbody line\r\n";
         let s = AuthoredSkill::from_markdown("x", raw).expect("parse crlf");
@@ -566,6 +655,15 @@ mod tests {
     // ------------------------------------------------------------------
     // Registry: precedence, routing, matching, sections
     // ------------------------------------------------------------------
+
+    #[test]
+    fn recovered_names_reports_only_flagged_skills() {
+        let clean = skill("clean", SkillKind::Playbook, Some("developer"), "fine");
+        let mut tampered = skill("tampered", SkillKind::Playbook, Some("developer"), "recovered");
+        tampered.recovered = true;
+        let reg = AuthoredRegistry::from_tiers(vec![vec![clean, tampered]]);
+        assert_eq!(reg.recovered_names(), vec!["tampered".to_string()]);
+    }
 
     #[test]
     fn higher_tier_overrides_lower_by_name() {

@@ -308,6 +308,7 @@ pub fn build_prompt_request(session_id: Uuid, message: String, user_ref: Option<
         user_ref,
         depth: Default::default(),
         origin: RequestOrigin::Chat,
+        forced_skill: None,
     }
 }
 

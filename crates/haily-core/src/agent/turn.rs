@@ -15,11 +15,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
 
+use super::outcome::{record_outcome_and_update_skill, OutcomeMetricsInput};
+use super::stream::stream_llm_response;
 use crate::approval::ApprovalBroker;
 use crate::routing::{self, TierDecision};
 use crate::{budget, context, feedback_parser, tool_call};
-use super::outcome::{record_outcome_and_update_skill, OutcomeMetricsInput};
-use super::stream::stream_llm_response;
 
 fn estimate_tokens(s: &str) -> i64 {
     (s.len() / 4) as i64
@@ -111,6 +111,10 @@ pub struct TurnRuntime {
     /// makes this turn behave identically to the pre-phase-4 turn (tier always `None`, zero
     /// `routing_decisions` rows, no escalation rescue attempted).
     pub routing_enabled: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): `approval.mode`, shared from
+    /// the Orchestrator exactly like `kill` — so the L0 turn and every sub-turn it spawns
+    /// observe the same live-toggleable mode.
+    pub approval_mode: crate::permission_mode::ApprovalModeHandle,
     /// View Engine Phase A (phase 3): the SAME `Arc<ViewStore>` the Orchestrator holds for
     /// its whole lifetime (`Orchestrator::view_store()`), not a fresh turn-scoped store —
     /// so a `present_view` insert here and the `get_view` Tauri command's read observe one
@@ -138,6 +142,7 @@ pub async fn run_turn(
         tools,
         kill,
         routing_enabled,
+        approval_mode,
         view_store,
     } = runtime;
     let session_id = req.session_id.to_string();
@@ -182,9 +187,16 @@ pub async fn run_turn(
 
     let context_window = llm.context_window();
     let token_budget = budget::TokenBudget::new(context_window);
-    let (mut messages, _ctx) =
-        context::build_messages(&kms, &db, &tools, &session_id, &req.message, context_window)
-            .await?;
+    let (mut messages, _ctx) = context::build_messages(
+        &kms,
+        &db,
+        &tools,
+        &session_id,
+        &req.message,
+        req.forced_skill.as_deref(),
+        context_window,
+    )
+    .await?;
 
     // Minted ONCE per turn (never from LLM/task text) — every tool call this turn, and
     // every sub-turn `delegate.rs` spawns from it, shares this id/counter so the whole
@@ -384,10 +396,16 @@ pub async fn run_turn(
                     }
                 }
 
-                let (result, tool_ok) =
-                    tool_call::dispatch(&tool_name, args.clone(), &tools, &tool_ctx, &kill)
-                        .await
-                        .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
+                let (result, tool_ok) = tool_call::dispatch(
+                    &tool_name,
+                    args.clone(),
+                    &tools,
+                    &tool_ctx,
+                    &kill,
+                    &approval_mode,
+                )
+                .await
+                .unwrap_or_else(|e| (format!("Error: {e:#}"), false));
 
                 tool_call_log.push(serde_json::json!({
                     "tool": &tool_name,
@@ -524,7 +542,11 @@ pub async fn run_turn(
     // nothing (see migration 0031's write contract) — this call sits after every fallible
     // `?` in this function has already resolved, so it only ever runs on a completed turn.
     if routing_active {
-        let escalated_to = if current_tier != decision.tier { current_tier } else { None };
+        let escalated_to = if current_tier != decision.tier {
+            current_tier
+        } else {
+            None
+        };
         let new_row = routing_decisions::NewRoutingDecision {
             turn_id: turn_id_str.as_str(),
             run_id: None, // an L0 chat turn is not a pipeline run
@@ -560,7 +582,9 @@ pub async fn run_turn(
     // synthetic `Complete` sites — the badge is strictly an L0-turn concept.
     if routing_active {
         let badge = build_turn_meta_badge(&llm.snapshot(), current_tier);
-        let _ = tx.send(ResponseChunk::TurnMeta { badge: Some(badge) }).await;
+        let _ = tx
+            .send(ResponseChunk::TurnMeta { badge: Some(badge) })
+            .await;
     }
     let _ = tx.send(ResponseChunk::Complete).await;
 
@@ -745,6 +769,9 @@ mod turn_integration_tests {
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -761,6 +788,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -882,6 +910,9 @@ mod turn_integration_tests {
             max_depth: 2,
             model_tier: None,
             kill: Arc::clone(&kill),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
         };
 
         let mut l0_registry = ToolRegistry::new();
@@ -895,6 +926,9 @@ mod turn_integration_tests {
             tools: Arc::new(l0_registry),
             kill,
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -924,6 +958,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -998,6 +1033,9 @@ mod turn_integration_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -1011,6 +1049,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -1031,9 +1070,9 @@ mod turn_integration_tests {
                     "a tier=None turn's badge must be the bare session-default model name"
                 );
             }
-            other => panic!(
-                "expected [.., TurnMeta, Complete] as the last two chunks, got: {other:?}"
-            ),
+            other => {
+                panic!("expected [.., TurnMeta, Complete] as the last two chunks, got: {other:?}")
+            }
         }
         assert_eq!(
             chunks
@@ -1060,6 +1099,9 @@ mod turn_integration_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -1073,6 +1115,7 @@ mod turn_integration_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         run_turn(&req, runtime, tx, &broker, &cancel)
@@ -1084,7 +1127,9 @@ mod turn_integration_tests {
             chunks.push(c);
         }
         assert!(
-            !chunks.iter().any(|c| matches!(c, ResponseChunk::TurnMeta { .. })),
+            !chunks
+                .iter()
+                .any(|c| matches!(c, ResponseChunk::TurnMeta { .. })),
             "routing_enabled=false must emit ZERO TurnMeta chunks, got: {chunks:?}"
         );
         assert!(matches!(chunks.last(), Some(ResponseChunk::Complete)));
@@ -1192,6 +1237,9 @@ mod outcome_signal_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(routing_enabled)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -1206,6 +1254,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1213,7 +1262,10 @@ mod outcome_signal_tests {
         drain.await.expect("drain task");
     }
 
-    pub(super) async fn latest_trace(db: &DbHandle, session_id: uuid::Uuid) -> db_skills::TaskTrace {
+    pub(super) async fn latest_trace(
+        db: &DbHandle,
+        session_id: uuid::Uuid,
+    ) -> db_skills::TaskTrace {
         db_skills::most_recent_trace(db, &session_id.to_string())
             .await
             .expect("most_recent_trace")
@@ -1242,7 +1294,10 @@ mod outcome_signal_tests {
                     let _ = stream.read(&mut buf).await;
                     let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let idx = n.min(contents.len().saturating_sub(1));
-                    let content = contents.get(idx).cloned().unwrap_or_else(|| "Final answer.".to_string());
+                    let content = contents
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| "Final answer.".to_string());
                     let delta = serde_json::json!({
                         "choices": [{ "delta": { "content": content } }]
                     })
@@ -1286,7 +1341,10 @@ mod outcome_signal_tests {
                     let _ = stream.read(&mut buf).await;
                     let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let idx = n.min(contents.len().saturating_sub(1));
-                    let content = contents.get(idx).cloned().unwrap_or_else(|| "Final answer.".to_string());
+                    let content = contents
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(|| "Final answer.".to_string());
                     let payload = serde_json::json!({
                         "choices": [{ "message": { "content": content } }]
                     })
@@ -1326,6 +1384,9 @@ mod outcome_signal_tests {
             tools: Arc::new(registry),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -1340,6 +1401,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1355,8 +1417,14 @@ mod outcome_signal_tests {
         let (db, kms, _dir) = test_db_kms().await;
         let session_id = uuid::Uuid::new_v4();
 
-        run_plain_turn(db.clone(), kms, session_id, "what's the weather like", "It's sunny today.")
-            .await;
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "what's the weather like",
+            "It's sunny today.",
+        )
+        .await;
 
         let trace = latest_trace(&db, session_id).await;
         assert_eq!(trace.outcome, "success");
@@ -1480,10 +1548,7 @@ mod outcome_signal_tests {
         let trace = latest_trace(&db, session_id).await;
         assert_eq!(trace.label_source.as_deref(), Some("repeat_request"));
 
-        let after = db_skills::get_skill(&db, &skill.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let after = db_skills::get_skill(&db, &skill.id).await.unwrap().unwrap();
         assert!(
             after.confidence > mid,
             "a Success outcome with a non-unknown label must move confidence upward via EMA, got {} (was {mid})",
@@ -1542,10 +1607,7 @@ mod outcome_signal_tests {
             trace.label_source
         );
 
-        let after = db_skills::get_skill(&db, &skill.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let after = db_skills::get_skill(&db, &skill.id).await.unwrap().unwrap();
         assert_eq!(
             after.confidence, confidence_before,
             "a benign, uncorroborated repeat must leave skill confidence UNCHANGED"
@@ -1693,8 +1755,15 @@ mod outcome_signal_tests {
         db_skills::update_skill_confidence(&db, &skill.id, 0.2, 1.0)
             .await
             .expect("seed low confidence");
-        let before = db_skills::get_skill(&db, &skill.id).await.unwrap().unwrap().confidence;
-        assert!((before - 0.2).abs() < 1e-9, "sanity: confidence seeded at 0.2");
+        let before = db_skills::get_skill(&db, &skill.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .confidence;
+        assert!(
+            (before - 0.2).abs() < 1e-9,
+            "sanity: confidence seeded at 0.2"
+        );
 
         // L0's own real signal: a same-session action_journal row already undone
         // within the 5-minute window — independent of anything the sub-turn does,
@@ -1755,6 +1824,9 @@ mod outcome_signal_tests {
             max_depth: 2,
             model_tier: None,
             kill: Arc::clone(&kill),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
         };
 
         let mut l0_registry = ToolRegistry::new();
@@ -1779,6 +1851,9 @@ mod outcome_signal_tests {
             tools: Arc::new(l0_registry),
             kill,
             routing_enabled: Arc::new(AtomicBool::new(true)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -1793,6 +1868,7 @@ mod outcome_signal_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
         run_turn(&req, runtime, tx, &broker, &cancel)
             .await
@@ -1801,7 +1877,9 @@ mod outcome_signal_tests {
 
         // Both traces must exist: the sub-turn's own (telemetry value stands) AND
         // the L0 turn's own.
-        let all_traces = db_skills::recent_traces(&db, 10).await.expect("recent_traces");
+        let all_traces = db_skills::recent_traces(&db, 10)
+            .await
+            .expect("recent_traces");
         let session_traces: Vec<_> = all_traces
             .into_iter()
             .filter(|t| t.session_id == session_id.to_string())
@@ -1812,11 +1890,15 @@ mod outcome_signal_tests {
             "both the sub-turn's own trace AND the L0 turn's trace must be inserted, got: {session_traces:?}"
         );
         assert!(
-            session_traces.iter().any(|t| t.label_source.as_deref() == Some("undo_within_n_min")),
+            session_traces
+                .iter()
+                .any(|t| t.label_source.as_deref() == Some("undo_within_n_min")),
             "the L0 turn's own trace must carry the undo_within_5min label"
         );
         assert!(
-            session_traces.iter().any(|t| t.task_description.contains("[helper]")),
+            session_traces
+                .iter()
+                .any(|t| t.task_description.contains("[helper]")),
             "the sub-turn's own trace must exist with its [domain] task_description prefix"
         );
 
@@ -1892,15 +1974,20 @@ mod routing_toggle_tests {
         assert_eq!(trace.outcome, "success");
         assert!(trace.label_source.is_none());
 
-        let messages = haily_db::queries::sessions::recent_messages(&db, &session_id.to_string(), 10)
-            .await
-            .expect("recent_messages");
+        let messages =
+            haily_db::queries::sessions::recent_messages(&db, &session_id.to_string(), 10)
+                .await
+                .expect("recent_messages");
         assert!(
-            messages.iter().any(|m| m.role == "assistant" && m.content == "Hanoi is the capital of Vietnam."),
+            messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content == "Hanoi is the capital of Vietnam."),
             "assistant response must persist exactly as scripted, got: {messages:?}"
         );
 
-        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        let rows = routing_decisions::list_recent(&db, 10)
+            .await
+            .expect("list_recent");
         assert!(
             rows.is_empty(),
             "routing_enabled=false must write ZERO routing_decisions rows, got: {rows:?}"
@@ -1916,9 +2003,18 @@ mod routing_toggle_tests {
         let (db, kms, _dir) = test_db_kms().await;
         let session_id = uuid::Uuid::new_v4();
 
-        run_plain_turn(db.clone(), kms, session_id, "hi there", "Hello! How can I help?").await;
+        run_plain_turn(
+            db.clone(),
+            kms,
+            session_id,
+            "hi there",
+            "Hello! How can I help?",
+        )
+        .await;
 
-        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        let rows = routing_decisions::list_recent(&db, 10)
+            .await
+            .expect("list_recent");
         assert_eq!(
             rows.len(),
             1,
@@ -1989,6 +2085,9 @@ mod routing_toggle_tests {
             tools: Arc::new(ToolRegistry::new()),
             kill: Arc::new(AtomicBool::new(false)),
             routing_enabled: Arc::new(AtomicBool::new(false)),
+            approval_mode: crate::permission_mode::new_handle(
+                crate::permission_mode::ApprovalMode::AcceptEdits,
+            ),
             view_store: Arc::new(crate::view::ViewStore::new()),
         };
         let broker = Arc::new(ApprovalBroker::new());
@@ -2003,6 +2102,7 @@ mod routing_toggle_tests {
             user_ref: None,
             depth: Default::default(),
             origin: Default::default(),
+            forced_skill: None,
         };
 
         let result = run_turn(&req, runtime, tx, &broker, &cancel).await;
@@ -2014,7 +2114,9 @@ mod routing_toggle_tests {
              rescue may fire even with a tier override configured, got: {result:?}"
         );
 
-        let rows = routing_decisions::list_recent(&db, 10).await.expect("list_recent");
+        let rows = routing_decisions::list_recent(&db, 10)
+            .await
+            .expect("list_recent");
         assert!(
             rows.is_empty(),
             "a failed turn with routing off must still write zero routing_decisions rows, got: {rows:?}"

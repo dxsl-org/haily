@@ -7,6 +7,9 @@
 use crate::auto_approve::{load_auto_approve, validate_auto_approve};
 use crate::config::{load_llm_config, ODOO_API_KEY_PREF};
 use crate::credential_store::{is_keyring_marker, CredentialPolicy, CredentialStore};
+use crate::notify::{NoopNotifier, OsNotifier, ToastCoalescer};
+use crate::run_control::RunControlRegistry;
+use crate::slash_registry::SlashRegistry;
 use crate::turns::TurnRegistry;
 use crate::{dispatch, reaper, watchers};
 use anyhow::Result;
@@ -29,11 +32,30 @@ use uuid::Uuid;
 /// tied to the interactive session) and Linux secret-service (needs a D-Bus session bus)
 /// are both structurally unavailable in a true daemon/Session-0 context, so a headless
 /// boot that still tried the keyring could hang or error on every credential read.
-#[derive(Debug, Clone, Copy)]
+///
+/// `os_notifier` (Unified Chat UI phase 7, D7) is the seam for a real OS toast — the Tauri shell
+/// constructs its window-focus-aware implementation BEFORE calling `bootstrap` (a Tauri
+/// `AppHandle` already exists at that point in `src-tauri`'s `setup()`) and overrides this field;
+/// every other caller (CLI, headless, every test in this crate) keeps the `Default`
+/// [`NoopNotifier`]. Not `Copy` (an `Arc<dyn OsNotifier>` isn't) — no caller relies on `Copy`
+/// semantics for this struct (every call site constructs or `..Default::default()`s it fresh).
+#[derive(Clone)]
 pub struct BootstrapOptions {
     pub enable_daemon: bool,
     pub enable_watcher: bool,
     pub attempt_keyring: bool,
+    pub os_notifier: Arc<dyn OsNotifier>,
+}
+
+impl std::fmt::Debug for BootstrapOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapOptions")
+            .field("enable_daemon", &self.enable_daemon)
+            .field("enable_watcher", &self.enable_watcher)
+            .field("attempt_keyring", &self.attempt_keyring)
+            .field("os_notifier", &"<dyn OsNotifier>")
+            .finish()
+    }
 }
 
 impl Default for BootstrapOptions {
@@ -42,6 +64,7 @@ impl Default for BootstrapOptions {
             enable_daemon: true,
             enable_watcher: true,
             attempt_keyring: true,
+            os_notifier: Arc::new(NoopNotifier),
         }
     }
 }
@@ -86,6 +109,23 @@ pub struct AppHandle {
     /// launch task on this SAME tracker, so `AppHandle::shutdown`'s drain covers them too.
     pub(crate) tasks: TaskTracker,
     turns: Arc<TurnRegistry>,
+    /// Per-run kill/pause/resume control handles (Unified Chat UI phase 6, D3). `pub(crate)`
+    /// (not private): `run_control::control::resume_run` (same crate, different module) reaches
+    /// `app.shutdown`/`app.tasks` directly, mirroring `launch.rs`'s existing access.
+    pub(crate) run_control: Arc<RunControlRegistry>,
+    /// Data-driven slash-command registry (Unified Chat UI phase 2, D1) — built-ins +
+    /// authored + gate-filtered synthesized skills, unioned. `pub` (mirrors `db`/`kms`) so the
+    /// mode layer (`src-tauri`) can clone the SAME handle into its own `AppState` for
+    /// `list_slash_commands`, rather than maintaining a second registry.
+    pub slash_registry: Arc<SlashRegistry>,
+    /// OS-toast notifier (Unified Chat UI phase 7, D7) — the SAME `Arc` every launch path
+    /// (`launch.rs`, `run_control::control::resume_run`, `trigger.rs` via `LaunchHandles`)
+    /// threads into `spawn_run_event_bridge`. `pub(crate)`: only same-crate launch code needs it.
+    pub(crate) notifier: Arc<dyn OsNotifier>,
+    /// Cross-run toast burst coalescer (D7) — ONE instance for the process lifetime, shared by
+    /// every run's bridge instance so a burst across CONCURRENT runs collapses correctly (a
+    /// per-run instance would never see another run's recent toast). `pub(crate)`, same reason.
+    pub(crate) toast_coalescer: Arc<ToastCoalescer>,
 }
 
 impl AppHandle {
@@ -100,6 +140,10 @@ impl AppHandle {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let turns = Arc::new(TurnRegistry::new());
+        // Unified Chat UI phase 6 (D3): constructed here (mirrors `turns`) so it can be handed
+        // into `spawn_dispatch_loop` for `trigger.rs`'s launch path AND stored on `AppHandle` for
+        // `launch.rs`/the mode layer — one registry shared by every launch path.
+        let run_control = Arc::new(RunControlRegistry::new());
 
         let db_path = data_dir.join("haily.db");
         info!("DB: {}", db_path.display());
@@ -226,12 +270,29 @@ impl AppHandle {
         // resolver/kill/transcript injection loop just above but necessarily separate from it.
         am.wire_self_reference();
 
+        // Unified Chat UI phase 2 (D1): built once at boot, then rebuilt lazily by the
+        // dispatch loop itself (`SlashRegistry::ensure_fresh` polls `AuthoredRegistry::version()`
+        // per request — no push hook, per the P02↔P08 interop contract).
+        let slash_registry = Arc::new(SlashRegistry::new());
+        slash_registry.rebuild(&kms, &db).await;
+
+        // Unified Chat UI phase 7 (D7): `opts.os_notifier` is either the Tauri shell's real,
+        // window-focus-aware implementation (constructed by `src-tauri` BEFORE this call) or the
+        // `Default`'s `NoopNotifier` (CLI/headless/tests). `toast_coalescer` is constructed fresh
+        // per process — one instance shared by every launch path via `AppHandle`/`LaunchHandles`.
+        let notifier = Arc::clone(&opts.os_notifier);
+        let toast_coalescer = Arc::new(ToastCoalescer::new());
+
         dispatch::spawn_dispatch_loop(
             am.clone(),
             Arc::clone(&orchestrator),
             shutdown.child_token(),
             tasks.clone(),
             Arc::clone(&turns),
+            Arc::clone(&slash_registry),
+            Arc::clone(&run_control),
+            Arc::clone(&notifier),
+            Arc::clone(&toast_coalescer),
         )
         .await?;
 
@@ -299,6 +360,10 @@ impl AppHandle {
             shutdown,
             tasks,
             turns,
+            run_control,
+            slash_registry,
+            notifier,
+            toast_coalescer,
         })
     }
 
@@ -317,6 +382,25 @@ impl AppHandle {
     /// pattern.
     pub fn turn_registry(&self) -> Arc<TurnRegistry> {
         Arc::clone(&self.turns)
+    }
+
+    /// Shared handle to the run-control registry (Unified Chat UI phase 6, D3), for callers
+    /// (e.g. the Tauri command layer) that want their own `Arc` clone — mirrors
+    /// `turn_registry()`.
+    pub fn run_control_registry(&self) -> Arc<RunControlRegistry> {
+        Arc::clone(&self.run_control)
+    }
+
+    /// Shared OS-toast notifier (Unified Chat UI phase 7, D7), for callers (dispatch-layer
+    /// `trigger.rs`, tests) that build their own [`crate::run_control::LaunchCtx`]/
+    /// [`crate::trigger::LaunchHandles`] outside `launch.rs`'s own entrypoint.
+    pub fn os_notifier(&self) -> Arc<dyn OsNotifier> {
+        Arc::clone(&self.notifier)
+    }
+
+    /// Shared toast-burst coalescer (D7) — see [`Self::os_notifier`]'s doc.
+    pub fn toast_coalescer(&self) -> Arc<ToastCoalescer> {
+        Arc::clone(&self.toast_coalescer)
     }
 
     /// Snapshot of every in-flight tool approval across all channels (phase 11a) for the

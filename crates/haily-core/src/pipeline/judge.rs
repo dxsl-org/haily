@@ -120,6 +120,11 @@ pub struct JudgeContext {
     pub llm: Arc<LlmRouter>,
     pub broker: Arc<dyn haily_types::ApprovalGate>,
     pub kill: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): threaded into the judge
+    /// sub-turn's `SubTurnRequest` — mirrors `kill` exactly. A judge is read-only
+    /// (`EmitJsonTool` is `RiskTier::Read`), so this never actually gates a write here
+    /// today, but the sub-turn tool loop is shared machinery, not a bypass.
+    pub approval_mode: crate::permission_mode::ApprovalModeHandle,
     pub cancel: CancellationToken,
     pub user_tx: mpsc::Sender<ResponseChunk>,
     pub session_id: Uuid,
@@ -176,6 +181,7 @@ impl JudgeContext {
             cancel: child.clone(),
             approval_tx: sub_tx,
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
             turn_id: Uuid::new_v4(),
             turn_deletes: Arc::clone(&self.turn_deletes),
             max_tool_calls: Some(JUDGE_MAX_TOOL_CALLS),
@@ -241,7 +247,10 @@ fn extract_json_value(raw: &str) -> Option<Value> {
     let s = raw.trim();
     let s = if let Some(rest) = s.strip_prefix("```") {
         let after_lang = rest.split_once('\n').map(|x| x.1).unwrap_or(rest);
-        after_lang.rsplit_once("```").map(|(b, _)| b).unwrap_or(after_lang)
+        after_lang
+            .rsplit_once("```")
+            .map(|(b, _)| b)
+            .unwrap_or(after_lang)
     } else {
         s
     };
@@ -301,7 +310,11 @@ pub async fn plan_design(jc: &JudgeContext, task: &str, depth: DepthMode) -> Des
             )
             .await
             .unwrap_or_default();
-        DesignResult { design, design_calls: 1, lens_designs: Vec::new() }
+        DesignResult {
+            design,
+            design_calls: 1,
+            lens_designs: Vec::new(),
+        }
     };
     tracing::info!(
         depth = depth.as_label(),
@@ -319,19 +332,39 @@ pub async fn judge_panel(jc: &JudgeContext, task: &str) -> DesignResult {
     // sub-turn already carries `JUDGE_BRANCH_TIMEOUT_SECS` internally, and `tokio::join!`
     // resolves when both branches have (returning `None` on a branch that timed out).
     let (risk, simple) = tokio::join!(
-        jc.run_subturn(LENS_RISK_PROMPT, task.to_string(), Arc::new(ToolRegistry::new()), None, None),
-        jc.run_subturn(LENS_SIMPLE_PROMPT, task.to_string(), Arc::new(ToolRegistry::new()), None, None),
+        jc.run_subturn(
+            LENS_RISK_PROMPT,
+            task.to_string(),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None
+        ),
+        jc.run_subturn(
+            LENS_SIMPLE_PROMPT,
+            task.to_string(),
+            Arc::new(ToolRegistry::new()),
+            None,
+            None
+        ),
     );
     let risk_design = risk.unwrap_or_default();
     let simple_design = simple.unwrap_or_default();
 
-    let synth_tier = jc.max_available_tier("tổng hợp phương án (synthesis)").await;
+    let synth_tier = jc
+        .max_available_tier("tổng hợp phương án (synthesis)")
+        .await;
     let synth_task = format!(
         "Task:\n{task}\n\n## Candidate A (risk-first lens)\n{risk_design}\n\n## Candidate B \
          (simplicity-first lens)\n{simple_design}\n\nGraft these into ONE design.",
     );
     let design = jc
-        .run_subturn(SYNTHESIS_PROMPT, synth_task, Arc::new(ToolRegistry::new()), synth_tier, None)
+        .run_subturn(
+            SYNTHESIS_PROMPT,
+            synth_task,
+            Arc::new(ToolRegistry::new()),
+            synth_tier,
+            None,
+        )
         .await
         .unwrap_or_else(|| {
             // If synthesis failed, fall back to the risk-first design (never average, never
@@ -339,7 +372,11 @@ pub async fn judge_panel(jc: &JudgeContext, task: &str) -> DesignResult {
             risk_design.clone()
         });
 
-    DesignResult { design, design_calls: 3, lens_designs: vec![risk_design, simple_design] }
+    DesignResult {
+        design,
+        design_calls: 3,
+        lens_designs: vec![risk_design, simple_design],
+    }
 }
 
 // -- Refuter votes (Deep, per Critical finding) ------------------------------------------
@@ -434,8 +471,13 @@ pub async fn apex_judge(
             tier,
         )
         .await
-        .unwrap_or_else(|| json!({ "chosen": "", "rationale": "apex judge produced no parseable verdict" }));
-    ApexVerdict { verdict, warned_tier_fallback: !ultra }
+        .unwrap_or_else(
+            || json!({ "chosen": "", "rationale": "apex judge produced no parseable verdict" }),
+        );
+    ApexVerdict {
+        verdict,
+        warned_tier_fallback: !ultra,
+    }
 }
 
 #[cfg(test)]

@@ -101,6 +101,31 @@ pub async fn get_scoped(
     .await?)
 }
 
+/// The active (non-deleted) workspace bound to `session_id`, if any (Unified Chat UI phase 6,
+/// D3) — `resume_run`'s lookup, since a resumable `pipeline_runs` row's own `run_id` is usually
+/// still `NULL` (a workspace is only stamped with its driving run's id AFTER the whole launch
+/// reaches a terminal/paused state — see `coding_workspaces::set_run_id`'s doc — so an
+/// interrupted/paused row mid-launch cannot be joined back to its workspace by `run_id` at all).
+/// A launch opens exactly one workspace per session, so `session_id` alone is the reliable join
+/// key here. Returns the most recently created match if more than one somehow exists.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn find_by_session(
+    db: &DbHandle,
+    session_id: &str,
+) -> Result<Option<CodingWorkspaceRow>> {
+    Ok(sqlx::query_as::<_, CodingWorkspaceRow>(
+        "SELECT * FROM coding_workspaces
+         WHERE session_id = ? AND deleted_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
 /// All active (non-deleted) workspaces, oldest first — the set the orphan-worktree GC (P4)
 /// reconciles filesystem worktrees against.
 ///

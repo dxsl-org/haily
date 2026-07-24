@@ -6,10 +6,15 @@ mod budget;
 /// primitives — see that module's doc comment.
 pub mod coding_intent;
 mod context;
-pub mod depth;
 mod delegate;
+pub mod depth;
 mod domains;
 pub mod feedback_parser;
+/// Named permission ladder (Unified Chat UI phase 11, D5) — lives at the crate root (not
+/// nested under `tool_call`) because it is threaded through `TurnRuntime`/`SubTurnRequest`/
+/// `DelegateTool`/`PipelineRunner`/`JudgeContext` exactly like the `kill` switch, not just
+/// read inside `tool_call::dispatch`.
+pub mod permission_mode;
 pub mod pipeline;
 pub mod routing;
 mod specialists;
@@ -67,6 +72,12 @@ pub struct Orchestrator {
     /// `false` collapses every turn's tier decision to `None` (identical model selection
     /// to a pre-phase-4 turn) and skips the `routing_decisions` telemetry write entirely.
     routing_enabled: Arc<AtomicBool>,
+    /// Named permission ladder (Unified Chat UI phase 11, D5): `approval.mode`. Mirrors
+    /// `kill`/`routing_enabled` exactly — seeded once from the persisted preference
+    /// (default `Manual`, the strictest rung), the runtime source of truth from here on,
+    /// and exposed via `approval_mode_handle()` so the app layer can flip it live from
+    /// `set_approval_mode` (which persists the DB row FIRST, then flips this handle).
+    approval_mode: permission_mode::ApprovalModeHandle,
     /// View Engine Phase A (phase 3): the ONE `ViewStore` instance for this orchestrator's
     /// lifetime — cloned into every turn/sub-turn `ToolContext` (as `Arc<dyn ViewSink>`, the
     /// write side) and exposed via [`Self::view_store`] (the read side, GUI-consumption-only;
@@ -159,13 +170,29 @@ impl Orchestrator {
         // ON (routing_enabled=false is the escape hatch, not the shipping default: a
         // strict superset of legacy behavior is safe to enable by default). Live-flipped
         // from here on via `routing_enabled_handle()` (see that method's doc).
-        let routing_enabled_pref = haily_db::queries::meta::get_preference(&db, "llm.routing_enabled")
+        let routing_enabled_pref =
+            haily_db::queries::meta::get_preference(&db, "llm.routing_enabled")
+                .await
+                .ok()
+                .flatten()
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true);
+        let routing_enabled = Arc::new(AtomicBool::new(routing_enabled_pref));
+
+        // Named permission ladder (Unified Chat UI phase 11, D5): seed from the persisted
+        // `approval.mode` preference, defaulting to `Manual` (the strictest rung) when
+        // unset/unparseable — `ApprovalMode::parse`'s fail-safe contract, not re-derived
+        // here. Live-flipped from here on via `approval_mode_handle()`.
+        let approval_mode_pref = haily_db::queries::meta::get_preference(&db, "approval.mode")
             .await
             .ok()
-            .flatten()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(true);
-        let routing_enabled = Arc::new(AtomicBool::new(routing_enabled_pref));
+            .flatten();
+        let approval_mode = permission_mode::new_handle(
+            approval_mode_pref
+                .as_deref()
+                .map(permission_mode::ApprovalMode::parse)
+                .unwrap_or_default(),
+        );
 
         let mut base_v1 = ToolRegistry::build_v1();
 
@@ -278,6 +305,7 @@ impl Orchestrator {
                     max_depth: 2, // L1 (depth=1) can spawn; L2 (depth=2) blocked by depth guard
                     model_tier: spec.model_tier,
                     kill: Arc::clone(&kill),
+                    approval_mode: Arc::clone(&approval_mode),
                 }));
             }
 
@@ -293,6 +321,7 @@ impl Orchestrator {
                 max_depth: 1, // L0 (depth=0) can spawn L1; L1 depth guard handles the rest
                 model_tier: domain.model_tier,
                 kill: Arc::clone(&kill),
+                approval_mode: Arc::clone(&approval_mode),
             }));
         }
 
@@ -407,6 +436,7 @@ impl Orchestrator {
             approval_broker: Arc::new(ApprovalBroker::with_auto_approve(auto_approve)),
             kill,
             routing_enabled,
+            approval_mode,
             view_store: Arc::new(view::ViewStore::new()),
         })
     }
@@ -443,6 +473,7 @@ impl Orchestrator {
             tools: Arc::clone(&self.tools),
             kill: Arc::clone(&self.kill),
             routing_enabled: Arc::clone(&self.routing_enabled),
+            approval_mode: Arc::clone(&self.approval_mode),
             view_store: Arc::clone(&self.view_store),
         };
         agent::run_turn(&req, runtime, tx, &self.approval_broker, &cancel).await
@@ -463,6 +494,9 @@ impl Orchestrator {
     pub async fn launch_coding_run(
         &self,
         spec: pipeline::CodingRunSpec,
+        // Unified Chat UI phase 6 (D3): the caller-constructed pause handle for `pause_run` —
+        // registered into the run-control registry BEFORE this call, mirroring `cancel`.
+        pause: Arc<AtomicBool>,
         user_tx: mpsc::Sender<ResponseChunk>,
         events_tx: mpsc::Sender<RunEvent>,
         distillation_tx: Option<mpsc::Sender<Notification>>,
@@ -474,8 +508,18 @@ impl Orchestrator {
             llm: Arc::clone(&self.llm),
             broker: Arc::clone(&self.approval_broker) as Arc<dyn ApprovalGate>,
             kill: Arc::clone(&self.kill),
+            approval_mode: Arc::clone(&self.approval_mode),
         };
-        pipeline::launch_coding_run(deps, spec, user_tx, events_tx, distillation_tx, cancel).await
+        pipeline::launch_coding_run(
+            deps,
+            spec,
+            pause,
+            user_tx,
+            events_tx,
+            distillation_tx,
+            cancel,
+        )
+        .await
     }
 
     pub fn llm_provider(&self) -> String {
@@ -530,6 +574,16 @@ impl Orchestrator {
     /// shutdown-guarded `app` Mutex and has no orchestrator access of its own).
     pub fn routing_enabled_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.routing_enabled)
+    }
+
+    /// Named permission ladder (Unified Chat UI phase 11, D5): the `approval.mode` live
+    /// handle, for the app layer to flip from `set_approval_mode` without an orchestrator
+    /// round-trip — mirrors `kill_handle()`/`routing_enabled_handle()` exactly. The caller
+    /// MUST persist the `approval.mode` preference row FIRST, then call
+    /// `permission_mode::store` on this handle — never the reverse (fail toward the
+    /// stricter mode on a crash between the two).
+    pub fn approval_mode_handle(&self) -> permission_mode::ApprovalModeHandle {
+        Arc::clone(&self.approval_mode)
     }
 
     /// Snapshot of every in-flight tool approval across all channels (phase 11a), for the
@@ -797,7 +851,10 @@ mod wiring_tests {
         // to a future scout sub_registry cannot silently drop a capability.
         let base = ToolRegistry::build_v1();
         for t in SCOUT_CODING_TOOLS {
-            assert!(base.get(t).is_some(), "scout coding tool {t} missing from build_v1");
+            assert!(
+                base.get(t).is_some(),
+                "scout coding tool {t} missing from build_v1"
+            );
         }
     }
 
@@ -834,7 +891,10 @@ mod wiring_tests {
         use crate::domains::SKILL_TOOLS;
         let base = ToolRegistry::build_v1();
         for t in SKILL_TOOLS {
-            assert!(base.get(t).is_some(), "skill tool {t} missing from build_v1");
+            assert!(
+                base.get(t).is_some(),
+                "skill tool {t} missing from build_v1"
+            );
         }
         for d in DOMAINS {
             let sub = base.sub_registry(d.allowed_tools);
@@ -862,10 +922,19 @@ mod wiring_tests {
             .expect("judge specialist exists");
         let sub = base.sub_registry(judge.allowed_tools);
         for read_tool in ["fs_read", "fs_grep"] {
-            assert!(sub.get(read_tool).is_some(), "judge must resolve read tool {read_tool}");
+            assert!(
+                sub.get(read_tool).is_some(),
+                "judge must resolve read tool {read_tool}"
+            );
         }
         for write_tool in [
-            "fs_write", "fs_edit", "fs_move", "fs_delete", "shell_exec", "code_exec", "git_commit",
+            "fs_write",
+            "fs_edit",
+            "fs_move",
+            "fs_delete",
+            "shell_exec",
+            "code_exec",
+            "git_commit",
         ] {
             assert!(
                 sub.get(write_tool).is_none(),
@@ -874,7 +943,10 @@ mod wiring_tests {
         }
         // Read-only also means it whitelists no delegation tool (never spawns work).
         assert!(
-            !judge.allowed_tools.iter().any(|t| t.starts_with("delegate_to")),
+            !judge
+                .allowed_tools
+                .iter()
+                .any(|t| t.starts_with("delegate_to")),
             "judge must not be able to delegate"
         );
     }
@@ -1029,13 +1101,23 @@ mod routing_enabled_tests {
     #[tokio::test]
     async fn routing_enabled_defaults_to_true_when_the_preference_is_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let db = Arc::new(
+            DbHandle::init(&dir.path().join("haily.db"))
+                .await
+                .expect("db init"),
+        );
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         let base_url = spawn_plain_answer_sse_server("hi").await;
 
         let (orchestrator, shutdown, tasks) = init_orchestrator(db, kms, base_url).await;
         assert!(
-            orchestrator.routing_enabled_handle().load(Ordering::Acquire),
+            orchestrator
+                .routing_enabled_handle()
+                .load(Ordering::Acquire),
             "absent llm.routing_enabled preference must default to ON"
         );
         cleanup(shutdown, tasks).await;
@@ -1044,16 +1126,26 @@ mod routing_enabled_tests {
     #[tokio::test]
     async fn routing_enabled_seeds_false_from_a_persisted_preference() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
+        let db = Arc::new(
+            DbHandle::init(&dir.path().join("haily.db"))
+                .await
+                .expect("db init"),
+        );
         meta::upsert_preference(&db, "llm.routing_enabled", "false", "test")
             .await
             .expect("seed preference");
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         let base_url = spawn_plain_answer_sse_server("hi").await;
 
         let (orchestrator, shutdown, tasks) = init_orchestrator(db, kms, base_url).await;
         assert!(
-            !orchestrator.routing_enabled_handle().load(Ordering::Acquire),
+            !orchestrator
+                .routing_enabled_handle()
+                .load(Ordering::Acquire),
             "a persisted llm.routing_enabled=false preference must seed the Atomic OFF"
         );
         cleanup(shutdown, tasks).await;
@@ -1065,10 +1157,19 @@ mod routing_enabled_tests {
     #[tokio::test]
     async fn live_toggle_takes_effect_on_the_very_next_turn_without_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let db = Arc::new(
+            DbHandle::init(&dir.path().join("haily.db"))
+                .await
+                .expect("db init"),
+        );
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         let base_url = spawn_plain_answer_sse_server("hello").await;
-        let (orchestrator, shutdown, tasks) = init_orchestrator(Arc::clone(&db), kms, base_url).await;
+        let (orchestrator, shutdown, tasks) =
+            init_orchestrator(Arc::clone(&db), kms, base_url).await;
 
         async fn drive_one_turn(orchestrator: &Orchestrator, message: &str) {
             let req = Request {
@@ -1078,6 +1179,7 @@ mod routing_enabled_tests {
                 user_ref: None,
                 depth: Default::default(),
                 origin: Default::default(),
+                forced_skill: None,
             };
             let (tx, mut rx) = mpsc::channel(64);
             let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1091,18 +1193,26 @@ mod routing_enabled_tests {
         // Turn 1: default ON — must write one routing_decisions row.
         drive_one_turn(&orchestrator, "hi there").await;
         assert_eq!(
-            routing_decisions::list_recent(&db, 10).await.expect("list_recent").len(),
+            routing_decisions::list_recent(&db, 10)
+                .await
+                .expect("list_recent")
+                .len(),
             1,
             "the first (routing-enabled) turn must write exactly one telemetry row"
         );
 
         // Flip live — no restart, no new Orchestrator.
-        orchestrator.routing_enabled_handle().store(false, Ordering::Release);
+        orchestrator
+            .routing_enabled_handle()
+            .store(false, Ordering::Release);
 
         // Turn 2: same orchestrator instance — must write ZERO additional rows.
         drive_one_turn(&orchestrator, "what time is it").await;
         assert_eq!(
-            routing_decisions::list_recent(&db, 10).await.expect("list_recent").len(),
+            routing_decisions::list_recent(&db, 10)
+                .await
+                .expect("list_recent")
+                .len(),
             1,
             "flipping routing_enabled OFF must take effect on the VERY NEXT turn — no \
              new row from the second turn, with no restart of the orchestrator"
@@ -1130,8 +1240,14 @@ mod view_store_sharing_tests {
             entity: "contact".to_string(),
             schema: vec![],
             records: vec![],
-            projections: vec![ProjectionSpec { kind: ProjectionKind::Table, binding: None }],
-            active: ProjectionSpec { kind: ProjectionKind::Table, binding: None },
+            projections: vec![ProjectionSpec {
+                kind: ProjectionKind::Table,
+                binding: None,
+            }],
+            active: ProjectionSpec {
+                kind: ProjectionKind::Table,
+                binding: None,
+            },
             total: None,
             cursor: None,
             provenance: ViewProvenance::LlmProjected,
@@ -1141,8 +1257,16 @@ mod view_store_sharing_tests {
     #[tokio::test]
     async fn tool_side_insert_and_command_side_get_observe_the_same_store() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(haily_db::DbHandle::init(&dir.path().join("haily.db")).await.expect("db init"));
-        let kms = Arc::new(KmsHandle::init((*db).clone(), dir.path()).await.expect("kms init"));
+        let db = Arc::new(
+            haily_db::DbHandle::init(&dir.path().join("haily.db"))
+                .await
+                .expect("db init"),
+        );
+        let kms = Arc::new(
+            KmsHandle::init((*db).clone(), dir.path())
+                .await
+                .expect("kms init"),
+        );
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let orchestrator = Orchestrator::init(

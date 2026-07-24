@@ -156,12 +156,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
         let session_id = Uuid::new_v4().to_string();
-        sessions::create_session(&db, &session_id, "test", None).await.unwrap();
-        let run = pipeline_runs::create(&db, &session_id, None, 4).await.unwrap();
+        sessions::create_session(&db, &session_id, "test", None)
+            .await
+            .unwrap();
+        let run = pipeline_runs::create(&db, &session_id, None, 4)
+            .await
+            .unwrap();
         (db, session_id, run.id, dir)
     }
 
-    fn finding<'a>(run: &'a str, sid: &'a str, ws: &'a str, cat: &'a str, module: &'a str, summary: &'a str) -> NewReviewFinding<'a> {
+    fn finding<'a>(
+        run: &'a str,
+        sid: &'a str,
+        ws: &'a str,
+        cat: &'a str,
+        module: &'a str,
+        summary: &'a str,
+    ) -> NewReviewFinding<'a> {
         NewReviewFinding {
             run_id: run,
             session_id: sid,
@@ -179,9 +190,24 @@ mod tests {
         let (db, sid, run, _dir) = setup().await;
         let ws = "ws-1";
         // Two findings of the SAME class → recurs; one of a different class → does not.
-        insert_finding(&db, finding(&run, &sid, ws, "critical", "crates/core", "unwrap a")).await.unwrap();
-        insert_finding(&db, finding(&run, &sid, ws, "critical", "crates/core", "unwrap b")).await.unwrap();
-        insert_finding(&db, finding(&run, &sid, ws, "high", "crates/db", "n+1 once")).await.unwrap();
+        insert_finding(
+            &db,
+            finding(&run, &sid, ws, "critical", "crates/core", "unwrap a"),
+        )
+        .await
+        .unwrap();
+        insert_finding(
+            &db,
+            finding(&run, &sid, ws, "critical", "crates/core", "unwrap b"),
+        )
+        .await
+        .unwrap();
+        insert_finding(
+            &db,
+            finding(&run, &sid, ws, "high", "crates/db", "n+1 once"),
+        )
+        .await
+        .unwrap();
 
         let classes = recurrent_classes_for_workspace(&db, ws, 2).await.unwrap();
         assert_eq!(classes.len(), 1, "only the class with >=2 findings recurs");
@@ -190,7 +216,9 @@ mod tests {
         assert_eq!(classes[0].count, 2);
 
         // findings_for_class returns the raw material for the proposal.
-        let rows = findings_for_class(&db, ws, "critical", "crates/core", 5).await.unwrap();
+        let rows = findings_for_class(&db, ws, "critical", "crates/core", 5)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2);
     }
 }

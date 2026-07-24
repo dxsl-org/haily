@@ -120,12 +120,16 @@ impl MockSaas {
     /// The server task lives for the process; a dropped `MockSaas` just stops new resets.
     pub async fn start(records: Vec<SeedRecord>) -> Self {
         let state = Arc::new(Mutex::new(MockState::seed(&records)));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock saas");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock saas");
         let addr = listener.local_addr().expect("mock addr");
         let srv_state = Arc::clone(&state);
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let st = Arc::clone(&srv_state);
                 tokio::spawn(handle_conn(stream, st));
             }
@@ -144,7 +148,10 @@ impl MockSaas {
 
     /// A direct snapshot digest for the bit-equal undo assertion.
     pub fn digest(&self) -> String {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).digest()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .digest()
     }
 }
 
@@ -203,12 +210,26 @@ type RpcResult = Result<Value, (String, String)>;
 /// Interpret one `execute_kw` envelope against the store, returning the Odoo-shaped `result`
 /// or a `(fault_name, message)` the response wraps as `error.data.name`.
 fn handle_rpc(req: &Value, state: &Arc<Mutex<MockState>>) -> RpcResult {
-    let args = req.pointer("/params/args").and_then(Value::as_array).ok_or_else(|| {
-        ("odoo.exceptions.ValidationError".to_string(), "malformed execute_kw".to_string())
-    })?;
+    let args = req
+        .pointer("/params/args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            (
+                "odoo.exceptions.ValidationError".to_string(),
+                "malformed execute_kw".to_string(),
+            )
+        })?;
     // args = [db, uid, key, model, method, args, kwargs]
-    let model = args.get(3).and_then(Value::as_str).unwrap_or_default().to_string();
-    let method = args.get(4).and_then(Value::as_str).unwrap_or_default().to_string();
+    let model = args
+        .get(3)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let method = args
+        .get(4)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let call_args = args.get(5).cloned().unwrap_or(Value::Null);
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -216,7 +237,10 @@ fn handle_rpc(req: &Value, state: &Arc<Mutex<MockState>>) -> RpcResult {
         "create" => {
             let vals = call_args.get(0).cloned().unwrap_or(Value::Null);
             let mut rec = vals.as_object().cloned().ok_or_else(|| {
-                ("odoo.exceptions.ValidationError".to_string(), "create needs a vals object".to_string())
+                (
+                    "odoo.exceptions.ValidationError".to_string(),
+                    "create needs a vals object".to_string(),
+                )
             })?;
             let id = st.next_id;
             st.next_id += 1;
@@ -229,7 +253,11 @@ fn handle_rpc(req: &Value, state: &Arc<Mutex<MockState>>) -> RpcResult {
         }
         "write" => {
             let ids = ids_arg(call_args.get(0));
-            let values = call_args.get(1).and_then(Value::as_object).cloned().unwrap_or_default();
+            let values = call_args
+                .get(1)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
             let v = st.bump();
             let tbl = st.models.entry(model).or_default();
             for id in &ids {
@@ -269,7 +297,10 @@ fn ids_arg(arg: Option<&Value>) -> Vec<i64> {
     match arg {
         Some(Value::Array(a)) => a
             .iter()
-            .filter_map(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .filter_map(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .collect(),
         Some(v) => v.as_i64().into_iter().collect(),
         None => Vec::new(),
@@ -280,7 +311,9 @@ fn ids_arg(arg: Option<&Value>) -> Vec<i64> {
 /// only operator the connector ever emits for read-back). Returns matching records (INCLUDING
 /// inactive ones, so an archive's read-back verification still locates the record).
 fn search(st: &MockState, model: &str, domain: &Value) -> Vec<Value> {
-    let Some(tbl) = st.models.get(model) else { return Vec::new() };
+    let Some(tbl) = st.models.get(model) else {
+        return Vec::new();
+    };
     // `domain` here is the connector's `search_read` domain — a list of `["field","=",val]`
     // clauses (the caller already peeled the execute_kw args wrapper). An empty/absent domain
     // matches every record (Odoo semantics).
@@ -292,9 +325,14 @@ fn search(st: &MockState, model: &str, domain: &Value) -> Vec<Value> {
 }
 
 fn clause_matches(rec: &Map<String, Value>, clause: &Value) -> bool {
-    let Some(c) = clause.as_array() else { return true };
-    let (Some(field), Some(op), Some(val)) = (c.first().and_then(Value::as_str), c.get(1).and_then(Value::as_str), c.get(2))
-    else {
+    let Some(c) = clause.as_array() else {
+        return true;
+    };
+    let (Some(field), Some(op), Some(val)) = (
+        c.first().and_then(Value::as_str),
+        c.get(1).and_then(Value::as_str),
+        c.get(2),
+    ) else {
         return true;
     };
     let actual = rec.get(field).unwrap_or(&Value::Null);
@@ -313,6 +351,10 @@ fn values_eq(a: &Value, b: &Value) -> bool {
     }
     match (a.as_i64(), b.as_i64()) {
         (Some(x), Some(y)) => x == y,
-        _ => a.as_str().zip(b.as_str()).map(|(x, y)| x == y).unwrap_or(false),
+        _ => a
+            .as_str()
+            .zip(b.as_str())
+            .map(|(x, y)| x == y)
+            .unwrap_or(false),
     }
 }

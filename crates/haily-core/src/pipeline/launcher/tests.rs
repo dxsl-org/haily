@@ -165,11 +165,15 @@ fn deps(
         llm,
         broker: broker as Arc<dyn haily_types::ApprovalGate>,
         kill,
+        approval_mode: crate::permission_mode::new_handle(
+            crate::permission_mode::ApprovalMode::AcceptEdits,
+        ),
     }
 }
 
 fn plan_spec(fx: &Fixture) -> CodingRunSpec {
     CodingRunSpec {
+        run_id: Uuid::new_v4(),
         kind: RunKind::Plan,
         task: TASK.to_string(),
         session_id: fx.session_id,
@@ -177,6 +181,11 @@ fn plan_spec(fx: &Fixture) -> CodingRunSpec {
         repo_path: Some(fx.repo.path().to_path_buf()),
         depth: DepthMode::Normal,
     }
+}
+
+/// A never-flipped pause handle for tests that do not exercise `pause_run`.
+fn no_pause() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
 }
 
 #[tokio::test]
@@ -212,6 +221,7 @@ async fn happy_path_plan_run_completes_and_ships_live_run_events() {
             Arc::new(AtomicBool::new(false)),
         ),
         plan_spec(&fx),
+        no_pause(),
         user_tx,
         ev_tx,
         None,
@@ -294,6 +304,7 @@ async fn run_id_is_stamped_and_workspace_retained_on_a_paused_run() {
             Arc::new(AtomicBool::new(false)),
         ),
         plan_spec(&fx),
+        no_pause(),
         user_tx,
         ev_tx,
         None,
@@ -353,6 +364,7 @@ async fn kill_switch_aborts_the_run_at_the_next_stage_boundary() {
     let report = launch_coding_run(
         deps(&fx, llm, Arc::clone(&broker), Arc::clone(&kill)),
         plan_spec(&fx),
+        no_pause(),
         user_tx,
         ev_tx,
         None,

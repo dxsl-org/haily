@@ -376,8 +376,9 @@ export async function acknowledgeConnectorVersion(connectorName: string, version
 
 // ---------------------------------------------------------------------------
 // Phase 11a — Channel Event Backbone (GUI cockpit read/action surface).
-// The Svelte components (RunTimeline, DiffViewer, SkillsBrowser, WorkspacePanel,
-// ApprovalsQueue, ChannelsPanel) that CONSUME these wrappers land in P11b.
+// The Svelte components (RunTimeline, DiffViewer, SkillsBrowser, ApprovalsQueue, ChannelsPanel)
+// that CONSUME these wrappers land in P11b. `WorkspacePanel` (its original name) was absorbed
+// into `components/workspaces/WorkspacesList.svelte` by Unified Chat UI phase 10.
 // ---------------------------------------------------------------------------
 
 /** Mirrors `haily_types::RunEvent`'s `#[serde(tag = "type", content = "data")]` envelope
@@ -584,7 +585,13 @@ export async function pinSkill(name: string, pinned: boolean): Promise<void> {
 
 /** One active coding workspace. Mirrors `haily_app::cockpit::WorkspaceView`.
  * `sandbox_enforcing === false` is the `NullSandbox` warning: execution is NOT isolated and
- * requires per-work-root first-exec approval — the panel must surface it prominently. */
+ * requires per-work-root first-exec approval — the panel must surface it prominently.
+ *
+ * `branch`/`worktree_path` are git-specific and MUST only ever be rendered under Settings →
+ * Advanced (Unified Chat UI phase 10, D6) — the default Workspaces screen's status/copy is a
+ * pure function of the other fields below, never these two. `resumable` is computed
+ * server-side from the SAME guard `resume_run` itself enforces (status/reason-class AND the
+ * worktree still existing) — never re-derive it from `run_status` alone. */
 export interface WorkspaceView {
   id: string;
   session_id: string;
@@ -594,8 +601,23 @@ export interface WorkspaceView {
   work_item_id: string | null;
   created_at: string;
   dirty: boolean;
+  /** Count of changed paths — `0` when clean or `worktree_reclaimed`. */
+  changed_file_count: number;
   sandbox_kind: string;
   sandbox_enforcing: boolean;
+  /** The pipeline run driving this workspace, if known yet. `null` before any run is linked. */
+  run_id: string | null;
+  /** Originating task text, for the row's "Bản làm việc riêng cho {task}" label. */
+  task: string | null;
+  /** Raw `pipeline_runs.status` of the linked run — `null` if none is linked yet. */
+  run_status: string | null;
+  /** Set only when `run_status === 'paused'`. */
+  pause_reason_class: string | null;
+  /** `true` when the worktree directory itself is gone (already applied+removed, or GC'd) while
+   * the workspace row is still active — the "đã dọn dẹp" state. */
+  worktree_reclaimed: boolean;
+  /** Whether "Tiếp tục" (`resumeRun`) should be offered — server-computed, see the interface doc. */
+  resumable: boolean;
 }
 
 /** Active coding workspaces with dirty status and host sandbox posture. Read-only. */
@@ -733,4 +755,192 @@ export async function mobileServerStatus(): Promise<MobileStatus> {
  */
 export async function mobileRegenerateCert(): Promise<string> {
   return invoke('mobile_regenerate_cert');
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 2 (D1) — data-driven slash-command registry: built-ins +
+// authored + gate-filtered synthesized skills, unioned and name-sorted. Consumed by the
+// slash palette + ＋ menu (phase 3).
+// ---------------------------------------------------------------------------
+
+/** Which built-in pipeline/control action a slash command maps to. Mirrors
+ * `haily_app::slash_registry::BuiltInKind` — `'pass_through'` covers every built-in that
+ * resolves to an ordinary chat turn (most non-`plan`/`build` commands; `/help`/`/undo`/
+ * `/writes`/`/kill`/`/settings` are intercepted earlier on CLI/Telegram and never reach the
+ * dispatch-layer registry there, but still appear here for the GUI palette). */
+export type BuiltInKind = 'plan' | 'build' | 'pass_through';
+
+/** Mirrors `haily_app::slash_registry::SlashAction`'s `#[serde(tag = "type", content = "data")]`
+ * envelope — a discriminated union for the same reason as `Chunk`/`RunEvent`. `SkillTurn`
+ * carries the underlying skill's OWN name (not necessarily the same as the command's slugified
+ * `name` above it, if the name was normalized or shadow-qualified). */
+export type SlashActionDto =
+  | { type: 'BuiltIn'; data: BuiltInKind }
+  | { type: 'SkillTurn'; data: string };
+
+/** Which store a command's underlying skill came from — badge the palette entry
+ * accordingly. Mirrors `haily_app::slash_registry::SlashSource`. */
+export type SlashSource = 'built_in' | 'authored' | 'synthesized';
+
+/** One command in the merged registry. Mirrors `haily_app::slash_registry::SlashCommand`. */
+export interface SlashCommand {
+  name: string;
+  description: string;
+  arg_hint: string | null;
+  example: string | null;
+  action: SlashActionDto;
+  source: SlashSource;
+}
+
+/** The current slash-command registry: built-ins + enabled authored + enabled synthesized
+ * skills, name-sorted. Rebuilds opportunistically server-side before returning, so a skill
+ * enabled/edited moments ago is reflected without waiting for the next chat message. */
+export async function listSlashCommands(): Promise<SlashCommand[]> {
+  return invoke('list_slash_commands');
+}
+
+// ---------------------------------------------------------------------------
+// Unified Chat UI phase 8 (D4) — structured skill editor + versioning. Mirrors
+// `haily_kms::skill_editor`. Local-GUI-only: never bridged to mobile.
+// ---------------------------------------------------------------------------
+
+/** Which store a skill's content lives in. Mirrors `haily_kms::skill_editor::SkillEditKind`. */
+export type SkillEditKind = 'authored' | 'synthesized';
+
+/** The 4-field structured shape both edit paths render to/from markdown. Mirrors
+ * `haily_kms::skill_editor::SkillDraft`. */
+export interface SkillDraft {
+  procedure: string;
+  success_conditions: string;
+  forbidden_actions: string;
+  required_from_user: string;
+}
+
+/** One skill's editable view. Mirrors `haily_kms::skill_editor::SkillDetail`. */
+export interface SkillDetail {
+  name: string;
+  kind: SkillEditKind;
+  draft: SkillDraft;
+}
+
+/** One recorded save/pre-edit snapshot. Mirrors `haily_db::queries::skill_versions::SkillVersion`. */
+export interface SkillVersion {
+  id: string;
+  skill_name: string;
+  kind: SkillEditKind;
+  content_md: string;
+  sha256: string;
+  note: string | null;
+  created_at: string;
+}
+
+/** Fetch one skill's structured-editor view — the editor's "open" action. */
+export async function getSkillDetail(name: string, kind: SkillEditKind): Promise<SkillDetail> {
+  return invoke('get_skill_detail', { name, kind });
+}
+
+/** Save a skill's structured fields. Returns the full saved content (informational). */
+export async function editSkill(name: string, kind: SkillEditKind, draft: SkillDraft): Promise<string> {
+  return invoke('edit_skill', { name, kind, draft });
+}
+
+/** Version history for one skill, newest first. */
+export async function listSkillVersions(name: string): Promise<SkillVersion[]> {
+  return invoke('list_skill_versions', { name });
+}
+
+/** Restore a skill to a prior recorded version. */
+export async function revertSkill(name: string, versionId: string): Promise<string> {
+  return invoke('revert_skill', { name, versionId });
+}
+
+/** Promote a synthesized skill to an authored kit-pack file — exits the decay lifecycle. */
+export async function promoteSkill(name: string): Promise<string> {
+  return invoke('promote_skill', { name });
+}
+
+/** Manually archive a synthesized skill (distinct from automatic confidence-decay archival). */
+export async function archiveSkillManual(name: string): Promise<void> {
+  return invoke('archive_skill_manual', { name });
+}
+
+/** Name-sorted authored skills currently served from a recovery snapshot because their on-disk
+ * file failed manifest-hash verification (review MED-1: tamper/interrupted-edit signal). Empty
+ * on a clean load — poll or check on the Skills screen to badge any name present here. */
+export async function listRecoveredSkills(): Promise<string[]> {
+  return invoke('list_recovered_skills');
+}
+
+/** The named permission ladder (Unified Chat UI phase 11, D5). Unset/unknown reads as
+ * `manual` — the strictest rung — everywhere this is consumed. */
+export type ApprovalMode = 'manual' | 'accept_edits' | 'auto';
+
+/** Set the permission ladder. Backend normalizes any unrecognized string to `manual` and
+ * persists BEFORE flipping the live handle (fails toward the stricter mode on a crash). */
+export async function setApprovalMode(mode: ApprovalMode): Promise<void> {
+  return invoke('set_approval_mode', { mode });
+}
+
+/** Per-run kill/pause/resume control (Unified Chat UI phase 6, D3). Local-GUI-only — never
+ * exposed on the mobile/remote bridge; `run_id` carries no session-ownership check of its own. */
+
+/** Cancel a run immediately. Returns `false` (not an error) if the run was already
+ * terminal/unknown — nothing to do. */
+export async function killRun(runId: string): Promise<boolean> {
+  return invoke('kill_run', { runId });
+}
+
+/** Best-effort, stage-boundary pause. Returns `false` (not an error) if the run has no live
+ * entry (already terminal/paused, or unknown). */
+export async function pauseRun(runId: string): Promise<boolean> {
+  return invoke('pause_run', { runId });
+}
+
+/** Resume an `interrupted` run, or a `paused` run whose reason is retries-exhausted or
+ * explicit-stop — never an approval-wait pause (that resolves through its approval card).
+ * Returns `false` (not an error) for any ineligible/unknown run. Throws if the run's workspace
+ * was already reclaimed or its change already applied — surface that message verbatim. */
+export async function resumeRun(runId: string): Promise<boolean> {
+  return invoke('resume_run', { runId });
+}
+
+/** One run row for the Runs screen (Unified Chat UI phase 7, D6). Mirrors
+ * `haily_app::runs_view::RunSummary`. Deliberately carries RAW status/reason fields rather
+ * than a pre-rendered sentence — VN narration is derived client-side (`run-summary.ts`),
+ * overlaid with the live reducer's richer per-event narration for an in-flight run.
+ * `resumable` is server-computed from the SAME guard `resumeRun` itself enforces — never
+ * re-derive it from `status` alone (mirrors `WorkspaceView.resumable`'s own contract). */
+export interface RunSummary {
+  id: string;
+  session_id: string;
+  work_item_id: string | null;
+  status: string;
+  pause_reason_class: string | null;
+  task: string | null;
+  stage_index: number;
+  attempt: number;
+  attempts_remaining: number;
+  tier_used: string | null;
+  backend_used: string | null;
+  /** Raw per-attempt token JSON array (`[{stage,attempt,tier,backend,prompt_tokens,
+   * completion_tokens}]`) — parsed by `RunTelemetry.svelte`; `null` until any attempt recorded
+   * one. */
+  per_attempt_tokens: string | null;
+  created_at: string;
+  updated_at: string;
+  resumable: boolean;
+}
+
+/** Runs for the Runs screen: every active run plus a bounded window of recent terminal
+ * history (server-side cap — see `haily_app::runs_view::list_runs`'s doc). Read-only,
+ * local-GUI-only. */
+export async function listRuns(): Promise<RunSummary[]> {
+  return invoke('list_runs');
+}
+
+/** Rehydrate one run's persisted timeline for the drill-in (Unified Chat UI phase 7, D6) — the
+ * backend ALSO reconciles a missing terminal event against `pipeline_runs.status`, so a
+ * crashed/restarted run's timeline never renders as permanently "running" here. */
+export async function listRunEvents(runId: string): Promise<RunEvent[]> {
+  return invoke('list_run_events', { runId });
 }

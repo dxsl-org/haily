@@ -48,7 +48,11 @@ fn scout_stage_is_read_only_and_all_stages_are_leaves() {
 fn reject_path_re_runs_design_with_feedback_and_drops_scout() {
     let feedback = "split phase 2 into two smaller phases";
     let p = build_plan_pipeline(TASK, SLUG, Some(feedback), DepthMode::Normal);
-    assert_eq!(p.runs.len(), 3, "reject path is design→write→approval (scout dropped)");
+    assert_eq!(
+        p.runs.len(),
+        3,
+        "reject path is design→write→approval (scout dropped)"
+    );
     assert_eq!(p.runs[0].name, "design");
     assert!(
         p.runs[0].prompt_ref.contains(feedback),
@@ -61,8 +65,15 @@ fn reject_path_re_runs_design_with_feedback_and_drops_scout() {
 fn design_stage_carries_a_forced_grammar() {
     let p = build_plan_pipeline(TASK, SLUG, None, DepthMode::Normal);
     let design = p.runs.iter().find(|s| s.name == "design").unwrap();
-    assert!(design.grammar.is_some(), "the design stage must force the emit_plan_draft grammar");
-    assert!(design.grammar.as_deref().unwrap().contains("emit_plan_draft"));
+    assert!(
+        design.grammar.is_some(),
+        "the design stage must force the emit_plan_draft grammar"
+    );
+    assert!(design
+        .grammar
+        .as_deref()
+        .unwrap()
+        .contains("emit_plan_draft"));
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +96,11 @@ async fn git(dir: &std::path::Path, args: &[&str]) {
         .output()
         .await
         .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 async fn fixture() -> Fixture {
@@ -93,7 +108,9 @@ async fn fixture() -> Fixture {
     git(repo.path(), &["init", "-b", "main"]).await;
     git(repo.path(), &["config", "user.email", "t@haily.test"]).await;
     git(repo.path(), &["config", "user.name", "Test"]).await;
-    tokio::fs::write(repo.path().join("README.md"), "hello\n").await.unwrap();
+    tokio::fs::write(repo.path().join("README.md"), "hello\n")
+        .await
+        .unwrap();
     git(repo.path(), &["add", "."]).await;
     git(repo.path(), &["commit", "-m", "init"]).await;
 
@@ -106,12 +123,23 @@ async fn fixture() -> Fixture {
         .unwrap();
 
     let wt_root = tempfile::tempdir().unwrap();
-    let workspace =
-        CodingWorkspace::open(&db, &session_id.to_string(), repo.path(), wt_root.path(), None)
-            .await
-            .expect("open workspace");
+    let workspace = CodingWorkspace::open(
+        &db,
+        &session_id.to_string(),
+        repo.path(),
+        wt_root.path(),
+        None,
+    )
+    .await
+    .expect("open workspace");
 
-    Fixture { db, kms, session_id, workspace, _dirs: vec![repo, dbdir, wt_root] }
+    Fixture {
+        db,
+        kms,
+        session_id,
+        workspace,
+        _dirs: vec![repo, dbdir, wt_root],
+    }
 }
 
 /// Scripted OpenAI-compatible responder: `responses[i]` for the i-th completion, then "done".
@@ -122,14 +150,19 @@ async fn spawn_scripted(responses: Vec<String>) -> String {
     let counter = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             let responses = Arc::clone(&responses);
             let counter = Arc::clone(&counter);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf).await;
                 let i = counter.fetch_add(1, Ordering::SeqCst);
-                let content = responses.get(i).cloned().unwrap_or_else(|| "done".to_string());
+                let content = responses
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "done".to_string());
                 let payload =
                     serde_json::json!({ "choices": [{ "message": { "content": content } }] })
                         .to_string();
@@ -179,6 +212,7 @@ fn make_runner(
         base_tools,
         broker,
         Arc::new(AtomicBool::new(false)),
+        crate::permission_mode::new_handle(crate::permission_mode::ApprovalMode::AcceptEdits),
         tokio_util::sync::CancellationToken::new(),
         user_tx,
         events,
@@ -248,7 +282,13 @@ async fn scripted_plan_run_writes_artifacts_and_blocks_on_approval() {
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
     let saw = Arc::new(AtomicBool::new(false));
-    let responder = spawn_approver(user_rx, Arc::clone(&broker), fx.session_id, vec![true], Arc::clone(&saw));
+    let responder = spawn_approver(
+        user_rx,
+        Arc::clone(&broker),
+        fx.session_id,
+        vec![true],
+        Arc::clone(&saw),
+    );
 
     let runner = make_runner(
         &fx,
@@ -276,7 +316,10 @@ async fn scripted_plan_run_writes_artifacts_and_blocks_on_approval() {
     let _ = responder.await;
 
     assert_eq!(report.status, RunStatus::Done, "the plan run must complete");
-    assert!(saw.load(Ordering::SeqCst), "the approval checkpoint must have reached the user");
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "the approval checkpoint must have reached the user"
+    );
 
     // Artifacts on disk with the 7-field frontmatter.
     let root = fx.workspace.worktree_root();
@@ -285,17 +328,36 @@ async fn scripted_plan_run_writes_artifacts_and_blocks_on_approval() {
         .expect("plan.md exists");
     assert!(plan_md.contains("## Phases"), "plan.md must list phases");
     let phase = tokio::fs::read_to_string(
-        root.join(".agents").join(SLUG).join("phase-01-add-limiter.md"),
+        root.join(".agents")
+            .join(SLUG)
+            .join("phase-01-add-limiter.md"),
     )
     .await
     .expect("phase-01 file exists");
-    for field in ["phase: 1", "title:", "status:", "priority:", "effort:", "dependencies:", "tier:"] {
-        assert!(phase.contains(field), "phase frontmatter missing `{field}`:\n{phase}");
+    for field in [
+        "phase: 1",
+        "title:",
+        "status:",
+        "priority:",
+        "effort:",
+        "dependencies:",
+        "tier:",
+    ] {
+        assert!(
+            phase.contains(field),
+            "phase frontmatter missing `{field}`:\n{phase}"
+        );
     }
 
     // Linkage: the work item now points at the rendered plan.
-    let linked = haily_db::queries::work_items::get(&fx.db, &wi.id).await.unwrap().unwrap();
-    assert_eq!(linked.plan_path.as_deref(), Some(".agents/251101-plan/plan.md"));
+    let linked = haily_db::queries::work_items::get(&fx.db, &wi.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        linked.plan_path.as_deref(),
+        Some(".agents/251101-plan/plan.md")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -308,10 +370,10 @@ async fn malformed_draft_retries_once_then_pauses() {
     let llm = build_router(
         spawn_scripted(vec![
             "scouted".to_string(),
-            emit_invalid(),           // design attempt 1: tool errors, no draft written
-            "could not".to_string(),  // design attempt 1 gives up → gate fails
-            emit_invalid(),           // design attempt 2 (retry): same
-            "could not".to_string(),  // → gate fails again → pause
+            emit_invalid(),          // design attempt 1: tool errors, no draft written
+            "could not".to_string(), // design attempt 1 gives up → gate fails
+            emit_invalid(),          // design attempt 2 (retry): same
+            "could not".to_string(), // → gate fails again → pause
         ])
         .await,
     )
@@ -320,14 +382,7 @@ async fn malformed_draft_retries_once_then_pauses() {
     let (user_tx, _user_rx) = tokio::sync::mpsc::channel(64);
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
-    let runner = make_runner(
-        &fx,
-        llm,
-        plan_tools(&fx.workspace),
-        broker,
-        user_tx,
-        ev_tx,
-    );
+    let runner = make_runner(&fx, llm, plan_tools(&fx.workspace), broker, user_tx, ev_tx);
 
     let spec = RunSpec {
         pipeline: build_plan_pipeline(TASK, SLUG, None, DepthMode::Normal),
@@ -340,10 +395,22 @@ async fn malformed_draft_retries_once_then_pauses() {
     };
     let report = runner.run(spec).await.expect("run");
 
-    assert_eq!(report.status, RunStatus::Paused, "a twice-malformed draft must pause the run");
-    assert_eq!(report.retries, 1, "exactly one design retry before the pause");
+    assert_eq!(
+        report.status,
+        RunStatus::Paused,
+        "a twice-malformed draft must pause the run"
+    );
+    assert_eq!(
+        report.retries, 1,
+        "exactly one design retry before the pause"
+    );
     assert!(
-        !fx.workspace.worktree_root().join(".agents").join(SLUG).join("plan.md").exists(),
+        !fx.workspace
+            .worktree_root()
+            .join(".agents")
+            .join(SLUG)
+            .join("plan.md")
+            .exists(),
         "no plan.md is rendered when the design stage never produces a valid draft"
     );
 }
@@ -410,9 +477,18 @@ async fn declined_plan_reruns_design_once_and_then_completes() {
     let report = run_plan(&runner, &fx.db, spec).await.expect("run");
     let _ = responder.await;
 
-    assert_eq!(report.status, RunStatus::Done, "the re-run plan must complete after approval");
+    assert_eq!(
+        report.status,
+        RunStatus::Done,
+        "the re-run plan must complete after approval"
+    );
     assert!(
-        fx.workspace.worktree_root().join(".agents").join(SLUG).join("plan.md").exists(),
+        fx.workspace
+            .worktree_root()
+            .join(".agents")
+            .join(SLUG)
+            .join("plan.md")
+            .exists(),
         "the re-rendered plan.md must be on disk after the accepted re-run"
     );
 }
@@ -437,8 +513,13 @@ async fn declined_plan_without_feedback_stays_paused() {
     let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(512);
     let broker = Arc::new(ApprovalBroker::new());
     let saw = Arc::new(AtomicBool::new(false));
-    let responder =
-        spawn_approver(user_rx, Arc::clone(&broker), fx.session_id, vec![false], Arc::clone(&saw));
+    let responder = spawn_approver(
+        user_rx,
+        Arc::clone(&broker),
+        fx.session_id,
+        vec![false],
+        Arc::clone(&saw),
+    );
 
     let runner = make_runner(
         &fx,

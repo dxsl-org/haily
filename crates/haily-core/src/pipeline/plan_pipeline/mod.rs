@@ -230,7 +230,10 @@ impl<'a> PlanRunSpec<'a> {
 /// content gates are Design's draft JSON and Write's `plan.md`. `git` is guaranteed: the
 /// workspace IS a git worktree.
 fn orient_gate() -> Gate {
-    Gate::Command { program: "git".into(), args: vec!["--version".into()] }
+    Gate::Command {
+        program: "git".into(),
+        args: vec!["--version".into()],
+    }
 }
 
 // -- Stage prompts (inline instruction text). ------------------------------------------------

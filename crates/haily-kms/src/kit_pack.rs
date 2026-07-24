@@ -18,12 +18,14 @@
 //!   references/<skill>/<sec>.md -> ReferenceChunk attached to <skill>
 //! ```
 
-use crate::authored_skills::{AuthoredSkill, ReferenceChunk};
+use crate::authored_skills::{AuthoredSkill, ReferenceChunk, SkillKind};
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use haily_db::{queries::skill_versions, DbHandle};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path};
+use uuid::Uuid;
 
 /// Max bytes for a single kit-pack file (P2 review LOW2) — bounds worst-case load memory.
 const MAX_KIT_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
@@ -40,7 +42,7 @@ fn is_escaping_rel(rel: &str) -> bool {
 }
 
 /// The kit-pack manifest — version metadata + per-file sha256 (hex).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
     /// The HailyKit commit this pack was exported from (`"unknown"` if unavailable).
@@ -57,56 +59,224 @@ pub struct Manifest {
 /// Returns an error only when the manifest itself is missing or unparseable — an
 /// individual file that fails verification is skipped (logged), not fatal.
 pub fn load(dir: &Path) -> Result<Vec<AuthoredSkill>> {
-    let manifest_path = dir.join("manifest.json");
-    let manifest_raw = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading kit-pack manifest {}", manifest_path.display()))?;
-    let manifest: Manifest =
-        serde_json::from_str(&manifest_raw).context("parsing kit-pack manifest.json")?;
+    let manifest = read_manifest(dir)?;
 
-    // Verify every listed file; keep only those whose bytes match the pinned hash.
     let mut verified: HashMap<String, String> = HashMap::new();
     for (rel, expected) in &manifest.files {
-        // Path-escape guard (P2 review LOW1): a manifest key like `../../secret.md` (or an
-        // absolute path) must not read a file outside the kit-pack dir. Since the manifest is
-        // only sha256-pinned (signature deferred), an attacker who edits it could otherwise turn
-        // "load tampered pack content" into "read an arbitrary file off disk".
-        if is_escaping_rel(rel) {
-            tracing::warn!(file = %rel, "kit-pack manifest entry escapes the pack dir — skipping");
-            continue;
-        }
-        let path = dir.join(rel);
-        // Size cap (P2 review LOW2): bound worst-case memory — skip an oversized entry before
-        // reading it whole.
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_KIT_FILE_BYTES {
-                tracing::warn!(file = %rel, size = meta.len(), "kit-pack file exceeds size cap — skipping");
-                continue;
-            }
-        }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(file = %rel, "kit-pack file unreadable — skipping: {e}");
-                continue;
-            }
-        };
-        let actual = sha256_hex(&bytes);
-        if &actual != expected {
-            tracing::warn!(
-                file = %rel,
-                "kit-pack file sha256 mismatch (altered out-of-band) — skipping"
-            );
-            continue;
-        }
-        match String::from_utf8(bytes) {
-            Ok(text) => {
+        match verify_one(dir, rel, expected) {
+            VerifyOutcome::Ok(text) => {
                 verified.insert(rel.clone(), text);
             }
-            Err(_) => tracing::warn!(file = %rel, "kit-pack file is not valid UTF-8 — skipping"),
+            VerifyOutcome::HashMismatch => tracing::warn!(
+                file = %rel,
+                "kit-pack file sha256 mismatch (altered out-of-band) — skipping"
+            ),
+            VerifyOutcome::Skip => {}
         }
     }
 
     Ok(build_skills(&verified, &manifest))
+}
+
+/// Like [`load`], but a sha256 MISMATCH is recovered from the newest matching `skill_versions`
+/// row instead of unconditionally skipping the skill (Unified Chat UI phase 8, D4 — the
+/// CRITICAL boot-fallback fix). Every other rejection reason (missing manifest entry escaping
+/// the pack dir, oversized, unreadable, non-UTF8) has no recorded prior state to recover, so it
+/// still just skips as before. This is what makes `write_skill_atomic`'s crash window
+/// survivable: a crash between the skill-file rename and the manifest rename leaves the
+/// manifest pointing at the OLD hash, which no longer matches the NEW bytes already on disk —
+/// but `skill_editor::ops::snapshot_current` already recorded the pre-edit state as a version
+/// before the write began, so THIS loader recovers that instead of dropping the skill.
+///
+/// The recovery itself does NOT silently swallow the tamper/crash signal (review MED-1): each
+/// recovered skill is logged at `error!` (not `warn!` — the old fail-closed drop was
+/// user-visible, so downgrading to a log line alone would be a real observability regression)
+/// AND flagged `recovered = true` on the returned [`AuthoredSkill`], which
+/// `AuthoredRegistry::recovered_names` surfaces for a GUI badge (P09) — the signal is reachable
+/// by the GUI, not log-only.
+///
+/// # Errors
+/// Returns an error only when the manifest itself is missing/unparseable (same as `load`).
+pub async fn load_with_versions_fallback(dir: &Path, db: &DbHandle) -> Result<Vec<AuthoredSkill>> {
+    let manifest = read_manifest(dir)?;
+
+    let mut verified: HashMap<String, String> = HashMap::new();
+    let mut recovered_names: HashSet<String> = HashSet::new();
+    for (rel, expected) in &manifest.files {
+        match verify_one(dir, rel, expected) {
+            VerifyOutcome::Ok(text) => {
+                verified.insert(rel.clone(), text);
+            }
+            VerifyOutcome::HashMismatch => {
+                let name = skill_name_from_rel(rel);
+                let recovered = match &name {
+                    Some(name) => skill_versions::latest_version(db, name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|v| v.kind == "authored"),
+                    None => None,
+                };
+                match recovered {
+                    Some(version) => {
+                        tracing::error!(
+                            file = %rel,
+                            "kit-pack file sha256 mismatch (external tamper or an interrupted edit) — \
+                             recovered previous version from skill_versions"
+                        );
+                        if let Some(name) = name {
+                            recovered_names.insert(name);
+                        }
+                        verified.insert(rel.clone(), version.content_md);
+                    }
+                    None => tracing::warn!(
+                        file = %rel,
+                        "kit-pack file sha256 mismatch (altered out-of-band) — skipping, no fallback available"
+                    ),
+                }
+            }
+            VerifyOutcome::Skip => {}
+        }
+    }
+
+    let mut skills = build_skills(&verified, &manifest);
+    for skill in &mut skills {
+        if recovered_names.contains(&skill.name) {
+            skill.recovered = true;
+        }
+    }
+    Ok(skills)
+}
+
+fn read_manifest(dir: &Path) -> Result<Manifest> {
+    let manifest_path = dir.join("manifest.json");
+    let manifest_raw = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading kit-pack manifest {}", manifest_path.display()))?;
+    serde_json::from_str(&manifest_raw).context("parsing kit-pack manifest.json")
+}
+
+/// `skills/<name>.md` or `standards/<name>.md` → `<name>`; anything else (a reference chunk, or
+/// a nested/escaping path already rejected by `verify_one`) yields `None`.
+fn skill_name_from_rel(rel: &str) -> Option<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let is_skill_file =
+        (parts.first() == Some(&"skills") || parts.first() == Some(&"standards")) && parts.len() == 2;
+    is_skill_file.then(|| parts[1].trim_end_matches(".md").to_string())
+}
+
+/// Outcome of verifying one manifest-declared file — `HashMismatch` is split out from the other
+/// rejection reasons because ONLY it has a recorded prior state a caller might recover from
+/// (`load_with_versions_fallback`); the others (escaping path, oversized, unreadable, non-UTF8)
+/// never had a valid version to fall back to in the first place.
+enum VerifyOutcome {
+    Ok(String),
+    HashMismatch,
+    Skip,
+}
+
+/// The exact per-file checks `load` always ran, factored out so both loaders share them.
+fn verify_one(dir: &Path, rel: &str, expected: &str) -> VerifyOutcome {
+    // Path-escape guard (P2 review LOW1): a manifest key like `../../secret.md` (or an
+    // absolute path) must not read a file outside the kit-pack dir. Since the manifest is
+    // only sha256-pinned (signature deferred), an attacker who edits it could otherwise turn
+    // "load tampered pack content" into "read an arbitrary file off disk".
+    if is_escaping_rel(rel) {
+        tracing::warn!(file = %rel, "kit-pack manifest entry escapes the pack dir — skipping");
+        return VerifyOutcome::Skip;
+    }
+    let path = dir.join(rel);
+    // Size cap (P2 review LOW2): bound worst-case memory — skip an oversized entry before
+    // reading it whole.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_KIT_FILE_BYTES {
+            tracing::warn!(file = %rel, size = meta.len(), "kit-pack file exceeds size cap — skipping");
+            return VerifyOutcome::Skip;
+        }
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(file = %rel, "kit-pack file unreadable — skipping: {e}");
+            return VerifyOutcome::Skip;
+        }
+    };
+    let actual = sha256_hex(&bytes);
+    if actual != *expected {
+        return VerifyOutcome::HashMismatch;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => VerifyOutcome::Ok(text),
+        Err(_) => {
+            tracing::warn!(file = %rel, "kit-pack file is not valid UTF-8 — skipping");
+            VerifyOutcome::Skip
+        }
+    }
+}
+
+/// The manifest-relative path for a skill file: whatever path the CURRENT manifest already has
+/// for `name` (so an edit lands in the same `skills/`/`standards/` subdir it was shipped under),
+/// falling back to `{subdir}/{name}.md` for a brand-new authored file (e.g. `promote_to_authored`,
+/// where no manifest entry exists yet). `name` MUST already be validated
+/// (`skill_editor::validate_skill_name`) by the caller — this function does not re-check it.
+pub fn skill_rel_path(dir: &Path, name: &str, kind: SkillKind) -> String {
+    let subdir = if kind == SkillKind::Standard { "standards" } else { "skills" };
+    let fallback = format!("{subdir}/{name}.md");
+    let Ok(manifest) = read_manifest(dir) else {
+        return fallback;
+    };
+    let skills_path = format!("skills/{name}.md");
+    let standards_path = format!("standards/{name}.md");
+    if manifest.files.contains_key(&skills_path) {
+        return skills_path;
+    }
+    if manifest.files.contains_key(&standards_path) {
+        return standards_path;
+    }
+    fallback
+}
+
+/// Atomically write `content` as the kit-pack file at `rel_path` under `dir`, recompute its
+/// sha256, and commit the updated `manifest.json` LAST (CRITICAL, D4 — see this module's top
+/// doc comment): the skill file is temp-written and renamed into place first, then a temp
+/// manifest (every existing entry plus this one's new hash) is renamed into place as the
+/// single commit point. A crash before that final rename leaves the manifest pointing at the
+/// OLD hash for `rel_path` — `load_with_versions_fallback` recovers from that instead of
+/// silently dropping the skill; a crash after leaves both files consistently updated.
+///
+/// # Errors
+/// Returns an error if `rel_path` escapes `dir`, the manifest is missing/unparseable, or any
+/// file operation fails.
+pub fn write_skill_atomic(dir: &Path, rel_path: &str, content: &str) -> Result<String> {
+    if is_escaping_rel(rel_path) {
+        anyhow::bail!("refusing to write kit-pack file outside the pack dir: {rel_path}");
+    }
+    let mut manifest = read_manifest(dir)?;
+
+    let target = dir.join(rel_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating kit-pack subdir {}", parent.display()))?;
+    }
+    let tmp_target = target.with_extension(format!("md.tmp-{}", Uuid::new_v4()));
+    std::fs::write(&tmp_target, content.as_bytes())
+        .with_context(|| format!("writing temp kit-pack file {}", tmp_target.display()))?;
+    std::fs::rename(&tmp_target, &target)
+        .with_context(|| format!("renaming kit-pack file into place {}", target.display()))?;
+
+    let hash = sha256_hex(content.as_bytes());
+    manifest.files.insert(rel_path.to_string(), hash.clone());
+
+    let manifest_path = dir.join("manifest.json");
+    let tmp_manifest = dir.join(format!("manifest.json.tmp-{}", Uuid::new_v4()));
+    let serialized =
+        serde_json::to_string_pretty(&manifest).context("serializing updated kit-pack manifest")?;
+    std::fs::write(&tmp_manifest, serialized.as_bytes())
+        .with_context(|| format!("writing temp kit-pack manifest {}", tmp_manifest.display()))?;
+    // COMMIT POINT: the loader only sees `rel_path` as verified once this rename lands.
+    std::fs::rename(&tmp_manifest, &manifest_path)
+        .with_context(|| format!("renaming kit-pack manifest into place {}", manifest_path.display()))?;
+
+    Ok(hash)
 }
 
 /// Assemble verified file contents into skills, attaching reference chunks by skill name.
@@ -309,5 +479,120 @@ mod tests {
         assert!(is_escaping_rel("/etc/passwd"));
         assert!(!is_escaping_rel("skills/plan.md"));
         assert!(!is_escaping_rel("references/cook/tdd-workflow.md"));
+    }
+
+    // ------------------------------------------------------------------
+    // Unified Chat UI phase 8 (D4): atomic write + boot-fallback recovery
+    // ------------------------------------------------------------------
+
+    async fn test_db() -> (DbHandle, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn write_skill_atomic_updates_file_and_manifest_hash() {
+        let dir = make_pack(false);
+        let new_content = "---\nname: cook\ndescription: build code\nwhen_to_use: implement a change\ndomain: developer\nkind: stage-prompt\n---\nEDITED BODY\n";
+
+        let hash = write_skill_atomic(dir.path(), "skills/cook.md", new_content).expect("atomic write");
+        assert_eq!(hash, sha256_hex(new_content.as_bytes()));
+
+        let on_disk = fs::read_to_string(dir.path().join("skills/cook.md")).unwrap();
+        assert_eq!(on_disk, new_content);
+
+        let manifest: Manifest =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.files.get("skills/cook.md").unwrap(), &hash);
+        // The untouched reference entry must survive the manifest rewrite.
+        assert!(manifest.files.contains_key("references/cook/tdd.md"));
+
+        let skills = load(dir.path()).expect("reload after atomic write");
+        assert_eq!(skills[0].body.trim(), "EDITED BODY");
+    }
+
+    #[test]
+    fn write_skill_atomic_rejects_an_escaping_rel_path() {
+        let dir = make_pack(false);
+        let result = write_skill_atomic(dir.path(), "../outside.md", "x");
+        assert!(result.is_err(), "an escaping rel_path must never be written");
+    }
+
+    #[tokio::test]
+    async fn crash_between_file_write_and_manifest_rename_recovers_from_skill_versions() {
+        // Simulate the exact crash window `write_skill_atomic` closes: the skill FILE already
+        // has the new bytes, but `manifest.json` still pins the OLD hash (as if the process
+        // died after the file rename but before the manifest rename). A pre-edit snapshot
+        // (what `skill_editor::ops::snapshot_current` would have inserted) is the only way
+        // back to a consistent skill.
+        let dir = make_pack(false);
+        let (db, _db_dir) = test_db().await;
+
+        let pre_edit_content = fs::read_to_string(dir.path().join("skills/cook.md")).unwrap();
+        skill_versions::insert_version(
+            &db,
+            "cook",
+            "authored",
+            &pre_edit_content,
+            &sha256_hex(pre_edit_content.as_bytes()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Overwrite the file with "new" bytes WITHOUT touching manifest.json — the crash state.
+        fs::write(dir.path().join("skills/cook.md"), "half-written garbage").unwrap();
+
+        let skills = load_with_versions_fallback(dir.path(), &db)
+            .await
+            .expect("fallback load must not fail");
+        let cook = skills.iter().find(|s| s.name == "cook").expect("cook recovered, not dropped");
+        assert!(
+            cook.body.contains("cook body"),
+            "recovered content must be the pre-edit snapshot, got: {}",
+            cook.body
+        );
+        // The unaffected reference-bearing file must still load normally.
+        assert_eq!(cook.references.len(), 1, "other kit-pack content is unaffected");
+        // MED-1 review fix: the tamper/crash signal must be GUI-reachable, not log-only.
+        assert!(cook.recovered, "a recovered skill must be flagged, not just logged");
+    }
+
+    #[tokio::test]
+    async fn a_cleanly_loaded_skill_is_never_flagged_recovered() {
+        let dir = make_pack(false);
+        let (db, _db_dir) = test_db().await;
+        let skills = load_with_versions_fallback(dir.path(), &db).await.unwrap();
+        assert!(!skills[0].recovered, "a hash-verified skill must never be flagged recovered");
+    }
+
+    #[tokio::test]
+    async fn crash_with_no_prior_version_still_skips_gracefully_not_fatally() {
+        // First-ever edit crashing mid-way: no `skill_versions` row exists yet, so recovery is
+        // impossible — the loader must still just skip this one skill (old behavior), not error
+        // the whole kit-pack load.
+        let dir = make_pack(false);
+        let (db, _db_dir) = test_db().await;
+        fs::write(dir.path().join("skills/cook.md"), "half-written garbage").unwrap();
+
+        let skills = load_with_versions_fallback(dir.path(), &db)
+            .await
+            .expect("fallback load must not fail even with nothing to recover");
+        assert!(skills.is_empty(), "no fallback available — the skill is skipped, not fabricated");
+    }
+
+    #[test]
+    fn skill_rel_path_prefers_the_manifest_entry_over_the_default_subdir() {
+        let dir = make_pack(false);
+        // "cook" is shipped under skills/ — even if called with a mismatched kind, the
+        // existing manifest entry wins.
+        assert_eq!(skill_rel_path(dir.path(), "cook", SkillKind::Standard), "skills/cook.md");
+        // A brand-new name (no manifest entry) falls back to the kind-derived default.
+        assert_eq!(skill_rel_path(dir.path(), "brand-new", SkillKind::Playbook), "skills/brand-new.md");
+        assert_eq!(
+            skill_rel_path(dir.path(), "brand-new", SkillKind::Standard),
+            "standards/brand-new.md"
+        );
     }
 }

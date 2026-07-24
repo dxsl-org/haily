@@ -16,23 +16,28 @@
   );
   const truncatedCount = $derived(Math.max(0, job.events.length - MAX_RENDERED));
 
+  // VN vocabulary (Unified Chat UI phase 7, D6 — this card is mounted for the first time here,
+  // via the Runs drill-in's `RunTimeline`) — mirrors `RunProgressCard`'s own `STATUS_LABEL`.
   const STATUS_LABEL: Record<Job['status'], string> = {
-    running: 'Running',
-    paused: 'Paused',
-    complete: 'Complete',
-    failed: 'Failed',
+    running: 'Đang chạy',
+    paused: 'Tạm dừng',
+    complete: 'Hoàn tất',
+    failed: 'Thất bại',
+    // A synthesized `RunComplete{outcome:"interrupted"}` marker must render distinctly from
+    // both a running job and a genuine failure (review MED) — never collapsed into 'complete'.
+    interrupted: 'Gián đoạn',
   };
 </script>
 
 <div class="job">
   <button class="job-head" onclick={onToggle} aria-expanded={isExpanded}>
     <span class="status status-{job.status}">{STATUS_LABEL[job.status]}</span>
-    <span class="title">{job.workItemId || `run …${job.runId.slice(-8)}`}</span>
+    <span class="title">{job.workItemId || `tác vụ …${job.runId.slice(-8)}`}</span>
     {#if job.currentStage}
       <span class="stage">{job.currentStage}{job.currentTier ? ` · ${job.currentTier}` : ''}</span>
     {/if}
     {#if job.lastAttempt !== null && job.lastAttempt > 0}
-      <span class="attempt">retry #{job.lastAttempt}</span>
+      <span class="attempt">lần thử lại #{job.lastAttempt}</span>
     {/if}
     <span class="chevron">{isExpanded ? '▾' : '▸'}</span>
   </button>
@@ -40,7 +45,7 @@
   {#if isExpanded}
     <div class="events">
       {#if truncatedCount > 0}
-        <div class="truncated">… {truncatedCount} earlier events not shown</div>
+        <div class="truncated">… {truncatedCount} sự kiện trước đó không hiển thị</div>
       {/if}
       {#each visibleEvents as event, i (i)}
         {@const d = describeEvent(event)}
@@ -88,6 +93,7 @@
   .status-paused { color: #fbbf24; }
   .status-complete { color: #4ade80; }
   .status-failed { color: #f87171; }
+  .status-interrupted { color: #fb923c; }
 
   .title {
     color: #e0dff5;

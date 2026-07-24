@@ -230,15 +230,51 @@ pub async fn get_skill(db: &DbHandle, id: &str) -> Result<Option<Skill>> {
     .await?)
 }
 
+/// Fetch a single active skill by NAME — the skill editor's (Unified Chat UI phase 8) lookup
+/// key, unlike `get_skill`'s ID-keyed targeted EMA updates.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub async fn get_skill_by_name(db: &DbHandle, name: &str) -> Result<Option<Skill>> {
+    Ok(sqlx::query_as::<_, Skill>(
+        "SELECT * FROM kms_skills WHERE name = ? AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await?)
+}
+
+/// Overwrite a synthesized skill's `description` column — the skill editor's (phase 8, D4)
+/// "body" for a synthesized skill: `kms_skills` has no dedicated body column, and `description`
+/// is already the free-form prose field `synthesized_skill_body`/Jaccard matching read, so the
+/// structured-editor's rendered markdown replaces it directly rather than adding a migration.
+///
+/// # Errors
+/// Returns an error if the update fails.
+pub async fn update_skill_body(db: &DbHandle, id: &str, body: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE kms_skills SET description = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(body)
+    .bind(&now)
+    .bind(id)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
 /// Fetch a skill by ID regardless of archived/deleted state — unlike `get_skill`
 /// (which exists for "targeted EMA updates" on ACTIVE skills only), this is for
 /// callers that need to observe the archival outcome itself (e.g. a corroboration-
 /// floor test asserting a skill was or was not archived by `apply_skill_decay`).
 pub async fn get_skill_any_state(db: &DbHandle, id: &str) -> Result<Option<Skill>> {
-    Ok(sqlx::query_as::<_, Skill>("SELECT * FROM kms_skills WHERE id = ?")
-        .bind(id)
-        .fetch_optional(db.pool())
-        .await?)
+    Ok(
+        sqlx::query_as::<_, Skill>("SELECT * FROM kms_skills WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?,
+    )
 }
 
 /// Top-N active skills by confidence — used to inject skills into the system prompt.
@@ -709,7 +745,9 @@ mod gate_label_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = DbHandle::init(&dir.path().join("t.db")).await.unwrap();
         let session_id = Uuid::new_v4().to_string();
-        sessions::create_session(&db, &session_id, "test", None).await.unwrap();
+        sessions::create_session(&db, &session_id, "test", None)
+            .await
+            .unwrap();
         (db, session_id, dir)
     }
 
@@ -724,19 +762,32 @@ mod gate_label_tests {
     #[tokio::test]
     async fn gate_label_applies_to_an_unlabeled_trace() {
         let (db, sid, _dir) = db_with_session().await;
-        let t = insert_trace(&db, &sid, "build stage", "[]", "success", Some(1), metrics_with_label(None))
-            .await
-            .unwrap();
+        let t = insert_trace(
+            &db,
+            &sid,
+            "build stage",
+            "[]",
+            "success",
+            Some(1),
+            metrics_with_label(None),
+        )
+        .await
+        .unwrap();
         assert_eq!(t.label_source, None, "precondition: trace starts unlabeled");
 
-        let changed = apply_gate_result_label(&db, &t.id, "failure").await.unwrap();
+        let changed = apply_gate_result_label(&db, &t.id, "failure")
+            .await
+            .unwrap();
         assert!(changed, "an unlabeled trace must accept the gate label");
 
         let after = recent_traces(&db, 5).await.unwrap();
         let after = after.iter().find(|r| r.id == t.id).unwrap();
         assert_eq!(after.label_source.as_deref(), Some("gate_result"));
         assert_eq!(after.label_confidence, Some(0.9));
-        assert_eq!(after.outcome, "failure", "outcome must reflect the gate verdict");
+        assert_eq!(
+            after.outcome, "failure",
+            "outcome must reflect the gate verdict"
+        );
     }
 
     #[tokio::test]
@@ -754,8 +805,13 @@ mod gate_label_tests {
         .await
         .unwrap();
 
-        let changed = apply_gate_result_label(&db, &t.id, "success").await.unwrap();
-        assert!(!changed, "an explicit_feedback label must protect the trace from a gate relabel");
+        let changed = apply_gate_result_label(&db, &t.id, "success")
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "an explicit_feedback label must protect the trace from a gate relabel"
+        );
 
         let after = recent_traces(&db, 5).await.unwrap();
         let after = after.iter().find(|r| r.id == t.id).unwrap();
@@ -764,6 +820,9 @@ mod gate_label_tests {
             Some("explicit_feedback"),
             "explicit feedback must survive — a gate result never overwrites it"
         );
-        assert_eq!(after.outcome, "failure", "outcome must NOT be rewritten when the label is protected");
+        assert_eq!(
+            after.outcome, "failure",
+            "outcome must NOT be rewritten when the label is protected"
+        );
     }
 }

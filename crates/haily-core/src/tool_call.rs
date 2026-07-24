@@ -1,6 +1,8 @@
 /// Tool call parsing, loop-guard, and dispatch.
+use crate::permission_mode::{self, ApprovalModeHandle};
 use crate::tag_matcher::{self, TagMatch};
 use anyhow::{bail, Result};
+use haily_db::queries::journal;
 use haily_tools::journal_undo::IS_COMPENSATION_TOOL;
 use haily_tools::{RiskTier, ToolContext, ToolRegistry, MAX_AUTO_DELETES_PER_TURN};
 use haily_types::ResponseChunk;
@@ -220,6 +222,7 @@ pub async fn dispatch(
     registry: &ToolRegistry,
     ctx: &ToolContext,
     kill: &Arc<AtomicBool>,
+    mode: &ApprovalModeHandle,
 ) -> Result<(String, bool)> {
     let tool = registry
         .get(tool_name)
@@ -291,61 +294,77 @@ pub async fn dispatch(
         ));
     }
 
+    let approval_mode = permission_mode::load(mode);
     match effective_tier {
         RiskTier::Blocked => {
             bail!("tool '{tool_name}' is blocked");
+        }
+        RiskTier::ReversibleWrite => {
+            // Named permission ladder (D5): `manual` prompts even a plain ReversibleWrite
+            // (stricter than the pre-ladder runtime, which always auto-ran it);
+            // `accept_edits`/`auto` auto-run it exactly as before. `reversible: true` since
+            // this tier is, by construction, journaled/undoable.
+            if permission_mode::should_prompt(approval_mode, effective_tier) {
+                if let Some(refusal) = request_approval(ctx, tool_name, &args, true).await {
+                    return Ok(refusal);
+                }
+            }
         }
         RiskTier::IrreversibleWrite => {
             // Pre-validated allowlist (destructive/exfil tools can never be listed —
             // enforced at startup, not here) lets specific low-risk IrreversibleWrite
             // tools skip the interactive prompt. Every bypass is logged at warn: it
-            // is a deliberate, auditable trust decision, not silent.
+            // is a deliberate, auditable trust decision, not silent. This bypass is
+            // orthogonal to the permission ladder — it wins in EVERY mode, same as before.
             if ctx.approval_gate.is_auto_approved(tool_name) {
                 warn!(
                     tool = tool_name,
                     "tool call auto-approved via config allowlist"
                 );
-            } else {
-                let approval_id = Uuid::new_v4();
+                // Review fix (LOW): an allowlisted bypass executes without a human prompt
+                // in EVERY mode, same as `auto` — it must leave the same RECORD-ONLY audit
+                // row `auto` mode does, or this path would be a silent gap in the "every
+                // irreversible write that executes without a prompt gets an audit row"
+                // contract. Unconditional (not mode-gated): the allowlist bypass already
+                // wins in every mode, so its audit trail must too. Best-effort, same as
+                // the `auto`-mode call below.
+                if let Err(e) = record_only_journal_write(ctx, tool_name, &args).await {
+                    warn!(
+                        tool = tool_name,
+                        error = %e,
+                        "record-only journal write failed for an allowlisted irreversible write"
+                    );
+                }
+            } else if permission_mode::should_prompt(approval_mode, effective_tier) {
                 // The tool's OWN tier (pre-escalation) tells the UI whether this prompt
                 // exists only because M2's per-turn cap escalated a normally-reversible
                 // delete, vs. a tool that is genuinely IrreversibleWrite/Blocked on its
                 // own merits — see `ResponseChunk::ToolApprovalRequest::reversible` doc.
                 let is_cap_escalated_reversible = tier == RiskTier::ReversibleWrite;
-                let _ = ctx
-                    .approval_tx
-                    .send(ResponseChunk::ToolApprovalRequest {
-                        tool: tool_name.to_string(),
-                        args: args.to_string(),
-                        approval_id,
-                        // Server-derived "who is asking" — from `ctx.depth` + the static
-                        // domain name, NEVER from LLM/task text, so a compromised
-                        // sub-agent cannot forge `L0`. Display-only (see `ResponseChunk`).
-                        origin: Some(approval_origin(ctx.depth, ctx.domain)),
-                        reversible: is_cap_escalated_reversible,
-                    })
-                    .await;
-
-                let approved = ctx
-                    .approval_gate
-                    .request(approval_id, ctx.session_id, &ctx.cancel)
-                    .await;
-                if !approved {
-                    info!(tool = tool_name, %approval_id, "tool call denied (declined, timed out, or cancelled)");
-                    let _ = ctx
-                        .approval_tx
-                        .send(ResponseChunk::ToolResult {
-                            name: tool_name.to_string(),
-                            ok: false,
-                            reversible: false,
-                            journal_id: None,
-                        })
-                        .await;
-                    return Ok(("Người dùng đã từ chối yêu cầu này.".to_string(), false));
+                if let Some(refusal) =
+                    request_approval(ctx, tool_name, &args, is_cap_escalated_reversible).await
+                {
+                    return Ok(refusal);
+                }
+            } else {
+                // `auto` mode: skip the prompt, but leave a RECORD-ONLY audit row — no
+                // compensator, no undo promised (D5 user decision; the ladder copy says
+                // so explicitly). Best-effort: a write failure here never blocks the tool
+                // call it is auditing.
+                info!(
+                    tool = tool_name,
+                    "auto-approved via `auto` permission mode — recording audit-only journal row"
+                );
+                if let Err(e) = record_only_journal_write(ctx, tool_name, &args).await {
+                    warn!(
+                        tool = tool_name,
+                        error = %e,
+                        "record-only journal write failed for an auto-approved irreversible write"
+                    );
                 }
             }
         }
-        RiskTier::Read | RiskTier::ReversibleWrite => {}
+        RiskTier::Read => {}
     }
 
     info!(tool = tool_name, "executing tool");
@@ -401,6 +420,91 @@ pub async fn dispatch(
     };
 
     Ok((result, ok))
+}
+
+/// Requests an interactive approval for `tool_name` and awaits its resolution. Returns
+/// `Some((decline_text, false))` when denied/timed out/cancelled — the caller MUST return
+/// this immediately without ever calling `execute()`. Returns `None` when approved, meaning
+/// the caller should proceed. `reversible` is the server-derived flag surfaced on both the
+/// emitted `ToolApprovalRequest` and (on denial) the `ToolResult` — `true` for a genuine
+/// `ReversibleWrite` or a cap-escalated delete, `false` for a tool that is
+/// `IrreversibleWrite`/`Blocked` on its own merits. Shared by both the `ReversibleWrite` and
+/// `IrreversibleWrite` prompting branches in `dispatch` (D5) so the approval wire-protocol
+/// and denial bookkeeping exist in exactly one place.
+async fn request_approval(
+    ctx: &ToolContext,
+    tool_name: &str,
+    args: &serde_json::Value,
+    reversible: bool,
+) -> Option<(String, bool)> {
+    let approval_id = Uuid::new_v4();
+    let _ = ctx
+        .approval_tx
+        .send(ResponseChunk::ToolApprovalRequest {
+            tool: tool_name.to_string(),
+            args: args.to_string(),
+            approval_id,
+            // Server-derived "who is asking" — from `ctx.depth` + the static domain name,
+            // NEVER from LLM/task text, so a compromised sub-agent cannot forge `L0`.
+            origin: Some(approval_origin(ctx.depth, ctx.domain)),
+            reversible,
+        })
+        .await;
+
+    let approved = ctx
+        .approval_gate
+        .request(approval_id, ctx.session_id, &ctx.cancel)
+        .await;
+    if approved {
+        return None;
+    }
+    info!(tool = tool_name, %approval_id, "tool call denied (declined, timed out, or cancelled)");
+    let _ = ctx
+        .approval_tx
+        .send(ResponseChunk::ToolResult {
+            name: tool_name.to_string(),
+            ok: false,
+            reversible: false,
+            journal_id: None,
+        })
+        .await;
+    Some(("Người dùng đã từ chối yêu cầu này.".to_string(), false))
+}
+
+/// Writes a RECORD-ONLY audit row for an `IrreversibleWrite` auto-approved under the
+/// `auto` permission mode (D5). `compensability: "final"` + no `compensation_plan` means
+/// `journal_undo`'s refusal logic (`compensability == "final"`, see `journal_undo::logic`)
+/// rejects any undo attempt against this row — full audit trail, but never a route back to
+/// the `ReversibleWrite` undo path (`tool_call::dispatch`'s `journal_id` surfacing at
+/// `:361-376` in this file, keyed on the tool's own tier, is untouched by this function).
+async fn record_only_journal_write(
+    ctx: &ToolContext,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Result<()> {
+    let session_id = ctx.session_id.to_string();
+    let turn_id = ctx.turn_id.to_string();
+    let idempotency_key = Uuid::new_v4().to_string();
+    journal::insert(
+        &ctx.db,
+        journal::NewAction {
+            session_id: &session_id,
+            tool_name,
+            tool_tier: "IrreversibleWrite",
+            compensability: "final",
+            idempotency_key: &idempotency_key,
+            correlation_ref: tool_name,
+            request_params: &args.to_string(),
+            pre_state: None,
+            pre_state_version: None,
+            compensation_plan: None,
+            turn_id: Some(&turn_id),
+            retention_days: haily_tools::LOCAL_RETENTION_DAYS,
+            manifest_hash: None,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Build the display-only `origin` label for a `ToolApprovalRequest`, derived SERVER-
@@ -553,7 +657,10 @@ mod tests {
         assert_eq!(MAX_TOOL_CALLS, 10);
         let mut g = LoopGuard::new();
         for i in 0..MAX_TOOL_CALLS {
-            assert!(g.check("t", &serde_json::json!({ "i": i })).is_ok(), "call {i} under ceiling");
+            assert!(
+                g.check("t", &serde_json::json!({ "i": i })).is_ok(),
+                "call {i} under ceiling"
+            );
         }
         assert!(
             g.check("t", &serde_json::json!({ "i": "over" })).is_err(),
@@ -567,7 +674,10 @@ mod tests {
         // are identical — only the count ceiling differs.
         let mut g = LoopGuard::with_limit(3);
         for i in 0..3 {
-            assert!(g.check("t", &serde_json::json!({ "i": i })).is_ok(), "call {i} under limit");
+            assert!(
+                g.check("t", &serde_json::json!({ "i": i })).is_ok(),
+                "call {i} under limit"
+            );
         }
         assert!(
             g.check("t", &serde_json::json!({ "i": 99 })).is_err(),
@@ -700,6 +810,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -724,6 +835,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -819,6 +931,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -859,6 +972,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -886,6 +1000,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -943,6 +1058,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -988,6 +1104,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1044,6 +1161,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1069,6 +1187,15 @@ mod tests {
     /// is not specifically exercising the switch.
     fn kill_off() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
+    }
+
+    /// Default test mode — `accept_edits` matches the pre-ladder runtime this whole test
+    /// suite was written against (a plain `ReversibleWrite` auto-runs, `IrreversibleWrite`
+    /// prompts). The ladder's own boundary (`manual` prompting both, `auto` skipping both
+    /// with a record-only journal row) is covered by the dedicated `permission_mode` tests
+    /// further down this module.
+    fn mode_accept_edits() -> ApprovalModeHandle {
+        permission_mode::new_handle(permission_mode::ApprovalMode::AcceptEdits)
     }
 
     /// A pure-read tool used by the kill-switch tests to prove reads still run when writes
@@ -1128,10 +1255,16 @@ mod tests {
         let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
         let kill = Arc::new(AtomicBool::new(true));
 
-        let (read_text, read_ok) =
-            dispatch("read_thing", serde_json::json!({}), &registry, &ctx, &kill)
-                .await
-                .unwrap();
+        let (read_text, read_ok) = dispatch(
+            "read_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+            &mode_accept_edits(),
+        )
+        .await
+        .unwrap();
         assert!(read_ok, "reads must run under the kill switch");
         assert_eq!(read_text, "read-result");
 
@@ -1142,6 +1275,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1171,6 +1305,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1199,6 +1334,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1228,6 +1364,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1241,6 +1378,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1309,9 +1447,16 @@ mod tests {
         let (ctx, _rx, _dir) = test_ctx_with_deletes(broker, 0).await;
         let kill = Arc::new(AtomicBool::new(true));
 
-        let (text, ok) = dispatch("task_delete", serde_json::json!({}), &registry, &ctx, &kill)
-            .await
-            .unwrap();
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+            &mode_accept_edits(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             !ok,
@@ -1340,6 +1485,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1403,6 +1549,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1464,6 +1611,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1529,6 +1677,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1603,6 +1752,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1680,6 +1830,7 @@ mod tests {
                 &registry,
                 &ctx,
                 &kill_off(),
+                &mode_accept_edits(),
             ),
         )
         .await
@@ -1717,6 +1868,7 @@ mod tests {
         let broker = Arc::new(ApprovalBroker::new());
         let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
         let kill = kill_off();
+        let mode = mode_accept_edits();
 
         let dispatch_fut = dispatch(
             "task_create",
@@ -1724,6 +1876,7 @@ mod tests {
             &registry,
             &ctx,
             &kill,
+            &mode,
         );
         let (dispatch_result, chunk) = tokio::join!(dispatch_fut, async {
             while let Some(chunk) = rx.recv().await {
@@ -1787,6 +1940,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1827,6 +1981,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1854,6 +2009,7 @@ mod tests {
             &registry,
             &ctx,
             &kill_off(),
+            &mode_accept_edits(),
         )
         .await
         .unwrap();
@@ -1876,5 +2032,342 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unified Chat UI phase 11 (D5) — named permission ladder, dispatch-level integration.
+    // `permission_mode::should_prompt_table` (in `permission_mode.rs`) covers the pure
+    // (mode × tier) decision; these prove dispatch actually WIRES that decision in, plus the
+    // two invariants the ladder must never violate: the kill switch beats every mode, and a
+    // live mode change takes effect on the very next call with no restart.
+    // -----------------------------------------------------------------------
+
+    /// A tool with NO risk_tier at all reachable here — used to prove `Blocked` never runs
+    /// regardless of mode.
+    struct BlockedTool;
+
+    #[async_trait]
+    impl Tool for BlockedTool {
+        fn name(&self) -> &str {
+            "blocked_thing"
+        }
+        fn description(&self) -> &str {
+            "never allowed to execute"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn risk_tier(&self, _args: &serde_json::Value) -> RiskTier {
+            RiskTier::Blocked
+        }
+        async fn execute(&self, _args: serde_json::Value, _ctx: &ToolContext) -> Result<String> {
+            Ok("must never run".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_mode_prompts_a_plain_reversible_write_that_accept_edits_would_auto_run() {
+        // `task_delete` (RetieredDeleteTool stand-in) is `ReversibleWrite` and auto-runs under
+        // `accept_edits` (see the cap-escalation tests above) — under `manual` it must prompt.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RetieredDeleteTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, Arc::clone(&broker), CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Manual);
+
+        let session_id = ctx.session_id;
+        let saw_reversible = Arc::new(std::sync::Mutex::new(None));
+        let saw_reversible_c = Arc::clone(&saw_reversible);
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest {
+                    approval_id,
+                    reversible,
+                    ..
+                } = chunk
+                {
+                    *saw_reversible_c.lock().unwrap() = Some(reversible);
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, true);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch(
+            "task_delete",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(ok, "an approved prompt must still execute: {text}");
+        assert_eq!(text, "deleted");
+        assert_eq!(
+            *saw_reversible.lock().unwrap(),
+            Some(true),
+            "a plain ReversibleWrite prompted under manual must carry reversible:true"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_mode_still_prompts_irreversible_write_exactly_like_accept_edits() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, Arc::clone(&broker), CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Manual);
+
+        let session_id = ctx.session_id;
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+
+        assert!(!ok, "manual denies exactly like accept_edits: {text}");
+        assert_eq!(text, "Người dùng đã từ chối yêu cầu này.");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_auto_approves_irreversible_write_and_leaves_a_record_only_journal_row() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Auto);
+        let db = Arc::clone(&ctx.db);
+        let session_id = ctx.session_id.to_string();
+        let turn_id = ctx.turn_id.to_string();
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "auto mode must auto-run the irreversible write: {text}");
+        assert_eq!(text, "deleted");
+
+        let chunk = rx
+            .recv()
+            .await
+            .expect("dispatch must emit exactly one chunk");
+        assert!(
+            matches!(chunk, ResponseChunk::ToolResult { ok: true, .. }),
+            "auto mode must never raise a ToolApprovalRequest — got {chunk:?}"
+        );
+
+        let rows = journal::list_by_turn(&db, &turn_id, &session_id)
+            .await
+            .expect("query journal");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one record-only journal row expected"
+        );
+        assert_eq!(rows[0].tool_name, "delete_thing");
+        assert_eq!(
+            rows[0].compensability, "final",
+            "record-only row must be marked non-compensable"
+        );
+        assert!(
+            rows[0].compensation_plan.is_none(),
+            "record-only row must carry NO compensation plan — no undo promised"
+        );
+    }
+
+    /// Review fix (LOW): the pre-validated allowlist bypass (`is_auto_approved`) also
+    /// executes an `IrreversibleWrite` without a human prompt — it must leave the SAME
+    /// record-only audit row `auto` mode does, in EVERY mode (checked here under
+    /// `manual`, the strictest rung, to prove the bypass is unconditional on mode).
+    #[tokio::test]
+    async fn allowlisted_bypass_leaves_a_record_only_journal_row_even_under_manual() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::with_auto_approve(
+            ["delete_thing".to_string()].into_iter().collect(),
+        ));
+        let (ctx, mut rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Manual);
+        let db = Arc::clone(&ctx.db);
+        let session_id = ctx.session_id.to_string();
+        let turn_id = ctx.turn_id.to_string();
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "allowlisted tool must auto-run with no prompt: {text}");
+        assert_eq!(text, "deleted");
+
+        let chunk = rx
+            .recv()
+            .await
+            .expect("dispatch must emit exactly one chunk");
+        assert!(
+            matches!(chunk, ResponseChunk::ToolResult { ok: true, .. }),
+            "the allowlist bypass must never raise a ToolApprovalRequest — got {chunk:?}"
+        );
+
+        let rows = journal::list_by_turn(&db, &turn_id, &session_id)
+            .await
+            .expect("query journal");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the allowlisted bypass must leave exactly one record-only journal row"
+        );
+        assert_eq!(rows[0].tool_name, "delete_thing");
+        assert_eq!(
+            rows[0].compensability, "final",
+            "record-only row must be marked non-compensable"
+        );
+        assert!(
+            rows[0].compensation_plan.is_none(),
+            "record-only row must carry NO compensation plan — no undo promised"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_writes_even_under_auto_mode() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, _rx, _dir) = test_ctx(0, broker, CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Auto);
+        let kill = Arc::new(AtomicBool::new(true));
+
+        let (text, ok) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill,
+            &mode,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok,
+            "the kill switch must block writes in EVERY mode, including auto"
+        );
+        assert!(text.contains("safety.disable_writes"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn blocked_tier_never_runs_regardless_of_mode() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(BlockedTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        for approval_mode in [
+            permission_mode::ApprovalMode::Manual,
+            permission_mode::ApprovalMode::AcceptEdits,
+            permission_mode::ApprovalMode::Auto,
+        ] {
+            let (ctx, _rx, _dir) = test_ctx(0, Arc::clone(&broker), CancellationToken::new()).await;
+            let mode = permission_mode::new_handle(approval_mode);
+            let result = dispatch(
+                "blocked_thing",
+                serde_json::json!({}),
+                &registry,
+                &ctx,
+                &kill_off(),
+                &mode,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "Blocked must refuse under {approval_mode:?}, never modulated by the ladder"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_change_is_live_on_the_very_next_dispatch_call() {
+        // ONE handle, flipped mid-test — proves the ladder is a live toggle (mirrors the kill
+        // switch's `kill_switch_live_toggle_no_restart`), not a per-call snapshot.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RequireApprovalTool));
+        let broker = Arc::new(ApprovalBroker::new());
+        let (ctx, mut rx, _dir) = test_ctx(0, Arc::clone(&broker), CancellationToken::new()).await;
+        let mode = permission_mode::new_handle(permission_mode::ApprovalMode::Manual);
+
+        let session_id = ctx.session_id;
+        let broker_c = Arc::clone(&broker);
+        let responder = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let ResponseChunk::ToolApprovalRequest { approval_id, .. } = chunk {
+                    use haily_types::ApprovalResolver;
+                    broker_c.resolve(approval_id, session_id, false);
+                    break;
+                }
+            }
+        });
+
+        let (_text, ok1) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert!(
+            !ok1,
+            "manual mode must prompt (and here be denied) on the first call"
+        );
+
+        // Flip the SAME handle live — no new dispatch param, no restart.
+        permission_mode::store(&mode, permission_mode::ApprovalMode::Auto);
+
+        let (text2, ok2) = dispatch(
+            "delete_thing",
+            serde_json::json!({}),
+            &registry,
+            &ctx,
+            &kill_off(),
+            &mode,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ok2,
+            "the SAME handle, now flipped to auto, must auto-run on the very next call: {text2}"
+        );
     }
 }
